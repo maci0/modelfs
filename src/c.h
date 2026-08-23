@@ -1,6 +1,5 @@
 #include <fuse.h>
 #include <fuse_common.h>
-#include <fuse_lowlevel.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -13,9 +12,6 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
-#include <string.h>
-#include <time.h>
 #include <poll.h>
 #include <ifaddrs.h>
-#include <net/if.h>
 #include <limits.h>

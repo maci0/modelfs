@@ -56,7 +56,6 @@ pub fn pathScore(ewma_bps: f64, hops: u32, inflight: u32) f64 {
 }
 
 pub const PathCand = struct {
-    peer_id: []const u8,
     ip: []const u8,
     port: u16,
     ewma_bps: f64,
@@ -689,9 +688,9 @@ test "path score: 200G L2 beats 10G routed beats busy 200G" {
 
 test "pickBest is exclusive: one winner, skips !have" {
     const cands = [_]PathCand{
-        .{ .peer_id = "a", .ip = "192.168.0.1", .port = 18080, .ewma_bps = 1e9, .hops = 0, .inflight = 0, .have = false },
-        .{ .peer_id = "b", .ip = "192.168.0.2", .port = 18080, .ewma_bps = 5e8, .hops = 0, .inflight = 0, .have = true },
-        .{ .peer_id = "c", .ip = "192.168.0.3", .port = 18080, .ewma_bps = 9e9, .hops = 0, .inflight = 0, .have = true },
+        .{ .ip = "192.168.0.1", .port = 18080, .ewma_bps = 1e9, .hops = 0, .inflight = 0, .have = false },
+        .{ .ip = "192.168.0.2", .port = 18080, .ewma_bps = 5e8, .hops = 0, .inflight = 0, .have = true },
+        .{ .ip = "192.168.0.3", .port = 18080, .ewma_bps = 9e9, .hops = 0, .inflight = 0, .have = true },
     };
     const i = pickBest(&cands).?;
     try std.testing.expectEqual(@as(usize, 2), i);

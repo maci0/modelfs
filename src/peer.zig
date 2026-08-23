@@ -23,10 +23,6 @@ pub const Server = struct {
     http_inflight: std.atomic.Value(u32) = .init(0),
 
     pub fn bindAll(self: *Server, specs: []const proto.LeaseAddr) !void {
-        if (specs.len == 0) {
-            try self.bindOne("0.0.0.0", proto.default_port);
-            return;
-        }
         var seen_port: std.AutoHashMap(u16, void) = std.AutoHashMap(u16, void).init(self.gpa);
         defer seen_port.deinit();
         for (specs) |a| {
@@ -717,7 +713,6 @@ pub fn fillFromPeers(
         }
         const has = idx / 8 < bits.len and (bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
         try cands.append(gpa, .{
-            .peer_id = p.peer_id,
             .ip = p.ip,
             .port = p.port,
             .ewma_bps = p.ewma_bps,

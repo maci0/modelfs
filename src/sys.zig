@@ -405,16 +405,6 @@ test "monoSec never goes backwards" {
     try std.testing.expect(m1 >= m0);
 }
 
-test "io_uring availability" {
-    if (@import("builtin").os.tag == .linux) {
-        if (@hasDecl(std.os.linux, "IoUring")) {
-            var ring = std.os.linux.IoUring.init(8, 0) catch return;
-            defer ring.deinit();
-            try std.testing.expect(ring.sq.sqes.len > 0);
-        }
-    }
-}
-
 test "parentOf" {
     try std.testing.expectEqualStrings("/a/b", parentOf("/a/b/c"));
     try std.testing.expectEqualStrings("/", parentOf("/a"));
