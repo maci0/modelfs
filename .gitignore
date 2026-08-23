@@ -8,8 +8,14 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Vendored/downloaded dependencies
-.deps/
+# Vendored/downloaded dependencies: the arm64 libfuse3 provenance (.deb
+# files + README with digests) ships so the documented aarch64 cross-build
+# works from a fresh clone. The extracted root/ and lib/ trees are build
+# inputs recreated from the .deb files (see .deps/fuse3-arm64/README.md).
+.deps/*
+!.deps/fuse3-arm64/
+.deps/fuse3-arm64/root/
+.deps/fuse3-arm64/lib/
 
 # Scratch and runtime state
 .scratch/
