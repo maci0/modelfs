@@ -69,7 +69,7 @@ sudo chown 1000:1000 /models /net/192.168.0.100/models /var/cache/modelfs
 
 # spark1 and spark2, same command (hostname + NICs differ)
 ~/bin/modelfs mount /models --origin /net/192.168.0.100/models \
-  --psk-value modelfs-spark-psk
+  --psk /etc/modelfs.psk
 ```
 
 Foreground (systemd `Type=simple`). Logs: `advertise ip:port`, `piece k path nfs|peer`, `cull piece k path`.

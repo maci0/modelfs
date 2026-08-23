@@ -573,22 +573,37 @@ fn cmdPeers(gpa: std.mem.Allocator, opts: Opts) !u8 {
         const blob = sys.readFileAlloc(gpa, fp, 64 * 1024) catch |err| {
             // Open failure covers the normal race against expiry cleanup;
             // anything persisting across invocations is named, matching the
-            // corrupt-lease warn below and Catalog.refresh's policy.
-            if (err != error.OpenFailed)
-                std.log.warn("peers: cannot read lease {s}: {t}", .{ name, err });
+            // corrupt-lease warn below and Catalog.refresh's policy. Names
+            // are echoed only when printable (shared-storage input).
+            if (err != error.OpenFailed) {
+                if (discover.printable(name)) {
+                    std.log.warn("peers: cannot read lease {s}: {t}", .{ name, err });
+                } else {
+                    std.log.warn("peers: cannot read a lease whose name has control bytes: {t}", .{err});
+                }
+            }
             continue;
         };
         defer gpa.free(blob);
         const parsed = proto.parseLease(gpa, blob) catch {
-            std.log.warn("peers: skipping corrupt lease {s}", .{name});
+            if (discover.printable(name)) {
+                std.log.warn("peers: skipping corrupt lease {s}", .{name});
+            } else {
+                std.log.warn("peers: skipping corrupt lease (name has control bytes)", .{});
+            }
             continue;
         };
         defer parsed.deinit();
         const live = parsed.value.until >= now;
         const status_str = if (live) "live" else "expired";
-        std.debug.print("{s} (until={d}, {s})\n", .{ parsed.value.id, parsed.value.until, status_str });
+        // Lease ids and addresses come off shared storage as other nodes'
+        // JSON; echo them only when free of control bytes so `modelfs peers`
+        // cannot be turned into a terminal-injection vector.
+        const id_shown = if (discover.printable(parsed.value.id)) parsed.value.id else "<id withheld: control bytes>";
+        std.debug.print("{s} (until={d}, {s})\n", .{ id_shown, parsed.value.until, status_str });
         for (parsed.value.addrs) |a| {
-            std.debug.print("  -> {s}:{d} (speed={d}mbps)\n", .{ a.ip, a.port, a.mbps });
+            const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
+            std.debug.print("  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
         }
         any = true;
     }

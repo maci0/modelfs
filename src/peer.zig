@@ -705,15 +705,20 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
     try probeSlots(gpa, psk, cat, rel, peers.items, slots);
 
     var cands: std.ArrayList(discover.PathCand) = .empty;
-    errdefer cands.deinit(gpa);
+    errdefer {
+        for (cands.items) |cand| gpa.free(cand.ip);
+        cands.deinit(gpa);
+    }
     for (paths) |p| {
         var bits: []u8 = &.{};
         if (slot_of.get(p.peer_id)) |si| {
             if (slots[si]) |b| bits = b;
         }
         const has = idx / 8 < bits.len and (bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
+        const ip_copy = try gpa.dupe(u8, p.ip);
+        errdefer gpa.free(ip_copy);
         try cands.append(gpa, .{
-            .ip = p.ip,
+            .ip = ip_copy,
             .port = p.port,
             .ewma_bps = p.ewma_bps,
             .hops = p.hops,
@@ -734,7 +739,10 @@ pub fn fillFromPeers(
     out: []u8,
 ) !void {
     const cands = try probeCandidates(gpa, psk, cat, rel, idx);
-    defer gpa.free(cands);
+    defer {
+        for (cands) |cand| gpa.free(cand.ip);
+        gpa.free(cands);
+    }
 
     // exclusive: one winner, then next on failure, then error (caller uses NFS)
     var remaining = cands;

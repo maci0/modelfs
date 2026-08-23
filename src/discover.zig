@@ -89,6 +89,20 @@ pub fn pickBest(cands: []const PathCand) ?usize {
 /// `modelfs peers`; every module referencing the path must use this constant.
 pub const cluster_dir = ".cluster";
 
+/// True when s carries no C0 control byte or DEL. Lease file names come off
+/// shared NFS storage and lease ids out of other nodes' JSON, so neither is
+/// trustworthy for verbatim echo: a co-tenant planting ".cluster/<newline>
+/// forged line.json" would forge multi-line daemon log entries, and an id
+/// holding escapes would inject into the terminal running `modelfs peers`.
+/// Same policy store.relOk applies to paths; such entries are still swept,
+/// only their names are withheld from output.
+pub fn printable(s: []const u8) bool {
+    for (s) |ch| {
+        if (ch < 0x20 or ch == 0x7f) return false;
+    }
+    return true;
+}
+
 pub const Catalog = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -333,12 +347,23 @@ pub const Catalog = struct {
             // ENOENT is the normal race against expiry cleanup; anything else
             // persisting across ticks is worth naming.
             const blob = sys.readFileBuf(&lease_buf, fp) catch |err| {
-                if (err != error.OpenFailed)
-                    std.log.warn("lease read failed for {s}: {t}", .{ name, err });
+                if (err != error.OpenFailed) {
+                    // Name echoed only when printable: it comes from shared
+                    // storage anyone with origin write access can craft.
+                    if (printable(name)) {
+                        std.log.warn("lease read failed for {s}: {t}", .{ name, err });
+                    } else {
+                        std.log.warn("lease read failed for a name with control bytes: {t}", .{err});
+                    }
+                }
                 continue;
             };
             const parsed = proto.parseLease(self.gpa, blob) catch {
-                std.log.warn("skipping corrupt lease {s}", .{name});
+                if (printable(name)) {
+                    std.log.warn("skipping corrupt lease {s}", .{name});
+                } else {
+                    std.log.warn("skipping corrupt lease (name has control bytes)", .{});
+                }
                 continue;
             };
             defer parsed.deinit();
@@ -410,10 +435,18 @@ pub const Catalog = struct {
             if (sys.statPath(fp, &st) != 0) continue;
             if (st.st_mtim.tv_sec > cutoff) continue;
             if (c.unlink(fp) != 0) {
-                std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ name, sys.errno() });
+                if (printable(name)) {
+                    std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ name, sys.errno() });
+                } else {
+                    std.log.warn("lease sweep unlink failed for a name with control bytes (errno {d})", .{sys.errno()});
+                }
                 continue;
             }
-            std.log.info("swept stale cluster lease {s}", .{name});
+            if (printable(name)) {
+                std.log.info("swept stale cluster lease {s}", .{name});
+            } else {
+                std.log.info("swept stale cluster lease (name has control bytes)", .{});
+            }
         }
     }
 
@@ -596,6 +629,17 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
     cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0});
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
+}
+
+test "printable gates lease names and ids for log echo" {
+    try std.testing.expect(printable("spark1.json"));
+    try std.testing.expect(printable("spark9"));
+    // CR/LF would forge multi-line daemon log entries
+    try std.testing.expect(!printable("a\n2026-08-24 ERROR forged"));
+    try std.testing.expect(!printable("a\rb"));
+    // ESC and other C0 bytes, plus DEL, would inject terminal escapes
+    try std.testing.expect(!printable("\x1b]0;pwned\x07"));
+    try std.testing.expect(!printable("\x7f"));
 }
 
 test "sweepLeases removes stale claims, keeps fresh and own" {
