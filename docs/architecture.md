@@ -81,6 +81,8 @@ modelfs pin gguf/foo.gguf
 modelfs unpin gguf/foo.gguf
 ```
 
+`status` prints the daemon's `status.json` from the cache dir (`id`, `pid`, live peer count, piece size); a missing file means the mount is not running. `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live.
+
 Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_ID`.
 
 `--id`, `--advertise IP:PORT`, `--cache`, `--listen` override defaults. `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
