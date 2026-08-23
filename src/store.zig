@@ -1,0 +1,1656 @@
+//! Local piece cache: per-file bitfields with persisted sidecars, hydration
+//! claims, pinning, and hole-punch culling (in-memory and disk-only victims).
+const std = @import("std");
+const piece = @import("piece.zig");
+const cull = @import("cull.zig");
+const sys = @import("sys.zig");
+const c = sys.c;
+
+/// ENOENT is the expected already-gone case; any other unlink failure would
+/// leave stale cache artifacts that a same-size recreate can resurrect.
+fn unlinkOrWarn(path_z: [*:0]const u8, what: []const u8, rel: []const u8) void {
+    if (c.unlink(path_z) != 0) {
+        const e = sys.errno();
+        if (e != c.ENOENT)
+            std.log.warn("forget {s}: cannot remove cached {s} (errno {d})", .{ rel, what, e });
+    }
+}
+
+pub const Store = struct {
+    /// Idle window a file must exceed before a cached piece may be punched:
+    /// cullOne picks candidates this stale, and punchPiece revalidates under
+    /// the file lock so a read/fill/transfer inside the window is never culled.
+    pub const recency_secs: i64 = 10;
+
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    origin: []const u8,
+    cache: []const u8,
+    piece_size: u32,
+    water: cull.Water = .{},
+    mu: std.Io.Mutex = .init,
+    files: std.StringHashMap(*Cached),
+    /// Bumped under mu after every mutation of on-disk cache artifacts
+    /// (data/meta unlink or rewrite). get()'s builder loads the sidecar
+    /// OUTSIDE mu; without this stamp a builder that started before a
+    /// concurrent forget/reap-punch could publish an entry whose bits
+    /// describe pieces whose bytes were just unlinked or holed -- reads
+    /// would serve hole zeros that the bits claim are cached. Builders
+    /// sample the epoch before loadBits and discard the build when it
+    /// changed before the insert window.
+    purge_epoch: u64 = 0,
+
+    pub const Cached = struct {
+        rel: []u8,
+        size: u64,
+        mu: std.Io.Mutex = .init,
+        bits: piece.Bitfield,
+        filling: std.AutoHashMap(u32, void),
+        cache_fd: c_int = -1,
+        last_access: std.atomic.Value(i64) = .init(0),
+        /// Active users of this pointer. Taken under store.mu together with
+        /// the map lookup; released by releaseFile. An entry removed from the
+        /// map (forget/reap) can no longer be acquired, so the last release
+        /// on a removed entry frees it.
+        refs: std.atomic.Value(u32) = .init(0),
+        /// Set when the entry is removed from the map. Read with .acquire by
+        /// the final releaser to decide destruction.
+        dead: std.atomic.Value(bool) = .init(false),
+        /// Peer transfers currently streaming through this entry (the whole
+        /// /data span: hydration plus send). punchPiece refuses to hole a
+        /// piece while this is nonzero: bytes in flight are read straight
+        /// from the pages a punch would cut, and the fetching peer would
+        /// mark the resulting hole zeros filled. Recency stamping alone
+        /// cannot provide this -- a single stalled sendfile chunk can block
+        /// far longer than recency_secs.
+        xfer: std.atomic.Value(u32) = .init(0),
+
+        pub fn deinit(self: *Cached, gpa: std.mem.Allocator) void {
+            sys.close(self.cache_fd);
+            self.bits.deinit(gpa);
+            self.filling.deinit();
+            gpa.free(self.rel);
+            gpa.destroy(self);
+        }
+    };
+
+    /// Drops one reference acquired via get()/lookupRef(). When the entry was
+    /// evicted from the map while the reference was outstanding, the final
+    /// release destroys it.
+    pub fn releaseFile(self: *Store, file: *Cached) void {
+        if (file.refs.fetchSub(1, .acq_rel) != 1) return;
+        if (!file.dead.load(.acquire)) return;
+        file.deinit(self.gpa);
+    }
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, origin: []const u8, cache: []const u8, piece_size: u32) Store {
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .origin = origin,
+            .cache = cache,
+            .piece_size = piece_size,
+            .files = std.StringHashMap(*Cached).init(gpa),
+        };
+    }
+
+    pub fn deinit(self: *Store) void {
+        var it = self.files.iterator();
+        while (it.next()) |e| {
+            const f = e.value_ptr.*;
+            // Entries still referenced at shutdown belong to handlers the
+            // drain wait gave up on. Destroying them would hand those threads
+            // freed memory; leaking them is bounded by the stuck-handler cap
+            // and strictly safer.
+            if (f.refs.load(.acquire) != 0) {
+                std.log.warn("store shutdown: {s} still referenced; leaking entry", .{f.rel});
+                continue;
+            }
+            f.deinit(self.gpa);
+        }
+        self.files.deinit();
+    }
+
+    pub fn originPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+        return sys.joinZ(buf, self.origin, rel);
+    }
+
+    /// Joins cache/<sub>/<rel> (rel empty names the subdir itself): one
+    /// policy for every artifact path under the cache root.
+    fn cacheSubPath(self: Store, buf: []u8, sub: []const u8, rel: []const u8) ![*:0]u8 {
+        var mid: [sys.c.PATH_MAX]u8 = undefined;
+        const d = try sys.joinZ(&mid, self.cache, sub);
+        return sys.joinZ(buf, std.mem.span(d), rel);
+    }
+
+    pub fn cacheDataPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+        return self.cacheSubPath(buf, "data", rel);
+    }
+
+    pub fn cacheMetaPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+        var mid: [sys.c.PATH_MAX]u8 = undefined;
+        const n = try self.cacheSubPath(&mid, "meta", rel);
+        return sys.appendExt(buf, n, ".pieces");
+    }
+
+    pub fn cachePinPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+        return self.cacheSubPath(buf, "pin", rel);
+    }
+
+    pub fn ensureLayout(self: Store) i32 {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
+            const p = self.cacheSubPath(&buf, sub, "") catch return -sys.c.ENAMETOOLONG;
+            if (sys.mkdirAll(std.mem.span(p), 0o755) != 0) return sys.negErrno();
+        }
+        return 0;
+    }
+
+    pub fn statOrigin(self: Store, rel: []const u8, st: *c.struct_stat) i32 {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
+        return sys.statPath(p, st);
+    }
+
+    fn pinExists(self: Store, rel: []const u8) bool {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.cachePinPath(&buf, rel) catch return false;
+        var st: c.struct_stat = undefined;
+        return sys.statPath(p, &st) == 0;
+    }
+
+    pub fn setPin(self: Store, rel: []const u8, on: bool) i32 {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.cachePinPath(&buf, rel) catch return -c.ENAMETOOLONG;
+        if (on) {
+            const parent = sys.parentOf(std.mem.span(p));
+            _ = sys.mkdirAll(parent, 0o755);
+            return sys.writeFileNoFollow(p, "");
+        }
+        if (c.unlink(p) != 0) {
+            const e = sys.errno();
+            if (e == c.ENOENT) return 0;
+            return -e;
+        }
+        return 0;
+    }
+
+    /// Unlinks the data/meta/pin artifacts keyed to rel. A path that no
+    /// longer fits PATH_MAX cannot name an existing artifact, so build
+    /// failures join ENOENT as already-gone.
+    fn purgeArtifacts(self: *Store, rel: []const u8) void {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        if (self.cacheDataPath(&buf, rel)) |cp| {
+            unlinkOrWarn(cp, "data", rel);
+        } else |_| {}
+        if (self.cacheMetaPath(&buf, rel)) |mp| {
+            unlinkOrWarn(mp, "meta", rel);
+        } else |_| {}
+        if (self.cachePinPath(&buf, rel)) |pp| {
+            unlinkOrWarn(pp, "pin", rel);
+        } else |_| {}
+    }
+
+    /// Drop all cache state keyed to rel. The namespace mutates through
+    /// origin-side unlink and rename while cache identity is the path, so the
+    /// in-memory entry (bits, open fd to a possibly unlinked inode) and the
+    /// data/meta/pin artifacts must die with it: a same-size recreate would
+    /// otherwise serve the previous file's bytes through resurrected bits.
+    /// Map removal, artifact unlinks, and eviction share one store.mu window
+    /// so a concurrent get() cannot recreate the entry (and hydrate fresh
+    /// bytes into it) between removal and unlink. Concurrent holders keep
+    /// their reference alive until releaseFile; whoever holds the last
+    /// reference frees the entry.
+    ///
+    /// The open cache fd is deliberately NOT closed here even though holders'
+    /// references pin the entry: a reference holder may be past openCache()
+    /// and about to pwrite/pread/sendfile on that exact descriptor. Closing
+    /// it now lets the kernel hand the number to the next open() (another
+    /// file's cache fd), turning the holder's I/O into writes to an
+    /// unrelated cached file. Leaving it open keeps every outstanding use
+    /// pointed at the purged (unlinked) inode, where late I/O is harmless;
+    /// Cached.deinit closes it with the entry.
+    pub fn forget(self: *Store, rel: []const u8) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.files.fetchRemove(rel)) |kv| {
+            const file = kv.value;
+            // Bits wipe, artifact unlinks, and the dead stamp share one
+            // file.mu window (same shape as reapIdle). finishPiece and
+            // copyIntoCache re-check dead under this same lock before they
+            // save; stamping only after the unlock would leave a window
+            // where a late finisher (a fill or write-through claimed before
+            // the unlink) recreates the meta sidecar with filled bits over
+            // artifacts that no longer exist, and a same-size recreate would
+            // serve hole zeros as cached model data.
+            file.mu.lockUncancelable(self.io);
+            @memset(file.bits.bytes, 0);
+            self.purgeArtifacts(rel);
+            file.dead.store(true, .release);
+            file.mu.unlock(self.io);
+            // Invalidate any get() builder whose sidecar read raced this
+            // purge: its insert window now sees a changed epoch and retries.
+            self.purge_epoch += 1;
+            // Removal above blocks new references; past this point refs only
+            // decreases. Zero means nobody holds it: free now.
+            if (file.refs.load(.acquire) == 0) file.deinit(self.gpa);
+            return;
+        }
+        // No live entry: artifacts from an earlier run must still be purged.
+        self.purgeArtifacts(rel);
+        self.purge_epoch += 1;
+    }
+
+    fn loadBits(self: *Store, rel: []const u8, file_size: u64) !piece.Bitfield {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const p = try self.cacheMetaPath(&buf, rel);
+        const blob = sys.readFileAlloc(self.gpa, p, 8 * 1024 * 1024) catch {
+            return piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+        };
+        defer self.gpa.free(blob);
+        // A truncated or corrupt sidecar (torn writeFile, crash mid-save) must
+        // degrade to "nothing cached", never poison every read of the file.
+        return piece.Bitfield.decode(self.gpa, blob, self.piece_size, file_size) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.BadBitfield => piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size)),
+        };
+    }
+
+    /// Persists the entry's current bits. False means the sidecar was not
+    /// updated (encode failure, unwritable path, torn write); callers that
+    /// gate destructive disk work on persisted state must treat false as
+    /// "do not proceed".
+    pub fn saveBits(self: *Store, file: *Cached) bool {
+        var blob: std.ArrayList(u8) = .empty;
+        defer blob.deinit(self.gpa);
+        file.bits.encode(self.piece_size, file.size, &blob, self.gpa) catch {
+            std.log.warn("bitfield encode failed for {s}; cache state resets on restart", .{file.rel});
+            return false;
+        };
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.cacheMetaPath(&buf, file.rel) catch return false;
+        const parent = sys.parentOf(std.mem.span(p));
+        _ = sys.mkdirAll(parent, 0o755);
+        if (sys.writeFileNoFollow(p, blob.items) != 0) {
+            std.log.warn("bitfield save failed for {s}; cache state resets on restart", .{file.rel});
+            return false;
+        }
+        return true;
+    }
+
+    /// Brings a live entry in line with a freshly observed origin size:
+    /// swaps in an empty bitfield sized for the new length and truncates the
+    /// cache fd so stale pieces cannot serve the new inode. Must be called
+    /// WITHOUT store.mu held (it takes file.mu internally).
+    fn reconcileSize(self: *Store, f: *Cached, file_size: u64) !*Cached {
+        if (f.size == file_size) return f;
+        const nb = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+        // Swap under the file lock, as mf_truncate does: readers read
+        // size/bits/cache_fd while holding it, and the ftruncate must sit in
+        // the same window so cache_fd cannot be closed (entry destroyed by
+        // the last releaser) between capture and use.
+        f.mu.lockUncancelable(self.io);
+        var ob = f.bits;
+        f.bits = nb;
+        f.size = file_size;
+        if (f.cache_fd >= 0) _ = sys.ftruncate(f.cache_fd, file_size);
+        f.mu.unlock(self.io);
+        ob.deinit(self.gpa);
+        return f;
+    }
+
+    /// Referenced entry reconciled to file_size; on failure the reference is
+    /// released before the error escapes (the one cleanup rule all three
+    /// lookup sites in get() must share).
+    fn refReconciled(self: *Store, hit: *Cached, file_size: u64) !*Cached {
+        return self.reconcileSize(hit, file_size) catch |err| {
+            self.releaseFile(hit);
+            return err;
+        };
+    }
+
+    /// References a map hit found while holding store.mu, releases the lock,
+    /// and returns the entry reconciled to file_size.
+    fn refHitUnlocking(self: *Store, hit: *Cached, file_size: u64) !*Cached {
+        _ = hit.refs.fetchAdd(1, .monotonic);
+        self.mu.unlock(self.io);
+        return self.refReconciled(hit, file_size);
+    }
+
+    /// Returns a referenced entry: the caller owns one reference and must
+    /// releaseFile it. References are taken under store.mu so an entry cannot
+    /// be evicted between lookup and refcount bump.
+    pub fn get(self: *Store, rel: []const u8, file_size: u64) !*Cached {
+        // Fast path: map probe only, never disk I/O under the global lock.
+        self.mu.lockUncancelable(self.io);
+        if (self.files.get(rel)) |hit| return self.refHitUnlocking(hit, file_size);
+        self.mu.unlock(self.io);
+
+        // Slow path: build the entry (sidecar read + decode) outside the
+        // global lock so one cold open cannot serialize every other
+        // get/forget/cull behind disk I/O. A racing builder loses the insert
+        // below and discards its copy. A racing artifact mutation (forget,
+        // reap purge, disk punch) bumps purge_epoch between the sample and
+        // the insert check; that build is then discarded -- its bits could
+        // describe pieces whose bytes were just unlinked or holed -- and the
+        // attempt restarts from a fresh map probe and epoch sample.
+        while (true) {
+            self.mu.lockUncancelable(self.io);
+            if (self.files.get(rel)) |hit| return self.refHitUnlocking(hit, file_size);
+            const epoch0 = self.purge_epoch;
+            self.mu.unlock(self.io);
+
+            // Constructed in a scope so the errdefers cover only the build:
+            // once f.* is assigned, f owns every field and all later cleanup
+            // goes through f.deinit (double-free otherwise: an early error
+            // return would fire both the errdefers and the deinit path).
+            const f = blk: {
+                const raw = try self.gpa.create(Cached);
+                errdefer self.gpa.destroy(raw);
+                const rel_own = try self.gpa.dupe(u8, rel);
+                errdefer self.gpa.free(rel_own);
+                const bits = try self.loadBits(rel, file_size);
+                errdefer bits.deinit(self.gpa);
+                raw.* = .{
+                    .rel = rel_own,
+                    .size = file_size,
+                    .bits = bits,
+                    .filling = std.AutoHashMap(u32, void).init(self.gpa),
+                    .last_access = .init(sys.monoSec()),
+                };
+                break :blk raw;
+            };
+
+            self.mu.lockUncancelable(self.io);
+            if (self.files.get(rel)) |winner| {
+                defer f.deinit(self.gpa);
+                return self.refHitUnlocking(winner, file_size);
+            }
+            if (self.purge_epoch != epoch0) {
+                self.mu.unlock(self.io);
+                f.deinit(self.gpa);
+                continue;
+            }
+            self.files.put(f.rel, f) catch |err| {
+                self.mu.unlock(self.io);
+                f.deinit(self.gpa);
+                return err;
+            };
+            // Publish and reference atomically: the first release can arrive
+            // before the caller's use, so the entry must be born with refs=1.
+            _ = f.refs.fetchAdd(1, .monotonic);
+            self.mu.unlock(self.io);
+            return f;
+        }
+    }
+
+    /// Referenced lookup without size reconciliation or creation, for
+    /// callers that only need the live entry if one exists.
+    pub fn lookupRef(self: *Store, rel: []const u8) ?*Cached {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const f = self.files.get(rel) orelse return null;
+        _ = f.refs.fetchAdd(1, .monotonic);
+        return f;
+    }
+
+    /// Frees every entry that is unreferenced, quiescent for at least
+    /// min_idle_secs, unpinned, not mid-fill, and holds nothing worth keeping:
+    /// idle entries get their fd closed; entries that are still fully empty
+    /// are evicted outright (their data/meta/pin artifacts carry no cached
+    /// bytes). Bounds the files map on nodes that churn through many model
+    /// paths without unlinks.
+    pub fn reapIdle(self: *Store, min_idle_secs: i64) void {
+        var victims: std.ArrayList(*Cached) = .empty;
+        defer victims.deinit(self.gpa);
+
+        // Collection, map removal, artifact unlinks, and destruction share
+        // one store.mu window so forget()/get() cannot interleave: a racing
+        // get() must never recreate the entry (and hydrate fresh bytes into
+        // it) between removal and unlink.
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        var it = self.files.iterator();
+        while (it.next()) |e| {
+            const f = e.value_ptr.*;
+            // Cheap gates outside file.mu: busy entries and steady-state
+            // warm ones (fd closed, pieces cached) cost one atomic load.
+            if (f.refs.load(.acquire) != 0) continue;
+            if (sys.monoSec() - f.last_access.load(.monotonic) < min_idle_secs) continue;
+            var evict = false;
+            f.mu.lockUncancelable(self.io);
+            candidate: {
+                if (f.filling.count() != 0) break :candidate;
+                if (sys.monoSec() - f.last_access.load(.monotonic) < min_idle_secs) break :candidate;
+                if (f.cache_fd >= 0) {
+                    sys.close(f.cache_fd);
+                    f.cache_fd = -1;
+                }
+                // Pieces still cached are worth keeping; nothing else to do.
+                if (f.bits.filled() != 0) break :candidate;
+                if (self.pinExists(f.rel)) break :candidate;
+                evict = true;
+            }
+            f.mu.unlock(self.io);
+            if (!evict) continue;
+            _ = f.refs.fetchAdd(1, .monotonic);
+            victims.append(self.gpa, f) catch {
+                _ = f.refs.fetchSub(1, .monotonic);
+                continue;
+            };
+        }
+        for (victims.items) |f| {
+            if (!self.files.remove(f.rel)) {
+                _ = f.refs.fetchSub(1, .monotonic);
+                continue;
+            }
+            f.mu.lockUncancelable(self.io);
+            self.purgeArtifacts(f.rel);
+            // Same stamp-before-unlock rule as forget: nothing can reach
+            // this entry past the map removal, but the invariant "dead is
+            // visible to any later file.mu holder" stays universal.
+            f.dead.store(true, .release);
+            f.mu.unlock(self.io);
+            // Same builder-invalidation contract as forget: a get() whose
+            // sidecar read raced this purge must not publish its stale bits.
+            self.purge_epoch += 1;
+            // We hold the only reference (store.mu blocked any other taker),
+            // so this always destroys.
+            _ = f.refs.fetchSub(1, .acq_rel);
+            f.deinit(self.gpa);
+        }
+    }
+
+    pub fn openCache(self: *Store, file: *Cached) i32 {
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        return self.openCacheUnlocked(file);
+    }
+
+    /// Claim exclusive fill of piece idx. Returns false if already filled,
+    /// including by a concurrent filler that finishes while we wait. A
+    /// persistent allocation failure surfaces as an error instead of
+    /// spinning forever: an unbounded retry here would wedge the reader
+    /// (FUSE read, peer hydrate) with no timeout and no signal.
+    pub fn claimPiece(self: *Store, file: *Cached, idx: u32) !bool {
+        while (true) {
+            file.mu.lockUncancelable(self.io);
+            if (file.bits.get(idx)) {
+                file.mu.unlock(self.io);
+                return false;
+            }
+            if (file.filling.contains(idx)) {
+                file.mu.unlock(self.io);
+                sys.sleepMs(2);
+                continue;
+            }
+            file.filling.put(idx, {}) catch |err| {
+                file.mu.unlock(self.io);
+                return err;
+            };
+            // A fill in flight is access: it must keep punchPiece (which
+            // rechecks recency under the same lock) from culling under it.
+            file.last_access.store(sys.monoSec(), .monotonic);
+            file.mu.unlock(self.io);
+            return true;
+        }
+    }
+
+    pub fn finishPiece(self: *Store, file: *Cached, idx: u32, ok: bool) void {
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        // A forget that raced this fill removed the entry and unlinked its
+        // artifacts while the claim was in flight: drop the claim but
+        // persist nothing. Saving here would recreate a sidecar naming
+        // filled pieces over a data file that no longer exists.
+        if (file.dead.load(.acquire)) {
+            _ = file.filling.remove(idx);
+            return;
+        }
+        _ = file.filling.remove(idx);
+        if (ok) file.bits.set(idx);
+        _ = self.saveBits(file);
+    }
+
+    pub fn hasPiece(self: *Store, file: *Cached, idx: u32) bool {
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        return file.bits.get(idx);
+    }
+
+    pub fn writePiece(self: *Store, file: *Cached, idx: u32, buf: []const u8) i32 {
+        const fd = self.openCache(file);
+        if (fd < 0) return fd;
+        const off = piece.offset(idx, self.piece_size);
+        const n = sys.pwriteAll(fd, buf, off);
+        if (n < 0) return @intCast(n);
+        sys.fadviseDontneed(fd, off, buf.len);
+        return 0;
+    }
+
+    pub fn readCache(self: *Store, file: *Cached, buf: []u8, off: u64) isize {
+        const fd = self.openCache(file);
+        if (fd < 0) return fd;
+        file.last_access.store(sys.monoSec(), .monotonic);
+        return sys.preadAll(fd, buf, off);
+    }
+
+    pub fn originPread(self: Store, rel: []const u8, buf: []u8, off: u64) isize {
+        var path: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.originPath(&path, rel) catch return -c.ENAMETOOLONG;
+        const fd = sys.open(p, c.O_RDONLY, 0);
+        if (fd < 0) return sys.negErrno();
+        defer sys.close(fd);
+        return sys.preadAll(fd, buf, off);
+    }
+
+    pub fn originPwrite(self: Store, rel: []const u8, buf: []const u8, off: u64) isize {
+        var path: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.originPath(&path, rel) catch return -c.ENAMETOOLONG;
+        const fd = sys.open(p, c.O_WRONLY, 0);
+        if (fd < 0) return sys.negErrno();
+        defer sys.close(fd);
+        return sys.pwriteAll(fd, buf, off);
+    }
+
+    /// Copies bytes this node just wrote through the mount into the local
+    /// cache and marks the pieces they fully span. The entry is grown with
+    /// its piece marks preserved: an append is our own write, not an external
+    /// rewrite, so reconcileSize's wipe-on-size-change reset must not fire
+    /// here (it would discard every earlier chunk's cached pieces on a
+    /// sequential ingest). Call only when the observed origin size equals
+    /// `end`; any other size goes through get()'s conservative reset.
+    pub fn cacheFill(self: *Store, rel: []const u8, end: u64, off: u64, data: []const u8) void {
+        const file = blk: {
+            if (self.lookupRef(rel)) |f| break :blk f;
+            break :blk self.get(rel, end) catch {
+                // Same contract as copyIntoCache's failures: say why reads
+                // will fall back to origin instead of skipping silently.
+                std.log.warn("cache fill skipped for {s} (no cache entry); reads fall back to origin", .{rel});
+                return;
+            };
+        };
+        defer self.releaseFile(file);
+
+        var grew = false;
+        file.mu.lockUncancelable(self.io);
+        if (end > file.size) {
+            // Our own append: earlier piece marks stay valid.
+            file.bits.resize(self.gpa, piece.count(end, self.piece_size)) catch {
+                // OOM leaves the field undersized: appended pieces stay
+                // unmarked and re-hydrate instead of serving hole zeros.
+                std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
+            };
+            file.size = end;
+            grew = true;
+        } else if (end < file.size) {
+            // Entry is longer than the observed origin: someone truncated
+            // externally. Reset like reconcileSize instead of keeping marks
+            // for bytes past the new end.
+            if (piece.Bitfield.init(self.gpa, piece.count(end, self.piece_size))) |nb| {
+                var ob = file.bits;
+                file.bits = nb;
+                file.size = end;
+                grew = true;
+                ob.deinit(self.gpa);
+            } else |_| {
+                std.log.warn("bitfield shrink failed for {s}; stale tail pieces refill", .{rel});
+            }
+        }
+        file.last_access.store(sys.monoSec(), .monotonic);
+        file.mu.unlock(self.io);
+
+        _ = self.copyIntoCache(file, off, data, if (grew) end else null);
+    }
+
+    /// Copies a landed origin write into the cache fd and marks the pieces it
+    /// fully spans, so reads serve the copy instead of re-hydrating over NFS.
+    /// Grows the cache file to `truncate_to` first when set (a reused fd
+    /// predates the caller's growth). Returns false when the copy did not
+    /// land or pieces could not be marked; reads then fall back to origin
+    /// rather than serve hole zeros.
+    pub fn copyIntoCache(self: *Store, file: *Cached, off: u64, data: []const u8, truncate_to: ?u64) bool {
+        const cfd = self.openCache(file);
+        if (cfd < 0) {
+            std.log.warn("cache fill skipped for {s} (errno {d}); reads fall back to origin", .{ file.rel, -cfd });
+            return false;
+        }
+        if (truncate_to) |sz| _ = sys.ftruncate(cfd, sz);
+        const w = sys.pwriteAll(cfd, data, off);
+        if (w != @as(isize, @intCast(data.len))) {
+            std.log.warn("cache fill failed for {s} (errno {d}); reads fall back to origin", .{ file.rel, -w });
+            return false;
+        }
+        sys.fadviseDontneed(cfd, off, data.len);
+        const cov = piece.fullCover(off, data.len, self.piece_size);
+        // Marking and the sidecar save share file.mu: saveBits encodes
+        // size/bits, and a concurrent truncate may swap and free them.
+        file.mu.lockUncancelable(self.io);
+        // Same dead-entry contract as finishPiece: a forget that raced this
+        // write-through unlinked these artifacts; marking plus saving would
+        // resurrect a sidecar claiming filled pieces over missing bytes.
+        const dead = file.dead.load(.acquire);
+        if (!dead) {
+            var i = cov.start;
+            while (i < cov.end) : (i += 1) file.bits.set(i);
+            _ = self.saveBits(file);
+        }
+        file.mu.unlock(self.io);
+        return !dead;
+    }
+
+    /// Null when the cache filesystem cannot be stat'ed; callers must not
+    /// read that as "plenty free" without saying so.
+    pub fn freePercentChecked(self: Store) ?u32 {
+        var vs: c.struct_statvfs = undefined;
+        var z: [sys.c.PATH_MAX]u8 = undefined;
+        const p = sys.toZ(&z, self.cache) catch return null;
+        if (c.statvfs(p, &vs) != 0) return null;
+        return cull.freePercent(@as(u64, vs.f_bavail), @as(u64, vs.f_blocks));
+    }
+
+    pub fn punchPiece(self: *Store, file: *Cached, idx: u32) bool {
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        // Revalidate recency under the file lock: cullOne picked this file on
+        // a >=10s idle sample, but a read, fill, or peer transfer may have
+        // started since. Punching a piece mid-transfer would serve hole zeros
+        // and the peer would mark them filled.
+        if (sys.monoSec() - file.last_access.load(.monotonic) < recency_secs) return false;
+        if (self.pinExists(file.rel)) return false;
+        if (file.filling.contains(idx)) return false;
+        // Bytes of this entry may be mid-send to a fetching peer (stalled
+        // socket, multi-piece response): punching now ships hole zeros that
+        // the peer cannot tell from real data and will mark filled.
+        if (file.xfer.load(.monotonic) != 0) return false;
+        if (!file.bits.get(idx)) return false;
+        const fd = if (file.cache_fd >= 0) file.cache_fd else self.openCacheUnlocked(file);
+        if (fd < 0) return false;
+        const off = piece.offset(idx, self.piece_size);
+        const ln = piece.len(file.size, idx, self.piece_size);
+        // Write-ahead order: the cleared mark must be durable before the hole
+        // exists. Hole first, persist second, a crash between the two leaves
+        // the sidecar claiming filled over punched bytes, and post-restart
+        // reads serve hole zeros as cached model data -- the one corruption
+        // every other guard in this file exists to prevent. Persisted first,
+        // every crash point is safe: cleared bits over intact bytes merely
+        // refill, and only a completed save authorizes the punch.
+        file.bits.clear(idx);
+        if (!self.saveBits(file)) {
+            // The on-disk sidecar still says filled; keep bytes and mark.
+            file.bits.set(idx);
+            return false;
+        }
+        if (sys.punchHole(fd, off, ln) != 0) {
+            // Bytes stay: restore the mark in memory and on disk so reads
+            // keep serving the cached copy and LRU state stays truthful.
+            file.bits.set(idx);
+            _ = self.saveBits(file);
+            return false;
+        }
+        std.log.info("cull piece {d} {s}", .{ idx, file.rel });
+        return true;
+    }
+
+    /// Caller must hold file.mu.
+    fn openCacheUnlocked(self: *Store, file: *Cached) i32 {
+        if (file.cache_fd >= 0) return file.cache_fd;
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.cacheDataPath(&buf, file.rel) catch return -c.ENAMETOOLONG;
+        const parent = sys.parentOf(std.mem.span(p));
+        _ = sys.mkdirAll(parent, 0o755);
+        // O_NOFOLLOW on the data file: it is opened O_RDWR|O_CREAT and then
+        // ftruncate'd/pwritten, so a symlink planted at this name in a
+        // writable cache tree would turn the daemon into an arbitrary-file
+        // truncate/write primitive.
+        const fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, 0o644);
+        if (fd < 0) return sys.negErrno();
+        if (sys.ftruncate(fd, file.size) != 0) {
+            const e = sys.negErrno();
+            sys.close(fd);
+            return e;
+        }
+        file.cache_fd = fd;
+        return fd;
+    }
+
+    /// Punch one LRU unpinned piece. Returns false if nothing to cull.
+    pub fn cullOne(self: *Store) bool {
+        // Idle time is elapsed time: monotonic clock, immune to NTP steps.
+        const now = sys.monoSec();
+        const Cand = struct { f: *Cached, at: i64 };
+        var cands: std.ArrayList(Cand) = .empty;
+        defer cands.deinit(self.gpa);
+        // Phase 1 under store.mu is memory-only: an atomic last_access load
+        // plus a reference pin per idle entry. Stat'ing pin files and probing
+        // bits here used to hold this global lock -- which every get() and
+        // lookupRef() takes -- behind O(files) disk I/O on every cull round.
+        self.mu.lockUncancelable(self.io);
+        var it = self.files.iterator();
+        while (it.next()) |e| {
+            const f = e.value_ptr.*;
+            const at = f.last_access.load(.monotonic);
+            if (now - at < recency_secs) continue;
+            _ = f.refs.fetchAdd(1, .monotonic);
+            cands.append(self.gpa, .{ .f = f, .at = at }) catch {
+                _ = f.refs.fetchSub(1, .monotonic);
+                continue;
+            };
+        }
+        self.mu.unlock(self.io);
+        defer for (cands.items) |cd| self.releaseFile(cd.f);
+
+        // Phase 2 runs outside every lock, LRU first: punchPiece revalidates
+        // recency, pin, mid-fill, and bit state under file.mu, so a stale
+        // sample only wastes one attempt before the next candidate.
+        std.mem.sort(Cand, cands.items, {}, struct {
+            fn lessThan(_: void, a: Cand, b: Cand) bool {
+                return a.at < b.at;
+            }
+        }.lessThan);
+        for (cands.items) |cd| {
+            if (self.pinExists(cd.f.rel)) continue;
+            const idx = blk: {
+                cd.f.mu.lockUncancelable(self.io);
+                defer cd.f.mu.unlock(self.io);
+                break :blk cd.f.bits.lastSet();
+            } orelse continue;
+            if (self.punchPiece(cd.f, idx)) return true;
+        }
+        return self.cullOneOnDisk();
+    }
+
+    /// One disk-only cull candidate sampled by walkData.
+    const DiskVictim = struct {
+        rel: [sys.c.PATH_MAX]u8,
+        len: usize,
+        at: i64,
+    };
+
+    /// Disk-only victims one data-tree walk samples. The walk costs
+    /// O(cache files) readdir+stat calls; sampling several lets cullOneOnDisk
+    /// punch one piece per victim before walking again, so sustained culling
+    /// pays the scan once per batch instead of once per punched piece.
+    const walk_sample_cap: usize = 8;
+
+    fn cullOneOnDisk(self: *Store) bool {
+        var data: [sys.c.PATH_MAX]u8 = undefined;
+        const root = sys.joinZ(&data, self.cache, "data") catch return false;
+        var victims: [walk_sample_cap]DiskVictim = undefined;
+        var count: usize = 0;
+        self.walkData(std.mem.span(root), "", &victims, &count, 0);
+        // Oldest first: one LRU punch per sampled victim. punchPiece and
+        // punchDisk revalidate pin, mid-fill, and bit state under their own
+        // locks, so a stale sample wastes one attempt before the next
+        // candidate instead of ending the round.
+        var punched = false;
+        for (victims[0..count]) |*v| {
+            const rel = v.rel[0..v.len];
+            const live = self.lookupRef(rel) orelse {
+                punched = self.punchDisk(rel) or punched;
+                continue;
+            };
+            defer self.releaseFile(live);
+            live.mu.lockUncancelable(self.io);
+            const idx = live.bits.lastSet();
+            live.mu.unlock(self.io);
+            if (idx) |i| punched = self.punchPiece(live, i) or punched;
+        }
+        return punched;
+    }
+
+    /// True when (at, len) names an older cull candidate than the sampled
+    /// one: mtime ascending, then the same tie-break the single-best scan
+    /// used (shorter rel wins an mtime tie).
+    fn victimOlder(at: i64, len: usize, v: *const DiskVictim) bool {
+        if (at != v.at) return at < v.at;
+        return len < v.len;
+    }
+
+    /// Inserts one candidate into the oldest-first victim sample, replacing
+    /// the youngest when full. A candidate that does not beat the current
+    /// worst entry leaves the sample untouched.
+    fn considerVictim(victims: *[walk_sample_cap]DiskVictim, count: *usize, nrel: []const u8, at: i64) void {
+        const slot = if (count.* < walk_sample_cap) blk: {
+            const s = count.*;
+            count.* += 1;
+            break :blk s;
+        } else blk: {
+            if (!victimOlder(at, nrel.len, &victims[walk_sample_cap - 1])) return;
+            break :blk walk_sample_cap - 1;
+        };
+        const v = &victims[slot];
+        v.at = at;
+        v.len = nrel.len;
+        @memcpy(v.rel[0..nrel.len], nrel);
+        var i = slot;
+        while (i > 0 and victimOlder(victims[i].at, victims[i].len, &victims[i - 1])) {
+            std.mem.swap(DiskVictim, &victims[i], &victims[i - 1]);
+            i -= 1;
+        }
+    }
+
+    /// Deepest data/<a>/<b>/... nesting the on-disk cull scan will enter.
+    /// statPath follows symlinks, so a directory symlink loop planted in a
+    /// writable cache tree would otherwise recurse until the stack dies;
+    /// past this bound entries are simply invisible to disk culling.
+    const walk_max_depth: u32 = 64;
+
+    fn walkData(self: *Store, dir_path: []const u8, rel: []const u8, victims: *[walk_sample_cap]DiskVictim, count: *usize, depth: u32) void {
+        if (depth >= walk_max_depth) return;
+        var z: [sys.c.PATH_MAX]u8 = undefined;
+        const dz = sys.toZ(&z, dir_path) catch return;
+        const dir = c.opendir(dz) orelse return;
+        defer _ = c.closedir(dir);
+        while (c.readdir(dir)) |ent| {
+            const name = sys.dirName(ent);
+            if (name.len == 0 or name[0] == '.') continue;
+            var child: [sys.c.PATH_MAX]u8 = undefined;
+            const cp = sys.joinZ(&child, dir_path, name) catch continue;
+            var st: c.struct_stat = undefined;
+            if (sys.statPath(cp, &st) != 0) continue;
+            var nrel_buf: [sys.c.PATH_MAX]u8 = undefined;
+            const nrel_z = if (rel.len == 0)
+                sys.toZ(&nrel_buf, name) catch continue
+            else
+                sys.joinZ(&nrel_buf, rel, name) catch continue;
+            const nrel = std.mem.span(nrel_z);
+            if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
+                self.walkData(std.mem.span(cp), nrel, victims, count, depth + 1);
+                continue;
+            }
+            if ((st.st_mode & c.S_IFMT) != c.S_IFREG) continue;
+            if (st.st_blocks == 0) continue;
+            if (self.pinExists(nrel)) continue;
+            self.mu.lockUncancelable(self.io);
+            const in_mem = self.files.get(nrel) != null;
+            self.mu.unlock(self.io);
+            if (in_mem) continue;
+            considerVictim(victims, count, nrel, st.st_mtim.tv_sec);
+        }
+    }
+
+    fn punchDisk(self: *Store, rel: []const u8) bool {
+        if (self.pinExists(rel)) return false;
+        var dbuf: [sys.c.PATH_MAX]u8 = undefined;
+        const dp = self.cacheDataPath(&dbuf, rel) catch return false;
+        const fd = sys.open(dp, c.O_RDWR | c.O_NOFOLLOW, 0);
+        if (fd < 0) return false;
+        defer sys.close(fd);
+        var st: c.struct_stat = undefined;
+        if (sys.fstat(fd, &st) != 0) return false;
+        const size: u64 = @intCast(st.st_size);
+        // Builder-contract sample: if any artifact mutation (forget, reap
+        // purge, another punch) lands between this and the critical section
+        // below, the bits loaded here describe artifacts that no longer
+        // exist, and the attempt is discarded instead of punching blind.
+        self.mu.lockUncancelable(self.io);
+        const epoch0 = self.purge_epoch;
+        self.mu.unlock(self.io);
+        var bits = self.loadBits(rel, size) catch return false;
+        defer bits.deinit(self.gpa);
+        const idx = bits.lastSet() orelse return false;
+        const off = piece.offset(idx, self.piece_size);
+        const ln = piece.len(size, idx, self.piece_size);
+        bits.clear(idx);
+        // Encode and path resolution stay outside the lock; both failures
+        // bail before anything is mutated, so no hole can outlive its
+        // unpersisted mark.
+        var blob: std.ArrayList(u8) = .empty;
+        defer blob.deinit(self.gpa);
+        bits.encode(self.piece_size, size, &blob, self.gpa) catch {
+            std.log.warn("bitfield encode failed for {s}; piece {d} stays cached", .{ rel, idx });
+            return false;
+        };
+        var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+        const mp = self.cacheMetaPath(&mbuf, rel) catch return false;
+        // Write-ahead (same contract as punchPiece): the cleared field is
+        // persisted before any destructive step. A save failure leaves the
+        // old sidecar standing and nothing punched; a crash after the save
+        // but before the punch costs only a refill over intact bytes.
+        if (sys.writeFileNoFollow(mp, blob.items) != 0) {
+            std.log.warn("bitfield save failed for {s}; piece {d} stays cached", .{ rel, idx });
+            return false;
+        }
+        // One store.mu window covers the liveness recheck, the punch, and the
+        // builder-invalidation bump -- the same shape as forget/reapIdle
+        // purges. A get() cannot insert an entry for rel inside this window
+        // (insertion takes store.mu), so a sampled victim can never grow a
+        // live entry mid-punch: one that inserted before the window makes
+        // contains() bail without punching, and one whose sidecar read raced
+        // the rewrite above discards at insert because the bump below follows
+        // the completed mutation -- sampling the new epoch guarantees the
+        // reader sees post-punch bits.
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.files.contains(rel)) return false;
+        if (self.purge_epoch != epoch0) return false;
+        if (sys.punchHole(fd, off, ln) != 0) return false;
+        self.purge_epoch += 1;
+        std.log.info("cull piece {d} {s}", .{ idx, rel });
+        return true;
+    }
+};
+
+/// True when rel is a safe origin-relative path at a trust boundary: not
+/// empty, not absolute, no "." or ".." component, no control byte. Applied to
+/// every externally supplied path before it joins a root (FUSE, peer HTTP,
+/// CLI pin); without it a peer request can escape the origin/cache trees or
+/// forge multi-line entries in operator logs via \n in a path.
+pub fn relOk(rel: []const u8) bool {
+    if (rel.len == 0 or rel[0] == '/') return false;
+    for (rel) |ch| {
+        // Control bytes (C0 plus DEL) cover NUL truncation, CR/LF log
+        // injection, and ANSI escape injection into terminal logs. None of
+        // them can appear in a legitimate model path.
+        if (ch < 0x20 or ch == 0x7f) return false;
+    }
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
+    }
+    return true;
+}
+
+test "cacheFill grows entry preserving earlier piece marks" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-fill");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-fill");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Piece size 16: a sequential ingest of three chunks must keep every
+    // fully-written piece marked. Regression: the write path went through
+    // reconcileSize on each growth, wiping all marks but the last chunk's.
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var w1: [16]u8 = undefined;
+    @memset(&w1, 0xAA);
+    // mf_create would have made the origin file before any write lands.
+    var zbuf: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&zbuf, "{s}/app.bin", .{origin_d});
+    var fbuf2: [160]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fbuf2, fp), ""));
+    try std.testing.expectEqual(@as(isize, 16), st.originPwrite("app.bin", &w1, 0));
+    st.cacheFill("app.bin", 16, 0, &w1);
+
+    {
+        const f = st.lookupRef("app.bin").?;
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        try std.testing.expectEqual(@as(u64, 16), f.size);
+        try std.testing.expectEqual(@as(u32, 1), f.bits.nbits);
+        try std.testing.expect(f.bits.get(0));
+        f.mu.unlock(std.testing.io);
+    }
+
+    var w2: [24]u8 = undefined;
+    @memset(&w2, 0xBB);
+    try std.testing.expectEqual(@as(isize, 24), st.originPwrite("app.bin", &w2, 16));
+    st.cacheFill("app.bin", 40, 16, &w2);
+
+    {
+        const f = st.lookupRef("app.bin").?;
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        try std.testing.expectEqual(@as(u64, 40), f.size);
+        try std.testing.expectEqual(@as(u32, 3), f.bits.nbits);
+        // pieces 0 and 1 fully written; piece 2 only half covered
+        try std.testing.expect(f.bits.get(0));
+        try std.testing.expect(f.bits.get(1));
+        try std.testing.expect(!f.bits.get(2));
+        f.mu.unlock(std.testing.io);
+    }
+
+    // A third append completes piece 2 without disturbing earlier marks.
+    var w3: [8]u8 = undefined;
+    @memset(&w3, 0xCC);
+    try std.testing.expectEqual(@as(isize, 8), st.originPwrite("app.bin", &w3, 40));
+    st.cacheFill("app.bin", 48, 40, &w3);
+
+    {
+        const f = st.lookupRef("app.bin").?;
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        try std.testing.expectEqual(@as(u64, 48), f.size);
+        // Piece 2 spans two appends, so neither write alone fully covers
+        // it; it stays unmarked until a read hydrates it (per-write
+        // marking, as documented on fullCover).
+        try std.testing.expectEqual(@as(u32, 2), f.bits.filled());
+        f.mu.unlock(std.testing.io);
+    }
+
+    // The cache copy serves every written region back directly.
+    var w2_full: [24]u8 = undefined;
+    @memset(&w2_full, 0xBB);
+    var rd: [48]u8 = undefined;
+    const f = try st.get("app.bin", 48);
+    defer st.releaseFile(f);
+    const n = st.readCache(f, &rd, 0);
+    try std.testing.expectEqual(@as(isize, 48), n);
+    try std.testing.expectEqualSlices(u8, &w1, rd[0..16]);
+    try std.testing.expectEqualSlices(u8, &w2_full, rd[16..40]);
+    try std.testing.expectEqualSlices(u8, &w3, rd[40..48]);
+}
+
+test "relOk rejects traversal and absolute paths" {
+    try std.testing.expect(relOk("gguf/a.gguf"));
+    try std.testing.expect(relOk("a.bin"));
+    // traversal in every position
+    try std.testing.expect(!relOk("../etc/passwd"));
+    try std.testing.expect(!relOk("gguf/../../etc/passwd"));
+    try std.testing.expect(!relOk("a/.."));
+    try std.testing.expect(!relOk(".."));
+    try std.testing.expect(!relOk("./a.bin"));
+    // absolute and empty
+    try std.testing.expect(!relOk("/etc/passwd"));
+    try std.testing.expect(!relOk(""));
+    // NUL would truncate the path at the syscall boundary
+    try std.testing.expect(!relOk("a\x00b"));
+    // CR/LF/ESC must not reach log sinks: a peer-supplied path could forge
+    // multi-line log entries or inject terminal escapes
+    try std.testing.expect(!relOk("a\n2026-08-23 INFO forged"));
+    try std.testing.expect(!relOk("a\rb"));
+    try std.testing.expect(!relOk("\x1b[31mred\x1b[0m"));
+    try std.testing.expect(!relOk("a\tb"));
+    try std.testing.expect(!relOk("a\x7fb"));
+}
+
+test "store get file size update and pin" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pin");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pin");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f1 = try st.get("bar.bin", 32);
+    try std.testing.expectEqual(@as(u64, 32), f1.size);
+    try std.testing.expectEqual(@as(u32, 2), f1.bits.nbits);
+
+    // Resizing file
+    const f2 = try st.get("bar.bin", 64);
+    try std.testing.expectEqual(f1, f2);
+    try std.testing.expectEqual(@as(u64, 64), f2.size);
+    try std.testing.expectEqual(@as(u32, 4), f2.bits.nbits);
+
+    // Pinning
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("bar.bin", true));
+    try std.testing.expect(st.pinExists("bar.bin"));
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("bar.bin", false));
+    try std.testing.expect(!st.pinExists("bar.bin"));
+
+    // Both lookups hold a reference; dropping both frees the entry (any leak
+    // or double free is reported by the testing allocator).
+    st.releaseFile(f1);
+    st.releaseFile(f2);
+}
+
+test "forget drops bits, fd, and disk artifacts for the path" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-forget");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-forget");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f1 = try st.get("gone.bin", 64);
+    f1.mu.lockUncancelable(std.testing.io);
+    f1.bits.set(0);
+    f1.bits.set(3);
+    f1.mu.unlock(std.testing.io);
+    _ = st.saveBits(f1);
+    try std.testing.expect(st.openCache(f1) >= 0);
+
+    // No live entry: artifacts from an earlier process must still be purged.
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    st.forget("never-known.bin");
+    const stale_meta = try st.cacheMetaPath(&mb, "never-known.bin");
+    var st_buf: c.struct_stat = undefined;
+    try std.testing.expect(sys.statPath(stale_meta, &st_buf) != 0);
+
+    st.forget("gone.bin");
+    // The entry is evicted from the map: a later get() builds a fresh one.
+    // The old pointer stays valid until its reference is dropped, and its
+    // bits were emptied so no stale state survives. The cache fd also stays
+    // valid until that release (closing it under live holders would let the
+    // descriptor number be reused mid-I/O); it dies with the entry.
+    const f2 = try st.get("gone.bin", 64);
+    try std.testing.expect(f2 != f1);
+    f1.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 0), f1.bits.filled());
+    try std.testing.expect(f1.cache_fd >= 0);
+    f1.mu.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
+    const meta = try st.cacheMetaPath(&mb, "gone.bin");
+    try std.testing.expect(sys.statPath(meta, &st_buf) != 0);
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const data = try st.cacheDataPath(&db, "gone.bin");
+    try std.testing.expect(sys.statPath(data, &st_buf) != 0);
+    st.releaseFile(f1);
+    st.releaseFile(f2);
+}
+
+test "corrupt sidecar degrades to empty bitfield" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-corrupt");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-corrupt");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Torn sidecar, as a crash mid-saveBits can leave behind: shorter than
+    // the header must not make every read of the file fail.
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const torn = try st.cacheMetaPath(&mb, "torn.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(torn, "MF"));
+
+    const f1 = try st.get("torn.bin", 64);
+    try std.testing.expectEqual(@as(u32, 4), f1.bits.nbits);
+    try std.testing.expectEqual(@as(u32, 0), f1.bits.filled());
+
+    // Plausible length but wrong magic must also reset, not fail.
+    var bb: [sys.c.PATH_MAX]u8 = undefined;
+    const bad = try st.cacheMetaPath(&bb, "bad.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(bad, "XXXX" ** 8));
+
+    const f2 = try st.get("bad.bin", 64);
+    try std.testing.expectEqual(@as(u32, 4), f2.bits.nbits);
+    try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
+    st.releaseFile(f1);
+    st.releaseFile(f2);
+}
+
+test "forget evicts after release and reapIdle frees idle empty entries" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-reap");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-reap");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // forget evicts from the map immediately; the entry dies with the last
+    // release, not before (the reference must stay valid until then). The
+    // open cache fd is part of that validity: it closes with the entry, so
+    // holders never see their descriptor yanked and reused.
+    const f1 = try st.get("cycle.bin", 64);
+    try std.testing.expectEqual(@as(usize, 1), st.files.count());
+    try std.testing.expect(st.openCache(f1) >= 0);
+    st.forget("cycle.bin");
+    try std.testing.expectEqual(@as(usize, 0), st.files.count());
+    f1.mu.lockUncancelable(std.testing.io);
+    try std.testing.expect(f1.cache_fd >= 0);
+    f1.mu.unlock(std.testing.io);
+    st.releaseFile(f1);
+
+    // A filled entry survives the reaper, but its idle fd is closed...
+    const f2 = try st.get("kept.bin", 64);
+    try std.testing.expect(st.openCache(f2) >= 0);
+    f2.mu.lockUncancelable(std.testing.io);
+    f2.bits.set(0);
+    f2.last_access.store(sys.monoSec() - 3600, .monotonic);
+    f2.mu.unlock(std.testing.io);
+    st.releaseFile(f2);
+
+    // ...while an empty idle entry is evicted outright.
+    const f3 = try st.get("empty.bin", 64);
+    f3.last_access.store(sys.monoSec() - 3600, .monotonic);
+    st.releaseFile(f3);
+
+    st.reapIdle(60);
+    try std.testing.expectEqual(@as(usize, 1), st.files.count());
+    const f2b = st.lookupRef("kept.bin").?;
+    try std.testing.expectEqual(f2, f2b);
+    f2b.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(c_int, -1), f2b.cache_fd);
+    try std.testing.expect(f2b.bits.get(0));
+    f2b.mu.unlock(std.testing.io);
+    st.releaseFile(f2b);
+}
+
+test "punchPiece refuses while a peer transfer is inflight" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-xfer");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-xfer");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("busy.bin", 64);
+    defer st.releaseFile(f);
+    f.mu.lockUncancelable(std.testing.io);
+    f.bits.set(0);
+    // Age the entry past the recency window: stamping alone must not be
+    // what protects an in-flight transfer (a stalled sendfile chunk can
+    // block far longer than recency_secs).
+    f.last_access.store(sys.monoSec() - 3600, .monotonic);
+    f.mu.unlock(std.testing.io);
+
+    _ = f.xfer.fetchAdd(1, .monotonic);
+    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(st.hasPiece(f, 0));
+
+    // Transfer done: the idle cached piece culls normally.
+    _ = f.xfer.fetchSub(1, .monotonic);
+    try std.testing.expect(st.punchPiece(f, 0));
+    try std.testing.expect(!st.hasPiece(f, 0));
+}
+
+/// Writes a meta sidecar for rel naming exactly `filled` pieces as cached,
+/// the way finishPiece/saveBits would leave it.
+fn writeFilledSidecar(st: *Store, rel: []const u8, size: u64, filled: []const u32) !void {
+    var bits = try piece.Bitfield.init(std.testing.allocator, piece.count(size, st.piece_size));
+    defer bits.deinit(std.testing.allocator);
+    for (filled) |i| bits.set(i);
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(std.testing.allocator);
+    try bits.encode(st.piece_size, size, &blob, std.testing.allocator);
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, rel);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(mp, blob.items));
+}
+
+test "punchDisk refuses a rel owned by a live entry" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pd-live");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pd-live");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Disk-only victim sampled by walkData, then hydrated into a live entry
+    // before the punch runs: the entry's bits say filled, so punching would
+    // serve hole zeros behind them. Regression: punchDisk never rechecked
+    // map membership between walkData's sample and the punch.
+    const pattern = "0123456789abcdef";
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.cacheDataPath(&db, "live.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(dp, pattern));
+    try writeFilledSidecar(&st, "live.bin", pattern.len, &.{0});
+
+    const f = try st.get("live.bin", pattern.len);
+    defer st.releaseFile(f);
+    try std.testing.expect(!st.punchDisk("live.bin"));
+
+    var rb: [16]u8 = undefined;
+    const got = sys.readFileBuf(&rb, dp) catch return error.ReadFailed;
+    try std.testing.expectEqualStrings(pattern, got);
+}
+
+test "punchDisk punches an orphaned rel and publishes cleared bits" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pd-orph");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pd-orph");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const pattern = "0123456789abcdef";
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.cacheDataPath(&db, "orph.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(dp, pattern));
+    try writeFilledSidecar(&st, "orph.bin", pattern.len, &.{0});
+
+    const e0 = st.purge_epoch;
+    try std.testing.expect(st.punchDisk("orph.bin"));
+    try std.testing.expectEqual(e0 + 1, st.purge_epoch);
+
+    // The sidecar rewrite precedes the epoch bump, so any builder sampling
+    // the new epoch reads post-punch bits: a fresh entry must not believe
+    // the punched piece is cached.
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, "orph.bin");
+    const blob = try sys.readFileAlloc(gpa, mp, 4096);
+    defer gpa.free(blob);
+    var decoded = try piece.Bitfield.decode(gpa, blob, st.piece_size, pattern.len);
+    defer decoded.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 0), decoded.filled());
+
+    const f = try st.get("orph.bin", pattern.len);
+    defer st.releaseFile(f);
+    try std.testing.expect(!f.bits.get(0));
+}
+
+test "considerVictim keeps a bounded oldest-first sample" {
+    var victims: [Store.walk_sample_cap]Store.DiskVictim = undefined;
+    var count: usize = 0;
+    // Fill the sample with at=10..17 in scrambled arrival order.
+    const ats = [_]i64{ 13, 10, 16, 11, 17, 12, 15, 14 };
+    for (ats, 0..) |at, i| {
+        var nb: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "f{d}.bin", .{i});
+        Store.considerVictim(&victims, &count, name, at);
+    }
+    try std.testing.expectEqual(Store.walk_sample_cap, count);
+    for (&victims, 0..) |*v, i| {
+        try std.testing.expectEqual(@as(i64, @intCast(10 + i)), v.at);
+    }
+    // An older candidate replaces the youngest and bubbles to the front...
+    Store.considerVictim(&victims, &count, "old.bin", 5);
+    try std.testing.expectEqualStrings("old.bin", victims[0].rel[0..victims[0].len]);
+    try std.testing.expectEqual(@as(i64, 5), victims[0].at);
+    // ...and one younger than every entry is ignored outright.
+    Store.considerVictim(&victims, &count, "young.bin", 99);
+    try std.testing.expectEqual(@as(i64, 16), victims[count - 1].at);
+}
+
+test "walkData samples oldest-first disk-only files across subdirs" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-walk");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-walk");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Cached files at two nesting levels plus an old pinned file the scan
+    // must skip; mtimes are stamped explicitly so ordering does not depend
+    // on write scheduling.
+    var db: [256]u8 = undefined;
+    const sub = try std.fmt.bufPrint(&db, "{s}/data/gguf", .{cache_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(sub, 0o755));
+    const entries = [_]struct { rel: []const u8, age: i64 }{
+        .{ .rel = "pinned.bin", .age = 400 },
+        .{ .rel = "old.bin", .age = 300 },
+        .{ .rel = "gguf/mid.bin", .age = 200 },
+        .{ .rel = "new.bin", .age = 100 },
+    };
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    for (entries) |e| {
+        var fb: [320]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fb, "{s}/data/{s}", .{ cache_d, e.rel });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "cached"));
+        const past = [2]std.os.linux.timespec{
+            .{ .sec = sys.nowSec() - e.age, .nsec = 0 },
+            .{ .sec = sys.nowSec() - e.age, .nsec = 0 },
+        };
+        const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zbuf, fp), &past, 0);
+        try std.testing.expectEqual(@as(usize, 0), rc);
+    }
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("pinned.bin", true));
+
+    var rb: [sys.c.PATH_MAX]u8 = undefined;
+    const root = try sys.joinZ(&rb, cache_d, "data");
+    var victims: [Store.walk_sample_cap]Store.DiskVictim = undefined;
+    var count: usize = 0;
+    st.walkData(std.mem.span(root), "", &victims, &count, 0);
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    const want = [_][]const u8{ "old.bin", "gguf/mid.bin", "new.bin" };
+    for (want, 0..) |w, i| {
+        try std.testing.expectEqualStrings(w, victims[i].rel[0..victims[i].len]);
+        if (i > 0) try std.testing.expect(victims[i - 1].at <= victims[i].at);
+    }
+}
+
+test "get survives concurrent artifact invalidation between loadBits and insert" {
+    // Regression harness for the purge_epoch contract: a get() builder whose
+    // sidecar read raced a forget/reap-punch must retry instead of publishing
+    // bits loaded from the pre-mutation artifacts. The bumper thread forces
+    // epoch mismatches inside the unlocked build window; every mismatch walks
+    // the retry path (deinit + rebuild), so any double-free of the entry,
+    // its rel copy, or its bitfield trips the testing allocator.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-epoch");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-epoch");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // forget bumps the epoch exactly once per purge.
+    {
+        const f = try st.get("epoch.bin", 64);
+        st.releaseFile(f);
+        const e0 = st.purge_epoch;
+        st.forget("epoch.bin");
+        try std.testing.expectEqual(e0 + 1, st.purge_epoch);
+    }
+
+    var done = std.atomic.Value(bool).init(false);
+    const bumper = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Store, stop: *std.atomic.Value(bool)) void {
+            // Bursts with sleeps between them: a tight spinner could starve
+            // every build window and livelock get()'s retry. The gaps let
+            // builders complete; the bursts land inside others.
+            while (!stop.load(.acquire)) {
+                s.mu.lockUncancelable(s.io);
+                s.purge_epoch +%= 1;
+                s.mu.unlock(s.io);
+                sys.sleepMs(1);
+            }
+        }
+    }.run, .{ &st, &done });
+    defer {
+        done.store(true, .release);
+        bumper.join();
+    }
+
+    // Each round is a fresh slow-path build (forget removes the entry); the
+    // bumper keeps invalidating builds mid-flight, exercising the retry.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const f = try st.get("race.bin", 64);
+        try std.testing.expectEqual(@as(u64, 64), f.size);
+        try std.testing.expectEqual(@as(u32, 64 / 16), f.bits.nbits);
+        st.releaseFile(f);
+        st.forget("race.bin");
+    }
+    try std.testing.expectEqual(@as(usize, 0), st.files.count());
+}
+
+/// Makes every sidecar rewrite fail until undone (read-only sidecar file),
+/// the way a full or failing cache filesystem would.
+const SidecarBroken = struct {
+    path_z: [sys.c.PATH_MAX]u8,
+
+    fn apply(st: *Store, rel: []const u8) !SidecarBroken {
+        var self = SidecarBroken{ .path_z = undefined };
+        _ = try st.cacheMetaPath(&self.path_z, rel);
+        try std.testing.expectEqual(@as(i32, 0), c.chmod(&self.path_z, 0o444));
+        return self;
+    }
+
+    fn undo(self: *const SidecarBroken) void {
+        _ = c.chmod(&self.path_z, 0o644);
+    }
+};
+
+test "punchPiece refuses to cut the hole unless the cleared bits persist" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pp-save");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pp-save");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var pattern: [32]u8 = undefined;
+    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 37 + 5);
+    const f = try st.get("p.bin", pattern.len);
+    defer st.releaseFile(f);
+    try std.testing.expect(st.openCache(f) >= 0);
+    try std.testing.expectEqual(@as(isize, 32), sys.pwriteAll(f.cache_fd, &pattern, 0));
+    f.mu.lockUncancelable(std.testing.io);
+    f.bits.set(0);
+    f.bits.set(1);
+    try std.testing.expect(st.saveBits(f));
+    // Age past punchPiece's recency window, as a cull candidate would sit.
+    f.last_access.store(sys.monoSec() - 3600, .monotonic);
+    f.mu.unlock(std.testing.io);
+
+    // Regression: punching first and persisting second let a failed sidecar
+    // save leave a hole under a filled mark -- post-restart reads would
+    // serve hole zeros as cached bytes. The punch must be refused instead,
+    // leaving both bytes and mark intact.
+    var broken = try SidecarBroken.apply(&st, "p.bin");
+    defer broken.undo();
+    try std.testing.expect(!st.punchPiece(f, 0));
+
+    f.mu.lockUncancelable(std.testing.io);
+    try std.testing.expect(f.bits.get(0));
+    f.mu.unlock(std.testing.io);
+    var back: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 32), sys.preadAll(f.cache_fd, &back, 0));
+    try std.testing.expectEqualSlices(u8, &pattern, &back);
+
+    // Once saves work again the same piece culls normally.
+    broken.undo();
+    try std.testing.expect(st.punchPiece(f, 0));
+    try std.testing.expect(!st.hasPiece(f, 0));
+}
+
+test "disk cull refuses to cut the hole unless the cleared bits persist" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pd-save");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pd-save");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Orphaned artifacts from an earlier run, no live entry: data present,
+    // sidecar says piece 0 filled.
+    const pattern = "0123456789abcdef";
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.cacheDataPath(&db, "d.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(dp, pattern));
+    try writeFilledSidecar(&st, "d.bin", pattern.len, &.{0});
+
+    var broken = try SidecarBroken.apply(&st, "d.bin");
+    defer broken.undo();
+    try std.testing.expect(!st.punchDisk("d.bin"));
+
+    var rb: [16]u8 = undefined;
+    const got = sys.readFileBuf(&rb, dp) catch return error.ReadFailed;
+    try std.testing.expectEqualStrings(pattern, got);
+
+    // With persistence possible again the orphan punches through cullOne.
+    broken.undo();
+    try std.testing.expect(st.cullOne());
+    const after = sys.readFileBuf(&rb, dp) catch return error.ReadFailed;
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** pattern.len), after);
+}
+
+test "claimPiece surfaces allocation failure instead of spinning" {
+    const gpa = std.testing.allocator;
+    var st = Store.init(gpa, std.testing.io, "/unused", "/unused", 16);
+    defer st.deinit();
+    const f = try st.get("oom.bin", 64);
+    defer st.releaseFile(f);
+
+    // Rebind the entry's filling map to an allocator whose first allocation
+    // fails: claimPiece must report the failure to its caller (which turns it
+    // into EIO/500) rather than retry forever and wedge the reader.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    f.filling.deinit();
+    f.filling = std.AutoHashMap(u32, void).init(failing.allocator());
+    try std.testing.expectError(error.OutOfMemory, st.claimPiece(f, 0));
+}
+
+test "late finisher on a forgotten entry does not resurrect the sidecar" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-latefin");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-latefin");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    var stbuf: c.struct_stat = undefined;
+
+    // A fill claimed before a concurrent unlink: forget purges the artifacts
+    // while this reference is outstanding; the late finishPiece must drop
+    // the claim without saving. Regression: saving unconditionally recreated
+    // a sidecar naming filled pieces over a data file that no longer exists,
+    // and a same-size recreate would trust those bits and serve hole zeros.
+    const f = try st.get("late.bin", 64);
+    try std.testing.expect(try st.claimPiece(f, 0));
+    st.forget("late.bin");
+    st.finishPiece(f, 0, true);
+    const mp = try st.cacheMetaPath(&mb, "late.bin");
+    try std.testing.expect(sys.statPath(mp, &stbuf) != 0);
+    st.releaseFile(f);
+
+    // Same contract for the write-through path: copyIntoCache on a dead
+    // entry reports failure instead of marking and saving bits.
+    const f2 = try st.get("late2.bin", 64);
+    defer st.releaseFile(f2);
+    try std.testing.expect(st.openCache(f2) >= 0);
+    st.forget("late2.bin");
+    const mp2 = try st.cacheMetaPath(&mb, "late2.bin");
+    try std.testing.expect(!st.copyIntoCache(f2, 0, "0123456789abcdef", null));
+    try std.testing.expect(sys.statPath(mp2, &stbuf) != 0);
+
+    // The dead stamp must be visible to any file.mu holder that follows the
+    // purge: finishPiece's skip runs under the same lock forget stamped in,
+    // so there is no window where the save slips through.
+    const f3 = try st.get("late3.bin", 64);
+    defer st.releaseFile(f3);
+    st.forget("late3.bin");
+    f3.mu.lockUncancelable(std.testing.io);
+    const dead_seen = f3.dead.load(.acquire);
+    f3.mu.unlock(std.testing.io);
+    try std.testing.expect(dead_seen);
+}

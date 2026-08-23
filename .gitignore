@@ -1,0 +1,16 @@
+# Zig
+zig-out/
+.zig-cache/
+
+# Python
+__pycache__/
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Vendored/downloaded dependencies
+.deps/
+
+# Scratch and runtime state
+.scratch/
+.gauntlet.lock
