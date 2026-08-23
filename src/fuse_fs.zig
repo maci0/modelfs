@@ -172,35 +172,29 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
 fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []u8) i32 {
     // piece.len() never exceeds piece_size, even when a concurrent append
     // grows the tail piece after cover() was computed, so the caller's
-    // piece-size scratch always fits. file.size moves only under file.mu
-    // (truncate, reconcileSize, cacheFill): a stale unlocked read could make
-    // ln disagree with the bit actually marked filled and serve hole zeros,
-    // so sample it under the lock.
-    // An allocation failure claiming the piece must fail this read with
-    // ENOMEM rather than hang: claimPiece no longer retries OOM forever.
+    // piece-size scratch always fits. An allocation failure claiming the
+    // piece must fail this read with ENOMEM rather than hang: claimPiece no
+    // longer retries OOM forever.
     const claimed = st.store.claimPiece(file, idx) catch return -sys.c.ENOMEM;
     if (!claimed) return 0;
-    file.mu.lockUncancelable(st.io);
-    const ln = piece.len(file.size, idx, st.store.piece_size);
-    file.mu.unlock(st.io);
-    // A truncate raced us between claimPiece and this sample and shrank the
-    // file below this piece: there is nothing to hydrate. Drop the claim so
-    // concurrent fillers are not blocked, and report success -- the caller's
-    // bounds-checked read then returns a short count against the new size.
-    // Passing an empty buffer onward would underflow fillFromPeers' range
-    // end computation (out.len - 1) and abort the daemon.
+    // claimedPieceLen samples file.size under file.mu; zero means a truncate
+    // raced us between the claim and the sample and shrank the file below
+    // this piece. Drop the claim so concurrent fillers are not blocked, and
+    // report success -- the caller's bounds-checked read then returns a short
+    // count against the new size. Passing an empty buffer onward would
+    // underflow fillFromPeers' range end computation (out.len - 1) and abort
+    // the daemon.
+    const ln = st.store.claimedPieceLen(file, idx);
     if (ln == 0) {
         st.store.finishPiece(file, idx, false);
         return 0;
     }
     const buf = scratch[0..ln];
-    var ok = true;
     var from_peer = true;
     peer.fillFromPeers(st.gpa, st.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf) catch {
         from_peer = false;
         const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
-        ok = n == @as(isize, @intCast(ln));
-        if (!ok) {
+        if (n != @as(isize, @intCast(ln))) {
             st.store.finishPiece(file, idx, false);
             if (n < 0) return @intCast(n);
             return -sys.c.EIO;

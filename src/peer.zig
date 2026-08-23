@@ -149,6 +149,11 @@ const dial_timeout_ms: u32 = 15_000;
 /// sending a partial head slower than the timeout.
 pub const head_deadline_ms: i64 = 10_000;
 
+/// Cap on a peer-chosen Content-Length driving an allocation in
+/// readFlexBodyAlloc. Caller-supplied destinations bypass it: their length is
+/// verified against Content-Length instead.
+const max_alloc_body_bytes: usize = 512 * 1024 * 1024;
+
 fn readHeadFull(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize) !void {
     return readHeadFullDeadline(fd, buf, out_head_len, out_total_read, sys.monoMs() + head_deadline_ms);
 }
@@ -322,15 +327,12 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                 return false;
             };
             if (claimed) {
-                // file.size moves only under file.mu; sample it under the
-                // lock so ln cannot disagree with the bit finishPiece sets.
-                file.mu.lockUncancelable(self.io);
-                const ln = piece.len(file.size, pi, ps);
-                file.mu.unlock(self.io);
-                // A truncate raced us between the claim and this sample and
+                // claimedPieceLen samples file.size under the lock so ln
+                // cannot disagree with the bit finishPiece sets. Zero means a
+                // truncate raced us between the claim and the sample and
                 // shrank the file below this piece: drop the claim and move
-                // on instead of marking an empty piece filled (a later grow
-                // preserves marks, so the bogus bit would serve hole zeros).
+                // on instead of marking an empty piece filled.
+                const ln = self.store.claimedPieceLen(file, pi);
                 if (ln == 0) {
                     self.store.finishPiece(file, pi, false);
                     continue;
@@ -577,7 +579,7 @@ fn readFlexBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8) ![
     } else {
         // Content-Length is untrusted peer input: refuse absurd bodies
         // instead of letting one bad response drive a giant allocation.
-        if (want_len > 512 * 1024 * 1024) return error.BodyTooLarge;
+        if (want_len > max_alloc_body_bytes) return error.BodyTooLarge;
         if (want_len == 0) return try gpa.alloc(u8, 0);
     }
 
@@ -668,19 +670,14 @@ fn probeSlots(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, r
     if (spawned < todo.items.len) probeWorker(&ctx);
 }
 
-pub fn fillFromPeers(
-    gpa: std.mem.Allocator,
-    psk: []const u8,
-    cat: *discover.Catalog,
-    rel: []const u8,
-    idx: u32,
-    ps: u32,
-    out: []u8,
-) !void {
+/// Snapshot of the catalog reduced to one candidate per unique peer id, each
+/// carrying its /have answer for piece idx: peers answered by the recent-
+/// probe cache skip the wire; the rest are probed concurrently (a serial
+/// probe would pay one full connect+request+response round trip per peer
+/// before any piece data moves). Caller frees the returned slice with gpa.
+fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32) ![]discover.PathCand {
     const paths = try cat.snapshot(gpa);
     defer discover.Catalog.freeSnapshot(gpa, paths);
-    var cands: std.ArrayList(discover.PathCand) = .empty;
-    defer cands.deinit(gpa);
 
     // One probe per unique peer id: several lease paths can name the same
     // node, and probing each would duplicate wire round trips and slots.
@@ -706,6 +703,9 @@ pub fn fillFromPeers(
     // by the recent-probe cache skip the wire entirely, so a sequential fill
     // of one file probes once per peer per TTL instead of once per piece.
     try probeSlots(gpa, psk, cat, rel, peers.items, slots);
+
+    var cands: std.ArrayList(discover.PathCand) = .empty;
+    errdefer cands.deinit(gpa);
     for (paths) |p| {
         var bits: []u8 = &.{};
         if (slot_of.get(p.peer_id)) |si| {
@@ -721,9 +721,23 @@ pub fn fillFromPeers(
             .have = has,
         });
     }
+    return cands.toOwnedSlice(gpa);
+}
+
+pub fn fillFromPeers(
+    gpa: std.mem.Allocator,
+    psk: []const u8,
+    cat: *discover.Catalog,
+    rel: []const u8,
+    idx: u32,
+    ps: u32,
+    out: []u8,
+) !void {
+    const cands = try probeCandidates(gpa, psk, cat, rel, idx);
+    defer gpa.free(cands);
 
     // exclusive: one winner, then next on failure, then error (caller uses NFS)
-    var remaining = cands.items;
+    var remaining = cands;
     while (discover.pickBest(remaining)) |bi| {
         const win = remaining[bi];
         _ = cat.inflight(win.ip, win.port, 1);

@@ -300,7 +300,10 @@ pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![
     if (got == size) return buf;
     // Short read (concurrent truncate, flaky NFS): shrink so callers free a
     // slice whose length matches its allocation.
-    return gpa.realloc(buf, got) catch return error.OutOfMemory;
+    return gpa.realloc(buf, got) catch {
+        gpa.free(buf);
+        return error.OutOfMemory;
+    };
 }
 
 pub fn readFileBuf(buf: []u8, path: [*:0]const u8) ![]u8 {

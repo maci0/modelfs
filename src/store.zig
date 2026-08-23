@@ -256,9 +256,10 @@ pub const Store = struct {
         };
     }
 
-    /// Persists the entry's current bits. False means the sidecar was not
-    /// updated (encode failure, unwritable path, torn write); callers that
-    /// gate destructive disk work on persisted state must treat false as
+    /// Persists the entry's current bits. Caller must hold file.mu: encode
+    /// reads bits/size under it. False means the sidecar was not updated
+    /// (encode failure, unwritable path, torn write); callers that gate
+    /// destructive disk work on persisted state must treat false as
     /// "do not proceed".
     pub fn saveBits(self: *Store, file: *Cached) bool {
         var blob: std.ArrayList(u8) = .empty;
@@ -512,6 +513,20 @@ pub const Store = struct {
         _ = self.saveBits(file);
     }
 
+    /// Length of piece idx sampled under file.mu immediately after a
+    /// successful claimPiece. file.size moves only under that lock (truncate,
+    /// reconcileSize, cacheFill), so an unlocked read could make the length
+    /// disagree with the bit finishPiece sets and serve hole zeros. Returns 0
+    /// when a truncate raced the claim and shrank the file below the piece:
+    /// the caller must finishPiece(.., false) and skip it instead of marking
+    /// an empty piece filled (a later grow preserves marks, so the bogus bit
+    /// would survive).
+    pub fn claimedPieceLen(self: *Store, file: *Cached, idx: u32) u32 {
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        return piece.len(file.size, idx, self.piece_size);
+    }
+
     pub fn hasPiece(self: *Store, file: *Cached, idx: u32) bool {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
@@ -572,7 +587,7 @@ pub const Store = struct {
         };
         defer self.releaseFile(file);
 
-        var grew = false;
+        var resized = false;
         file.mu.lockUncancelable(self.io);
         if (end > file.size) {
             // Our own append: earlier piece marks stay valid.
@@ -582,7 +597,7 @@ pub const Store = struct {
                 std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
             };
             file.size = end;
-            grew = true;
+            resized = true;
         } else if (end < file.size) {
             // Entry is longer than the observed origin: someone truncated
             // externally. Reset like reconcileSize instead of keeping marks
@@ -591,7 +606,7 @@ pub const Store = struct {
                 var ob = file.bits;
                 file.bits = nb;
                 file.size = end;
-                grew = true;
+                resized = true;
                 ob.deinit(self.gpa);
             } else |_| {
                 std.log.warn("bitfield shrink failed for {s}; stale tail pieces refill", .{rel});
@@ -600,7 +615,7 @@ pub const Store = struct {
         file.last_access.store(sys.monoSec(), .monotonic);
         file.mu.unlock(self.io);
 
-        _ = self.copyIntoCache(file, off, data, if (grew) end else null);
+        _ = self.copyIntoCache(file, off, data, if (resized) end else null);
     }
 
     /// Copies a landed origin write into the cache fd and marks the pieces it
