@@ -91,8 +91,10 @@ python3 "${SCRIPT_DIR}/cluster_verify.py" \
 echo "=== Step 6: Verifying node cache sizes & culling bounds ==="
 for i in $(seq 1 "${NUM_NODES}"); do
     CACHE_DIR="${TEMP_DIR}/node_${i}_cache"
-    USAGE_BYTES=$(du -sb "${CACHE_DIR}" 2>/dev/null | cut -f1 || echo "0")
-    USAGE_MB=$((USAGE_BYTES / 1024 / 1024))
+    # POSIX du -sk (KB): GNU-only -b fails outright on busybox, where the
+    # fallback below would report 0 and silently skip the size assertion.
+    USAGE_KB=$(du -sk "${CACHE_DIR}" 2>/dev/null | cut -f1 || echo "0")
+    USAGE_MB=$((USAGE_KB / 1024))
     echo "Node spark_${i} Cache Size: ${USAGE_MB} MB (Original file size: ${FILE_SIZE_MB} MB)"
     if [ "${USAGE_MB}" -gt "${FILE_SIZE_MB}" ]; then
         echo "Error: Node spark_${i} cache exceeds file size!"
