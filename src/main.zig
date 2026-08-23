@@ -69,10 +69,15 @@ const Opts = struct {
 };
 
 fn parseHostPort(s: []const u8, default_port: u16) !proto.LeaseAddr {
+    // Every consumer inet_pton's the ip field (bind, dial, hops scoring), so
+    // an empty host ("", ":1234") can only fail later -- or, for --seed,
+    // silently on every discovery tick. Reject it where the flag is parsed.
     if (std.mem.findScalarLast(u8, s, ':')) |i| {
+        if (i == 0) return error.BadHostPort;
         const port = try std.fmt.parseInt(u16, s[i + 1 ..], 10);
         return .{ .ip = s[0..i], .port = port, .mbps = 0 };
     }
+    if (s.len == 0) return error.BadHostPort;
     return .{ .ip = s, .port = default_port, .mbps = 0 };
 }
 
@@ -210,6 +215,16 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             return error.UnknownFlag;
         } else {
             try rest.append(gpa, a);
+        }
+    }
+    // Flag and env sources share one gate: an empty id makes this node
+    // publish the same lease file as every other empty-id node and
+    // overwrite each other -- the exact collision hostname() refuses to
+    // fall into silently.
+    if (opts.id) |id| {
+        if (id.len == 0) {
+            if (!builtin.is_test) std.debug.print("--id needs a non-empty name\n", .{});
+            return error.BadId;
         }
     }
     return .{ .cmd = cmd, .opts = opts, .rest = try rest.toOwnedSlice(gpa) };
@@ -615,6 +630,11 @@ test "parseHostPort splits and defaults" {
     try std.testing.expectEqualStrings("spark1", b.ip);
     try std.testing.expectEqual(@as(u16, 18080), b.port);
     try std.testing.expectError(error.Overflow, parseHostPort("h:70000", 18080));
+    // An empty host names no interface: bind/dial inet_pton would reject it
+    // later (a bad --seed silently, on every discovery tick), so refuse it
+    // at the flag boundary instead.
+    try std.testing.expectError(error.BadHostPort, parseHostPort("", 18080));
+    try std.testing.expectError(error.BadHostPort, parseHostPort(":19081", 18080));
 }
 
 test "listenPort accepts bare port per --listen [IP:]PORT" {
@@ -681,6 +701,8 @@ test "parseArgs rejects bad values" {
     // malformed seed/advertise addresses are named, not bare parseInt failures
     try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--seed", "h:70000" }));
     try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "10.0.0.1:99999" }));
+    // an empty address (bare comma split) is refused at the flag, not at bind
+    try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "," }));
     // watermarks are percentages of free space (freePercent clamps to 100):
     // values above 100 would pin the cull phase permanently
     try std.testing.expectError(error.BadWatermark, parseArgs(gpa, &environ, &.{ "mount", "--brun", "101" }));
@@ -690,6 +712,11 @@ test "parseArgs rejects bad values" {
         defer freeParsed(parsed, gpa);
         break :blk parsed.opts.water.bcull;
     });
+    // an empty id (flag or env) would collide every such node onto one lease;
+    // kept last because the env put below taints every later parse
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "" }));
+    try environ.put("MODELFS_ID", "");
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
 }
 
 test "parseArgs defaults come from the environ map" {

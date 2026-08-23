@@ -124,8 +124,16 @@ pub const Bitfield = struct {
         var total: u32 = 0;
         var i: usize = 0;
         while (i + 8 <= self.bytes.len) : (i += 8) {
-            const word = std.mem.readInt(u64, self.bytes[i..][0..8], .little);
-            total += @popCount(word);
+            // Same pad-bit defense as lastSet: a final word that is only
+            // partly valid (nbits not a multiple of 64) must not count its
+            // pad bits when they get set by corruption or a future writer.
+            const lo: u32 = @intCast(i * 8);
+            var w = std.mem.readInt(u64, self.bytes[i..][0..8], .little);
+            if (lo + 64 > self.nbits) {
+                const valid: u6 = @intCast(self.nbits - lo);
+                w &= (@as(u64, 1) << valid) - 1;
+            }
+            total += @popCount(w);
         }
         while (i < self.bytes.len) : (i += 1) {
             // Same pad-bit defense as lastSet: writers keep them zero, but
@@ -292,6 +300,30 @@ test "stale bitfield size resets" {
     defer bf2.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 8), bf2.nbits);
     try std.testing.expectEqual(@as(u32, 0), bf2.filled());
+}
+
+test "filled masks pad bits inside a full trailing word" {
+    const gpa = std.testing.allocator;
+    // nbits=60: bytesLen=8, so the whole field is one full-width u64 word
+    // whose top four bits (60..63) are pad. Regression: the word loop counted
+    // them unmasked, so a corrupt field inflated filled() (which reapIdle
+    // gates eviction on) while lastSet correctly ignored the same bits.
+    var bf = try Bitfield.init(gpa, 60);
+    defer bf.deinit(gpa);
+    bf.set(0);
+    bf.set(59);
+    try std.testing.expectEqual(@as(u32, 2), bf.filled());
+    // Corrupt every pad bit in the trailing word.
+    bf.bytes[7] |= 0b11110000;
+    try std.testing.expectEqual(@as(u32, 2), bf.filled());
+    try std.testing.expectEqual(@as(u32, 59), bf.lastSet().?);
+
+    // A byte-aligned tail keeps its existing defense too.
+    var bf2 = try Bitfield.init(gpa, 10);
+    defer bf2.deinit(gpa);
+    bf2.set(9);
+    bf2.bytes[1] |= 0b11110000;
+    try std.testing.expectEqual(@as(u32, 1), bf2.filled());
 }
 
 test "lastSet scans words and tolerates pad bits" {
