@@ -235,7 +235,7 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     // refuse it before any socket is bound.
     if (opts.psk_value) |v| {
         if (v.len == 0) {
-            std.log.err("--psk-value is empty; refusing to serve unauthenticated", .{});
+            if (!builtin.is_test) std.log.err("--psk-value is empty; refusing to serve unauthenticated", .{});
             return error.EmptyPsk;
         }
         return gpa.dupe(u8, v);
@@ -243,8 +243,13 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
     const p = try sys.toZ(&z, opts.psk_file);
     const raw = sys.readFileAlloc(gpa, p, 4096) catch {
-        std.log.err("missing PSK at {s} (mode 0600). create one:", .{opts.psk_file});
-        std.log.err("  umask 077; openssl rand -hex 32 > {s}", .{opts.psk_file});
+        // Remediation output for operators, like every other usage print in
+        // this file: suppressed under test so the named errors stay
+        // assertable without tripping the runner's error-log counter.
+        if (!builtin.is_test) {
+            std.log.err("missing PSK at {s} (mode 0600). create one:", .{opts.psk_file});
+            std.log.err("  umask 077; openssl rand -hex 32 > {s}", .{opts.psk_file});
+        }
         return error.MissingPsk;
     };
     defer gpa.free(raw);
@@ -257,7 +262,7 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     }
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) {
-        std.log.err("PSK at {s} is empty; refusing to serve unauthenticated", .{opts.psk_file});
+        if (!builtin.is_test) std.log.err("PSK at {s} is empty; refusing to serve unauthenticated", .{opts.psk_file});
         return error.EmptyPsk;
     }
     return gpa.dupe(u8, trimmed);
@@ -744,4 +749,89 @@ test "parseArgs defaults come from the environ map" {
     defer freeParsed(parsed, gpa);
     try std.testing.expectEqualStrings("/env/origin", parsed.opts.origin.?);
     try std.testing.expectEqualStrings("spark-env", parsed.opts.id.?);
+}
+
+test "loadPsk refuses empty secrets and trims file contents" {
+    const gpa = std.testing.allocator;
+    var db: [128]u8 = undefined;
+    const scratch = try sys.scratchDir(&db, "modelfs-psk");
+    defer sys.deleteTree(std.testing.io, scratch);
+
+    // Scratch files carry 0644, so the group/other permission warning is an
+    // expected line here; raising the log level keeps it off the runner's
+    // stderr. Restored on scope exit so later tests still surface warnings.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    // Inline value passes through...
+    {
+        const psk = try loadPsk(gpa, .{ .psk_value = "inline secret" });
+        defer gpa.free(psk);
+        try std.testing.expectEqualStrings("inline secret", psk);
+    }
+    // ...but an empty one would authenticate every "Bearer " request.
+    try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, .{ .psk_value = "" }));
+
+    var zb: [192]u8 = undefined;
+    // Missing file: the named error the CLI turns into remediation output.
+    {
+        var pb: [160]u8 = undefined;
+        const absent = try std.fmt.bufPrint(&pb, "{s}/absent.psk", .{scratch});
+        try std.testing.expectError(error.MissingPsk, loadPsk(gpa, .{ .psk_file = absent }));
+    }
+    // File contents are trimmed of surrounding whitespace and newline.
+    {
+        var pb: [160]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&pb, "{s}/trimmed.psk", .{scratch});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "  topsecret \r\n"));
+        const psk = try loadPsk(gpa, .{ .psk_file = fp });
+        defer gpa.free(psk);
+        try std.testing.expectEqualStrings("topsecret", psk);
+    }
+    // A whitespace-only file is an empty secret: refuse it too.
+    {
+        var pb: [160]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&pb, "{s}/blank.psk", .{scratch});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "\n\t  \n"));
+        try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, .{ .psk_file = fp }));
+    }
+}
+
+test "leaseAddrs follows --listen and falls back to loopback" {
+    const gpa = std.testing.allocator;
+
+    // Explicit --advertise entries keep their own port unless they carried
+    // the default and an explicit --listen overrides it.
+    {
+        var opts = Opts{};
+        opts.listen = "0.0.0.0:19091";
+        try opts.advertise.append(gpa, .{ .ip = "10.0.0.1", .port = proto.default_port });
+        try opts.advertise.append(gpa, .{ .ip = "10.0.0.2", .port = 19090 });
+        defer opts.advertise.deinit(gpa);
+        var addrs = try leaseAddrs(gpa, opts, &.{}, 19091);
+        defer addrs.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 2), addrs.items.len);
+        try std.testing.expectEqual(@as(u16, 19091), addrs.items[0].port);
+        try std.testing.expectEqual(@as(u16, 19090), addrs.items[1].port);
+    }
+    // Without --advertise, every advertised local IP publishes with the
+    // effective listening port.
+    {
+        const local = [_][]const u8{ "192.168.1.5", "10.1.1.5" };
+        var addrs = try leaseAddrs(gpa, .{}, &local, 18080);
+        defer addrs.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 2), addrs.items.len);
+        try std.testing.expectEqualStrings("192.168.1.5", addrs.items[0].ip);
+        try std.testing.expectEqual(@as(u16, 18080), addrs.items[0].port);
+        try std.testing.expectEqual(@as(u16, 18080), addrs.items[1].port);
+    }
+    // No addresses at all: loopback keeps the node visible on localhost.
+    {
+        var addrs = try leaseAddrs(gpa, .{}, &.{}, 19095);
+        defer addrs.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), addrs.items.len);
+        try std.testing.expectEqualStrings("127.0.0.1", addrs.items[0].ip);
+        try std.testing.expectEqual(@as(u16, 19095), addrs.items[0].port);
+    }
 }

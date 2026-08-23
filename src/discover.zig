@@ -752,6 +752,63 @@ test "shortName strips domain" {
     try std.testing.expectEqualStrings("spark1", shortName("spark1.lan.example"));
 }
 
+test "publish stages a parseable lease, leaves no tmp, and replaces in place" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-pub");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    const addrs = [_]proto.LeaseAddr{
+        .{ .ip = "192.168.100.10", .port = 18080, .mbps = 200000 },
+        .{ .ip = "127.0.0.1", .port = 19090, .mbps = 0 },
+    };
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+    cat.publish();
+
+    // The lease lands at <id>.json under .cluster with no .json.tmp staging
+    // file left behind, and refresh's parser accepts exactly what publish
+    // wrote: this roundtrip is what makes the node visible to peers.
+    var zbuf: [192]u8 = undefined;
+    var stbuf: c.struct_stat = undefined;
+    var pbuf: [192]u8 = undefined;
+    const lease_fp = try std.fmt.bufPrint(&pbuf, "{s}/.cluster/me.json", .{origin_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, lease_fp), &stbuf) == 0);
+    var tbuf: [192]u8 = undefined;
+    const tmp_fp = try std.fmt.bufPrint(&tbuf, "{s}/.cluster/me.json.tmp", .{origin_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
+
+    const blob = try sys.readFileAlloc(gpa, try sys.toZ(&zbuf, lease_fp), 4096);
+    defer gpa.free(blob);
+    const parsed = try proto.parseLease(gpa, blob);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("me", parsed.value.id);
+    // until is publish-time nowSec() + 30; allow one second of drift so a
+    // second boundary between the two clock reads cannot flip the test.
+    const now = sys.nowSec();
+    try std.testing.expect(parsed.value.until >= now + 29);
+    try std.testing.expect(parsed.value.until <= now + 31);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.addrs.len);
+    try std.testing.expectEqualStrings("192.168.100.10", parsed.value.addrs[0].ip);
+    try std.testing.expectEqual(@as(u16, 18080), parsed.value.addrs[0].port);
+    try std.testing.expectEqual(@as(u32, 200000), parsed.value.addrs[0].mbps);
+    try std.testing.expectEqualStrings("127.0.0.1", parsed.value.addrs[1].ip);
+    try std.testing.expectEqual(@as(u16, 19090), parsed.value.addrs[1].port);
+
+    // A later tick republishes: rename over the live lease must replace the
+    // document wholesale (new address set wins), never fail or append.
+    const addrs2 = [_]proto.LeaseAddr{.{ .ip = "10.9.9.9", .port = 19100, .mbps = 10000 }};
+    var cat2 = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs2, &.{}, &.{});
+    defer cat2.deinit();
+    cat2.publish();
+    const blob2 = try sys.readFileAlloc(gpa, try sys.toZ(&zbuf, lease_fp), 4096);
+    defer gpa.free(blob2);
+    const parsed2 = try proto.parseLease(gpa, blob2);
+    defer parsed2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed2.value.addrs.len);
+    try std.testing.expectEqualStrings("10.9.9.9", parsed2.value.addrs[0].ip);
+}
+
 test "refresh skips self and expired leases" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
