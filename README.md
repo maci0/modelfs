@@ -78,3 +78,7 @@ python3 scripts/run_benchmarks_and_plots.py
   * `NET_SEND_REVIEW.md`: Network protocol and zero-copy `sendfile` architecture.
 * **[outputs/benchmark_results.md](outputs/benchmark_results.md)**: Full benchmark performance report.
 * **[outputs/figures/](outputs/figures/)**: High-resolution publication-quality benchmark plots.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
