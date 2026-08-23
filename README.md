@@ -1,83 +1,121 @@
 # ModelFS
 
-POSIX `/models` filesystem for LLM weights. One Zig 0.16 binary per spark node. FUSE mount via `libfuse3`; peer transfers stream zero-copy through Linux `sendfile`. Designed for high-throughput model loading across GPU clusters running `llama.cpp`, `vLLM`, or `SGLang`.
+A POSIX `/models` mount for LLM weights. One Zig binary per node: FUSE via `libfuse3`, a local NVMe piece cache, and peer-to-peer piece transfers that stream zero-copy through Linux `sendfile`. Engines (`llama.cpp`, `vLLM`, `SGLang`) just open files.
 
 ```
-/net/<nas>/models     NFS origin (read/write authority)
-/models               FUSE mount point on GPU spark nodes
-/var/cache/modelfs    Local NVMe cache (16 MiB default pieces)
-:18080                Peer HTTP protocol (PSK bearer auth)
+/net/<nas>/models     NFS origin (read/write authority, required)
+/models               FUSE mount point on the GPU nodes
+/var/cache/modelfs    local NVMe piece cache (16 MiB pieces)
+:18080                peer HTTP protocol (PSK bearer auth)
 ```
 
-Read hierarchy: **Local NVMe Piece → Cluster Peer (`sendfile`) → NFS Origin**.
-Write hierarchy: **NFS Origin first → Local NVMe Cache fill**.
+Reads: **local piece → cluster peer (`sendfile`) → origin**.
+Writes: **origin first → then fill the local cache**.
+
+A read that misses blocks until that one piece is filled from a single source. There is no background whole-file striping: it OOMed the unified memory on the target hardware.
+
+Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
 
 ---
 
-## Key Performance Benchmarks
+## Requirements
 
-| Metric / Benchmark | Performance | Details |
-| :--- | :--- | :--- |
-| **Peak Zero-Copy Throughput** | **3.63 GB/s** | Direct NVMe page cache to TCP socket streaming via Linux `sendfile` |
-| **9-Node Cluster Query Latency** | **1.13 ms** | O(1) bitfield scanning & lease lookup across 9 active nodes |
-| **16MB Piece Transfer Latency** | **5.08 ms** | Single-pass pre-allocated direct socket read |
-| **32MB Piece Transfer Latency** | **9.85 ms** | Single-pass pre-allocated direct socket read |
-| **64MB Piece Transfer Latency** | **17.63 ms** | Single-pass pre-allocated direct socket read |
+* Linux with `/dev/fuse` and **libfuse3** (headers to build: `libfuse3-dev` / `fuse3-devel`)
+* **Zig 0.16.0** or newer
+* A shared POSIX directory every node can see (NFS or anything else) to act as the origin
 
----
-
-## Architectural Highlights
-
-* **Zig 0.16.0 Standard Library Idioms**: Strictly typed error sets, zero-allocation stack-buffered directory scanning, and explicit memory allocators (`DebugAllocator` verified zero leaks).
-* **Strict C Interop Isolation**: libfuse3 and libc declarations are translated once from [`src/c.h`](src/c.h) by `build.zig` (`@cImport` is deprecated in Zig 0.16). `src/c.zig` re-exports that module, and every other module (`sys.zig`, `peer.zig`, `proto.zig`, `discover.zig`, `store.zig`, `main.zig`, `piece.zig`, `fuse_fs.zig`, `cull.zig`) reaches C declarations only through it.
-* **SIMD & Power-of-Two Optimizations**:
-  * Bitfield scanning leverages 64-bit hardware `@popCount` SIMD instructions.
-  * Piece index/offset arithmetic uses comptime bit-shifts (`<<`, `>>`) for power-of-two chunk sizes.
-* **Comptime Lookup Tables**: $O(1)$ URL encoding via a comptime-generated 256-entry character class LUT in `src/proto.zig`.
-
----
-
-## Dependencies
-
-* **Runtime**: none beyond the platform. The binary links only `libfuse3` and libc/pthread; `build.zig.zon` declares zero package dependencies.
-* **Cross builds**: aarch64 builds use the vendored Ubuntu noble libfuse3 under [`.deps/fuse3-arm64/`](.deps/fuse3-arm64/README.md) (provenance and sha256 digests recorded there).
-* **Python tooling** (`scripts/`): declared in [`requirements-dev.txt`](requirements-dev.txt) (`matplotlib`, `mypy`, `ruff`); install with `uv pip install -r requirements-dev.txt`.
-
----
-
-## Verification & Test Harnesses
+## Build
 
 ```bash
-# 1. Run full unit test suite (0 memory leaks)
-zig build test --summary all
+zig build -Doptimize=ReleaseFast          # ./zig-out/bin/modelfs
+zig build test --summary all              # unit tests
+```
 
-# 2. Run E2E CLI & Protocol integration suite
-./scripts/run_e2e_tests.sh
+Non-default libfuse3 locations, e.g. when cross-compiling:
 
-# 3. Run 9-Node Cluster multi-peer block exchange benchmark
-./scripts/run_cluster_e2e_9nodes.sh
+```bash
+zig build -Dtarget=aarch64-linux-gnu.2.39 -Doptimize=ReleaseFast \
+  -Dfuse-include=.deps/fuse3-arm64/root/usr/include/fuse3 \
+  -Dfuse-lib=.deps/fuse3-arm64/lib
+```
 
-# 4. Run Fault Tolerance & Lease Expiration test suite
-./scripts/test_fault_tolerance.sh
+## Quickstart
 
-# 5. Run full benchmark sweep & generate publication plots
+```bash
+# once per node
+sudo mkdir -p /models /var/cache/modelfs
+sudo chown "$(id -u):$(id -g)" /models /var/cache/modelfs
+umask 077; openssl rand -hex 32 | sudo tee /etc/modelfs.psk   # same file on every node
+
+# same command on every node (id defaults to the hostname)
+modelfs mount /models --origin /net/192.168.0.100/models
+```
+
+`mount` stays in the foreground (drop it in a systemd `Type=simple` unit; `--detach` to background it). Then:
+
+```bash
+modelfs status                                    # cache usage, pieces, cull phase
+modelfs peers --origin /net/192.168.0.100/models  # live cluster leases
+modelfs pin gguf/foo.gguf                         # keep a file out of the cull
+modelfs unpin gguf/foo.gguf
+```
+
+Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps the very first node. Every node needs the same PSK. `modelfs help` lists all flags: `--cache`, `--id`, `--listen`, `--advertise`, `--piece`, `--kernel-cache`, and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, and `MODELFS_ID` set the same values from the environment.
+
+Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS ([docs/operations.md](docs/operations.md)).
+
+---
+
+## Benchmarks
+
+Measured with nine `modelfs` instances on **one host over TCP loopback**, not across real NICs, so these bound the software rather than the network. Full report and plots: [docs/benchmarks.md](docs/benchmarks.md).
+
+| Benchmark | Result |
+| :--- | :--- |
+| Peak `sendfile` throughput (64 MiB pieces) | 3.5 GB/s |
+| Piece transfer latency, 16 / 32 / 64 MiB | 5.1 / 9.9 / 17.6 ms |
+| `/ping` sweep across 9 instances | 1.1 ms total |
+
+The piece-size sweep is why the default piece is 16 MiB: past it the gain is small, and every miss costs the reader a whole piece before the read returns.
+
+## Tests
+
+```bash
+./scripts/check.sh                        # fmt, unit tests, shellcheck, ruff, mypy
+./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end
+./scripts/run_cluster_e2e_9nodes.sh       # 9-instance block exchange
+./scripts/test_fault_tolerance.sh         # peer loss and lease expiry
 python3 scripts/run_benchmarks_and_plots.py
 ```
 
----
+Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt) (`uv pip install -r requirements-dev.txt`).
 
-## Review Reports & Documentation
+## Source layout
 
-* **[docs/peer-cache.md](docs/peer-cache.md)**: Peer discovery, caching hierarchy, and NVMe disk culling bounds.
-* **[docs/reviews/](docs/reviews/)**: Codebase audit and refactoring reports:
-  * `ZIG_REVIEW.md`: Core Zig implementation audit.
-  * `ZIG_0_16_REVIEW.md`: Zig 0.16 std lib API updates.
-  * `ZIG_PRACTICES_REVIEW.md`: Memory, error handling, and thread safety audit.
-  * `ABSTRACTION_REVIEW.md`: Module decomposition and API boundaries.
-  * `SIMD_REVIEW.md`: SIMD `@popCount` vectorization analysis.
-  * `NET_SEND_REVIEW.md`: Network protocol and zero-copy `sendfile` architecture.
-* **[outputs/benchmark_results.md](outputs/benchmark_results.md)**: Full benchmark performance report.
-* **[outputs/figures/](outputs/figures/)**: High-resolution publication-quality benchmark plots.
+| Module | Role |
+| :--- | :--- |
+| `main.zig` | CLI, command dispatch, mount wiring |
+| `fuse_fs.zig` | libfuse handlers, read hydration, write-through |
+| `store.zig` | local piece cache, persisted bitfields |
+| `piece.zig` | piece arithmetic and the bitfield itself |
+| `peer.zig` | peer HTTP server (`/ping`, `/have`, `/data`) and fetch client |
+| `proto.zig` | wire helpers: sizes, ranges, URL codec, bearer auth |
+| `discover.zig` | origin-side lease files: publish, refresh, sweep |
+| `cull.zig` | cache eviction watermarks |
+| `sys.zig` | syscall wrappers |
+| `c.zig` | the single door to libfuse3/libc |
+
+`@cImport` is gone in Zig 0.16, so C declarations are translated once from `src/c.h` by `build.zig`; `c.zig` re-exports that module and every other module goes through it. `build.zig.zon` declares no package dependencies: the binary links only `libfuse3`, libc, and pthread.
+
+## Documentation
+
+[docs/](docs/) has the index. Shortest path in:
+
+* [docs/architecture.md](docs/architecture.md) — how it actually behaves: cache layers, discovery, path scoring, auth, culling, write races.
+* [docs/operations.md](docs/operations.md) — the ZFS/NFS/FS-Cache setup underneath, and Hugging Face downloads.
+* [docs/benchmarks.md](docs/benchmarks.md) — numbers, with the caveats that qualify them.
+* [docs/audits.md](docs/audits.md) — review findings and their fixes; [docs/review-guides/](docs/review-guides/) holds the checklists they came from.
+* [docs/design.md](docs/design.md) — the original sketch, kept for history. It marks what never shipped.
 
 ## License
 

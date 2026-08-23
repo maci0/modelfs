@@ -49,7 +49,7 @@ One piece, one source. Misses block the read until that hole is filled. No full-
 | `/var/cache/modelfs` | pieces (`data/`, `meta/*.pieces`, `pin/`) |
 | `:18080` | peer HTTP, bound on all interfaces; non-loopback IPv4 advertised in the lease |
 
-Desktop: mount NFS at `/models` with `fsc` as in [nfs-layers.md](nfs-layers.md). Do not run `modelfs` there.
+Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run `modelfs` there.
 
 `stat` / `readdir` / `mkdir` / `unlink` / `rename` → origin. `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`.
 
@@ -117,7 +117,7 @@ Node identity is hostname, not an IP. Each spark writes a lease on the **origin*
 }
 ```
 
-Refresh every 10s, `until` = now+30s. Drop expired. Skip your own `id`. No PSK in the JSON. Origin root must be writable by uid 1000 so `.cluster` can be created.
+Refresh every 10s, `until` = now+30s. Drop expired. Skip your own `id`. No PSK in the JSON. Every node also sweeps the directory each tick: lease files whose mtime is older than 300 s and abandoned `<id>.json.tmp` staging files from crashed publishes are unlinked, except this node's own lease. Origin root must be writable by uid 1000 so `.cluster` can be created.
 
 ---
 

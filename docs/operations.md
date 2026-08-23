@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Ops runbook for this cluster; pairs with [peer-cache.md](peer-cache.md) |
+| Status | Ops runbook for this cluster; pairs with [architecture.md](architecture.md) |
 | Date | 2026-08-22 |
 
 NAS (Rocky/RHEL) exports `tank/models`. Desktop (Arch/Cachy) mounts it at `/models` with `cachefilesd`. Sparks (Ubuntu/DGX) mount it at `/net/192.168.0.100/models` **without** `fsc`; `modelfs` FUSE owns `/models`. UID **1000**, mode **755**.
@@ -78,7 +78,7 @@ sudo mkdir -p /net/192.168.0.100/models /models /var/cache/modelfs
 sudo chown 1000:1000 /net/192.168.0.100/models /models /var/cache/modelfs
 ```
 
-Then [peer-cache.md](peer-cache.md). No autofs package; `/net/...` is just a directory name.
+Then [architecture.md](architecture.md). No autofs package; `/net/...` is just a directory name.
 
 `soft` + `nofail` + automount: boot cannot hang. `hard` waits forever. `timeo` is tenths of a second.
 

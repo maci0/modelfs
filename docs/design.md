@@ -2,11 +2,11 @@
 
 | Field | Value |
 |---|---|
-| Status | Sketch. Shipped behavior is [peer-cache.md](peer-cache.md) |
+| Status | Sketch. Shipped behavior is [architecture.md](architecture.md) |
 | Date | 2026-08-21 |
 | Audience | Implementation |
 
-Original architecture notes. Several items here did not ship: origin-less two-node, CAS/blake3 chunks, S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rule 6 in section 4.8 (rationale: UMA OOM, see peer-cache.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
+Original architecture notes. Several items here did not ship: origin-less two-node, CAS/blake3 chunks, S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rule 6 in section 4.8 (rationale: UMA OOM, see architecture.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
 
 ModelFS is a POSIX mount for LLM weights. Nodes see a normal directory. llama.cpp, vLLM, and SGLang open files. Bytes come from a local NVMe cache, from peers over a piece protocol, or from a network origin.
 
@@ -59,7 +59,7 @@ flowchart TB
 
 ### 2.1 Goals
 
-Status is against the shipped code and [peer-cache.md](peer-cache.md) (2026-08-23).
+Status is against the shipped code and [architecture.md](architecture.md) (2026-08-23).
 
 | ID | Requirement | Status |
 |---|---|---|
@@ -370,7 +370,7 @@ Three strategies. Pick one. Mixing "build a DFS" with "wrap JuiceFS" is how this
 flowchart TB
   start[Need POSIX models + local cache + P2P]
   start --> q0{Have a ZFS/NFS NAS?}
-  q0 -->|yes| nfs["ZFS + NFS + FS-Cache<br/>docs/nfs-layers.md"]
+  q0 -->|yes| nfs["ZFS + NFS + FS-Cache<br/>docs/operations.md"]
   q0 -->|no| q1{Need 2-node with<br/>no extra store?}
   q1 -->|no, have object storage<br/>and can pay| juice["JuiceFS Enterprise<br/>cache group"]
   q1 -->|yes, or OSS only| q2{Write-back from any node<br/>and mmap-safe hydrate?}
@@ -380,7 +380,7 @@ flowchart TB
   q3 -->|yes, this repo| build["Build ModelFS"]
 ```
 
-When a ZFS box can export NFS, use that path first. Full compose: [nfs-layers.md](nfs-layers.md). No S3, no Postgres, no Redis, no bind mounts. Origin is the NAS. GPU nodes mount it at `/models` with `fsc`. Writes into `/models` are the replicate-back.
+When a ZFS box can export NFS, use that path first. Full compose: [operations.md](operations.md). No S3, no Postgres, no Redis, no bind mounts. Origin is the NAS. GPU nodes mount it at `/models` with `fsc`. Writes into `/models` are the replicate-back.
 
 ### 6.1 Strategy A: buy / configure a product
 
@@ -728,7 +728,7 @@ Logs at piece granularity are too noisy. Log file-level start/finish, verify fai
 
 ## 12. Open questions
 
-1. **Transport:** QUIC one-port vs HTTP/2 for v1? HTTP/2 is easier to debug; QUIC is fewer moving parts at scale. Resolved otherwise: shipped peers speak plain HTTP/1.1 (`GET /ping`, `/have?path=`, `/data?path=` with Range and Bearer PSK) on one TCP port; see [peer-cache.md](peer-cache.md).
+1. **Transport:** QUIC one-port vs HTTP/2 for v1? HTTP/2 is easier to debug; QUIC is fewer moving parts at scale. Resolved otherwise: shipped peers speak plain HTTP/1.1 (`GET /ping`, `/have?path=`, `/data?path=` with Range and Bearer PSK) on one TCP port; see [architecture.md](architecture.md).
 2. **Passthrough vs bind-mount** as the default on kernels without FUSE passthrough. Moot: neither shipped; the mount is a FUSE read path and defaults to `direct_io` (section 13, Frontend row).
 3. **Default piece size:** 4 MiB vs 16 MiB on 100 GbE. Resolved: 16 MiB (`--piece` overrides).
 4. **Pin cluster-wide default** for `modelfs pull`, or local-only until the user pins. Open: `modelfs pull` does not exist; pins are local markers today.
@@ -754,7 +754,7 @@ Resolved items were settled by the shipped code, not re-decided here; the rest r
 | v1 language | Go | Protocol/state bound, not CPU bound | Superseded: Zig |
 | v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 16 MiB pieces, no chunking |
 
-Superseded and not-shipped rows defer to [peer-cache.md](peer-cache.md), which is authoritative for what runs: plain HTTP peer protocol (`GET /ping`, `/have`, `/data`) instead of Have/Want/Piece frames, `.cluster/<id>.json` lease membership instead of an embedded store.
+Superseded and not-shipped rows defer to [architecture.md](architecture.md), which is authoritative for what runs: plain HTTP peer protocol (`GET /ping`, `/have`, `/data`) instead of Have/Want/Piece frames, `.cluster/<id>.json` lease membership instead of an embedded store.
 
 ---
 

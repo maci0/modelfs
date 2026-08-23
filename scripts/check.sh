@@ -19,7 +19,7 @@ echo "=== zig build test ==="
 zig build test || fail "zig build test failed"
 
 echo "=== shellcheck ==="
-shellcheck autoresearch.sh scripts/*.sh || fail "shellcheck reported violations"
+shellcheck scripts/*.sh || fail "shellcheck reported violations"
 
 echo "=== ruff ==="
 ruff check scripts/ || fail "ruff reported violations"
