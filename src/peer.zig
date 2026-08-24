@@ -43,8 +43,13 @@ pub const Server = struct {
         const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
         if (fd < 0) return error.Socket;
         var yes: c_int = 1;
+        // SO_REUSEADDR alone keeps restarts fast (TIME_WAIT leftovers from
+        // accepted connections do not block the rebind). SO_REUSEPORT would
+        // let a second modelfs bind the same live port and silently split
+        // connections between the old and new process -- usually different
+        // PSKs, so peers see random 401s -- instead of failing the duplicate
+        // start loudly like the FUSE mount side does.
         _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
-        _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEPORT, &yes, @sizeOf(c_int));
         if (c.bind(fd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)) != 0) {
             sys.close(fd);
             return error.Bind;
@@ -1061,6 +1066,35 @@ test "server start and stop" {
     const bound_port = boundPort(server.listen_fds.items[0]);
     try std.testing.expect(bound_port > 0);
     server.stop();
+}
+
+test "duplicate bind of a live port fails instead of sharing it" {
+    // Re-execution guard: starting a second daemon against a port whose
+    // first owner still lives must fail loudly (EADDRINUSE), never silently
+    // share the port via SO_REUSEPORT and split connections -- typically
+    // across two different PSKs -- between old and new process.
+    const gpa = std.testing.allocator;
+    var first = Server{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .psk = "secret",
+        .store = undefined,
+    };
+    try first.bindOne("127.0.0.1", 0);
+    const port = boundPort(first.listen_fds.items[0]);
+    try std.testing.expect(port > 0);
+
+    var second = Server{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .psk = "other-secret",
+        .store = undefined,
+    };
+    try std.testing.expectError(error.Bind, second.bindOne("127.0.0.1", port));
+    // The refused bind must not leave a listener behind.
+    try std.testing.expectEqual(@as(usize, 0), second.listen_fds.items.len);
+
+    first.stop();
 }
 
 test "fault tolerance: bad psk fetchHave fails with http status" {

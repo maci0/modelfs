@@ -81,7 +81,7 @@ modelfs pin gguf/foo.gguf
 modelfs unpin gguf/foo.gguf
 ```
 
-`status` prints the daemon's `status.json` from the cache dir; a missing file means the mount is not running. It carries liveness (`id`, `pid`, `uptime_s`), topology (`peers`, `piece`, `inflight` HTTP handlers), and lifetime counters (`stats`: reads/writes with errors, piece fills by source (peer vs origin) with byte totals, fill failures per tier, pieces culled, rejected auths, 5xx replies). `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live.
+`status` prints the daemon's `status.json` from the cache dir; a missing file means the mount is not running, and so does a leftover naming an exited pid (the crash case: the artifact is only served while its writer process still exists). It carries liveness (`id`, `pid`, `uptime_s`), topology (`peers`, `piece`, `inflight` HTTP handlers), and lifetime counters (`stats`: reads/writes with errors, piece fills by source (peer vs origin) with byte totals, fill failures per tier, pieces culled, rejected auths, 5xx replies). `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live.
 
 Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_ID`.
 

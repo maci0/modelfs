@@ -627,6 +627,19 @@ fn fuseMain(argv: []const [*c]u8, ops: *const fuse.fuse_operations, st: *fuse_fs
     return fuse.fuse_main_real(argc, cargv, ops, @sizeOf(fuse.fuse_operations), st);
 }
 
+/// True when the process named by pid still exists. kill(pid, 0) signals
+/// nothing; EPERM means the process exists but belongs to another user.
+/// Nonpositive or out-of-range ids name no process.
+fn pidAlive(pid: i64) bool {
+    if (pid <= 0 or pid > std.math.maxInt(i32)) return false;
+    std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |err| return err == error.PermissionDenied;
+    return true;
+}
+
+/// Only the pid field matters for liveness; every other status.json field is
+/// ignored here (and validated by whoever consumes the full document).
+const StatusLiveness = struct { pid: i64 };
+
 fn cmdStatus(gpa: std.mem.Allocator, opts: Opts) !u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
     const p = sys.joinZ(&z, opts.cache, fuse_fs.status_file) catch return 1;
@@ -635,6 +648,21 @@ fn cmdStatus(gpa: std.mem.Allocator, opts: Opts) !u8 {
         return 1;
     };
     defer gpa.free(blob);
+    // status.json is a crash leftover until proven otherwise: a daemon that
+    // died without unmounting leaves its document behind indefinitely, and
+    // serving it verbatim would report a dead node as live to every monitor
+    // keying on this command. The pid check retires the artifact when its
+    // writer exits; pid reuse can only ever false-positive, never hide a
+    // genuinely running daemon behind a stale report.
+    const doc = std.json.parseFromSlice(StatusLiveness, gpa, blob, .{ .ignore_unknown_fields = true }) catch {
+        std.debug.print("modelfs: not running ({s}/{s} is unreadable)\n", .{ opts.cache, fuse_fs.status_file });
+        return 1;
+    };
+    defer doc.deinit();
+    if (!pidAlive(doc.value.pid)) {
+        std.debug.print("modelfs: not running (stale status.json names exited pid {d})\n", .{doc.value.pid});
+        return 1;
+    }
     std.debug.print("{s}", .{blob});
     return 0;
 }
@@ -740,6 +768,56 @@ test "listenPort accepts bare port per --listen [IP:]PORT" {
     // numeric garbage must fail loudly, not silently become the default
     try std.testing.expectError(error.Overflow, listenPort("70000", 18080));
     try std.testing.expectError(error.Overflow, listenPort("h:70000", 18080));
+}
+
+test "pidAlive answers for live and exited processes" {
+    try std.testing.expect(pidAlive(@intCast(std.os.linux.getpid())));
+    // Nonpositive and out-of-range ids name no process.
+    try std.testing.expect(!pidAlive(0));
+    try std.testing.expect(!pidAlive(-5));
+    try std.testing.expect(!pidAlive(@as(i64, std.math.maxInt(i32)) + 1));
+    // A child that has been spawned AND waited on is deterministically dead:
+    // the liveness probe must answer for the process itself, not guess from
+    // the id's plausibility.
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{"true"},
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const dead_pid: i64 = @intCast(child.id.?);
+    const term = try child.wait(std.testing.io);
+    try std.testing.expect(term == .exited);
+    try std.testing.expect(!pidAlive(dead_pid));
+}
+
+test "cmdStatus retires a crashed daemon's status.json as not running" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-status-stale");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ cache_d, fuse_fs.status_file });
+
+    // A live writer's document is served verbatim with success.
+    var live_buf: [160]u8 = undefined;
+    const live_doc = try std.fmt.bufPrint(&live_buf, "{{\"id\":\"me\",\"pid\":{d},\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"stats\":{{}}}}\n", .{std.os.linux.getpid()});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live_doc));
+    _ = try cmdStatus(gpa, .{ .cache = cache_d });
+
+    // The same path after the daemon died without cleanup (crash, kill -9):
+    // the leftover names an exited pid and must read as not running, exit 1,
+    // like the absent-artifact case -- not as a live node with frozen stats.
+    var dead_buf: [96]u8 = undefined;
+    const dead_doc = try std.fmt.bufPrint(&dead_buf, "{{\"id\":\"me\",\"pid\":-3,\"uptime_s\":99}}\n", .{});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), dead_doc));
+    try std.testing.expectEqual(@as(u8, 1), try cmdStatus(gpa, .{ .cache = cache_d }));
+
+    // An unparseable leftover gets the same verdict as an absent one.
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "not json"));
+    try std.testing.expectEqual(@as(u8, 1), try cmdStatus(gpa, .{ .cache = cache_d }));
 }
 
 fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {
