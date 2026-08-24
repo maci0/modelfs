@@ -29,7 +29,8 @@ python3 "${SCRIPT_DIR}/peer_auth_probe.py" "${PEER_HOST}" "${PEER_PORT}"
 
 echo "=== Test 2: Expired Cluster Lease Marking ==="
 # Write an expired lease file directly to .cluster, then require the peers
-# command to report it as expired. cmdPeers prints via stderr, so merge 2>&1.
+# command to report it as expired. The listing goes to stdout; 2>&1 keeps
+# any warnings in the same capture.
 CLUSTER_DIR="${ORIGIN_DIR}/.cluster"
 mkdir -p "${CLUSTER_DIR}"
 EXPIRED_LEASE="${CLUSTER_DIR}/dead_node.json"

@@ -63,6 +63,24 @@ pub fn build(b: *std.Build) void {
     const fuse_inc = b.option([]const u8, "fuse-include", "libfuse3 headers") orelse "/usr/include/fuse3";
     const fuse_lib = b.option([]const u8, "fuse-lib", "libfuse3 library dir");
 
+    // `modelfs version` reports the release from build.zig.zon, the single
+    // source of truth; extracted here because 0.16 exposes no graph API for it.
+    const version_mod = blk: {
+        const zon = std.Io.Dir.cwd().readFileAlloc(
+            b.graph.io,
+            b.pathFromRoot("build.zig.zon"),
+            b.allocator,
+            .limited(1 << 20),
+        ) catch @panic("cannot read build.zig.zon");
+        const marker = ".version = \"";
+        const start = std.mem.indexOf(u8, zon, marker) orelse @panic("no .version in build.zig.zon");
+        const rest = zon[start + marker.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse @panic("unterminated .version in build.zig.zon");
+        const opts = b.addOptions();
+        opts.addOption([]const u8, "version", zon[start + marker.len .. start + marker.len + end]);
+        break :blk opts.createModule();
+    };
+
     // @cImport is deprecated in 0.16: C interop moves to the build system.
     // src/c.h + these macros reproduce the former @cImport block verbatim.
     const tc = b.addTranslateC(.{
@@ -84,6 +102,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     exe_mod.addImport("c", c_mod);
+    exe_mod.addImport("build_options", version_mod);
     if (fuse_lib) |dir| {
         exe_mod.addLibraryPath(.{ .cwd_relative = dir });
         exe_mod.linkSystemLibrary("fuse3", .{ .use_pkg_config = .no, .preferred_link_mode = .dynamic });
@@ -116,6 +135,7 @@ pub fn build(b: *std.Build) void {
     }
     test_mod.addIncludePath(.{ .cwd_relative = fuse_inc });
     test_mod.addImport("c", c_mod);
+    test_mod.addImport("build_options", version_mod);
     const unit = b.addTest(.{
         .name = "modelfs-test",
         .root_module = test_mod,

@@ -2,6 +2,7 @@
 //! pin), and mount wiring into the FUSE loop plus background workers.
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -21,21 +22,22 @@ const usage =
     \\
     \\Usage:
     \\  modelfs mount <dir> --origin PATH [options]
-    \\  modelfs status
+    \\  modelfs status [--cache PATH]
     \\  modelfs peers --origin PATH
-    \\  modelfs pin <relpath>
-    \\  modelfs unpin <relpath>
+    \\  modelfs pin <relpath> [--cache PATH]
+    \\  modelfs unpin <relpath> [--cache PATH]
+    \\  modelfs version
     \\  modelfs help
     \\
-    \\mount:
+    \\mount options:
     \\  --origin PATH         NFS/dir origin (required). Writes go here.
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
     \\  --id NAME             Override node id (default: hostname)
     \\  --listen [IP:]PORT    Peer HTTP port (default 18080); binds all interfaces
-    \\  --advertise IP:PORT   Extra addresses (default: all non-loopback IPv4)
-    \\  --psk FILE            Shared secret (default /etc/modelfs.psk)
-    \\  --psk-value STR       Shared secret inline (dev)
-    \\  --seed HOST[:PORT]    Peer seed if origin/.cluster is empty
+    \\  --advertise ADDRS     Extra addresses IP[:PORT], comma separated (default: all non-loopback IPv4)
+    \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
+    \\  --psk-value STR       Shared secret inline (dev; leaks via /proc cmdline)
+    \\  --seed HOST[:PORT]    Peer seed if origin/.cluster is empty; repeatable
     \\  --piece SIZE          Piece size (default 16M)
     \\  --direct-io           FUSE direct_io (default; skips kernel cache)
     \\  --kernel-cache        Allow kernel page cache (uses UMA RAM, can OOM)
@@ -44,13 +46,42 @@ const usage =
     \\  --bstop N             Cull hard below N% free (default 3)
     \\  --allow-other         -o allow_other (needs user_allow_other)
     \\  --detach              Background after mount
+    \\  --foreground          Stay in the foreground (default)
     \\
-    \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_ID
+    \\status/peers/pin take only the flags shown on their Usage line; every
+    \\command also accepts -h/--help.
+    \\
+    \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_ID set the same
+    \\values as their flags; an explicit flag wins.
+    \\
+    \\Examples:
+    \\  modelfs mount /models --origin /net/192.168.0.100/models
+    \\  modelfs status | jq -r .id
+    \\  modelfs pin gguf/foo.gguf
     \\
     \\Cluster leases live on the origin at .cluster/<id>.json, not under the
-    \\FUSE mount. Same PSK on every spark. Desktop can stay on plain NFS.
+    \\FUSE mount. Same PSK on every node. Desktop can stay on plain NFS.
     \\
 ;
+
+/// Data output (help text, status JSON, lease listings, pin confirmations)
+/// goes to stdout so pipes and redirections see only results; diagnostics
+/// stay on stderr via std.log/std.debug.print. Best effort: the runtime
+/// ignores SIGPIPE, so a closed reader surfaces here as BrokenPipe and the
+/// consumer is gone either way.
+fn writeOut(io: std.Io, bytes: []const u8) void {
+    // Under test, stdout is the runner's IPC channel (--listen=-): raw data
+    // written there corrupts the protocol and wedges the run. Every other
+    // user-facing print in this file carries the same guard.
+    if (builtin.is_test) return;
+    std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
+}
+
+fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    writeOut(io, line);
+}
 
 const Opts = struct {
     origin: ?[]const u8 = null,
@@ -150,6 +181,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return error.Help;
+        if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) return error.Version;
         if (std.mem.eql(u8, a, "--origin")) {
             opts.origin = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--cache")) {
@@ -166,10 +198,16 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 if (!builtin.is_test) std.debug.print("--piece {s}: bad size (want e.g. 16M)\n", .{raw});
                 return error.BadSize;
             };
-            if (psz > std.math.maxInt(u32)) return error.ValueTooLarge;
+            if (psz > std.math.maxInt(u32)) {
+                if (!builtin.is_test) std.debug.print("--piece {s}: too large (max 4294967295)\n", .{raw});
+                return error.ValueTooLarge;
+            }
             // A zero piece makes piece.cover() empty: reads would serve hole
             // zeros forever and nothing would ever hydrate.
-            if (psz == 0) return error.ZeroPieceSize;
+            if (psz == 0) {
+                if (!builtin.is_test) std.debug.print("--piece {s}: must be above zero\n", .{raw});
+                return error.ZeroPieceSize;
+            }
             opts.piece = @intCast(psz);
         } else if (std.mem.eql(u8, a, "--brun")) {
             opts.water.brun = try takePercent(args, a, &i);
@@ -222,7 +260,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         } else if (a.len > 0 and a[0] == '-') {
             // Plain print, like every other usage error in this loop; the
             // logger's level prefix is noise for a one-shot CLI failure.
-            if (!builtin.is_test) std.debug.print("unknown flag {s}\n", .{a});
+            if (!builtin.is_test) std.debug.print("unknown flag {s} (see 'modelfs help')\n", .{a});
             return error.UnknownFlag;
         } else {
             try rest.append(gpa, a);
@@ -317,27 +355,42 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+    // Bare global forms live at position 0, where parseArgs sees a command
+    // name, so they are answered here alongside their subcommand spellings.
+    const first = argv.items[0];
+    if (std.mem.eql(u8, first, "help") or
+        std.mem.eql(u8, first, "-h") or
+        std.mem.eql(u8, first, "--help"))
+    {
+        writeOut(init.io, usage);
+        return 0;
+    }
+    if (std.mem.eql(u8, first, "version") or
+        std.mem.eql(u8, first, "-V") or
+        std.mem.eql(u8, first, "--version"))
+    {
+        printOut(init.io, "modelfs {s}\n", .{build_options.version});
+        return 0;
+    }
     const parsed = parseArgs(gpa, init.environ_map, argv.items) catch |err| switch (err) {
         error.Help => {
-            std.debug.print("{s}", .{usage});
+            writeOut(init.io, usage);
             return 0;
         },
-        // Usage errors are operating errors, not crashes: report them as a
-        // plain message (the flag sites name the specifics) instead of the
-        // error-return stack trace dump.
+        error.Version => {
+            printOut(init.io, "modelfs {s}\n", .{build_options.version});
+            return 0;
+        },
+        // Usage errors exit 2, like every other bad invocation in this CLI
+        // (missing subcommand argument, unknown command). Each one is named
+        // at its own flag site inside parseArgs; only a failure before any
+        // site could report (allocation) still needs a line here.
         else => {
-            if (err != error.MissingValue and err != error.UnknownFlag) {
-                std.log.err("bad arguments: {t}", .{err});
-            }
-            return 1;
+            if (err == error.OutOfMemory) std.log.err("out of memory parsing arguments", .{});
+            return 2;
         },
     };
     defer freeParsed(parsed, gpa);
-
-    if (std.mem.eql(u8, parsed.cmd, "help") or std.mem.eql(u8, parsed.cmd, "--help")) {
-        std.debug.print("{s}", .{usage});
-        return 0;
-    }
     if (std.mem.eql(u8, parsed.cmd, "mount")) {
         if (parsed.rest.len < 1) {
             std.log.err("mount needs a directory", .{});
@@ -346,16 +399,17 @@ pub fn main(init: std.process.Init) !u8 {
         }
         return cmdMount(init, parsed.opts, parsed.rest[0]);
     }
-    if (std.mem.eql(u8, parsed.cmd, "status")) return cmdStatus(gpa, parsed.opts);
-    if (std.mem.eql(u8, parsed.cmd, "peers")) return cmdPeers(gpa, parsed.opts);
+    if (std.mem.eql(u8, parsed.cmd, "status")) return cmdStatus(init.io, gpa, parsed.opts);
+    if (std.mem.eql(u8, parsed.cmd, "peers")) return cmdPeers(init.io, gpa, parsed.opts);
     if (std.mem.eql(u8, parsed.cmd, "pin") or std.mem.eql(u8, parsed.cmd, "unpin")) {
         if (parsed.rest.len < 1) {
             std.log.err("{s} needs a path relative to the mount", .{parsed.cmd});
+            std.debug.print("{s}", .{usage});
             return 2;
         }
-        return cmdPin(gpa, parsed.opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
+        return cmdPin(init.io, gpa, parsed.opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
     }
-    std.log.err("unknown command {s}", .{parsed.cmd});
+    std.log.err("unknown command \"{s}\" (want mount, status, peers, pin, unpin, version, help)", .{parsed.cmd});
     std.debug.print("{s}", .{usage});
     return 2;
 }
@@ -447,6 +501,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     const gpa = init.gpa;
     const origin_raw = opts.origin orelse {
         std.log.err("mount needs --origin (the NFS path, e.g. /mnt/nas/models)", .{});
+        std.debug.print("{s}", .{usage});
         return 2;
     };
     const origin = sys.realpathAlloc(gpa, origin_raw) catch {
@@ -640,7 +695,7 @@ fn pidAlive(pid: i64) bool {
 /// ignored here (and validated by whoever consumes the full document).
 const StatusLiveness = struct { pid: i64 };
 
-fn cmdStatus(gpa: std.mem.Allocator, opts: Opts) !u8 {
+fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
     const p = sys.joinZ(&z, opts.cache, fuse_fs.status_file) catch return 1;
     const blob = sys.readFileAlloc(gpa, p, 4096) catch {
@@ -663,93 +718,112 @@ fn cmdStatus(gpa: std.mem.Allocator, opts: Opts) !u8 {
         std.debug.print("modelfs: not running (stale status.json names exited pid {d})\n", .{doc.value.pid});
         return 1;
     }
-    std.debug.print("{s}", .{blob});
+    writeOut(io, blob);
     return 0;
 }
 
-fn cmdPeers(gpa: std.mem.Allocator, opts: Opts) !u8 {
+fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     const origin = opts.origin orelse {
         std.log.err("peers needs --origin", .{});
+        std.debug.print("{s}", .{usage});
         return 2;
     };
     var dbuf: [sys.c.PATH_MAX]u8 = undefined;
     const dirz = sys.joinZ(&dbuf, origin, discover.cluster_dir) catch return 1;
-    const dir = sys.c.opendir(dirz) orelse {
-        std.debug.print("no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir });
-        return 0;
-    };
-    defer _ = sys.c.closedir(dir);
-    const now = sys.nowSec();
+    if (sys.c.opendir(dirz)) |dir| {
+        defer _ = sys.c.closedir(dir);
+        const now = sys.nowSec();
 
-    // Collect before printing: readdir order is filesystem-dependent (and
-    // the origin is NFS), so sorting by lease file name keeps the listing a
-    // function of the directory's contents alone and run-to-run diffable.
-    const Row = struct {
-        name: []const u8,
-        doc: std.json.Parsed(proto.Lease),
-    };
-    var rows: std.ArrayList(Row) = .empty;
-    defer {
-        for (rows.items) |r| r.doc.deinit();
-        for (rows.items) |r| gpa.free(r.name);
-        rows.deinit(gpa);
-    }
-    while (sys.c.readdir(dir)) |ent| {
-        const name = sys.dirName(ent);
-        if (!std.mem.endsWith(u8, name, ".json")) continue;
-        var fbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
-        const blob = sys.readFileAlloc(gpa, fp, 64 * 1024) catch |err| {
-            // Open failure covers the normal race against expiry cleanup;
-            // anything persisting across invocations is named, matching the
-            // corrupt-lease warn below and Catalog.refresh's policy.
-            if (err != error.OpenFailed) {
-                std.log.warn("peers: cannot read lease {s}: {t}", .{ discover.displayName(name), err });
+        // Collect before printing: readdir order is filesystem-dependent (and
+        // the origin is NFS), so sorting by lease file name keeps the listing a
+        // function of the directory's contents alone and run-to-run diffable.
+        const Row = struct {
+            name: []const u8,
+            doc: std.json.Parsed(proto.Lease),
+        };
+        var rows: std.ArrayList(Row) = .empty;
+        // parseLease leaves unescaped strings pointing into the file blob
+        // (std.json's alloc_if_needed), so every blob must outlive the
+        // printing below, not just the loop iteration that read it.
+        var blobs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (rows.items) |r| r.doc.deinit();
+            for (rows.items) |r| gpa.free(r.name);
+            rows.deinit(gpa);
+            for (blobs.items) |b| gpa.free(b);
+            blobs.deinit(gpa);
+        }
+        while (sys.c.readdir(dir)) |ent| {
+            const name = sys.dirName(ent);
+            if (!std.mem.endsWith(u8, name, ".json")) continue;
+            var fbuf: [sys.c.PATH_MAX]u8 = undefined;
+            const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
+            const blob = sys.readFileAlloc(gpa, fp, 64 * 1024) catch |err| {
+                // Open failure covers the normal race against expiry cleanup;
+                // anything persisting across invocations is named, matching the
+                // corrupt-lease warn below and Catalog.refresh's policy.
+                if (err != error.OpenFailed) {
+                    std.log.warn("peers: cannot read lease {s}: {t}", .{ discover.displayName(name), err });
+                }
+                continue;
+            };
+            const parsed = proto.parseLease(gpa, blob) catch {
+                gpa.free(blob);
+                std.log.warn("peers: skipping corrupt lease {s}", .{discover.displayName(name)});
+                continue;
+            };
+            blobs.append(gpa, blob) catch {
+                parsed.deinit();
+                gpa.free(blob);
+                continue;
+            };
+            const owned_name = gpa.dupe(u8, name) catch {
+                parsed.deinit();
+                _ = blobs.pop();
+                gpa.free(blob);
+                continue;
+            };
+            rows.append(gpa, .{ .name = owned_name, .doc = parsed }) catch {
+                gpa.free(owned_name);
+                parsed.deinit();
+                _ = blobs.pop();
+                gpa.free(blob);
+                continue;
+            };
+        }
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn lessThan(_: void, a: Row, b: Row) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
             }
-            continue;
-        };
-        defer gpa.free(blob);
-        const parsed = proto.parseLease(gpa, blob) catch {
-            std.log.warn("peers: skipping corrupt lease {s}", .{discover.displayName(name)});
-            continue;
-        };
-        const owned_name = gpa.dupe(u8, name) catch {
-            parsed.deinit();
-            continue;
-        };
-        rows.append(gpa, .{ .name = owned_name, .doc = parsed }) catch {
-            gpa.free(owned_name);
-            parsed.deinit();
-            continue;
-        };
-    }
-    std.mem.sort(Row, rows.items, {}, struct {
-        fn lessThan(_: void, a: Row, b: Row) bool {
-            return std.mem.order(u8, a.name, b.name) == .lt;
-        }
-    }.lessThan);
+        }.lessThan);
 
-    var any = false;
-    for (rows.items) |r| {
-        const lease = r.doc.value;
-        const live = lease.until >= now;
-        const status_str = if (live) "live" else "expired";
-        // Lease ids and addresses come off shared storage as other nodes'
-        // JSON; echo them only when free of control bytes so `modelfs peers`
-        // cannot be turned into a terminal-injection vector.
-        const id_shown = if (discover.printable(lease.id)) lease.id else "<id withheld: control bytes>";
-        std.debug.print("{s} (until={d}, {s})\n", .{ id_shown, lease.until, status_str });
-        for (lease.addrs) |a| {
-            const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
-            std.debug.print("  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
+        var any = false;
+        for (rows.items) |r| {
+            const lease = r.doc.value;
+            const live = lease.until >= now;
+            const status_str = if (live) "live" else "expired";
+            // Lease ids and addresses come off shared storage as other nodes'
+            // JSON; echo them only when free of control bytes so `modelfs peers`
+            // cannot be turned into a terminal-injection vector.
+            const id_shown = if (discover.printable(lease.id)) lease.id else "<id withheld: control bytes>";
+            printOut(io, "{s} (until={d}, {s})\n", .{ id_shown, lease.until, status_str });
+            for (lease.addrs) |a| {
+                const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
+                printOut(io, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
+            }
+            any = true;
         }
-        any = true;
+        if (!any) printOut(io, "no leases\n", .{});
+    } else {
+        // A missing/unreadable .cluster dir is an empty cluster, not an
+        // error: same exit-0 empty output as below, with the reason on stdout
+        // next to where the listing would have been.
+        printOut(io, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir });
     }
-    if (!any) std.debug.print("no leases\n", .{});
     return 0;
 }
 
-fn cmdPin(gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: bool) !u8 {
+fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: bool) !u8 {
     var dummy_io = std.Io.Threaded.init(gpa, .{});
     defer dummy_io.deinit();
     var store = store_mod.Store.init(gpa, dummy_io.io(), opts.origin orelse "", opts.cache, opts.piece);
@@ -771,7 +845,7 @@ fn cmdPin(gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: bool) !u8 {
         std.log.err("pin failed errno {d}", .{-rc});
         return 1;
     }
-    std.debug.print("{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel });
+    printOut(io, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel });
     return 0;
 }
 
@@ -836,7 +910,7 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     var live_buf: [160]u8 = undefined;
     const live_doc = try std.fmt.bufPrint(&live_buf, "{{\"id\":\"me\",\"pid\":{d},\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"stats\":{{}}}}\n", .{std.os.linux.getpid()});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live_doc));
-    _ = try cmdStatus(gpa, .{ .cache = cache_d });
+    _ = try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d });
 
     // The same path after the daemon died without cleanup (crash, kill -9):
     // the leftover names an exited pid and must read as not running, exit 1,
@@ -844,11 +918,11 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     var dead_buf: [96]u8 = undefined;
     const dead_doc = try std.fmt.bufPrint(&dead_buf, "{{\"id\":\"me\",\"pid\":-3,\"uptime_s\":99}}\n", .{});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), dead_doc));
-    try std.testing.expectEqual(@as(u8, 1), try cmdStatus(gpa, .{ .cache = cache_d }));
+    try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
 
     // An unparseable leftover gets the same verdict as an absent one.
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "not json"));
-    try std.testing.expectEqual(@as(u8, 1), try cmdStatus(gpa, .{ .cache = cache_d }));
+    try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
 }
 
 fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {
@@ -947,6 +1021,12 @@ test "parseArgs defaults come from the environ map" {
     defer freeParsed(parsed, gpa);
     try std.testing.expectEqualStrings("/env/origin", parsed.opts.origin.?);
     try std.testing.expectEqualStrings("spark-env", parsed.opts.id.?);
+}
+
+test "embedded version parses as semver" {
+    // build_options.version is extracted from build.zig.zon by build.zig;
+    // `modelfs version` must only ever print a well-formed release string.
+    _ = try std.SemanticVersion.parse(build_options.version);
 }
 
 test "loadPsk refuses empty secrets and trims file contents" {
