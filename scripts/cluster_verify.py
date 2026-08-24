@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 
 ARGC = 7  # prog + ORIGIN_FILE REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES
+MAX_PORT = 65535
 
 
 def main(argv: list[str]) -> int:
@@ -22,7 +23,26 @@ def main(argv: list[str]) -> int:
         )
         return 2
     origin_file, rel, psk_file = argv[1], argv[2], argv[3]
-    base_port, num_nodes, total_pieces = int(argv[4]), int(argv[5]), int(argv[6])
+    try:
+        base_port, num_nodes, total_pieces = int(argv[4]), int(argv[5]), int(argv[6])
+    except ValueError:
+        print(
+            f"{argv[0]}: BASE_PORT, NUM_NODES, TOTAL_PIECES must be integers",
+            file=sys.stderr,
+        )
+        return 2
+    # num_nodes == 0 would crash the round-robin modulo below, and zero or
+    # negative counts would make every check loop vacuous while the script
+    # still printed success: this gate must fail loudly instead.
+    if base_port < 1 or base_port + num_nodes > MAX_PORT:
+        print(f"{argv[0]}: BASE_PORT {base_port} out of range", file=sys.stderr)
+        return 2
+    if num_nodes < 1 or total_pieces < 1:
+        print(
+            f"{argv[0]}: NUM_NODES and TOTAL_PIECES must be >= 1 (got {num_nodes}, {total_pieces})",
+            file=sys.stderr,
+        )
+        return 2
 
     psk = Path(psk_file).read_text().strip()
     headers = {"Authorization": f"Bearer {psk}"}
