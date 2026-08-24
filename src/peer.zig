@@ -164,6 +164,15 @@ const dial_timeout_ms: u32 = 15_000;
 /// sending a partial head slower than the timeout.
 const head_deadline_ms: i64 = 10_000;
 
+/// Wall-clock budget for reading one response body: a base allowance plus
+/// 1s per expected MiB (Content-Length is known before any body byte is
+/// read). Same per-recv-reset hole as the head budget covers -- a dribbling
+/// peer must not hold a client fill (and the piece's filling claim every
+/// other reader of that piece waits behind) open-endedly -- scaled so healthy
+/// but slow links never trip it: a 16 MiB piece gets 76s (needs ~0.2 MB/s).
+const body_deadline_base_ms: i64 = 60_000;
+const body_deadline_per_mib_ms: i64 = 1_000;
+
 /// Cap on a peer-chosen Content-Length driving an allocation in
 /// readFlexBodyAlloc. Caller-supplied destinations bypass it: their length is
 /// verified against Content-Length instead.
@@ -586,6 +595,17 @@ fn dial(ip: []const u8, port: u16) !c_int {
 }
 
 fn readFlexBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8) ![]u8 {
+    return readFlexBodyAllocDeadline(gpa, fd, dest, null);
+}
+
+/// Total body budget scaled to the expected length (1s per MiB on top of the
+/// base allowance), unless the caller overrides it (tests inject short ones).
+fn bodyDeadlineFor(want_len: usize) i64 {
+    const mibs: i64 = @intCast(want_len / (1024 * 1024));
+    return sys.monoMs() + body_deadline_base_ms + mibs * body_deadline_per_mib_ms;
+}
+
+fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
@@ -618,6 +638,8 @@ fn readFlexBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8) ![
         if (want_len > max_alloc_body_bytes) return error.BodyTooLarge;
         if (want_len == 0) return try gpa.alloc(u8, 0);
     }
+    // Now that the expected length is known, size the total budget to it.
+    const deadline = deadline_ms orelse bodyDeadlineFor(want_len);
 
     const buf = dest orelse try gpa.alloc(u8, want_len);
     errdefer if (dest == null) gpa.free(buf);
@@ -631,8 +653,21 @@ fn readFlexBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8) ![
     }
 
     while (got < want_len) {
-        const n = sys.readOnce(fd, buf[got..]) catch return error.Read;
-        if (n == 0) break;
+        const remain_ms = deadline - sys.monoMs();
+        if (remain_ms <= 0) return error.BodyTimeout;
+        // The last blocking read must wake at the deadline; every caller of
+        // this helper closes the socket once the body settles, so the clamp
+        // never needs restoring for a later transfer stage.
+        if (remain_ms < sock_timeout_ms)
+            sys.setSockTimeout(fd, @intCast(remain_ms));
+        const n = sys.readOnce(fd, buf[got..]) catch {
+            if (deadline - sys.monoMs() <= 0) return error.BodyTimeout;
+            return error.Read;
+        };
+        if (n == 0) {
+            if (deadline - sys.monoMs() <= 0) return error.BodyTimeout;
+            break;
+        }
         got += n;
     }
     if (got != want_len) return error.ReadIncomplete;
@@ -959,6 +994,20 @@ test "readHeadFullDeadline aborts a dribbled head at the deadline" {
     const t0 = sys.monoMs();
     const err = readHeadFullDeadline(pair[1], &buf, &head_len, &total, t0 + 150);
     try std.testing.expectError(error.HeadTimeout, err);
+    try std.testing.expect(sys.monoMs() - t0 <= 2000);
+}
+
+test "readFlexBodyAllocDeadline aborts a dribbled body at the deadline" {
+    // Half the promised body, then silence. SO_RCVTIMEO alone resets on the
+    // dribble, so the fetch -- and on the fill path, the piece's filling
+    // claim every other reader of that piece spins behind -- would hang
+    // forever; the total body budget must expire instead.
+    const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n1234");
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    const t0 = sys.monoMs();
+    const err = readFlexBodyAllocDeadline(std.testing.allocator, pair[1], null, t0 + 150);
+    try std.testing.expectError(error.BodyTimeout, err);
     try std.testing.expect(sys.monoMs() - t0 <= 2000);
 }
 

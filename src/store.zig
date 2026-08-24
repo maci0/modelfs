@@ -250,9 +250,16 @@ pub const Store = struct {
         defer self.gpa.free(blob);
         // A truncated or corrupt sidecar (torn writeFile, crash mid-save) must
         // degrade to "nothing cached", never poison every read of the file.
+        // The reset is also named here: it means this file's cached state was
+        // discarded and everything re-hydrates over origin/peers, which an
+        // operator should be able to tell from the log instead of guessing why
+        // the cache went cold.
         return piece.Bitfield.decode(self.gpa, blob, self.piece_size, file_size) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
-            error.BadBitfield => piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size)),
+            error.BadBitfield => {
+                std.log.warn("corrupt piece sidecar for {s}; treating cache as empty", .{rel});
+                return piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+            },
         };
     }
 
@@ -1245,6 +1252,13 @@ test "corrupt sidecar degrades to empty bitfield" {
     var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
     defer st.deinit();
     try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // The torn sidecars below trip loadBits' reset warning by design; keep
+    // those expected lines off the runner's stderr like the punchPiece
+    // save-failure tests do. Restored on scope exit.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
 
     // Torn sidecar, as a crash mid-saveBits can leave behind: shorter than
     // the header must not make every read of the file fail.

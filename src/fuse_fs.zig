@@ -164,8 +164,15 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC, mode);
     if (fd < 0) return sys.negErrno();
     sys.close(fd);
-    const file = st.store.get(rel, 0) catch return -sys.c.ENOMEM;
-    st.store.releaseFile(file);
+    // The origin create above already landed: failing the syscall here (entry
+    // warmup OOM) would tell the caller the create failed over a file that
+    // exists and was possibly truncated. Warmup is best-effort; the next
+    // open/read rebuilds the entry.
+    if (st.store.get(rel, 0)) |file| {
+        st.store.releaseFile(file);
+    } else |_| {
+        std.log.warn("cache entry warmup failed for {s}; rebuilding on next open", .{rel});
+    }
     return 0;
 }
 
