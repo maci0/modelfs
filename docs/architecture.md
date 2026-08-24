@@ -153,7 +153,7 @@ Range: bytes=start-end
 Authorization: Bearer <psk>
 ```
 
-401 if missing/wrong. Listen `0.0.0.0:18080` (or `--listen`). At most 16 HTTP handlers.
+401 if missing/wrong. Listen `0.0.0.0:18080`; `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers.
 
 ---
 

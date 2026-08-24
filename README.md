@@ -103,6 +103,7 @@ Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt) (`uv pi
 | `cull.zig` | cache eviction watermarks |
 | `sys.zig` | syscall wrappers |
 | `c.zig` | the single door to libfuse3/libc |
+| `root.zig` | test aggregator: pulls every module's tests into the test binary |
 
 `@cImport` is gone in Zig 0.16, so C declarations are translated once from `src/c.h` by `build.zig`; `c.zig` re-exports that module and every other module goes through it. `build.zig.zon` declares no package dependencies: the binary links only `libfuse3`, libc, and pthread.
 
