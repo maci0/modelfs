@@ -264,11 +264,29 @@ pub fn readOnce(fd: c_int, buf: []u8) !usize {
 }
 
 fn writeFileFlags(path: [*:0]const u8, data: []const u8, extra_flags: c_int) i32 {
+    return writeFileFull(path, data, extra_flags, false);
+}
+
+/// Writes data at path; when `durable` is set, fsyncs before close so a
+/// later destructive step keyed to the same name cannot be reordered ahead
+/// of these bytes by delayed allocation across a power loss.
+fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, durable: bool) i32 {
     const fd = open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | extra_flags, 0o644);
     if (fd < 0) return negErrno();
     defer close(fd);
     const n = writeAll(fd, data);
     if (n < 0) return @intCast(n);
+    if (durable) {
+        while (true) {
+            const rc = std.os.linux.fsync(fd);
+            if (rc == 0) break;
+            // EINTR is retried like every other interruptible syscall here;
+            // any other failure means the durability guarantee does not hold
+            // and must surface as "not saved".
+            const e: i32 = @intCast(rc);
+            if (e != c.EINTR) return -e;
+        }
+    }
     return 0;
 }
 
@@ -282,6 +300,13 @@ pub fn writeFile(path: [*:0]const u8, data: []const u8) i32 {
 /// arbitrary file as the daemon user.
 pub fn writeFileNoFollow(path: [*:0]const u8, data: []const u8) i32 {
     return writeFileFlags(path, data, c.O_NOFOLLOW);
+}
+
+/// writeFileNoFollow plus fsync-before-close: for artifact writes whose
+/// durability orders them against a later destructive step on the same key
+/// (the bitfield cleared ahead of a hole punch).
+pub fn writeFileDurable(path: [*:0]const u8, data: []const u8) i32 {
+    return writeFileFull(path, data, c.O_NOFOLLOW, true);
 }
 
 pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![]u8 {

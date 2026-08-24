@@ -350,8 +350,9 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
         // Save while the new bits are still under the lock: saveBits encodes
         // size/bits and must never race the swap below (or another thread's
         // encode) on freed storage. The fd truncate shares this window so
-        // cache_fd cannot be closed between check and use.
-        _ = st.store.saveBits(file);
+        // cache_fd cannot be closed between check and use. Best-effort save:
+        // a lost sidecar here only costs refill, never stale bytes.
+        _ = st.store.saveBits(file, false);
         if (file.cache_fd >= 0) _ = sys.ftruncate(file.cache_fd, new_size);
         file.mu.unlock(st.io);
         ob.deinit(st.gpa);

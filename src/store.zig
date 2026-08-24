@@ -260,8 +260,13 @@ pub const Store = struct {
     /// reads bits/size under it. False means the sidecar was not updated
     /// (encode failure, unwritable path, torn write); callers that gate
     /// destructive disk work on persisted state must treat false as
-    /// "do not proceed".
-    pub fn saveBits(self: *Store, file: *Cached) bool {
+    /// "do not proceed". `durable` fsyncs the sidecar before returning:
+    /// required for punchPiece, where the cleared field must reach stable
+    /// storage before the hole is cut (a plain write lets delayed allocation
+    /// land the punch first, and power loss then leaves the old sidecar
+    /// claiming filled over hole zeros). Fill-path saves stay best-effort;
+    /// losing one only costs a refill over intact bytes.
+    pub fn saveBits(self: *Store, file: *Cached, durable: bool) bool {
         var blob: std.ArrayList(u8) = .empty;
         defer blob.deinit(self.gpa);
         file.bits.encode(self.piece_size, file.size, &blob, self.gpa) catch {
@@ -272,7 +277,11 @@ pub const Store = struct {
         const p = self.cacheMetaPath(&buf, file.rel) catch return false;
         const parent = sys.parentOf(std.mem.span(p));
         _ = sys.mkdirAll(parent, 0o755);
-        if (sys.writeFileNoFollow(p, blob.items) != 0) {
+        const w = if (durable)
+            sys.writeFileDurable(p, blob.items)
+        else
+            sys.writeFileNoFollow(p, blob.items);
+        if (w != 0) {
             std.log.warn("bitfield save failed for {s}; cache state resets on restart", .{file.rel});
             return false;
         }
@@ -510,7 +519,7 @@ pub const Store = struct {
         }
         _ = file.filling.remove(idx);
         if (ok) file.bits.set(idx);
-        _ = self.saveBits(file);
+        _ = self.saveBits(file, false);
     }
 
     /// Length of piece idx sampled under file.mu immediately after a
@@ -648,7 +657,7 @@ pub const Store = struct {
         if (!dead) {
             var i = cov.start;
             while (i < cov.end) : (i += 1) file.bits.set(i);
-            _ = self.saveBits(file);
+            _ = self.saveBits(file, false);
         }
         file.mu.unlock(self.io);
         return !dead;
@@ -687,20 +696,23 @@ pub const Store = struct {
         // exists. Hole first, persist second, a crash between the two leaves
         // the sidecar claiming filled over punched bytes, and post-restart
         // reads serve hole zeros as cached model data -- the one corruption
-        // every other guard in this file exists to prevent. Persisted first,
-        // every crash point is safe: cleared bits over intact bytes merely
-        // refill, and only a completed save authorizes the punch.
+        // every other guard in this file exists to prevent. The save below is
+        // fsync'ed (durable=true), so "persisted" means on stable storage, not
+        // merely handed to delayed allocation: every crash point is safe.
+        // Cleared bits over intact bytes merely refill; only a completed
+        // durable save authorizes the punch.
         file.bits.clear(idx);
-        if (!self.saveBits(file)) {
+        if (!self.saveBits(file, true)) {
             // The on-disk sidecar still says filled; keep bytes and mark.
             file.bits.set(idx);
+            _ = self.saveBits(file, false);
             return false;
         }
         if (sys.punchHole(fd, off, ln) != 0) {
             // Bytes stay: restore the mark in memory and on disk so reads
             // keep serving the cached copy and LRU state stays truthful.
             file.bits.set(idx);
-            _ = self.saveBits(file);
+            _ = self.saveBits(file, false);
             return false;
         }
         std.log.info("cull piece {d} {s}", .{ idx, file.rel });
@@ -920,10 +932,10 @@ pub const Store = struct {
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
         const mp = self.cacheMetaPath(&mbuf, rel) catch return false;
         // Write-ahead (same contract as punchPiece): the cleared field is
-        // persisted before any destructive step. A save failure leaves the
-        // old sidecar standing and nothing punched; a crash after the save
+        // persisted durably before any destructive step. A save failure leaves
+        // the old sidecar standing and nothing punched; a crash after the save
         // but before the punch costs only a refill over intact bytes.
-        if (sys.writeFileNoFollow(mp, blob.items) != 0) {
+        if (sys.writeFileDurable(mp, blob.items) != 0) {
             std.log.warn("bitfield save failed for {s}; piece {d} stays cached", .{ rel, idx });
             return false;
         }
@@ -1129,7 +1141,7 @@ test "forget drops bits, fd, and disk artifacts for the path" {
     f1.bits.set(0);
     f1.bits.set(3);
     f1.mu.unlock(std.testing.io);
-    _ = st.saveBits(f1);
+    _ = st.saveBits(f1, false);
     try std.testing.expect(st.openCache(f1) >= 0);
 
     // No live entry: artifacts from an earlier process must still be purged.
@@ -1541,7 +1553,7 @@ test "punchPiece refuses to cut the hole unless the cleared bits persist" {
     f.mu.lockUncancelable(std.testing.io);
     f.bits.set(0);
     f.bits.set(1);
-    try std.testing.expect(st.saveBits(f));
+    try std.testing.expect(st.saveBits(f, true));
     // Age past punchPiece's recency window, as a cull candidate would sit.
     f.last_access.store(sys.monoSec() - 3600, .monotonic);
     f.mu.unlock(std.testing.io);

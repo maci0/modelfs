@@ -603,49 +603,70 @@ fn readFlexBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8) ![
     return buf;
 }
 
-pub const ProbePeer = struct { ip: []const u8, port: u16 };
-
-const ProbeCtx = struct {
+pub const ProbeCtx = struct {
     gpa: std.mem.Allocator,
     psk: []const u8,
     rel: []const u8,
-    peers: []const ProbePeer,
-    /// Slot indexes that still need a probe (the rest came from cache).
+    paths: []const discover.Path,
+    /// Per unique peer id: indexes into paths, ordered best-first by the
+    /// lease priors (discover.pathScore over ewma/hops).
+    groups: []const []const usize,
+    /// Group indexes that still need a probe (the rest came from cache).
     todo: []const usize,
     slots: []?[]u8,
     cat: *discover.Catalog,
     next: std.atomic.Value(u32) = .init(0),
 };
 
-/// Claims one unprobed peer at a time and records its /have bitmap (null on
-/// failure). The atomic cursor lets any number of workers drain the list
-/// without overlap, so a partially started pool can always be finished off
-/// inline. Successes feed the catalog's short-TTL have cache so later pieces
-/// of the same file skip the probe entirely.
+/// Claims one unprobed group at a time and records its /have bitmap (null on
+/// failure). Addresses are tried best-first: the first answer wins, so a
+/// healthy multi-homed node costs one wire round trip total, and a dead
+/// preferred address falls through to the same node's remaining interfaces
+/// instead of hiding the whole node behind one unreachable NIC. Successes
+/// feed the catalog's short-TTL have cache so later pieces of the same file
+/// skip the probe entirely.
 fn probeWorker(ctx: *ProbeCtx) void {
     while (true) {
         const t = ctx.next.fetchAdd(1, .monotonic);
         if (t >= ctx.todo.len) return;
-        const i = ctx.todo[t];
-        const bits = fetchHave(ctx.gpa, ctx.psk, ctx.peers[i].ip, ctx.peers[i].port, ctx.rel) catch null;
-        ctx.slots[i] = bits;
-        if (bits) |b| ctx.cat.havePut(ctx.rel, ctx.peers[i].ip, ctx.peers[i].port, b);
+        const gi = ctx.todo[t];
+        for (ctx.groups[gi]) |pi| {
+            const p = ctx.paths[pi];
+            const bits = fetchHave(ctx.gpa, ctx.psk, p.ip, p.port, ctx.rel) catch continue;
+            ctx.slots[gi] = bits;
+            ctx.cat.havePut(ctx.rel, p.ip, p.port, bits);
+            break;
+        }
     }
 }
 
-/// Fills slots[] with one /have bitmap per peer: peers answered by the
+/// Fills slots[] with one /have bitmap per peer group: groups answered by the
 /// recent-probe cache skip the wire entirely; the rest are probed
 /// concurrently (a serial probe would pay one full connect+request+response
-/// round trip per peer before any piece data moves). slots must be all-null.
-fn probeSlots(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, peers: []const ProbePeer, slots: []?[]u8) !void {
+/// round trip per peer before any piece data moves), walking each group's
+/// addresses best-first until one answers. slots must be all-null.
+fn probeSlots(
+    gpa: std.mem.Allocator,
+    psk: []const u8,
+    cat: *discover.Catalog,
+    rel: []const u8,
+    paths: []const discover.Path,
+    groups: []const []const usize,
+    slots: []?[]u8,
+) !void {
     var todo: std.ArrayList(usize) = .empty;
     defer todo.deinit(gpa);
-    for (peers, 0..) |pp, si| {
-        if (cat.haveGet(gpa, rel, pp.ip, pp.port)) |cached| {
-            slots[si] = cached;
-        } else {
-            try todo.append(gpa, si);
+    for (groups, 0..) |g, gi| {
+        var answered = false;
+        for (g) |pi| {
+            const p = paths[pi];
+            if (cat.haveGet(gpa, rel, p.ip, p.port)) |cached| {
+                slots[gi] = cached;
+                answered = true;
+                break;
+            }
         }
+        if (!answered) try todo.append(gpa, gi);
     }
     if (todo.items.len == 0) return;
 
@@ -653,7 +674,8 @@ fn probeSlots(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, r
         .gpa = gpa,
         .psk = psk,
         .rel = rel,
-        .peers = peers,
+        .paths = paths,
+        .groups = groups,
         .todo = todo.items,
         .slots = slots,
         .cat = cat,
@@ -670,39 +692,67 @@ fn probeSlots(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, r
     if (spawned < todo.items.len) probeWorker(&ctx);
 }
 
-/// Snapshot of the catalog reduced to one candidate per unique peer id, each
-/// carrying its /have answer for piece idx: peers answered by the recent-
-/// probe cache skip the wire; the rest are probed concurrently (a serial
-/// probe would pay one full connect+request+response round trip per peer
-/// before any piece data moves). Caller frees the returned slice with gpa.
+/// Lease prior for best-first address ordering inside a peer-id group:
+/// pathScore with inflight fixed at 0, matching the pre-probe state.
+fn scoreOf(p: discover.Path) f64 {
+    return discover.pathScore(p.ewma_bps, p.hops, 0);
+}
+
+/// Snapshot of the catalog reduced to one candidate per lease path, each
+/// carrying its node's /have answer for piece idx: peers answered by the
+/// recent-probe cache skip the wire; the rest are probed concurrently, one
+/// best-first address walk per unique peer id. Caller frees the returned
+/// slice with gpa.
 fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32) ![]discover.PathCand {
     const paths = try cat.snapshot(gpa);
     defer discover.Catalog.freeSnapshot(gpa, paths);
 
-    // One probe per unique peer id: several lease paths can name the same
-    // node, and probing each would duplicate wire round trips and slots.
-    var slot_of = std.StringHashMap(usize).init(gpa);
-    defer slot_of.deinit();
-    var peers: std.ArrayList(ProbePeer) = .empty;
-    defer peers.deinit(gpa);
-    for (paths) |p| {
-        const gop = try slot_of.getOrPut(p.peer_id);
-        if (gop.found_existing) continue;
-        gop.value_ptr.* = peers.items.len;
-        try peers.append(gpa, .{ .ip = p.ip, .port = p.port });
+    // Group path indexes by unique peer id, each group stable-sorted
+    // best-first by the lease priors. Probing every address of every node
+    // would duplicate wire round trips and slots; probing only each node's
+    // first lease entry would probe interface enumeration order instead of
+    // fabric preference -- on multi-homed hosts that is whichever NIC
+    // getifaddrs listed first, which strands every fetch there no matter
+    // what pathScore would have picked. The walk keeps one probe per healthy
+    // node while letting a down preferred address fall through to that node's
+    // remaining interfaces.
+    var groups: std.ArrayList([]usize) = .empty;
+    defer {
+        for (groups.items) |g| gpa.free(g);
+        groups.deinit(gpa);
+    }
+    var group_of = std.StringHashMap(usize).init(gpa);
+    defer group_of.deinit();
+    for (paths, 0..) |p, pi| {
+        const gop = try group_of.getOrPut(p.peer_id);
+        if (!gop.found_existing) {
+            const g = try gpa.alloc(usize, 1);
+            errdefer gpa.free(g);
+            g[0] = pi;
+            try groups.append(gpa, g);
+            gop.value_ptr.* = groups.items.len - 1;
+            continue;
+        }
+        const g = try gpa.realloc(groups.items[gop.value_ptr.*], groups.items[gop.value_ptr.*].len + 1);
+        groups.items[gop.value_ptr.*] = g;
+        g[g.len - 1] = pi;
+        var j = g.len - 1;
+        while (j > 0 and scoreOf(paths[g[j]]) > scoreOf(paths[g[j - 1]])) {
+            std.mem.swap(usize, &g[j], &g[j - 1]);
+            j -= 1;
+        }
     }
 
-    const slots = try gpa.alloc(?[]u8, peers.items.len);
+    const slots = try gpa.alloc(?[]u8, groups.items.len);
     defer {
         for (slots) |s| if (s) |b| gpa.free(b);
         gpa.free(slots);
     }
     @memset(slots, null);
 
-    // One /have probe per unique peer id, issued concurrently; peers answered
-    // by the recent-probe cache skip the wire entirely, so a sequential fill
-    // of one file probes once per peer per TTL instead of once per piece.
-    try probeSlots(gpa, psk, cat, rel, peers.items, slots);
+    // One concurrent best-first probe per unique peer id, so a sequential
+    // fill of one file probes once per peer per TTL instead of once per piece.
+    try probeSlots(gpa, psk, cat, rel, paths, groups.items, slots);
 
     var cands: std.ArrayList(discover.PathCand) = .empty;
     errdefer {
@@ -711,8 +761,8 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
     }
     for (paths) |p| {
         var bits: []u8 = &.{};
-        if (slot_of.get(p.peer_id)) |si| {
-            if (slots[si]) |b| bits = b;
+        if (group_of.get(p.peer_id)) |gi| {
+            if (slots[gi]) |b| bits = b;
         }
         const has = idx / 8 < bits.len and (bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
         const ip_copy = try gpa.dupe(u8, p.ip);
