@@ -40,7 +40,3 @@ enable_error_code = [
     "deprecated",
 ]
 
-[[tool.mypy.overrides]]
-# matplotlib ships no type stubs.
-module = "matplotlib.*"
-ignore_missing_imports = true
