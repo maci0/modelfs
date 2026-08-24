@@ -57,7 +57,12 @@ def build_modelfs() -> str:
     # sendfile throughput; the piece-size sweep's shape depends on exactly
     # that fixed cost.
     res = subprocess.run(
-        ["zig", "build", "-Doptimize=ReleaseFast"], capture_output=True, text=True, check=False
+        ["zig", "build", "-Doptimize=ReleaseFast"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
     )
     if res.returncode != 0:
         print("Build failed:", res.stderr)
@@ -72,7 +77,9 @@ def make_origin_and_psk(temp_dir: str) -> tuple[str, str]:
     origin_dir = os.path.join(temp_dir, "origin")
     psk_file = os.path.join(temp_dir, "modelfs.psk")
     os.makedirs(origin_dir, exist_ok=True)
-    with open(psk_file, "w") as f:
+    # UTF-8 named: this file is the daemon's --psk input, read back byte-exact
+    # by the verifier and trimmed to " \t\r\n" on both sides.
+    with open(psk_file, "w", encoding="utf-8") as f:
         f.write(BENCH_PSK + "\n")
     os.chmod(psk_file, 0o600)
     return origin_dir, psk_file
@@ -443,7 +450,7 @@ peer latency.
 ![Tier latency comparison](figures/fig3_tier_latency_comparison.png)
 """
     report_path = "docs/benchmarks.md"
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_content)
     print(f"✓ Generated Benchmark Report: {report_path}")
 

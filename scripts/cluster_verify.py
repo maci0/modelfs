@@ -44,8 +44,16 @@ def main(argv: list[str]) -> int:
         )
         return 2
 
-    psk = Path(psk_file).read_text().strip()
-    headers = {"Authorization": f"Bearer {psk}"}
+    # The PSK crosses to the daemon as raw bytes (main.zig loadPsk reads the
+    # file undecoded and trims exactly b" \t\r\n"), so this side must too:
+    # a locale-default read_text() would crash on a binary key file or
+    # re-encode it under a legacy locale, and str.strip()'s wider
+    # Unicode-whitespace set would drop bytes (\v, \f) the daemon keeps as
+    # part of the secret, turning every request into a 401. latin-1 is the
+    # HTTP/1.1 header codec (http.client re-encodes it verbatim), so the
+    # token reaches the wire byte-exact.
+    token = b"Bearer " + Path(psk_file).read_bytes().strip(b" \t\r\n")
+    headers = {"Authorization": token.decode("latin-1")}
 
     # Read raw file from origin for verification
     with open(origin_file, "rb") as f:
