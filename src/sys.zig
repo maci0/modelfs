@@ -306,8 +306,18 @@ pub fn writeFileDurable(path: [*:0]const u8, data: []const u8) i32 {
 }
 
 pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![]u8 {
+    return readFileAllocOpenErrno(gpa, path, max, null);
+}
+
+/// readFileAlloc plus the failing open's errno written through open_errno_out
+/// (when non-null), so callers can separate ENOENT from EACCES-style
+/// conditions instead of reporting one generic cause for every open failure.
+pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32) ![]u8 {
     const fd = open(path, c.O_RDONLY, 0);
-    if (fd < 0) return error.OpenFailed;
+    if (fd < 0) {
+        if (open_errno_out) |out| out.* = errno();
+        return error.OpenFailed;
+    }
     defer close(fd);
     var st: c.struct_stat = undefined;
     if (fstat(fd, &st) != 0) return error.StatFailed;

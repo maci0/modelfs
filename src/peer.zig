@@ -275,6 +275,9 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
         return;
     }
     const file = self.store.get(rel, @intCast(st.st_size)) catch {
+        // The fetching peer only sees 500; without this line the serving
+        // node's log says nothing about why.
+        std.log.warn("cache entry open failed for {s}; replying 500", .{rel});
         replyStatus(fd, "500 Internal Server Error");
         return;
     };
@@ -285,6 +288,7 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
     file.mu.lockUncancelable(self.io);
     const snap = self.gpa.dupe(u8, file.bits.bytes) catch {
         file.mu.unlock(self.io);
+        std.log.warn("have bits snapshot failed for {s}; replying 500", .{rel});
         replyStatus(fd, "500 Internal Server Error");
         return;
     };
@@ -319,10 +323,12 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             // of it into the claim's retry spin.
             if (pbuf == null)
                 pbuf = self.gpa.alloc(u8, ps) catch {
+                    std.log.warn("hydration buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, pi });
                     replyStatus(fd, "500 Internal Server Error");
                     return false;
                 };
             const cl = self.store.beginFill(file, pi) catch {
+                std.log.warn("fill claim failed for {s} piece {d}; replying 500", .{ file.rel, pi });
                 replyStatus(fd, "500 Internal Server Error");
                 return false;
             };
@@ -400,7 +406,12 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     }
 
     const chunk_cap: usize = 4 * 1024 * 1024;
-    const buf = self.gpa.alloc(u8, @min(want, chunk_cap)) catch return;
+    const buf = self.gpa.alloc(u8, @min(want, chunk_cap)) catch {
+        // The 206 header is already on the wire, so the peer only sees a
+        // truncated body; this line is the sender-side trace of why.
+        std.log.warn("range stream buffer alloc failed for {s}; dropping connection", .{file.rel});
+        return;
+    };
     defer self.gpa.free(buf);
     var off = start;
     var remaining = want;
@@ -432,6 +443,9 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     // the internal peer protocol always sends exact piece bounds.
     const rg_end = @min(rg.end, size - 1);
     const file = self.store.get(rel, size) catch {
+        // Same operator-trace contract as serveHave's 500: the peer sees the
+        // status alone, so the local log must carry the cause.
+        std.log.warn("cache entry open failed for {s}; replying 500", .{rel});
         replyStatus(fd, "500 Internal Server Error");
         return;
     };

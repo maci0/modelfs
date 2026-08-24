@@ -242,15 +242,31 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     }
     var z: [sys.c.PATH_MAX]u8 = undefined;
     const p = try sys.toZ(&z, opts.psk_file);
-    const raw = sys.readFileAlloc(gpa, p, 4096) catch {
+    var open_errno: i32 = 0;
+    const raw = sys.readFileAllocOpenErrno(gpa, p, 4096, &open_errno) catch |err| switch (err) {
         // Remediation output for operators, like every other usage print in
         // this file: suppressed under test so the named errors stay
-        // assertable without tripping the runner's error-log counter.
-        if (!builtin.is_test) {
-            std.log.err("missing PSK at {s} (mode 0600). create one:", .{opts.psk_file});
-            std.log.err("  umask 077; openssl rand -hex 32 > {s}", .{opts.psk_file});
-        }
-        return error.MissingPsk;
+        // assertable without tripping the runner's error-log counter. A
+        // present-but-unreadable file (EACCES, EISDIR) must not be reported
+        // as "missing" -- the operator would be told to recreate a file that
+        // actually needs its permissions fixed.
+        error.OpenFailed => {
+            if (open_errno != sys.c.ENOENT) {
+                if (!builtin.is_test)
+                    std.log.err("cannot read PSK at {s} (errno {d}); check the file's permissions", .{ opts.psk_file, open_errno });
+                return error.PskUnreadable;
+            }
+            if (!builtin.is_test) {
+                std.log.err("missing PSK at {s} (mode 0600). create one:", .{opts.psk_file});
+                std.log.err("  umask 077; openssl rand -hex 32 > {s}", .{opts.psk_file});
+            }
+            return error.MissingPsk;
+        },
+        else => {
+            if (!builtin.is_test)
+                std.log.err("cannot read PSK at {s}: {t}", .{ opts.psk_file, err });
+            return error.PskUnreadable;
+        },
     };
     defer gpa.free(raw);
     // A group/world-readable PSK lets any local user impersonate this node to
@@ -424,10 +440,11 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     const cache = ensureDirReal(gpa, opts.cache, "cache") catch return 1;
     defer gpa.free(cache);
 
-    // MissingPsk/EmptyPsk are already reported with remediation steps inside
-    // loadPsk; anything else still needs a one-line cause before the clean exit.
+    // MissingPsk/EmptyPsk/PskUnreadable are already reported with remediation
+    // steps inside loadPsk; anything else still needs a one-line cause before
+    // the clean exit.
     const psk = loadPsk(gpa, opts) catch |err| {
-        if (err != error.MissingPsk and err != error.EmptyPsk)
+        if (err != error.MissingPsk and err != error.EmptyPsk and err != error.PskUnreadable)
             std.log.err("load PSK: {t}", .{err});
         return 1;
     };
@@ -823,6 +840,26 @@ test "loadPsk refuses empty secrets and trims file contents" {
         var pb: [160]u8 = undefined;
         const absent = try std.fmt.bufPrint(&pb, "{s}/absent.psk", .{scratch});
         try std.testing.expectError(error.MissingPsk, loadPsk(gpa, .{ .psk_file = absent }));
+    }
+    // A path that exists but cannot be opened must be reported unreadable,
+    // not "missing": the remediation for a missing file would misdiagnose
+    // it. A regular file in place of the final directory component makes
+    // open fail ENOTDIR deterministically, even under root.
+    {
+        var pb: [160]u8 = undefined;
+        const blocker = try std.fmt.bufPrint(&pb, "{s}/blocker", .{scratch});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, blocker), "x"));
+        var qb: [176]u8 = undefined;
+        const behind_blocker = try std.fmt.bufPrint(&qb, "{s}/x.psk", .{blocker});
+        try std.testing.expectError(error.PskUnreadable, loadPsk(gpa, .{ .psk_file = behind_blocker }));
+    }
+    // A PSK over the 4096-byte read cap is a read failure of an existing
+    // file (FileTooBig), equally distinct from a missing one.
+    {
+        var pb: [160]u8 = undefined;
+        const big_psk = try std.fmt.bufPrint(&pb, "{s}/big.psk", .{scratch});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, big_psk), "x" ** 5000));
+        try std.testing.expectError(error.PskUnreadable, loadPsk(gpa, .{ .psk_file = big_psk }));
     }
     // File contents are trimmed of surrounding whitespace and newline.
     {
