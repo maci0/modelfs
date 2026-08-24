@@ -39,6 +39,18 @@ pub fn indexAt(file_off: u64, piece_size: u32) u32 {
     return @intCast(@min(idx, std.math.maxInt(u32)));
 }
 
+/// Valid-bit count at bit lo capped to span, null when the whole span is
+/// valid. Written as a saturating subtraction instead of `lo + span >
+/// nbits`: the final word of a max-clamped field (nbits = maxInt(u32),
+/// what count() returns for sparse truncates near i64 max) sits at
+/// lo = maxInt(u32) - span + 1, where the addition overflows u32, panicking
+/// safe builds and silently skipping the pad mask in ReleaseFast.
+fn tailValidBits(lo: u32, span: u32, nbits: u32) ?u6 {
+    const v = nbits -| lo;
+    if (v >= span) return null;
+    return @intCast(v);
+}
+
 /// Inclusive start, exclusive end of pieces overlapping [file_off, file_off+n).
 pub fn cover(file_off: u64, n: u64, file_size: u64, piece_size: u32) struct { start: u32, end: u32 } {
     if (n == 0 or piece_size == 0 or file_off >= file_size) return .{ .start = 0, .end = 0 };
@@ -129,8 +141,7 @@ pub const Bitfield = struct {
             // pad bits when they get set by corruption or a future writer.
             const lo: u32 = @intCast(i * 8);
             var w = std.mem.readInt(u64, self.bytes[i..][0..8], .little);
-            if (lo + 64 > self.nbits) {
-                const valid: u6 = @intCast(self.nbits - lo);
+            if (tailValidBits(lo, 64, self.nbits)) |valid| {
                 w &= (@as(u64, 1) << valid) - 1;
             }
             total += @popCount(w);
@@ -140,7 +151,8 @@ pub const Bitfield = struct {
             // a corrupt field must not inflate the count.
             const lo: u32 = @intCast(i * 8);
             var b = self.bytes[i];
-            if (lo + 8 > self.nbits) b &= (@as(u8, 1) << @intCast(self.nbits - lo)) - 1;
+            if (tailValidBits(lo, 8, self.nbits)) |valid|
+                b &= (@as(u8, 1) << @as(u3, @intCast(valid))) - 1;
             total += @popCount(b);
         }
         return total;
@@ -155,10 +167,9 @@ pub const Bitfield = struct {
         while (end >= 8) {
             const lo: u32 = @intCast((end - 8) * 8);
             var w = std.mem.readInt(u64, self.bytes[end - 8 ..][0..8], .little);
-            if (lo + 64 > self.nbits) {
+            if (tailValidBits(lo, 64, self.nbits)) |valid| {
                 // Trim pad bits above nbits (writers keep them zero; this
                 // keeps that invariant local to the reader).
-                const valid: u6 = @intCast(self.nbits - lo);
                 w &= (@as(u64, 1) << valid) - 1;
             }
             if (w != 0) return lo + @as(u32, 63 - @clz(w));
@@ -211,6 +222,21 @@ pub const Bitfield = struct {
         return bf;
     }
 };
+
+test "tailValidBits survives the max-clamped final word" {
+    const max = std.math.maxInt(u32);
+    // The final word of a max-clamped field: `lo + 64 > nbits`, the form
+    // this helper replaced, overflows u32 exactly here (panic in safe
+    // builds, skipped mask in ReleaseFast). 63 of 64 bits stay valid.
+    try std.testing.expectEqual(@as(?u6, 63), tailValidBits(max - 63, 64, max));
+    // Same boundary in the byte tail: 7 of 8 bits valid.
+    try std.testing.expectEqual(@as(?u6, 7), tailValidBits(max - 7, 8, max));
+    // Fully valid spans return null, partially valid ones the remainder.
+    try std.testing.expectEqual(@as(?u6, null), tailValidBits(0, 64, 128));
+    try std.testing.expectEqual(@as(?u6, 60), tailValidBits(0, 64, 60));
+    try std.testing.expectEqual(@as(?u6, 6), tailValidBits(64, 8, 70));
+    try std.testing.expectEqual(@as(?u6, null), tailValidBits(64, 64, 128));
+}
 
 test "count clamps instead of overflowing u32" {
     const ps: u32 = 16 * 1024 * 1024;
