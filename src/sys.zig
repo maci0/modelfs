@@ -263,10 +263,6 @@ pub fn readOnce(fd: c_int, buf: []u8) !usize {
     }
 }
 
-fn writeFileFlags(path: [*:0]const u8, data: []const u8, extra_flags: c_int) i32 {
-    return writeFileFull(path, data, extra_flags, false);
-}
-
 /// Writes data at path; when `durable` is set, fsyncs before close so a
 /// later destructive step keyed to the same name cannot be reordered ahead
 /// of these bytes by delayed allocation across a power loss.
@@ -291,7 +287,7 @@ fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, dura
 }
 
 pub fn writeFile(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFlags(path, data, 0);
+    return writeFileFull(path, data, 0, false);
 }
 
 /// writeFile for daemon-owned artifact paths (cache data/meta/pin, lease and
@@ -299,7 +295,7 @@ pub fn writeFile(path: [*:0]const u8, data: []const u8) i32 {
 /// at one of those names must not redirect a truncate-and-write onto an
 /// arbitrary file as the daemon user.
 pub fn writeFileNoFollow(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFlags(path, data, c.O_NOFOLLOW);
+    return writeFileFull(path, data, c.O_NOFOLLOW, false);
 }
 
 /// writeFileNoFollow plus fsync-before-close: for artifact writes whose

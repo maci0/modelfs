@@ -45,11 +45,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
-    const run = b.addRunArtifact(exe);
-    run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
-    b.step("run", "Run modelfs").dependOn(&run.step);
-
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
