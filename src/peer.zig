@@ -341,6 +341,15 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                 if (got == @as(isize, @intCast(ln))) {
                     const w = self.store.writePiece(file, pi, pbuf.?[0..ln]);
                     self.store.finishPiece(file, pi, w == 0);
+                    if (w != 0) {
+                        // The bytes are in hand but the cache fs refused them
+                        // (full or failing disk). Falling through to the
+                        // !hasPiece check would reply 404 and make the
+                        // fetching peer believe the path is gone.
+                        std.log.warn("cache write failed for {s} piece {d} (errno {d}); replying 500", .{ file.rel, pi, -w });
+                        replyStatus(fd, "500 Internal Server Error");
+                        return false;
+                    }
                 } else {
                     self.store.finishPiece(file, pi, false);
                     // statOrigin passed, so the file exists: a failed or short
@@ -1062,6 +1071,57 @@ const TestServer = struct {
 test "fault tolerance: dial unreachable peer fails gracefully" {
     const err = dial("127.0.0.1", 19999);
     try std.testing.expectError(error.Connect, err);
+}
+
+test "serveData replies 500 when the cache refuses hydrated bytes" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-rocache");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-rocache");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Regression: when the origin read succeeded but the cache fs refused the
+    // bytes (here: an unwritable data artifact), the unset bit fell through
+    // to a 404 -- telling the fetching peer the path was gone -- with no log.
+    var pattern: [16]u8 = undefined;
+    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 53);
+    var fbuf: [192]u8 = undefined;
+    var fz: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fbuf, "{s}/ro.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
+
+    // Unwritable cache data file: openCache's O_RDWR|O_CREAT fails EACCES,
+    // so writePiece fails after originPread delivered every byte.
+    var dbuf: [192]u8 = undefined;
+    const data_dir = try std.fmt.bufPrint(&dbuf, "{s}/data", .{cache_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(data_dir, 0o755));
+    var pbuf: [192]u8 = undefined;
+    const dp = try std.fmt.bufPrint(&pbuf, "{s}/ro.bin", .{data_dir});
+    var dz: [sys.c.PATH_MAX]u8 = undefined;
+    const dpz = try sys.toZ(&dz, dp);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(dpz, ""));
+    try std.testing.expectEqual(@as(i32, 0), c.chmod(dpz, 0o444));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+    const port = srv.port();
+
+    // Expected-path warning; keep it off the runner's stderr like sibling
+    // fault-tolerance tests do.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    const fd = try sendRequest("secret", "127.0.0.1", port, "ro.bin", .{ .start = 0, .end = 15 });
+    defer sys.close(fd);
+    var head_buf: [8192]u8 = undefined;
+    var head_len: usize = 0;
+    var total_read: usize = 0;
+    try readHeadFull(fd, &head_buf, &head_len, &total_read);
+    // The status must name the server-side cache failure (500), not 404.
+    try std.testing.expect(std.mem.startsWith(u8, head_buf[0..head_len], "HTTP/1.1 500"));
 }
 
 test "serve joins its accept loops once stop shuts the listeners down" {

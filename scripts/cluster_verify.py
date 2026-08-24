@@ -38,7 +38,7 @@ def main(argv: list[str]) -> int:
         port = base_port + i
         url = f"http://127.0.0.1:{port}/ping"
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             assert resp.read() == b"ok", f"Node {i} ping failed"
 
     print(f"✓ All {num_nodes} peer nodes responding to HTTP /ping")
@@ -53,7 +53,7 @@ def main(argv: list[str]) -> int:
 
         have_url = f"http://127.0.0.1:{port}/have?path={path_enc}"
         have_req = urllib.request.Request(have_url, headers=headers)
-        with urllib.request.urlopen(have_req) as resp:
+        with urllib.request.urlopen(have_req, timeout=30) as resp:
             bits = resp.read()
             assert len(bits) > 0, f"Node {target_node} returned empty bitfield"
 

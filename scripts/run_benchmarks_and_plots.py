@@ -82,39 +82,42 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
         latencies_ms = []
 
         procs = []
-        for i in range(1, 10):
-            cache_dir = os.path.join(temp_dir, f"cache_{i}")
-            mount_dir = os.path.join(temp_dir, f"mount_{i}")
-            os.makedirs(cache_dir, exist_ok=True)
-            os.makedirs(mount_dir, exist_ok=True)
-            port = 19100 + i
-
-            p = subprocess.Popen(
-                [
-                    bin_path,
-                    "mount",
-                    mount_dir,
-                    "--origin",
-                    origin_dir,
-                    "--cache",
-                    cache_dir,
-                    "--id",
-                    f"node_{i}",
-                    "--listen",
-                    f"127.0.0.1:{port}",
-                    "--psk",
-                    psk_file,
-                    "--piece",
-                    "4M",
-                ]
-            )
-            procs.append((p, port, mount_dir))
-
-        time.sleep(2)  # Allow processes to bind and publish leases
-
-        headers = {"Authorization": f"Bearer {BENCH_PSK}"}
-
+        # The guard opens before the first daemon spawns: a failure partway
+        # through the loop (makedirs/Popen raising) must still tear down every
+        # daemon already started, not orphan it with its FUSE mount and port.
         try:
+            for i in range(1, 10):
+                cache_dir = os.path.join(temp_dir, f"cache_{i}")
+                mount_dir = os.path.join(temp_dir, f"mount_{i}")
+                os.makedirs(cache_dir, exist_ok=True)
+                os.makedirs(mount_dir, exist_ok=True)
+                port = 19100 + i
+
+                p = subprocess.Popen(
+                    [
+                        bin_path,
+                        "mount",
+                        mount_dir,
+                        "--origin",
+                        origin_dir,
+                        "--cache",
+                        cache_dir,
+                        "--id",
+                        f"node_{i}",
+                        "--listen",
+                        f"127.0.0.1:{port}",
+                        "--psk",
+                        psk_file,
+                        "--piece",
+                        "4M",
+                    ]
+                )
+                procs.append((p, port, mount_dir))
+
+            time.sleep(2)  # Allow processes to bind and publish leases
+
+            headers = {"Authorization": f"Bearer {BENCH_PSK}"}
+
             for num_nodes in node_counts:
                 # Measure /ping latency across active nodes
                 t0 = time.monotonic()
@@ -122,14 +125,14 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
                     port = 19100 + i
                     url = f"http://127.0.0.1:{port}/ping"
                     req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req) as resp:
+                    with urllib.request.urlopen(req, timeout=30) as resp:
                         assert resp.read() == b"ok"
                 t1 = time.monotonic()
                 elapsed_ms = round((t1 - t0) * 1000.0, 2)
                 latencies_ms.append(elapsed_ms)
                 print(f"  Nodes: {num_nodes} -> Total Latency: {elapsed_ms} ms")
         finally:
-            # Every spawned mount daemon must die even when a probe or assert
+            # Every spawned mount daemon must die even when a spawn or probe
             # raises; otherwise orphans hold ports and stale FUSE mounts.
             for p, _, mount_dir in procs:
                 stop_mount(p, mount_dir)
@@ -213,7 +216,7 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
                 )
 
                 t0 = time.monotonic()
-                with urllib.request.urlopen(req) as resp:
+                with urllib.request.urlopen(req, timeout=30) as resp:
                     got_data = resp.read()
                 t1 = time.monotonic()
 
