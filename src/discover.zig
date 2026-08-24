@@ -83,6 +83,19 @@ fn candTieLess(a: PathCand, b: PathCand) bool {
     }
 }
 
+/// The same tie-break over live catalog Paths: score descending, then ip
+/// bytes, then port. The peer probe walk sorts each multi-homed group with
+/// it so equal priors resolve by address bytes alone -- never by the lease
+/// document's address order, which is the publisher's getifaddrs
+/// enumeration and varies across reboots and machines.
+pub fn pathTieLess(a: Path, b: Path) bool {
+    switch (std.mem.order(u8, a.ip, b.ip)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => return a.port < b.port,
+    }
+}
+
 /// Highest score among candidates that have the piece. Null if none. Score
 /// ties break by candTieLess so the winner is a function of the candidate
 /// set alone, never of the order refresh happened to read the leases in.
@@ -832,6 +845,21 @@ test "pickBest breaks score ties by ip and port, never by list order" {
     const lo = PathCand{ .ip = "10.0.0.2", .port = 18079, .ewma_bps = 1e9, .hops = 0, .inflight = 0, .have = true };
     try std.testing.expectEqual(@as(usize, 1), pickBest(&.{ a, lo }).?);
     try std.testing.expectEqual(@as(usize, 0), pickBest(&.{ lo, a }).?);
+}
+
+test "pathTieLess orders by ip then port" {
+    // Same total order candTieLess gives candidates: the probe walk must
+    // resolve equal priors by address bytes, never by lease arrival order.
+    const mk = struct {
+        fn p(ip: []const u8, port: u16) Path {
+            return .{ .peer_id = "x", .ip = ip, .port = port, .ewma_bps = 1e8, .hops = 0 };
+        }
+    }.p;
+    try std.testing.expect(pathTieLess(mk("10.0.0.5", 18080), mk("10.0.0.9", 18080)));
+    try std.testing.expect(!pathTieLess(mk("10.0.0.9", 18080), mk("10.0.0.5", 18080)));
+    try std.testing.expect(pathTieLess(mk("10.0.0.5", 18079), mk("10.0.0.5", 18081)));
+    // Reflexivity: identical paths compare false both ways.
+    try std.testing.expect(!pathTieLess(mk("10.0.0.5", 18080), mk("10.0.0.5", 18080)));
 }
 
 test "same /24 is zero hops" {

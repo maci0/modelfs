@@ -824,28 +824,26 @@ fn scoreOf(p: discover.Path) f64 {
     return discover.pathScore(p.ewma_bps, p.hops, 0);
 }
 
-/// Snapshot of the catalog reduced to one candidate per lease path, each
-/// carrying its node's /have answer for piece idx: peers answered by the
-/// recent-probe cache skip the wire; the rest are probed concurrently, one
-/// best-first address walk per unique peer id. local_piece_size is this
-/// node's grid; a peer whose advertised grid differs answers unusable bits,
-/// so its candidates are marked !have rather than routing fills by them.
-/// Caller frees the returned slice with gpa.
-fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32, local_piece_size: u32) ![]discover.PathCand {
-    const paths = try cat.snapshot(gpa);
-    defer discover.Catalog.freeSnapshot(gpa, paths);
+/// Total order for the probe walk inside one peer-id group: higher lease
+/// prior first, then pathTieLess (ip bytes, then port). The tie-break is
+/// what keeps the walk a function of the address set alone: on a cold
+/// cluster every path carries the same prior, so without it the first-tried
+/// address would be decided by the publisher's getifaddrs order riding in
+/// the lease document -- environment enumeration order choosing which NIC
+/// gets the wire round trip and the first goodput sample.
+fn probeOrderLess(a: discover.Path, b: discover.Path) bool {
+    const sa = scoreOf(a);
+    const sb = scoreOf(b);
+    if (sa != sb) return sa > sb;
+    return discover.pathTieLess(a, b);
+}
 
-    // Group path indexes by unique peer id, each group stable-sorted
-    // best-first by the lease priors. Probing every address of every node
-    // would duplicate wire round trips and slots; probing only each node's
-    // first lease entry would probe interface enumeration order instead of
-    // fabric preference -- on multi-homed hosts that is whichever NIC
-    // getifaddrs listed first, which strands every fetch there no matter
-    // what pathScore would have picked. The walk keeps one probe per healthy
-    // node while letting a down preferred address fall through to that node's
-    // remaining interfaces.
+/// Groups snapshot indexes by unique peer id, each group sorted best-first
+/// by probeOrderLess. Caller frees the outer slice and every inner group
+/// with gpa.
+fn groupPathsByPeerId(gpa: std.mem.Allocator, paths: []const discover.Path) ![][]usize {
     var groups: std.ArrayList([]usize) = .empty;
-    defer {
+    errdefer {
         for (groups.items) |g| gpa.free(g);
         groups.deinit(gpa);
     }
@@ -863,15 +861,50 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
         }
         const g = try gpa.realloc(groups.items[gop.value_ptr.*], groups.items[gop.value_ptr.*].len + 1);
         groups.items[gop.value_ptr.*] = g;
+        // Insertion sort by the total order: equal-score addresses land in
+        // ip/port order instead of lease arrival order (see probeOrderLess).
         g[g.len - 1] = pi;
         var j = g.len - 1;
-        while (j > 0 and scoreOf(paths[g[j]]) > scoreOf(paths[g[j - 1]])) {
+        while (j > 0 and probeOrderLess(paths[g[j]], paths[g[j - 1]])) {
             std.mem.swap(usize, &g[j], &g[j - 1]);
             j -= 1;
         }
     }
+    return groups.toOwnedSlice(gpa);
+}
 
-    const slots = try gpa.alloc(?discover.HaveBits, groups.items.len);
+/// Snapshot of the catalog reduced to one candidate per lease path, each
+/// carrying its node's /have answer for piece idx: peers answered by the
+/// recent-probe cache skip the wire; the rest are probed concurrently, one
+/// best-first address walk per unique peer id. local_piece_size is this
+/// node's grid; a peer whose advertised grid differs answers unusable bits,
+/// so its candidates are marked !have rather than routing fills by them.
+/// Caller frees the returned slice with gpa.
+fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32, local_piece_size: u32) ![]discover.PathCand {
+    const paths = try cat.snapshot(gpa);
+    defer discover.Catalog.freeSnapshot(gpa, paths);
+
+    // Probing every address of every node would duplicate wire round trips
+    // and slots; probing only each node's first lease entry would probe
+    // interface enumeration order instead of fabric preference -- on
+    // multi-homed hosts that is whichever NIC getifaddrs listed first,
+    // which strands every fetch there no matter what pathScore would have
+    // picked. The walk keeps one probe per healthy node while letting a down
+    // preferred address fall through to that node's remaining interfaces.
+    const groups = try groupPathsByPeerId(gpa, paths);
+    defer {
+        for (groups) |g| gpa.free(g);
+        gpa.free(groups);
+    }
+    // peer_id -> group slot: each group's first index carries the group's
+    // peer id by construction (the entry that created the group).
+    var group_of = std.StringHashMap(usize).init(gpa);
+    defer group_of.deinit();
+    for (groups, 0..) |g, gi| {
+        try group_of.put(paths[g[0]].peer_id, gi);
+    }
+
+    const slots = try gpa.alloc(?discover.HaveBits, groups.len);
     defer {
         for (slots) |s| if (s) |rep| gpa.free(rep.bits);
         gpa.free(slots);
@@ -880,7 +913,7 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
 
     // One concurrent best-first probe per unique peer id, so a sequential
     // fill of one file probes once per peer per TTL instead of once per piece.
-    try probeSlots(gpa, psk, cat, rel, paths, groups.items, slots);
+    try probeSlots(gpa, psk, cat, rel, paths, groups, slots);
 
     var cands: std.ArrayList(discover.PathCand) = .empty;
     errdefer {
@@ -975,6 +1008,50 @@ test "rangeBps" {
     // updateGoodput's EWMA, which would poison the path score).
     try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, 0));
     try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, -1));
+}
+
+test "groupPathsByPeerId orders ties by ip and port, never by arrival order" {
+    const gpa = std.testing.allocator;
+    // One multi-homed node whose lease lists addresses in scrambled order
+    // (that order is the publisher's getifaddrs enumeration). Cold-cluster
+    // priors are equal, so the probe walk's first-tried address must follow
+    // ip/port bytes alone: both arrival permutations below must produce the
+    // same per-group walk. Regression: ties used to keep lease arrival
+    // order, letting environment enumeration choose which NIC got probed
+    // (and the goodput sample) first.
+    const mk = struct {
+        fn path(id: []const u8, ip: []const u8, port: u16, mbps_bps: f64) discover.Path {
+            return .{ .peer_id = id, .ip = ip, .port = port, .ewma_bps = mbps_bps, .hops = 0 };
+        }
+    }.path;
+    const fabric = 25e9;
+    const mgmt = 1e8;
+    const a1 = mk("spark", "10.0.0.9", 18080, fabric); // highest prior...
+    const a2 = mk("spark", "10.0.0.5", 18080, mgmt);
+    const a3 = mk("spark", "10.0.0.5", 18081, mgmt);
+    const b1 = mk("other", "10.1.0.1", 18080, mgmt);
+
+    const groups1 = try groupPathsByPeerId(gpa, &.{ a1, a2, a3, b1 });
+    defer {
+        for (groups1) |g| gpa.free(g);
+        gpa.free(groups1);
+    }
+    const groups2 = try groupPathsByPeerId(gpa, &.{ b1, a3, a2, a1 });
+    defer {
+        for (groups2) |g| gpa.free(g);
+        gpa.free(groups2);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), groups1.len);
+    // Highest prior walks first; equal-prior ties break by ip, then port.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, groups1[0]);
+    try std.testing.expectEqualSlices(usize, &.{3}, groups1[1]);
+
+    try std.testing.expectEqual(@as(usize, 2), groups2.len);
+    // Same addresses, reversed arrival: identical walk order per group
+    // (fabric address first, then the mgmt pair by ip/port).
+    try std.testing.expectEqualSlices(usize, &.{0}, groups2[0]);
+    try std.testing.expectEqualSlices(usize, &.{ 3, 2, 1 }, groups2[1]);
 }
 
 /// Connected socketpair with `response` already written into fds[0]: a

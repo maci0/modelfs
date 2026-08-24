@@ -680,7 +680,20 @@ fn cmdPeers(gpa: std.mem.Allocator, opts: Opts) !u8 {
     };
     defer _ = sys.c.closedir(dir);
     const now = sys.nowSec();
-    var any = false;
+
+    // Collect before printing: readdir order is filesystem-dependent (and
+    // the origin is NFS), so sorting by lease file name keeps the listing a
+    // function of the directory's contents alone and run-to-run diffable.
+    const Row = struct {
+        name: []const u8,
+        doc: std.json.Parsed(proto.Lease),
+    };
+    var rows: std.ArrayList(Row) = .empty;
+    defer {
+        for (rows.items) |r| r.doc.deinit();
+        for (rows.items) |r| gpa.free(r.name);
+        rows.deinit(gpa);
+    }
     while (sys.c.readdir(dir)) |ent| {
         const name = sys.dirName(ent);
         if (!std.mem.endsWith(u8, name, ".json")) continue;
@@ -700,15 +713,33 @@ fn cmdPeers(gpa: std.mem.Allocator, opts: Opts) !u8 {
             std.log.warn("peers: skipping corrupt lease {s}", .{discover.displayName(name)});
             continue;
         };
-        defer parsed.deinit();
-        const live = parsed.value.until >= now;
+        const owned_name = gpa.dupe(u8, name) catch {
+            parsed.deinit();
+            continue;
+        };
+        rows.append(gpa, .{ .name = owned_name, .doc = parsed }) catch {
+            gpa.free(owned_name);
+            parsed.deinit();
+            continue;
+        };
+    }
+    std.mem.sort(Row, rows.items, {}, struct {
+        fn lessThan(_: void, a: Row, b: Row) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lessThan);
+
+    var any = false;
+    for (rows.items) |r| {
+        const lease = r.doc.value;
+        const live = lease.until >= now;
         const status_str = if (live) "live" else "expired";
         // Lease ids and addresses come off shared storage as other nodes'
         // JSON; echo them only when free of control bytes so `modelfs peers`
         // cannot be turned into a terminal-injection vector.
-        const id_shown = if (discover.printable(parsed.value.id)) parsed.value.id else "<id withheld: control bytes>";
-        std.debug.print("{s} (until={d}, {s})\n", .{ id_shown, parsed.value.until, status_str });
-        for (parsed.value.addrs) |a| {
+        const id_shown = if (discover.printable(lease.id)) lease.id else "<id withheld: control bytes>";
+        std.debug.print("{s} (until={d}, {s})\n", .{ id_shown, lease.until, status_str });
+        for (lease.addrs) |a| {
             const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
             std.debug.print("  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
         }
