@@ -12,7 +12,7 @@ pub const Server = struct {
     /// Concurrent connection handlers the accept loop admits, and the worker
     /// count fillFromPeers probes with: probing harder than a peer accepts
     /// would only buy rejections, so both sides share one cap.
-    pub const max_inflight: u32 = 16;
+    const max_inflight: u32 = 16;
 
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -162,7 +162,7 @@ const dial_timeout_ms: u32 = 15_000;
 /// per-recv and resets on every dribbled byte, so without a total cap one
 /// connection can hold an inflight slot (or a client fill thread) forever by
 /// sending a partial head slower than the timeout.
-pub const head_deadline_ms: i64 = 10_000;
+const head_deadline_ms: i64 = 10_000;
 
 /// Cap on a peer-chosen Content-Length driving an allocation in
 /// readFlexBodyAlloc. Caller-supplied destinations bypass it: their length is
@@ -551,7 +551,7 @@ pub fn fetchRangeInto(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, p
     _ = try readFlexBodyAlloc(gpa, fd, out);
 }
 
-pub fn rangeBps(bytes: u64, dt_ns: i128) f64 {
+fn rangeBps(bytes: u64, dt_ns: i128) f64 {
     const sec = @as(f64, @floatFromInt(dt_ns)) / 1e9;
     if (sec <= 0) return 0;
     return @as(f64, @floatFromInt(bytes)) / sec;
@@ -639,7 +639,7 @@ fn readFlexBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8) ![
     return buf;
 }
 
-pub const ProbeCtx = struct {
+const ProbeCtx = struct {
     gpa: std.mem.Allocator,
     psk: []const u8,
     rel: []const u8,
@@ -1096,10 +1096,9 @@ const TestServer = struct {
         if (self.accept_thread) |t| t.join();
         // Drain detached connection handlers before freeing what they
         // reference (the same order as teardownMount): a handler still
-        // inside serveData/serveHave allocates on the shared testing
-        // allocator, which is not thread-safe, and touching freed State
-        // after destroy crashes or corrupts the leak check. Bounded so a
-        // wedged handler cannot hang the runner.
+        // inside serveData/serveHave would otherwise touch State, Store,
+        // and Server through the TestServer struct the destroy below
+        // frees. Bounded so a wedged handler cannot hang the runner.
         var waited: u32 = 0;
         while (self.server.http_inflight.load(.monotonic) != 0 and waited < 300) : (waited += 1)
             sys.sleepMs(10);

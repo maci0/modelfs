@@ -167,8 +167,8 @@ pub const Catalog = struct {
     /// 16 MiB). Only hits are cached: a stale entry can at worst send us to
     /// a peer that no longer has the piece, which the fetch-failure
     /// fallback already handles.
-    pub const have_ttl_ms: i64 = 2000;
-    pub const have_cache_cap: usize = 32;
+    const have_ttl_ms: i64 = 2000;
+    const have_cache_cap: usize = 32;
 
     const HaveEntry = struct {
         rel: []u8,
@@ -258,7 +258,7 @@ pub const Catalog = struct {
     /// one file per node id ever seen accumulates there forever. Nodes
     /// republish every discovery tick, so mtime age identifies dead claimants
     /// without parsing untrusted JSON or comparing clocks across hosts.
-    pub const sweep_min_age_secs: i64 = 300;
+    const sweep_min_age_secs: i64 = 300;
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -369,7 +369,7 @@ pub const Catalog = struct {
         const dirz = self.clusterDir(&dbuf) catch return;
         const dir = c.opendir(dirz) orelse {
             // Degrade to the previous peer list, but say why it went stale.
-            std.log.warn("cluster leases unreadable at {s}/.cluster; keeping previous peer list", .{self.origin});
+            std.log.warn("cluster leases unreadable at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
             return;
         };
         defer _ = c.closedir(dir);

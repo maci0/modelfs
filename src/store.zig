@@ -20,7 +20,7 @@ pub const Store = struct {
     /// Idle window a file must exceed before a cached piece may be punched:
     /// cullOne picks candidates this stale, and punchPiece revalidates under
     /// the file lock so a read/fill/transfer inside the window is never culled.
-    pub const recency_secs: i64 = 10;
+    const recency_secs: i64 = 10;
 
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1729,6 +1729,13 @@ test "punchPiece refuses to cut the hole unless the cleared bits persist" {
     for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 37 + 5);
     const f = try st.get("p.bin", pattern.len);
     defer st.releaseFile(f);
+    // Expected-path warnings from SidecarBroken below (saveBits names each
+    // failed persist); keep them off the runner's stderr like sibling
+    // fault-injection tests do. Restored on scope exit so later tests still
+    // surface unexpected warnings.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
     try std.testing.expect(st.openCache(f) >= 0);
     try std.testing.expectEqual(@as(isize, 32), sys.pwriteAll(f.cache_fd, &pattern, 0));
     f.mu.lockUncancelable(std.testing.io);
@@ -1783,6 +1790,10 @@ test "disk cull refuses to cut the hole unless the cleared bits persist" {
 
     var broken = try SidecarBroken.apply(&st, "d.bin");
     defer broken.undo();
+    // Same expected-warning suppression as the punchPiece save test above.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
     try std.testing.expect(!st.punchDisk("d.bin"));
 
     var rb: [16]u8 = undefined;
