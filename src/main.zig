@@ -253,6 +253,12 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
             if (!builtin.is_test) std.log.err("--psk-value is empty; refusing to serve unauthenticated", .{});
             return error.EmptyPsk;
         }
+        // argv is world-readable via /proc/<pid>/cmdline for the daemon's
+        // whole lifetime, so an inline secret hands the cluster credential to
+        // every local user. Never refuse (dev convenience), always surface it,
+        // like the group-readable PSK-file warning below.
+        if (!builtin.is_test)
+            std.log.warn("--psk-value exposes the secret in /proc/<pid>/cmdline to every local user; prefer --psk FILE (mode 0600)", .{});
         return gpa.dupe(u8, v);
     }
     var z: [sys.c.PATH_MAX]u8 = undefined;
