@@ -309,22 +309,17 @@ pub const Store = struct {
         return f;
     }
 
-    /// Referenced entry reconciled to file_size; on failure the reference is
-    /// released before the error escapes (the one cleanup rule all three
-    /// lookup sites in get() must share).
-    fn refReconciled(self: *Store, hit: *Cached, file_size: u64) !*Cached {
+    /// References a map hit found while holding store.mu, releases the lock,
+    /// and returns the entry reconciled to file_size; on reconcile failure
+    /// the reference is released before the error escapes (the one cleanup
+    /// rule all three lookup sites in get() must share).
+    fn refHitUnlocking(self: *Store, hit: *Cached, file_size: u64) !*Cached {
+        _ = hit.refs.fetchAdd(1, .monotonic);
+        self.mu.unlock(self.io);
         return self.reconcileSize(hit, file_size) catch |err| {
             self.releaseFile(hit);
             return err;
         };
-    }
-
-    /// References a map hit found while holding store.mu, releases the lock,
-    /// and returns the entry reconciled to file_size.
-    fn refHitUnlocking(self: *Store, hit: *Cached, file_size: u64) !*Cached {
-        _ = hit.refs.fetchAdd(1, .monotonic);
-        self.mu.unlock(self.io);
-        return self.refReconciled(hit, file_size);
     }
 
     /// Returns a referenced entry: the caller owns one reference and must
