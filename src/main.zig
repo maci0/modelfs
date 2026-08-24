@@ -197,6 +197,17 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                     if (!builtin.is_test) std.debug.print("--advertise {s}: bad address (want IP[:PORT])\n", .{v});
                     return error.BadHostPort;
                 };
+                // Same contract --seed resolves for: every lease consumer
+                // (peer dial, hops scoring) inet_pton's the ip field, so a
+                // name here would publish an address no peer can ever dial,
+                // silently dead-ending this node's P2P routes. Unlike a seed
+                // it names our own interface, so there is nothing to resolve:
+                // require the dotted quad where the flag is parsed.
+                var quad: [4]u8 = undefined;
+                if (!discover.parseV4(hp.ip, &quad)) {
+                    if (!builtin.is_test) std.debug.print("--advertise {s}: {s} is not an IPv4 address (peers dial dotted quads only)\n", .{ v, hp.ip });
+                    return error.BadAdvertiseIp;
+                }
                 try opts.advertise.append(gpa, hp);
             }
         } else if (std.mem.eql(u8, a, "--seed")) {
@@ -784,6 +795,10 @@ test "parseArgs rejects bad values" {
     try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "10.0.0.1:99999" }));
     // an empty address (bare comma split) is refused at the flag, not at bind
     try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "," }));
+    // host names in --advertise would publish addresses no peer can dial
+    try std.testing.expectError(error.BadAdvertiseIp, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "spark1" }));
+    try std.testing.expectError(error.BadAdvertiseIp, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "10.0.0.1:19091,host.example" }));
+    try std.testing.expectError(error.BadAdvertiseIp, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "::1" }));
     // watermarks are percentages of free space (freePercent clamps to 100):
     // values above 100 would pin the cull phase permanently
     try std.testing.expectError(error.BadWatermark, parseArgs(gpa, &environ, &.{ "mount", "--brun", "101" }));

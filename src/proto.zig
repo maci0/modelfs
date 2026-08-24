@@ -118,6 +118,8 @@ fn parseU64Fast(s: []const u8) ?u64 {
 }
 
 /// Parses an HTTP Range header value ("bytes=start-end"). End is inclusive.
+/// An open-ended form ("bytes=start-") names everything through EOF; the
+/// server clamps the end like any over-long explicit end.
 pub fn parseRange(h: []const u8) ?Range {
     const p = "bytes=";
     const s = std.mem.trim(u8, h, " \t");
@@ -125,7 +127,10 @@ pub fn parseRange(h: []const u8) ?Range {
     const body = s[p.len..];
     const dash = std.mem.findScalar(u8, body, '-') orelse return null;
     const a = parseU64Fast(body[0..dash]) orelse return null;
-    const b = parseU64Fast(body[dash + 1 ..]) orelse return null;
+    const b = if (body.len == dash + 1)
+        std.math.maxInt(u64)
+    else
+        parseU64Fast(body[dash + 1 ..]) orelse return null;
     if (b < a) return null;
     return .{ .start = a, .end = b };
 }
@@ -243,6 +248,12 @@ test "range and query" {
     try std.testing.expectEqual(@as(u64, 16777215), r.end);
     try std.testing.expect(parseRange("bytes=10-1") == null);
     try std.testing.expect(parseRange("bytes=-5") == null);
+    // the open-ended form names everything through EOF; the suffix form
+    // (last N bytes) stays unsupported and rejected
+    const open = parseRange("bytes=10-").?;
+    try std.testing.expectEqual(@as(u64, 10), open.start);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), open.end);
+    try std.testing.expect(parseRange("bytes=-") == null);
     try std.testing.expect(parseRange("chunks=0-5") == null);
     // 20-digit values above u64 max are rejected, not overflowed
     try std.testing.expect(parseRange("bytes=0-99999999999999999999") == null);

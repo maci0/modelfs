@@ -1,5 +1,9 @@
 # Changelog & Autoresearch Notebook
 
+## [Design review pass] - 2026-08-24
+- **`--advertise` requires dotted-quad IPs**: host names were accepted at the flag but every lease consumer (`peer.zig` dial, `discover.hopsBetween`) inet_pton's the ip field, so an advertised name published an address no peer could ever dial, silently dead-ending this node's P2P routes while NFS fallback masked it. Rejected at flag parse with a named error, mirroring the rationale that last pass made `--seed` resolve-or-fail-loudly; unlike a seed, an advertise address names our own interface, so there is nothing to resolve.
+- **Peer `/data` accepts open-ended ranges (`bytes=N-`)**: the endpoint already clamps over-long explicit ends per RFC 9110 so ordinary HTTP clients can ask for the rest of a file, but the standard form for exactly that request was refused with 400. An empty end now parses as "through EOF" and flows through the existing clamp; suffix ranges (`bytes=-N`) stay rejected. Covered at the parser and end to end through a live server.
+
 ## [Functional review pass] - 2026-08-24
 - **`--seed HOST[:PORT]` now works as documented**: seed hosts that are not dotted quads are resolved once at mount setup (`sys.resolveIpv4` via `getaddrinfo`), where an unresolvable host fails the mount with a named message instead of being accepted and then dying silently on every discovery tick's dial (peer dials only accept dotted quads). Numeric seeds pass through untouched; a regression-tested `buildSeeds` helper owns the resolution.
 - **Script probes**: `peer_auth_probe.py` gained the same 30s HTTP timeout its sibling probes got in ce3aff4, so a peer that accepts but never answers fails the fault-tolerance suite instead of hanging it.

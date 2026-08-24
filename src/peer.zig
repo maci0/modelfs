@@ -1281,6 +1281,44 @@ test "serveData clamps an over-long range end to EOF" {
     try std.testing.expectEqualSlices(u8, pattern[30..], tail);
 }
 
+test "serveData answers an open-ended range with the file tail" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-open");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-open");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Ordinary HTTP clients ask for the rest of a file with "bytes=N-";
+    // the endpoint must treat it like any over-long explicit end.
+    var pattern: [32]u8 = undefined;
+    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 29 + 7);
+    var fbuf: [192]u8 = undefined;
+    var fz: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fbuf, "{s}/open.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, srv.port());
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    try std.testing.expect(fd >= 0);
+    defer sys.close(fd);
+    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(fd, &addr, 5000));
+    var req_buf: [256]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET /data?path=open.bin HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret\r\nRange: bytes=16-\r\nConnection: close\r\n\r\n", .{});
+    try std.testing.expectEqual(@as(isize, @intCast(req.len)), sys.writeAll(fd, req));
+    const body = try readFlexBodyAlloc(gpa, fd, null);
+    defer gpa.free(body);
+    try std.testing.expectEqual(pattern.len - 16, body.len);
+    try std.testing.expectEqualSlices(u8, pattern[16..], body);
+}
+
 test "serveData counts as access for cull recency" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
