@@ -54,7 +54,7 @@ modelfs mount /models --origin /net/192.168.0.100/models
 `mount` stays in the foreground (drop it in a systemd `Type=simple` unit; `--detach` to background it). Then:
 
 ```bash
-modelfs status                                    # cache usage, pieces, cull phase
+modelfs status                                    # id, pid, peers, piece size
 modelfs peers --origin /net/192.168.0.100/models  # live cluster leases
 modelfs pin gguf/foo.gguf                         # keep a file out of the cull
 modelfs unpin gguf/foo.gguf
@@ -73,7 +73,6 @@ Measured with nine `modelfs` instances on **one host over TCP loopback**, not ac
 | Benchmark | Result |
 | :--- | :--- |
 | Peak `sendfile` throughput (64 MiB pieces) | 3.5 GB/s |
-| Piece transfer latency, 16 / 32 / 64 MiB | 5.1 / 9.9 / 17.6 ms |
 | `/ping` sweep across 9 instances | 1.1 ms total |
 
 The piece-size sweep is why the default piece is 16 MiB: past it the gain is small, and every miss costs the reader a whole piece before the read returns.
