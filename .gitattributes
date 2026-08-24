@@ -1,0 +1,5 @@
+# Everything text stays LF everywhere: CRLF would break #!/usr/bin/env bash
+# shebangs, zig fmt --check, and ruff format --check.
+* text=auto eol=lf
+
+*.png binary
