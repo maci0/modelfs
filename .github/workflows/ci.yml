@@ -1,0 +1,53 @@
+# Blocking gate: the same scripts/check.sh that README documents for local
+# runs, so a lint/type/test failure fails CI instead of scrolling by.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The gate only reads the repo; do not leak a write token into it.
+permissions:
+  contents: read
+
+# A new push to the same branch or PR supersedes the in-progress run.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to full commit SHAs (tag in comment): a moved tag
+      # cannot silently change what CI executes.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      # README requirement: compiling against libfuse3 needs its headers,
+      # which ubuntu-latest does not preinstall.
+      - name: Install libfuse3 development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfuse3-dev
+
+      # Python tooling exactly as pinned in requirements-dev.lock.txt
+      # (hash-verified install, per README). activate-environment creates
+      # .venv and puts it on PATH; the uv download/toolchain cache is on by
+      # default and keyed on requirements*.txt.
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          python-version: "3.12"
+          activate-environment: true
+
+      - name: Install pinned Python tooling
+        # check.sh invokes ruff/mypy by name from the activated venv.
+        run: uv pip install --require-hashes -r requirements-dev.lock.txt
+
+      # shellcheck is preinstalled on ubuntu-latest runners.
+      - name: Static analysis gate
+        run: ./scripts/check.sh
