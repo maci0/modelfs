@@ -246,6 +246,11 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     // on the old value then underflow the subtraction on the new one.
     file.mu.lockUncancelable(st.io);
     const fsize = file.size;
+    // A warm read touches no other state until readCache stamps at the end:
+    // without a stamp here, a cull punch (idle past the window, all gates
+    // green) could land between ensureRange's bit checks and the read and
+    // serve hole zeros behind bits this call already trusted.
+    file.last_access.store(sys.monoSec(), .monotonic);
     file.mu.unlock(st.io);
     if (uoff >= fsize) return 0;
     const n = @min(want, @as(usize, @intCast(fsize - uoff)));

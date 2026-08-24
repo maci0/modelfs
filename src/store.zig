@@ -513,7 +513,14 @@ pub const Store = struct {
             return;
         }
         _ = file.filling.remove(idx);
-        if (ok) file.bits.set(idx);
+        if (ok) {
+            file.bits.set(idx);
+            // Landing bytes is access. The claim's stamp predates the fill,
+            // so a fill slower than recency_secs would leave this fresh piece
+            // punchable the moment the filling claim cleared, before the
+            // reader's readCache gets its own stamp in.
+            file.last_access.store(sys.monoSec(), .monotonic);
+        }
         _ = self.saveBits(file, false);
     }
 
@@ -577,6 +584,12 @@ pub const Store = struct {
     pub fn hasPiece(self: *Store, file: *Cached, idx: u32) bool {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
+        // Probing a piece is read intent: stamping under this same lock keeps
+        // punchPiece's recency revalidation from holing the piece between
+        // this answer and the caller's read of it, including across a
+        // multi-piece hydration whose later pieces fill past the window
+        // (per-piece claim stamps alone go stale mid-loop).
+        file.last_access.store(sys.monoSec(), .monotonic);
         return file.bits.get(idx);
     }
 
@@ -1336,10 +1349,57 @@ test "punchPiece refuses while a peer transfer is inflight" {
 
     _ = f.xfer.fetchAdd(1, .monotonic);
     try std.testing.expect(!st.punchPiece(f, 0));
-    try std.testing.expect(st.hasPiece(f, 0));
+    // Passive bit observation (hasPiece itself now counts as access and
+    // would refresh the recency window under test).
+    f.mu.lockUncancelable(std.testing.io);
+    const piece0_cached = f.bits.get(0);
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(piece0_cached);
 
     // Transfer done: the idle cached piece culls normally.
     _ = f.xfer.fetchSub(1, .monotonic);
+    try std.testing.expect(st.punchPiece(f, 0));
+    try std.testing.expect(!st.hasPiece(f, 0));
+}
+
+test "fill completion and piece probes refresh the cull recency window" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-recency-fill");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-recency-fill");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("slow.bin", 64);
+    defer st.releaseFile(f);
+
+    // A fill that outruns the cull window: the claim stamped last_access at
+    // its start, so on completion the entry reads as window-stale. Regression:
+    // punchPiece could hole the just-filled piece before the reader's
+    // readCache stamped, serving hole zeros behind a bit this read trusted.
+    f.last_access.store(sys.monoSec() - 3600, .monotonic);
+    try std.testing.expect((try st.beginFill(f, 0)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef"));
+    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(st.hasPiece(f, 0));
+
+    // Same guard on the probe itself: a warm read answers every bit check
+    // without filling anything, so hasPiece must carry the stamp that keeps
+    // a concurrent punch out of the check-to-readCache window.
+    f.last_access.store(sys.monoSec() - 3600, .monotonic);
+    _ = st.hasPiece(f, 1);
+    try std.testing.expect(!st.punchPiece(f, 0));
+
+    // Once genuinely idle past the window, the same piece culls normally:
+    // the stamps close race windows, they do not block culling.
+    f.mu.lockUncancelable(std.testing.io);
+    f.last_access.store(sys.monoSec() - 3600, .monotonic);
+    f.mu.unlock(std.testing.io);
     try std.testing.expect(st.punchPiece(f, 0));
     try std.testing.expect(!st.hasPiece(f, 0));
 }

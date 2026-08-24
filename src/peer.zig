@@ -19,6 +19,11 @@ pub const Server = struct {
     psk: []const u8,
     store: *store_mod.Store,
     listen_fds: std.ArrayList(std.posix.fd_t) = .empty,
+    /// Guards listen_fds between serve()'s accept-loop spawner and stop():
+    /// an unmount landing while the freshly spawned serve thread is still
+    /// walking the list would otherwise close fds and free the list under it.
+    /// bindAll runs strictly before either thread exists, so it needs no lock.
+    fds_mu: std.Io.Mutex = .init,
     running: std.atomic.Value(bool) = .init(true),
     http_inflight: std.atomic.Value(u32) = .init(0),
 
@@ -59,24 +64,34 @@ pub const Server = struct {
             for (threads.items) |t| t.join();
             threads.deinit(self.gpa);
         }
-        // Reserve one slot per listener before spawning anything: an append
-        // failure after a spawn used to detach that accept loop beyond the
-        // join-all below, leaving it unsupervised at shutdown.
-        threads.ensureTotalCapacity(self.gpa, self.listen_fds.items.len) catch {
-            std.log.err("peer http: cannot allocate accept-loop registry; ports unserved", .{});
-            return;
-        };
-        for (self.listen_fds.items) |fd| {
-            const t = std.Thread.spawn(.{}, acceptLoop, .{ self, fd }) catch {
-                std.log.err("peer http: cannot start accept loop on fd {d}; port unserved", .{fd});
-                continue;
+        // The spawn phase takes fds_mu so stop() cannot tear the list down
+        // mid-walk; it must NOT span the join below, or an unmount would
+        // block in stop() behind a lock serve only releases after every
+        // accept loop exits.
+        {
+            // Reserve one slot per listener before spawning anything: an
+            // append failure after a spawn used to detach that accept loop
+            // beyond the join-all below, leaving it unsupervised at shutdown.
+            self.fds_mu.lockUncancelable(self.io);
+            defer self.fds_mu.unlock(self.io);
+            threads.ensureTotalCapacity(self.gpa, self.listen_fds.items.len) catch {
+                std.log.err("peer http: cannot allocate accept-loop registry; ports unserved", .{});
+                return;
             };
-            threads.appendAssumeCapacity(t);
+            for (self.listen_fds.items) |fd| {
+                const t = std.Thread.spawn(.{}, acceptLoop, .{ self, fd }) catch {
+                    std.log.err("peer http: cannot start accept loop on fd {d}; port unserved", .{fd});
+                    continue;
+                };
+                threads.appendAssumeCapacity(t);
+            }
         }
     }
 
     pub fn stop(self: *Server) void {
         self.running.store(false, .release);
+        self.fds_mu.lockUncancelable(self.io);
+        defer self.fds_mu.unlock(self.io);
         for (self.listen_fds.items) |fd| {
             _ = c.shutdown(fd, c.SHUT_RDWR);
             sys.close(fd);
