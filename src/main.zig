@@ -654,24 +654,15 @@ fn cmdPeers(gpa: std.mem.Allocator, opts: Opts) !u8 {
         const blob = sys.readFileAlloc(gpa, fp, 64 * 1024) catch |err| {
             // Open failure covers the normal race against expiry cleanup;
             // anything persisting across invocations is named, matching the
-            // corrupt-lease warn below and Catalog.refresh's policy. Names
-            // are echoed only when printable (shared-storage input).
+            // corrupt-lease warn below and Catalog.refresh's policy.
             if (err != error.OpenFailed) {
-                if (discover.printable(name)) {
-                    std.log.warn("peers: cannot read lease {s}: {t}", .{ name, err });
-                } else {
-                    std.log.warn("peers: cannot read a lease whose name has control bytes: {t}", .{err});
-                }
+                std.log.warn("peers: cannot read lease {s}: {t}", .{ discover.displayName(name), err });
             }
             continue;
         };
         defer gpa.free(blob);
         const parsed = proto.parseLease(gpa, blob) catch {
-            if (discover.printable(name)) {
-                std.log.warn("peers: skipping corrupt lease {s}", .{name});
-            } else {
-                std.log.warn("peers: skipping corrupt lease (name has control bytes)", .{});
-            }
+            std.log.warn("peers: skipping corrupt lease {s}", .{discover.displayName(name)});
             continue;
         };
         defer parsed.deinit();

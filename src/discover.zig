@@ -119,6 +119,14 @@ pub fn printable(s: []const u8) bool {
     return true;
 }
 
+/// Name safe to echo into a log line: the input when printable, else a fixed
+/// placeholder. Lease file names come off shared NFS storage anyone with
+/// origin write access can craft, so every site that logs one goes through
+/// here rather than re-deciding the printable gate inline.
+pub fn displayName(name: []const u8) []const u8 {
+    return if (printable(name)) name else "<name withheld: control bytes>";
+}
+
 /// True when s is safe to publish as this node's cluster id. The id names
 /// the lease file (<origin>/.cluster/<id>.json), is embedded verbatim as a
 /// JSON string in that document, and is echoed into logs, so it must be
@@ -381,22 +389,12 @@ pub const Catalog = struct {
             // persisting across ticks is worth naming.
             const blob = sys.readFileBuf(&lease_buf, fp) catch |err| {
                 if (err != error.OpenFailed) {
-                    // Name echoed only when printable: it comes from shared
-                    // storage anyone with origin write access can craft.
-                    if (printable(name)) {
-                        std.log.warn("lease read failed for {s}: {t}", .{ name, err });
-                    } else {
-                        std.log.warn("lease read failed for a name with control bytes: {t}", .{err});
-                    }
+                    std.log.warn("lease read failed for {s}: {t}", .{ displayName(name), err });
                 }
                 continue;
             };
             const parsed = proto.parseLease(self.gpa, blob) catch {
-                if (printable(name)) {
-                    std.log.warn("skipping corrupt lease {s}", .{name});
-                } else {
-                    std.log.warn("skipping corrupt lease (name has control bytes)", .{});
-                }
+                std.log.warn("skipping corrupt lease {s}", .{displayName(name)});
                 continue;
             };
             defer parsed.deinit();
@@ -468,18 +466,10 @@ pub const Catalog = struct {
             if (sys.statPath(fp, &st) != 0) continue;
             if (st.st_mtim.tv_sec > cutoff) continue;
             if (c.unlink(fp) != 0) {
-                if (printable(name)) {
-                    std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ name, sys.errno() });
-                } else {
-                    std.log.warn("lease sweep unlink failed for a name with control bytes (errno {d})", .{sys.errno()});
-                }
+                std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ displayName(name), sys.errno() });
                 continue;
             }
-            if (printable(name)) {
-                std.log.info("swept stale cluster lease {s}", .{name});
-            } else {
-                std.log.info("swept stale cluster lease (name has control bytes)", .{});
-            }
+            std.log.info("swept stale cluster lease {s}", .{displayName(name)});
         }
     }
 
@@ -683,6 +673,12 @@ test "printable gates lease names and ids for log echo" {
     // ESC and other C0 bytes, plus DEL, would inject terminal escapes
     try std.testing.expect(!printable("\x1b]0;pwned\x07"));
     try std.testing.expect(!printable("\x7f"));
+}
+
+test "displayName echoes printable names and withholds the rest" {
+    try std.testing.expectEqualStrings("spark1.json", displayName("spark1.json"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("a\nb"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("\x7f"));
 }
 
 test "validId gates the lease file name and JSON document" {

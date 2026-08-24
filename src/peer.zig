@@ -326,7 +326,7 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
 fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, size: u64) bool {
     const cov = piece.cover(start, want, size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
-    const ps = self.store.piece_size;
+    const piece_size = self.store.piece_size;
     var pbuf: ?[]u8 = null;
     defer if (pbuf) |b| self.gpa.free(b);
     var pi = cov.start;
@@ -337,7 +337,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             // leave the piece claimed forever and wedge every later filler
             // of it into the claim's retry spin.
             if (pbuf == null)
-                pbuf = self.gpa.alloc(u8, ps) catch {
+                pbuf = self.gpa.alloc(u8, piece_size) catch {
                     std.log.warn("hydration buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, pi });
                     replyStatus(fd, "500 Internal Server Error");
                     return false;
@@ -356,7 +356,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                 // 404 would tell the peer the path is gone over a size race.
                 .raced => continue,
                 .len => |ln| {
-                    const got = self.store.originPread(file.rel, pbuf.?[0..ln], piece.offset(pi, ps));
+                    const got = self.store.originPread(file.rel, pbuf.?[0..ln], piece.offset(pi, piece_size));
                     if (got == @as(isize, @intCast(ln))) {
                         const w = self.store.completeFill(file, pi, pbuf.?[0..ln]);
                         if (w != 0) {
@@ -821,7 +821,7 @@ pub fn fillFromPeers(
     cat: *discover.Catalog,
     rel: []const u8,
     idx: u32,
-    ps: u32,
+    piece_size: u32,
     out: []u8,
 ) !void {
     const cands = try probeCandidates(gpa, psk, cat, rel, idx);
@@ -835,7 +835,7 @@ pub fn fillFromPeers(
     while (discover.pickBest(remaining)) |bi| {
         const win = remaining[bi];
         _ = cat.inflight(win.ip, win.port, 1);
-        const start = piece.offset(idx, ps);
+        const start = piece.offset(idx, piece_size);
         // Saturating: a caller passing an empty buffer (only possible via an
         // out-of-band truncate race today) must not underflow the range end.
         const end = start +| out.len -| 1;
