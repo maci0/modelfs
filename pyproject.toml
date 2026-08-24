@@ -6,10 +6,24 @@ target-version = "py310"
 [tool.ruff.lint]
 # pycodestyle errors/warnings, pyflakes, bugbear, pyupgrade, simplify,
 # pylint's defect-oriented subset, and ruff-specific hygiene.
-select = ["E", "F", "W", "B", "UP", "SIM", "PL", "RUF"]
+# Plus defect-oriented groups: builtin shadowing (A), unused arguments
+# (ARG), comprehension pitfalls (C4), naive datetimes (DTZ),
+# private-member access (SLF), and committed debuggers (T10).
+select = ["E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ", "SLF", "T10"]
 
 [tool.mypy]
 strict = true
+# Beyond the strict bundle: flag unreachable code and redundant/truthiness
+# mistakes, require code-scoped ignores, and catch possibly-undefined names.
+warn_unreachable = true
+enable_error_code = [
+    "redundant-expr",
+    "redundant-self",
+    "truthy-bool",
+    "truthy-iterable",
+    "ignore-without-code",
+    "possibly-undefined",
+]
 
 [[tool.mypy.overrides]]
 # matplotlib ships no type stubs.
