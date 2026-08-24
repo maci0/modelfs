@@ -619,6 +619,12 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     }
     try std.testing.expectEqual(@as(usize, 1), cat.have_cache.items.len);
 
+    // Past the TTL the same entry answers nothing: stale bits would send
+    // fills to pieces a peer no longer has. (Backdating the stamp instead of
+    // sleeping keeps the suite fast.)
+    cat.have_cache.items[0].expires_ms = sys.monoMs() - 1;
+    try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080) == null);
+
     // Distinct keys fill to the cap; one more insert evicts exactly one
     // entry so the bound holds.
     var i: usize = 0;

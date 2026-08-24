@@ -296,4 +296,16 @@ test "lease json roundtrip" {
     try std.testing.expectEqual(@as(i64, 1710000060), parsed.value.until);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.addrs.len);
     try std.testing.expectEqual(@as(u32, 200000), parsed.value.addrs[0].mbps);
+
+    // Lease documents come off shared NFS storage: unknown fields from a
+    // newer peer must be tolerated...
+    {
+        const extended = "{\"id\":\"n1\",\"until\":5,\"addrs\":[],\"proto_version\":9}";
+        const p = try parseLease(std.testing.allocator, extended);
+        defer p.deinit();
+        try std.testing.expectEqualStrings("n1", p.value.id);
+    }
+    // ...while malformed JSON is rejected, not half-parsed.
+    try std.testing.expectError(error.UnexpectedEndOfInput, parseLease(std.testing.allocator, "{\"id\":"));
+    try std.testing.expectError(error.SyntaxError, parseLease(std.testing.allocator, "not json at all"));
 }

@@ -841,8 +841,13 @@ pub fn fillFromPeers(
 }
 
 test "rangeBps" {
+    // Exact rate: 16 MiB over 8 ms.
     const b = rangeBps(16 * 1024 * 1024, 8_000_000);
-    try std.testing.expect(b > 1e9);
+    try std.testing.expectEqual(@as(f64, 16 * 1024 * 1024) / 0.008, b);
+    // A non-positive elapsed time must yield 0, not inf/NaN (it feeds
+    // updateGoodput's EWMA, which would poison the path score).
+    try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, 0));
+    try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, -1));
 }
 
 /// Connected socketpair with `response` already written into fds[0]: a
@@ -1074,6 +1079,15 @@ const TestServer = struct {
         self.server.running.store(false, .release);
         for (self.server.listen_fds.items) |fd| _ = c.shutdown(fd, c.SHUT_RDWR);
         if (self.accept_thread) |t| t.join();
+        // Drain detached connection handlers before freeing what they
+        // reference (the same order as teardownMount): a handler still
+        // inside serveData/serveHave allocates on the shared testing
+        // allocator, which is not thread-safe, and touching freed State
+        // after destroy crashes or corrupts the leak check. Bounded so a
+        // wedged handler cannot hang the runner.
+        var waited: u32 = 0;
+        while (self.server.http_inflight.load(.monotonic) != 0 and waited < 300) : (waited += 1)
+            sys.sleepMs(10);
         self.server.stop();
         self.store.deinit();
         self.gpa.destroy(self);
@@ -1081,8 +1095,135 @@ const TestServer = struct {
 };
 
 test "fault tolerance: dial unreachable peer fails gracefully" {
-    const err = dial("127.0.0.1", 19999);
+    // Reserve a kernel-picked free port, then release it: dialing a closed
+    // port must fail with Connect. A hardcoded port here would break on any
+    // host where a real service already holds it.
+    const free_port = blk: {
+        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        try std.testing.expect(lfd >= 0);
+        defer sys.close(lfd);
+        var addr = std.mem.zeroes(c.struct_sockaddr_in);
+        addr.sin_family = c.AF_INET;
+        addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+        try std.testing.expectEqual(@as(i32, 0), c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)));
+        var got = std.mem.zeroes(c.struct_sockaddr_in);
+        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        try std.testing.expectEqual(@as(i32, 0), c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen));
+        break :blk std.mem.bigToNative(u16, got.sin_port);
+    };
+    const err = dial("127.0.0.1", free_port);
     try std.testing.expectError(error.Connect, err);
+}
+
+/// One raw request over its own connection; returns everything the server
+/// wrote until it closed the socket (every reply here carries
+/// "Connection: close"). Read failures surface so a hung handler fails the
+/// test on the client socket timeout instead of hanging the runner.
+fn roundTrip(port: u16, req: []const u8) !std.ArrayList(u8) {
+    const gpa = std.testing.allocator;
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, port);
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    try std.testing.expect(fd >= 0);
+    defer sys.close(fd);
+    sys.setSockTimeout(fd, 5000);
+    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(fd, &addr, 5000));
+    try std.testing.expect(sys.writeAll(fd, req) == @as(isize, @intCast(req.len)));
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = sys.readOnce(fd, &buf) catch break;
+        if (n == 0) break;
+        try out.appendSlice(gpa, buf[0..n]);
+        if (out.items.len > 64 * 1024) return error.ResponseTooBig;
+    }
+    return out;
+}
+
+test "serveHave answers with the exact cached bitfield blob" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-have");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-have");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Two pieces at piece size 16; warm both so /have must advertise both.
+    var pattern: [32]u8 = undefined;
+    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 13 + 1);
+    var fbuf: [192]u8 = undefined;
+    var fz: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fbuf, "{s}/bits.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+    const port = srv.port();
+    const warm = try fetchRange(gpa, "secret", "127.0.0.1", port, "bits.bin", 0, 31);
+    gpa.free(warm);
+
+    // The /have body is the raw cache bitfield: bit i names piece i, one
+    // byte per eight pieces, no sidecar header. fillFromPeers' candidate
+    // "have" decisions are computed from exactly these bytes.
+    const bits = try fetchHave(gpa, "secret", "127.0.0.1", port, "bits.bin");
+    defer gpa.free(bits);
+    try std.testing.expectEqual(@as(usize, 1), bits.len);
+    try std.testing.expectEqual(@as(u8, 0b00000011), bits[0]);
+
+    // A directory at the requested path is a miss (404), same as ENOENT:
+    // /have advertises regular files only.
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(try sys.joinZ(&fz, origin_d, "sub")), 0o755));
+    var res = try roundTrip(port, "GET /have?path=sub HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+    defer res.deinit(gpa);
+    try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "peer http dispatch answers ping, wrong method, and unknown paths" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-dispatch");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-dispatch");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+    const port = srv.port();
+
+    // /ping is the liveness probe: 200 with body "ok".
+    {
+        var res = try roundTrip(port, "GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\nok"));
+    }
+    // A non-GET method is refused even with valid auth.
+    {
+        var res = try roundTrip(port, "POST /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 405 Method Not Allowed\r\n"));
+    }
+    // Unknown paths are 404, not confused with origin misses.
+    {
+        var res = try roundTrip(port, "GET /nope?path=x.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+    }
+    // /data without a Range header is a client error, not a full-file send.
+    {
+        var fbuf: [192]u8 = undefined;
+        var fz: [192]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fbuf, "{s}/r.bin", .{origin_d});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), "data"));
+        var res = try roundTrip(port, "GET /data?path=r.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+    }
 }
 
 test "serveData replies 500 when the cache refuses hydrated bytes" {

@@ -1294,8 +1294,19 @@ test "forget evicts after release and reapIdle frees idle empty entries" {
     f3.last_access.store(sys.monoSec() - 3600, .monotonic);
     st.releaseFile(f3);
 
+    // ...and a pinned entry survives the reaper even when idle and empty:
+    // an operator's pin must hold across reaping, not just culling.
+    const f4 = try st.get("held.bin", 64);
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("held.bin", true));
+    f4.last_access.store(sys.monoSec() - 3600, .monotonic);
+    st.releaseFile(f4);
+
     st.reapIdle(60);
-    try std.testing.expectEqual(@as(usize, 1), st.files.count());
+    try std.testing.expectEqual(@as(usize, 2), st.files.count());
+    const f4b = st.lookupRef("held.bin").?;
+    try std.testing.expectEqual(f4, f4b);
+    st.releaseFile(f4b);
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("held.bin", false));
     const f2b = st.lookupRef("kept.bin").?;
     try std.testing.expectEqual(f2, f2b);
     f2b.mu.lockUncancelable(std.testing.io);
@@ -1336,6 +1347,49 @@ test "punchPiece refuses while a peer transfer is inflight" {
     _ = f.xfer.fetchSub(1, .monotonic);
     try std.testing.expect(st.punchPiece(f, 0));
     try std.testing.expect(!st.hasPiece(f, 0));
+}
+
+test "punchPiece refuses pinned and freshly accessed entries" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pp-gates");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pp-gates");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("gated.bin", 64);
+    defer st.releaseFile(f);
+    f.mu.lockUncancelable(std.testing.io);
+    f.bits.set(0);
+    f.mu.unlock(std.testing.io);
+
+    // A pinned piece must survive culling no matter how idle it sits.
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("gated.bin", true));
+    f.mu.lockUncancelable(std.testing.io);
+    f.last_access.store(sys.monoSec() - 3600, .monotonic);
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(st.hasPiece(f, 0));
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("gated.bin", false));
+
+    // A piece touched inside the recency window must not punch: a read,
+    // fill, or transfer may still be using those pages.
+    f.mu.lockUncancelable(std.testing.io);
+    f.last_access.store(sys.monoSec(), .monotonic);
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(st.hasPiece(f, 0));
+
+    // Past the window with nothing held, the same piece culls normally.
+    f.mu.lockUncancelable(std.testing.io);
+    f.last_access.store(sys.monoSec() - 3600, .monotonic);
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(st.punchPiece(f, 0));
 }
 
 /// Writes a meta sidecar for rel naming exactly `filled` pieces as cached,

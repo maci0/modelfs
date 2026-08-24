@@ -631,3 +631,59 @@ test "fuse operations wire every supported handler" {
     try std.testing.expect(o.init != null);
     try std.testing.expect(o.destroy != null);
 }
+
+test "statusJson publishes parseable liveness atomically and replaces in place" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-status");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = State{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .store = store_mod.Store.init(gpa, std.testing.io, "/unused", cache_d, 4096),
+        .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
+        .server = undefined,
+        .psk = "",
+        .direct_io = true,
+    };
+    defer st.store.deinit();
+    defer st.catalog.deinit();
+    // Two paths sharing one peer id plus one distinct peer: the published
+    // count must be unique peers (2), not raw paths (3).
+    try st.catalog.paths.append(gpa, .{ .peer_id = "dup", .ip = "10.0.0.1", .port = 18080, .ewma_bps = 1e8, .hops = 0 });
+    try st.catalog.paths.append(gpa, .{ .peer_id = "dup", .ip = "10.0.0.2", .port = 18080, .ewma_bps = 1e8, .hops = 0 });
+    try st.catalog.paths.append(gpa, .{ .peer_id = "other", .ip = "10.0.0.3", .port = 18080, .ewma_bps = 1e8, .hops = 0 });
+
+    try statusJson(&st);
+
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const fp = try sys.joinZ(&pbuf, cache_d, status_file);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const tmp_fp = try sys.appendExt(&zbuf, fp, ".tmp");
+    var stbuf: sys.c.struct_stat = undefined;
+    // The rename must leave no staging file behind: a leftover .tmp next to
+    // the live artifact means readers raced a torn write.
+    try std.testing.expect(sys.statPath(fp, &stbuf) == 0);
+    try std.testing.expect(sys.statPath(tmp_fp, &stbuf) != 0);
+
+    const blob = try sys.readFileAlloc(gpa, fp, 1024);
+    defer gpa.free(blob);
+    const StatusDoc = struct { id: []const u8, pid: i64, peers: u32, piece: u32 };
+    const doc = try std.json.parseFromSlice(StatusDoc, gpa, blob, .{});
+    defer doc.deinit();
+    try std.testing.expectEqualStrings("me", doc.value.id);
+    try std.testing.expectEqual(@as(i64, std.os.linux.getpid()), doc.value.pid);
+    try std.testing.expectEqual(@as(u32, 2), doc.value.peers);
+    try std.testing.expectEqual(@as(u32, 4096), doc.value.piece);
+
+    // A later discovery tick republishes: the rename replaces the document
+    // wholesale, so the peer count tracks membership instead of growing.
+    _ = st.catalog.paths.pop();
+    try statusJson(&st);
+    const blob2 = try sys.readFileAlloc(gpa, fp, 1024);
+    defer gpa.free(blob2);
+    const doc2 = try std.json.parseFromSlice(StatusDoc, gpa, blob2, .{});
+    defer doc2.deinit();
+    try std.testing.expectEqual(@as(u32, 1), doc2.value.peers);
+}
