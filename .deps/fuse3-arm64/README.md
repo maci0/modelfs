@@ -21,7 +21,10 @@ Downloaded from the Ubuntu noble archive (main/f/fuse3 pool):
   sha256: 9a32e4ed3fe950417074d534207d399c5a80ad06843e265ae75a06ba703feafb
 
 Verify before use: `sha256sum -c` against the digests above, then compare
-with `Release` file hashes from archive.ubuntu.com.
+with `Release` file hashes from archive.ubuntu.com. `build.zig` enforces
+these digests on every build and fails with a mismatch message if either
+`.deb` drifted; after a legitimate refresh, update both digests here and
+in `build.zig`.
 
 ## Layout
 
@@ -37,4 +40,4 @@ with `Release` file hashes from archive.ubuntu.com.
 Bump to a newer noble security update by replacing both `.deb`s with the
 same-versioned builds from the pool, re-extracting into `root/`
 (`dpkg-deb -x <deb> root/`), recreating the `lib/` symlinks, and updating
-the digests above.
+the digests above in this README and in `build.zig`.

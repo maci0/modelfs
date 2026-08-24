@@ -2,10 +2,12 @@
 # dependencies; these cover scripts/check.sh and scripts/run_benchmarks_and_plots.py.
 # check.sh additionally requires the system tools zig (0.16) and shellcheck,
 # which are not pip-installable and are intentionally not listed here.
-# Install: uv venv .venv && uv pip install -r requirements-dev.txt
+# Install: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
 #
 # Pins: lower bound = oldest validated version, capped before the next
 # breaking release so lint/config changes cannot drift in unnoticed.
+# requirements-dev.lock.txt resolves this file to exact, sha256-pinned
+# versions; regenerate it (command in its header) after changing bounds.
 matplotlib>=3.11,<4
 mypy>=2.1,<3
 ruff>=0.16,<0.17

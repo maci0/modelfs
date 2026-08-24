@@ -87,7 +87,7 @@ The piece-size sweep is why the default piece is 16 MiB: past it the gain is sma
 python3 scripts/run_benchmarks_and_plots.py
 ```
 
-Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt) (`uv pip install -r requirements-dev.txt`).
+Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); install the hash-verified lock with `uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt`.
 
 ## Source layout
 
