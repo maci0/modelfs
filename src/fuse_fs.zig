@@ -317,7 +317,14 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
         // The origin write already succeeded, so a failed cache copy only
         // costs re-hydration; the helper logs it and skips piece marking.
         _ = st.store.copyIntoCache(file, uoff, buf[0..@intCast(n)], if (end > old_size) end else null);
+        return @intCast(n);
     }
+    // Neither size observation landed: the entry's bits can no longer be
+    // proven to describe this inode's post-write contents, so drop them
+    // instead of silently serving pre-write bytes as current. The write
+    // itself already succeeded, so the syscall still reports n.
+    std.log.warn("post-write stat failed for {s}; cache marks dropped, pieces refill", .{rel});
+    st.store.distrust(rel);
     return @intCast(n);
 }
 

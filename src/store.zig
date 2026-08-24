@@ -241,6 +241,31 @@ pub const Store = struct {
         self.purge_epoch += 1;
     }
 
+    /// Drops trust in every cached byte keyed to rel after a write whose
+    /// post-write size could not be observed: unlinks the persisted sidecar
+    /// and clears the live entry's marks, so no read can serve pre-write
+    /// bytes as current. Unlike forget, data files and pins stay: the bytes
+    /// on disk are intact, they just cannot be proven current, and unmarked
+    /// pieces refill over them on demand. The unlink shares the store.mu
+    /// window with forget/reap purges so a racing get() builder cannot
+    /// publish bits loaded from the doomed sidecar; the mark wipe sits under
+    /// file.mu where finishPiece and copyIntoCache save.
+    pub fn distrust(self: *Store, rel: []const u8) void {
+        var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+        const mp = self.cacheMetaPath(&mbuf, rel) catch return;
+        self.mu.lockUncancelable(self.io);
+        unlinkOrWarn(mp, "meta", rel);
+        // Same builder-invalidation contract as forget: a builder whose
+        // sidecar read raced this unlink must not publish its stale bits.
+        self.purge_epoch += 1;
+        self.mu.unlock(self.io);
+        const f = self.lookupRef(rel) orelse return;
+        defer self.releaseFile(f);
+        f.mu.lockUncancelable(self.io);
+        @memset(f.bits.bytes, 0);
+        f.mu.unlock(self.io);
+    }
+
     fn loadBits(self: *Store, rel: []const u8, file_size: u64) !piece.Bitfield {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = try self.cacheMetaPath(&buf, rel);
@@ -1343,6 +1368,74 @@ test "forget evicts after release and reapIdle frees idle empty entries" {
     try std.testing.expect(f2b.bits.get(0));
     f2b.mu.unlock(std.testing.io);
     st.releaseFile(f2b);
+}
+
+test "distrust drops sidecar and live marks but keeps data bytes and pins" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-distrust");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-distrust");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Cached piece with landed bytes plus an operator pin: distrust must
+    // drop the trust state (sidecar + marks) without destroying either.
+    const f = try st.get("d.bin", 32);
+    try std.testing.expect(st.openCache(f) >= 0);
+    try std.testing.expectEqual(@as(isize, 32), sys.pwriteAll(f.cache_fd, "0123456789abcdef0123456789abcdef", 0));
+    f.mu.lockUncancelable(std.testing.io);
+    f.bits.set(1);
+    f.mu.unlock(std.testing.io);
+    _ = st.saveBits(f, false);
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("d.bin", true));
+    st.releaseFile(f);
+
+    const e0 = st.purge_epoch;
+    st.distrust("d.bin");
+    try std.testing.expectEqual(e0 + 1, st.purge_epoch);
+
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    var stbuf: c.struct_stat = undefined;
+    // Sidecar unlinked: a later build (this run or post-restart) cannot
+    // load the pre-write bits back.
+    const mp = try st.cacheMetaPath(&mb, "d.bin");
+    try std.testing.expect(sys.statPath(mp, &stbuf) != 0);
+    // Data file and pin stay: unmarked pieces refill over intact bytes,
+    // and the operator's pin outlives a failed stat.
+    const dp = try st.cacheDataPath(&db, "d.bin");
+    try std.testing.expect(sys.statPath(dp, &stbuf) == 0);
+    try std.testing.expect(st.pinExists("d.bin"));
+
+    // The live entry's marks are cleared under the same contract.
+    const f2 = st.lookupRef("d.bin").?;
+    defer st.releaseFile(f2);
+    f2.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
+    f2.mu.unlock(std.testing.io);
+
+    // A rel with no live entry still loses its persisted sidecar.
+    _ = try st.cacheMetaPath(&mb, "ghost.bin");
+    var ghost_bits = try piece.Bitfield.init(gpa, 2);
+    defer ghost_bits.deinit(gpa);
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(gpa);
+    try ghost_bits.encode(16, 32, &blob, gpa);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(mp, blob.items));
+    st.distrust("ghost.bin");
+    try std.testing.expect(sys.statPath(mp, &stbuf) != 0);
+
+    // The next build starts from nothing instead of the dropped bits.
+    const f3 = try st.get("ghost.bin", 32);
+    defer st.releaseFile(f3);
+    f3.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 0), f3.bits.filled());
+    f3.mu.unlock(std.testing.io);
 }
 
 test "punchPiece refuses while a peer transfer is inflight" {
