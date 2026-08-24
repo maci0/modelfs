@@ -230,11 +230,15 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     }
     // Flag and env sources share one gate: an empty id makes this node
     // publish the same lease file as every other empty-id node and
-    // overwrite each other -- the exact collision hostname() refuses to
-    // fall into silently.
+    // overwrite each other, and an id that cannot ride in the lease file
+    // name or JSON document (separator, quote, control byte, leading dot)
+    // makes every peer's parser refuse the lease -- either way this node
+    // drops out of discovery while NFS fallback hides why. Same rules
+    // discover.hostname answers to.
     if (opts.id) |id| {
-        if (id.len == 0) {
-            if (!builtin.is_test) std.debug.print("--id needs a non-empty name\n", .{});
+        if (!discover.validId(id)) {
+            if (!builtin.is_test)
+                std.debug.print("--id \"{s}\": must be printable ASCII without / \\ \" or a leading dot\n", .{id});
             return error.BadId;
         }
     }
@@ -808,10 +812,21 @@ test "parseArgs rejects bad values" {
         defer freeParsed(parsed, gpa);
         break :blk parsed.opts.water.bcull;
     });
+    // An id that cannot ride in the lease file name or JSON document would
+    // make every peer's parser refuse this node's lease (or skip it as a
+    // dot file): rejected at the flag boundary like --advertise's quads.
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "a\"b" }));
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "a\\b" }));
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "a/b" }));
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", ".lead" }));
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "a\nb" }));
     // an empty id (flag or env) would collide every such node onto one lease;
     // kept last because the env put below taints every later parse
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "" }));
     try environ.put("MODELFS_ID", "");
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
+    // The env source answers to the same gate.
+    try environ.put("MODELFS_ID", "x\"y");
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
 }
 

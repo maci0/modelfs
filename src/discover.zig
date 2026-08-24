@@ -103,6 +103,23 @@ pub fn printable(s: []const u8) bool {
     return true;
 }
 
+/// True when s is safe to publish as this node's cluster id. The id names
+/// the lease file (<origin>/.cluster/<id>.json), is embedded verbatim as a
+/// JSON string in that document, and is echoed into logs, so it must be
+/// printable ASCII without path separators (lease filename), quote or
+/// backslash (would corrupt the JSON for every peer's parser), or a leading
+/// dot (refresh skips dot files). An id failing this gate would otherwise
+/// partition its own node out of peer discovery while NFS fallback hides it.
+pub fn validId(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (s[0] == '.') return false;
+    for (s) |ch| {
+        if (ch < 0x20 or ch > 0x7e) return false;
+        if (ch == '/' or ch == '"' or ch == '\\') return false;
+    }
+    return true;
+}
+
 pub const Catalog = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -584,8 +601,11 @@ pub fn hostname(buf: []u8) []const u8 {
         return "node";
     }
     const s = shortName(std.mem.sliceTo(&host_buf, 0));
-    if (s.len == 0 or s.len >= buf.len) {
-        std.log.warn("hostname \"{s}\" unusable; using cluster id \"node\"", .{s});
+    // The same gate --id answers to: a hostname is kernel-set operator
+    // input, and one with a quote or slash would publish a lease document
+    // or file name every peer's parser refuses.
+    if (s.len == 0 or s.len >= buf.len or !validId(s)) {
+        std.log.warn("hostname \"{s}\" unusable as cluster id; using \"node\"", .{s});
         return "node";
     }
     @memcpy(buf[0..s.len], s);
@@ -647,6 +667,29 @@ test "printable gates lease names and ids for log echo" {
     // ESC and other C0 bytes, plus DEL, would inject terminal escapes
     try std.testing.expect(!printable("\x1b]0;pwned\x07"));
     try std.testing.expect(!printable("\x7f"));
+}
+
+test "validId gates the lease file name and JSON document" {
+    try std.testing.expect(validId("spark1"));
+    try std.testing.expect(validId("spark_1"));
+    try std.testing.expect(validId("node-9.a")); // dots after the first char are fine
+    try std.testing.expect(validId("spark 1")); // spaces survive name/JSON/log paths
+    try std.testing.expect(validId("x~!@#$%^&*()+=[]{};',<>?|`"));
+    // empty: every empty-id node would share one lease file
+    try std.testing.expect(!validId(""));
+    // leading dot: refresh skips dot files, so the lease would be invisible
+    try std.testing.expect(!validId(".hidden"));
+    try std.testing.expect(!validId(".."));
+    // path separator: the id names .cluster/<id>.json
+    try std.testing.expect(!validId("a/b"));
+    // quote or backslash: formatLease embeds the id verbatim as a JSON
+    // string; either would publish a document every peer parses as corrupt
+    try std.testing.expect(!validId("a\"b"));
+    try std.testing.expect(!validId("a\\b"));
+    // control bytes and non-ASCII: same JSON corruption via invalid escapes
+    try std.testing.expect(!validId("a\nb"));
+    try std.testing.expect(!validId("a\tb"));
+    try std.testing.expect(!validId("h\xc3\xa9llo"));
 }
 
 test "sweepLeases removes stale claims, keeps fresh and own" {
