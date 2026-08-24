@@ -822,10 +822,13 @@ pub const Store = struct {
 
         // Phase 2 runs outside every lock, LRU first: punchPiece revalidates
         // recency, pin, mid-fill, and bit state under file.mu, so a stale
-        // sample only wastes one attempt before the next candidate.
+        // sample only wastes one attempt before the next candidate. Equal-
+        // recency ties break by rel bytes: map iteration order must not
+        // decide which of several equally idle files is culled first.
         std.mem.sort(Cand, cands.items, {}, struct {
             fn lessThan(_: void, a: Cand, b: Cand) bool {
-                return a.at < b.at;
+                if (a.at != b.at) return a.at < b.at;
+                return std.mem.order(u8, a.f.rel, b.f.rel) == .lt;
             }
         }.lessThan);
         for (cands.items) |cd| {
@@ -879,12 +882,16 @@ pub const Store = struct {
         return punched;
     }
 
-    /// True when (at, len) names an older cull candidate than the sampled
-    /// one: mtime ascending, then the same tie-break the single-best scan
-    /// used (shorter rel wins an mtime tie).
-    fn victimOlder(at: i64, len: usize, v: *const DiskVictim) bool {
+    /// True when (at, len, rel) names an older cull candidate than the
+    /// sampled one: mtime ascending, then the same tie-break the single-best
+    /// scan used (shorter rel wins an mtime tie), then rel bytes. The full
+    /// order keeps the victim sample a function of durable state alone;
+    /// stopping at (at, len) would let readdir arrival order decide which of
+    /// several same-size same-mtime orphans the sample holds.
+    fn victimOlder(at: i64, len: usize, rel: []const u8, v: *const DiskVictim) bool {
         if (at != v.at) return at < v.at;
-        return len < v.len;
+        if (len != v.len) return len < v.len;
+        return std.mem.order(u8, rel, v.rel[0..v.len]) == .lt;
     }
 
     /// Inserts one candidate into the oldest-first victim sample, replacing
@@ -896,7 +903,7 @@ pub const Store = struct {
             count.* += 1;
             break :blk s;
         } else blk: {
-            if (!victimOlder(at, nrel.len, &victims[walk_sample_cap - 1])) return;
+            if (!victimOlder(at, nrel.len, nrel, &victims[walk_sample_cap - 1])) return;
             break :blk walk_sample_cap - 1;
         };
         const v = &victims[slot];
@@ -904,7 +911,7 @@ pub const Store = struct {
         v.len = nrel.len;
         @memcpy(v.rel[0..nrel.len], nrel);
         var i = slot;
-        while (i > 0 and victimOlder(victims[i].at, victims[i].len, &victims[i - 1])) {
+        while (i > 0 and victimOlder(victims[i].at, victims[i].len, victims[i].rel[0..victims[i].len], &victims[i - 1])) {
             std.mem.swap(DiskVictim, &victims[i], &victims[i - 1]);
             i -= 1;
         }
@@ -1553,6 +1560,26 @@ test "considerVictim keeps a bounded oldest-first sample" {
     // ...and one younger than every entry is ignored outright.
     Store.considerVictim(&victims, &count, "young.bin", 99);
     try std.testing.expectEqual(@as(i64, 16), victims[count - 1].at);
+
+    // Equal mtimes fall back to rel length, then rel bytes: the sampled
+    // order must be a function of durable state alone, not of readdir
+    // arrival order. Both arrival permutations below must sample identically.
+    var tv: [Store.walk_sample_cap]Store.DiskVictim = undefined;
+    var tcount: usize = 0;
+    for ([_][]const u8{ "z.bin", "b.bin", "aa.bin" }) |name| {
+        Store.considerVictim(&tv, &tcount, name, 7);
+    }
+    try std.testing.expectEqualStrings("b.bin", tv[0].rel[0..tv[0].len]);
+    try std.testing.expectEqualStrings("z.bin", tv[1].rel[0..tv[1].len]);
+    try std.testing.expectEqualStrings("aa.bin", tv[2].rel[0..tv[2].len]);
+    var tv2: [Store.walk_sample_cap]Store.DiskVictim = undefined;
+    var tcount2: usize = 0;
+    for ([_][]const u8{ "aa.bin", "z.bin", "b.bin" }) |name| {
+        Store.considerVictim(&tv2, &tcount2, name, 7);
+    }
+    try std.testing.expectEqualStrings(tv[0].rel[0..tv[0].len], tv2[0].rel[0..tv2[0].len]);
+    try std.testing.expectEqualStrings(tv[1].rel[0..tv[1].len], tv2[1].rel[0..tv2[1].len]);
+    try std.testing.expectEqualStrings(tv[2].rel[0..tv[2].len], tv2[2].rel[0..tv2[2].len]);
 }
 
 test "walkData samples oldest-first disk-only files across subdirs" {

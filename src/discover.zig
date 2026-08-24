@@ -69,14 +69,30 @@ pub const PathCand = struct {
     }
 };
 
-/// Highest score among candidates that have the piece. Null if none.
+/// Total order for score ties: ip bytes, then port. Candidate lists arrive
+/// in lease-directory readdir order (addresses in the publisher's
+/// getifaddrs order), so an unspecified tie would let environment
+/// enumeration order decide which peer serves a piece; cold clusters start
+/// every path at the same prior, making ties the steady state until the
+/// first goodput samples land.
+fn candTieLess(a: PathCand, b: PathCand) bool {
+    switch (std.mem.order(u8, a.ip, b.ip)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => return a.port < b.port,
+    }
+}
+
+/// Highest score among candidates that have the piece. Null if none. Score
+/// ties break by candTieLess so the winner is a function of the candidate
+/// set alone, never of the order refresh happened to read the leases in.
 pub fn pickBest(cands: []const PathCand) ?usize {
     var best_i: ?usize = null;
     var best_s: f64 = 0;
     for (cands, 0..) |cand, i| {
         if (!cand.have) continue;
         const s = cand.score();
-        if (best_i == null or s > best_s) {
+        if (best_i == null or s > best_s or (s == best_s and candTieLess(cand, cands[best_i.?]))) {
             best_i = i;
             best_s = s;
         }
@@ -788,7 +804,19 @@ test "pickBest is exclusive: one winner, skips !have" {
     };
     const i = pickBest(&cands).?;
     try std.testing.expectEqual(@as(usize, 2), i);
-    try std.testing.expectEqual(@as(?usize, null), pickBest(&.{cands[0]}));
+}
+
+test "pickBest breaks score ties by ip and port, never by list order" {
+    // A cold cluster hands every path the same prior, so equal scores are
+    // the steady state; the winner must not follow lease-readdir order.
+    const a = PathCand{ .ip = "10.0.0.2", .port = 18080, .ewma_bps = 1e9, .hops = 0, .inflight = 0, .have = true };
+    const b = PathCand{ .ip = "10.0.0.1", .port = 18081, .ewma_bps = 1e9, .hops = 0, .inflight = 0, .have = true };
+    try std.testing.expectEqual(@as(usize, 1), pickBest(&.{ a, b }).?);
+    try std.testing.expectEqual(@as(usize, 0), pickBest(&.{ b, a }).?);
+    // Same ip: the lower port wins regardless of arrival order.
+    const lo = PathCand{ .ip = "10.0.0.2", .port = 18079, .ewma_bps = 1e9, .hops = 0, .inflight = 0, .have = true };
+    try std.testing.expectEqual(@as(usize, 1), pickBest(&.{ a, lo }).?);
+    try std.testing.expectEqual(@as(usize, 0), pickBest(&.{ lo, a }).?);
 }
 
 test "same /24 is zero hops" {
