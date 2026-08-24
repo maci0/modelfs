@@ -173,22 +173,19 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     // piece.len() never exceeds piece_size, even when a concurrent append
     // grows the tail piece after cover() was computed, so the caller's
     // piece-size scratch always fits. An allocation failure claiming the
-    // piece must fail this read with ENOMEM rather than hang: claimPiece no
-    // longer retries OOM forever.
-    const claimed = st.store.claimPiece(file, idx) catch return -sys.c.ENOMEM;
-    if (!claimed) return 0;
-    // claimedPieceLen samples file.size under file.mu; zero means a truncate
-    // raced us between the claim and the sample and shrank the file below
-    // this piece. Drop the claim so concurrent fillers are not blocked, and
-    // report success -- the caller's bounds-checked read then returns a short
-    // count against the new size. Passing an empty buffer onward would
-    // underflow fillFromPeers' range end computation (out.len - 1) and abort
-    // the daemon.
-    const ln = st.store.claimedPieceLen(file, idx);
-    if (ln == 0) {
-        st.store.finishPiece(file, idx, false);
-        return 0;
-    }
+    // piece must fail this read with ENOMEM rather than hang: beginFill
+    // surfaces claim OOM instead of retrying it forever.
+    const cl = st.store.beginFill(file, idx) catch return -sys.c.ENOMEM;
+    const ln = switch (cl) {
+        // Filled by someone else, or a truncate shrank the file below the
+        // piece between claim and sample (the claim was dropped unmarked):
+        // report success either way -- the bounds-checked read below then
+        // returns a short count against the new size. Passing an empty
+        // buffer onward would underflow fillFromPeers' range end computation
+        // (out.len - 1) and abort the daemon.
+        .filled, .raced => return 0,
+        .len => |n| n,
+    };
     const buf = scratch[0..ln];
     var from_peer = true;
     peer.fillFromPeers(st.gpa, st.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf) catch {
@@ -201,13 +198,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
         }
     };
     std.log.info("piece {d} {s} {s}", .{ idx, file.rel, if (from_peer) "peer" else "nfs" });
-    const w = st.store.writePiece(file, idx, buf);
-    if (w != 0) {
-        st.store.finishPiece(file, idx, false);
-        return w;
-    }
-    st.store.finishPiece(file, idx, true);
-    return 0;
+    return st.store.completeFill(file, idx, buf);
 }
 
 /// fsize must be a size sample taken under file.mu by the caller (the same

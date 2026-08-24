@@ -477,12 +477,12 @@ pub const Store = struct {
         return self.openCacheUnlocked(file);
     }
 
-    /// Claim exclusive fill of piece idx. Returns false if already filled,
+    /// Claims exclusive fill of piece idx. False when already filled,
     /// including by a concurrent filler that finishes while we wait. A
     /// persistent allocation failure surfaces as an error instead of
     /// spinning forever: an unbounded retry here would wedge the reader
     /// (FUSE read, peer hydrate) with no timeout and no signal.
-    pub fn claimPiece(self: *Store, file: *Cached, idx: u32) !bool {
+    fn claimPiece(self: *Store, file: *Cached, idx: u32) !bool {
         while (true) {
             file.mu.lockUncancelable(self.io);
             if (file.bits.get(idx)) {
@@ -530,10 +530,53 @@ pub const Store = struct {
     /// the caller must finishPiece(.., false) and skip it instead of marking
     /// an empty piece filled (a later grow preserves marks, so the bogus bit
     /// would survive).
-    pub fn claimedPieceLen(self: *Store, file: *Cached, idx: u32) u32 {
+    fn claimedPieceLen(self: *Store, file: *Cached, idx: u32) u32 {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
         return piece.len(file.size, idx, self.piece_size);
+    }
+
+    /// Outcome of claiming one piece for a fill (the claim/sample contract
+    /// both fill paths -- FUSE read hydration and peer /data hydration --
+    /// must share, kept here so they cannot drift apart):
+    pub const FillClaim = union(enum) {
+        /// Already filled, including by a concurrent filler that finished
+        /// while we waited on its claim.
+        filled,
+        /// A truncate raced the claim and shrank the file below the piece:
+        /// the claim was dropped with finishPiece(.., false) and the piece
+        /// stays unmarked; the caller moves on without treating it as an
+        /// error or as data.
+        raced,
+        /// Byte length to fill, valid because file.size was sampled under
+        /// file.mu together with the bit check.
+        len: u32,
+    };
+
+    /// Claims exclusive fill of piece idx and samples its byte length under
+    /// file.mu in one step. The raced outcome already drops the claim
+    /// unmarked; callers keep their own policy for it versus .filled instead
+    /// of re-deriving the pair from claimPiece plus claimedPieceLen (and
+    /// possibly finishing or skipping wrong). An allocation failure while
+    /// taking the claim surfaces as an error instead of spinning forever.
+    pub fn beginFill(self: *Store, file: *Cached, idx: u32) !FillClaim {
+        if (!try self.claimPiece(file, idx)) return .filled;
+        const ln = self.claimedPieceLen(file, idx);
+        if (ln == 0) {
+            self.finishPiece(file, idx, false);
+            return .raced;
+        }
+        return .{ .len = ln };
+    }
+
+    /// Lands one claimed fill: writes buf at the piece offset and marks the
+    /// piece only when every byte reached the cache fd, so an unmarked piece
+    /// refills instead of serving hole zeros. Returns 0 on success, else the
+    /// negative errno from the write.
+    pub fn completeFill(self: *Store, file: *Cached, idx: u32, buf: []const u8) i32 {
+        const w = self.writePiece(file, idx, buf);
+        self.finishPiece(file, idx, w == 0);
+        return w;
     }
 
     pub fn hasPiece(self: *Store, file: *Cached, idx: u32) bool {
@@ -542,7 +585,9 @@ pub const Store = struct {
         return file.bits.get(idx);
     }
 
-    pub fn writePiece(self: *Store, file: *Cached, idx: u32, buf: []const u8) i32 {
+    /// Writes one piece at its offset. Internal step of completeFill; the
+    /// bit that makes the bytes visible is set there on success only.
+    fn writePiece(self: *Store, file: *Cached, idx: u32, buf: []const u8) i32 {
         const fd = self.openCache(file);
         if (fd < 0) return fd;
         const off = piece.offset(idx, self.piece_size);
@@ -1615,7 +1660,7 @@ test "disk cull refuses to cut the hole unless the cleared bits persist" {
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** pattern.len), after);
 }
 
-test "claimPiece surfaces allocation failure instead of spinning" {
+test "beginFill surfaces allocation failure instead of spinning" {
     const gpa = std.testing.allocator;
     var st = Store.init(gpa, std.testing.io, "/unused", "/unused", 16);
     defer st.deinit();
@@ -1623,12 +1668,12 @@ test "claimPiece surfaces allocation failure instead of spinning" {
     defer st.releaseFile(f);
 
     // Rebind the entry's filling map to an allocator whose first allocation
-    // fails: claimPiece must report the failure to its caller (which turns it
+    // fails: beginFill must report the failure to its caller (which turns it
     // into EIO/500) rather than retry forever and wedge the reader.
     var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
     f.filling.deinit();
     f.filling = std.AutoHashMap(u32, void).init(failing.allocator());
-    try std.testing.expectError(error.OutOfMemory, st.claimPiece(f, 0));
+    try std.testing.expectError(error.OutOfMemory, st.beginFill(f, 0));
 }
 
 test "late finisher on a forgotten entry does not resurrect the sidecar" {
@@ -1653,7 +1698,7 @@ test "late finisher on a forgotten entry does not resurrect the sidecar" {
     // a sidecar naming filled pieces over a data file that no longer exists,
     // and a same-size recreate would trust those bits and serve hole zeros.
     const f = try st.get("late.bin", 64);
-    try std.testing.expect(try st.claimPiece(f, 0));
+    try std.testing.expect((try st.beginFill(f, 0)) == .len);
     st.forget("late.bin");
     st.finishPiece(f, 0, true);
     const mp = try st.cacheMetaPath(&mb, "late.bin");

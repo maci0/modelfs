@@ -316,51 +316,49 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             // Allocate before claiming: nothing but finishPiece removes a
             // filling entry, so an allocation failure after the claim would
             // leave the piece claimed forever and wedge every later filler
-            // of it into claimPiece's retry spin.
+            // of it into the claim's retry spin.
             if (pbuf == null)
                 pbuf = self.gpa.alloc(u8, ps) catch {
                     replyStatus(fd, "500 Internal Server Error");
                     return false;
                 };
-            const claimed = self.store.claimPiece(file, pi) catch {
+            const cl = self.store.beginFill(file, pi) catch {
                 replyStatus(fd, "500 Internal Server Error");
                 return false;
             };
-            if (claimed) {
-                // claimedPieceLen samples file.size under the lock so ln
-                // cannot disagree with the bit finishPiece sets. Zero means a
-                // truncate raced us between the claim and the sample and
-                // shrank the file below this piece: drop the claim and move
-                // on instead of marking an empty piece filled.
-                const ln = self.store.claimedPieceLen(file, pi);
-                if (ln == 0) {
-                    self.store.finishPiece(file, pi, false);
-                    continue;
-                }
-                const got = self.store.originPread(file.rel, pbuf.?[0..ln], piece.offset(pi, ps));
-                if (got == @as(isize, @intCast(ln))) {
-                    const w = self.store.writePiece(file, pi, pbuf.?[0..ln]);
-                    self.store.finishPiece(file, pi, w == 0);
-                    if (w != 0) {
-                        // The bytes are in hand but the cache fs refused them
-                        // (full or failing disk). Falling through to the
-                        // !hasPiece check would reply 404 and make the
-                        // fetching peer believe the path is gone.
-                        std.log.warn("cache write failed for {s} piece {d} (errno {d}); replying 500", .{ file.rel, pi, -w });
-                        replyStatus(fd, "500 Internal Server Error");
+            switch (cl) {
+                // A concurrent filler finished while we waited on its claim:
+                // the hasPiece gate below re-checks the bit before streaming.
+                .filled => {},
+                // Truncate raced the claim and shrank the file below this
+                // piece; the claim was dropped unmarked. Move on: replying
+                // 404 would tell the peer the path is gone over a size race.
+                .raced => continue,
+                .len => |ln| {
+                    const got = self.store.originPread(file.rel, pbuf.?[0..ln], piece.offset(pi, ps));
+                    if (got == @as(isize, @intCast(ln))) {
+                        const w = self.store.completeFill(file, pi, pbuf.?[0..ln]);
+                        if (w != 0) {
+                            // The bytes are in hand but the cache fs refused them
+                            // (full or failing disk). Falling through to the
+                            // !hasPiece check would reply 404 and make the
+                            // fetching peer believe the path is gone.
+                            std.log.warn("cache write failed for {s} piece {d} (errno {d}); replying 500", .{ file.rel, pi, -w });
+                            replyStatus(fd, "500 Internal Server Error");
+                            return false;
+                        }
+                    } else {
+                        self.store.finishPiece(file, pi, false);
+                        // statOrigin passed, so the file exists: a failed or short
+                        // read is an upstream (origin) failure. Reporting 404 here
+                        // would make peers believe the path is gone. Log it too:
+                        // the 502 alone leaves the local operator no trace of why
+                        // hydration failed.
+                        std.log.warn("origin pread failed for {s} piece {d} (rc {d}); replying 502", .{ file.rel, pi, -got });
+                        replyStatus(fd, "502 Bad Gateway");
                         return false;
                     }
-                } else {
-                    self.store.finishPiece(file, pi, false);
-                    // statOrigin passed, so the file exists: a failed or short
-                    // read is an upstream (origin) failure. Reporting 404 here
-                    // would make peers believe the path is gone. Log it too:
-                    // the 502 alone leaves the local operator no trace of why
-                    // hydration failed.
-                    std.log.warn("origin pread failed for {s} piece {d} (rc {d}); replying 502", .{ file.rel, pi, -got });
-                    replyStatus(fd, "502 Bad Gateway");
-                    return false;
-                }
+                },
             }
         }
         if (!self.store.hasPiece(file, pi)) {
