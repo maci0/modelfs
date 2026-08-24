@@ -153,6 +153,8 @@ Range: bytes=start-end
 Authorization: Bearer <psk>
 ```
 
+`/have` replies carry `X-Piece-Size: <n>`, the piece grid the bitmap's bits are indexed against; a fetcher running a different `--piece` treats that peer's answer as no-answer instead of routing fills by bits that cover different byte ranges (a fleet should still run one piece size; mixed grids degrade to origin traffic, never to wrong data). Peers older than this header read as unknown and are assumed aligned. The bitmap body itself stays raw bits.
+
 401 if missing/wrong. Listen `0.0.0.0:18080`; `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers.
 
 ---

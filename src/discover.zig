@@ -119,6 +119,14 @@ pub fn printable(s: []const u8) bool {
     return true;
 }
 
+/// A successful /have answer: the peer's cached-piece bitmap plus the piece
+/// size its bits are indexed against. piece_size 0 means the peer did not
+/// advertise one (an older build); consumers assume alignment for those.
+pub const HaveBits = struct {
+    bits: []u8,
+    piece_size: u32,
+};
+
 /// Name safe to echo into a log line: the input when printable, else a fixed
 /// placeholder. Lease file names come off shared NFS storage anyone with
 /// origin write access can craft, so every site that logs one goes through
@@ -176,6 +184,10 @@ pub const Catalog = struct {
         port: u16,
         bits: []u8,
         expires_ms: i64,
+        /// Piece size the bits are indexed against, as advertised by the
+        /// peer; cached so a TTL hit carries the same alignment context a
+        /// fresh probe would.
+        piece_size: u32 = 0,
     };
 
     fn freeHaveEntry(gpa: std.mem.Allocator, e: HaveEntry) void {
@@ -187,21 +199,22 @@ pub const Catalog = struct {
     /// Owned copy of a fresh /have bitmap for (rel, ip, port), or null when
     /// no unexpired entry exists. Copies under the lock so the entry cannot
     /// be replaced or freed between lookup and use by a concurrent filler.
-    pub fn haveGet(self: *Catalog, gpa: std.mem.Allocator, rel: []const u8, ip: []const u8, port: u16) ?[]u8 {
+    pub fn haveGet(self: *Catalog, gpa: std.mem.Allocator, rel: []const u8, ip: []const u8, port: u16) ?HaveBits {
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
         const now = sys.monoMs();
         for (self.have_cache.items) |e| {
             if (e.port != port or !std.mem.eql(u8, e.rel, rel) or !std.mem.eql(u8, e.ip, ip)) continue;
             if (now >= e.expires_ms) return null;
-            return gpa.dupe(u8, e.bits) catch null;
+            const bits = gpa.dupe(u8, e.bits) catch return null;
+            return .{ .bits = bits, .piece_size = e.piece_size };
         }
         return null;
     }
 
     /// Caches a successful probe result; failures are never cached so a
     /// transiently down peer is retried on the next piece.
-    pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8) void {
+    pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32) void {
         const gpa = self.gpa;
         const now = sys.monoMs();
         self.have_mu.lockUncancelable(self.io);
@@ -216,6 +229,7 @@ pub const Catalog = struct {
             gpa.free(e.bits);
             self.have_cache.items[i].bits = b;
             self.have_cache.items[i].expires_ms = now + have_ttl_ms;
+            self.have_cache.items[i].piece_size = piece_size;
             return;
         }
         if (self.have_cache.items.len >= have_cache_cap) {
@@ -247,6 +261,7 @@ pub const Catalog = struct {
             .port = port,
             .bits = bits_own,
             .expires_ms = now + have_ttl_ms,
+            .piece_size = piece_size,
         }) catch {
             gpa.free(bits_own);
             gpa.free(ip_own);
@@ -626,22 +641,26 @@ test "have cache stores, replaces, evicts at cap, and frees" {
 
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080) == null);
 
-    cat.havePut("a.bin", "10.0.0.1", 18080, &.{ 1, 2 });
+    cat.havePut("a.bin", "10.0.0.1", 18080, &.{ 1, 2 }, 4096);
     {
-        const bits = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080).?;
-        defer gpa.free(bits);
-        try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, bits);
+        const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080).?;
+        defer gpa.free(got.bits);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, got.bits);
+        // The alignment context rides with the bits: a TTL hit must answer
+        // exactly what a fresh probe would have.
+        try std.testing.expectEqual(@as(u32, 4096), got.piece_size);
     }
     // A different rel, ip, or port must not hit this entry.
     try std.testing.expect(cat.haveGet(gpa, "b.bin", "10.0.0.1", 18080) == null);
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.2", 18080) == null);
 
     // Same key replaces in place instead of growing the table.
-    cat.havePut("a.bin", "10.0.0.1", 18080, &.{3});
+    cat.havePut("a.bin", "10.0.0.1", 18080, &.{3}, 8192);
     {
-        const bits = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080).?;
-        defer gpa.free(bits);
-        try std.testing.expectEqualSlices(u8, &.{3}, bits);
+        const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080).?;
+        defer gpa.free(got.bits);
+        try std.testing.expectEqualSlices(u8, &.{3}, got.bits);
+        try std.testing.expectEqual(@as(u32, 8192), got.piece_size);
     }
     try std.testing.expectEqual(@as(usize, 1), cat.have_cache.items.len);
 
@@ -657,10 +676,10 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     while (i < Catalog.have_cache_cap) : (i += 1) {
         var name_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "f{d}.bin", .{i});
-        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)});
+        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0);
     }
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
-    cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0});
+    cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0}, 0);
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
 }
 

@@ -324,8 +324,8 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
     };
     file.mu.unlock(self.io);
     defer self.gpa.free(snap);
-    var hdr: [160]u8 = undefined;
-    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{snap.len}) catch {
+    var hdr: [192]u8 = undefined;
+    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Piece-Size: {d}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ self.store.piece_size, snap.len }) catch {
         return;
     };
     _ = sys.writeAll(fd, h);
@@ -537,10 +537,35 @@ fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) 
     }
 }
 
-pub fn fetchHave(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) ![]u8 {
+/// Fetches one /have answer: the peer's cached-piece bitmap plus the piece
+/// size its bits are indexed against (X-Piece-Size). A bitmap's bit i names
+/// pieces of the SERVER's --piece grid, so without the size on the wire a
+/// fleet running mixed piece sizes silently misreads every answer -- bit i
+/// covers different byte ranges per node. Absent header (an older peer)
+/// reads as 0, meaning unknown; consumers assume alignment for those. A
+/// malformed header fails the probe like any other bad reply so failures
+/// stay uncached and retried.
+pub fn fetchHave(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !discover.HaveBits {
     const fd = try sendRequest(psk, ip, port, rel, null);
     defer sys.close(fd);
-    return readFlexBodyAlloc(gpa, fd, null);
+    var head_buf: [8192]u8 = undefined;
+    var head_len: usize = 0;
+    var total_read: usize = 0;
+    readHeadFull(fd, &head_buf, &head_len, &total_read) catch return error.Head;
+    return haveFromHead(gpa, fd, &head_buf, head_len, total_read);
+}
+
+/// Parses one /have response head (already read, body bytes possibly
+/// pipelined behind it in head_buf) and completes the bitmap body. The
+/// seam between dialing and parsing so tests can drive replies directly.
+fn haveFromHead(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize) !discover.HaveBits {
+    const head = head_buf[0..head_len];
+    const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
+    if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 200")) return error.HttpStatus;
+    const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
+    const piece_size = std.fmt.parseInt(u32, ps_str, 10) catch return error.BadPieceSize;
+    const bits = try finishBodyAlloc(gpa, fd, head_buf, head_len, total_read, null, null);
+    return .{ .bits = bits, .piece_size = piece_size };
 }
 
 /// Dials and sends one GET (/have, or /data when range is set); returns the
@@ -630,6 +655,16 @@ fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?
     var head_len: usize = 0;
     var total_read: usize = 0;
     readHeadFull(fd, &head_buf, &head_len, &total_read) catch return error.Head;
+    return finishBodyAlloc(gpa, fd, &head_buf, head_len, total_read, dest, deadline_ms);
+}
+
+/// Completes a response body whose head is already read: validates the
+/// status line, lifts pipelined body bytes out of head_buf, enforces
+/// Content-Length against dest (or allocates), and streams to the deadline.
+/// The one body reader every fetch path shares, so the length-matching
+/// contract cannot drift between them. head_buf must stay alive for the
+/// call; the returned slice never aliases it.
+fn finishBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
@@ -704,12 +739,12 @@ const ProbeCtx = struct {
     groups: []const []const usize,
     /// Group indexes that still need a probe (the rest came from cache).
     todo: []const usize,
-    slots: []?[]u8,
+    slots: []?discover.HaveBits,
     cat: *discover.Catalog,
     next: std.atomic.Value(u32) = .init(0),
 };
 
-/// Claims one unprobed group at a time and records its /have bitmap (null on
+/// Claims one unprobed group at a time and records its /have answer (null on
 /// failure). Addresses are tried best-first: the first answer wins, so a
 /// healthy multi-homed node costs one wire round trip total, and a dead
 /// preferred address falls through to the same node's remaining interfaces
@@ -723,9 +758,9 @@ fn probeWorker(ctx: *ProbeCtx) void {
         const gi = ctx.todo[t];
         for (ctx.groups[gi]) |pi| {
             const p = ctx.paths[pi];
-            const bits = fetchHave(ctx.gpa, ctx.psk, p.ip, p.port, ctx.rel) catch continue;
-            ctx.slots[gi] = bits;
-            ctx.cat.havePut(ctx.rel, p.ip, p.port, bits);
+            const rep = fetchHave(ctx.gpa, ctx.psk, p.ip, p.port, ctx.rel) catch continue;
+            ctx.slots[gi] = rep;
+            ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size);
             break;
         }
     }
@@ -743,7 +778,7 @@ fn probeSlots(
     rel: []const u8,
     paths: []const discover.Path,
     groups: []const []const usize,
-    slots: []?[]u8,
+    slots: []?discover.HaveBits,
 ) !void {
     var todo: std.ArrayList(usize) = .empty;
     defer todo.deinit(gpa);
@@ -792,9 +827,11 @@ fn scoreOf(p: discover.Path) f64 {
 /// Snapshot of the catalog reduced to one candidate per lease path, each
 /// carrying its node's /have answer for piece idx: peers answered by the
 /// recent-probe cache skip the wire; the rest are probed concurrently, one
-/// best-first address walk per unique peer id. Caller frees the returned
-/// slice with gpa.
-fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32) ![]discover.PathCand {
+/// best-first address walk per unique peer id. local_piece_size is this
+/// node's grid; a peer whose advertised grid differs answers unusable bits,
+/// so its candidates are marked !have rather than routing fills by them.
+/// Caller frees the returned slice with gpa.
+fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32, local_piece_size: u32) ![]discover.PathCand {
     const paths = try cat.snapshot(gpa);
     defer discover.Catalog.freeSnapshot(gpa, paths);
 
@@ -834,9 +871,9 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
         }
     }
 
-    const slots = try gpa.alloc(?[]u8, groups.items.len);
+    const slots = try gpa.alloc(?discover.HaveBits, groups.items.len);
     defer {
-        for (slots) |s| if (s) |b| gpa.free(b);
+        for (slots) |s| if (s) |rep| gpa.free(rep.bits);
         gpa.free(slots);
     }
     @memset(slots, null);
@@ -851,11 +888,21 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
         cands.deinit(gpa);
     }
     for (paths) |p| {
-        var bits: []u8 = &.{};
+        var has = false;
         if (group_of.get(p.peer_id)) |gi| {
-            if (slots[gi]) |b| bits = b;
+            if (slots[gi]) |rep| {
+                // A bitmap's bit i names pieces of the answering peer's
+                // --piece grid. Only an answer indexed against our own grid
+                // can route a fill; a mismatched one is treated as no
+                // answer (the fetch falls through to the next peer, then
+                // origin) instead of reading bits that cover different
+                // byte ranges than ours. piece_size 0 means the peer did
+                // not advertise one: assume alignment for compatibility.
+                if (rep.piece_size == 0 or rep.piece_size == local_piece_size) {
+                    has = idx / 8 < rep.bits.len and (rep.bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
+                }
+            }
         }
-        const has = idx / 8 < bits.len and (bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
         const ip_copy = try gpa.dupe(u8, p.ip);
         errdefer gpa.free(ip_copy);
         try cands.append(gpa, .{
@@ -880,7 +927,7 @@ pub fn fillFromPeers(
     out: []u8,
     stats: ?*store_mod.Stats,
 ) !void {
-    const cands = try probeCandidates(gpa, psk, cat, rel, idx);
+    const cands = try probeCandidates(gpa, psk, cat, rel, idx, piece_size);
     defer {
         for (cands) |cand| gpa.free(cand.ip);
         gpa.free(cands);
@@ -1289,12 +1336,15 @@ test "serveHave answers with the exact cached bitfield blob" {
     gpa.free(warm);
 
     // The /have body is the raw cache bitfield: bit i names piece i, one
-    // byte per eight pieces, no sidecar header. fillFromPeers' candidate
+    // byte per eight pieces. The X-Piece-Size header names the grid those
+    // bits are indexed against, so a fetcher running a different --piece
+    // can tell the answer apart from its own; fillFromPeers' candidate
     // "have" decisions are computed from exactly these bytes.
-    const bits = try fetchHave(gpa, "secret", "127.0.0.1", port, "bits.bin");
-    defer gpa.free(bits);
-    try std.testing.expectEqual(@as(usize, 1), bits.len);
-    try std.testing.expectEqual(@as(u8, 0b00000011), bits[0]);
+    const rep = try fetchHave(gpa, "secret", "127.0.0.1", port, "bits.bin");
+    defer gpa.free(rep.bits);
+    try std.testing.expectEqual(@as(usize, 1), rep.bits.len);
+    try std.testing.expectEqual(@as(u8, 0b00000011), rep.bits[0]);
+    try std.testing.expectEqual(@as(u32, 16), rep.piece_size);
 
     // A directory at the requested path is a miss (404), same as ENOENT:
     // /have advertises regular files only.
@@ -1302,6 +1352,41 @@ test "serveHave answers with the exact cached bitfield blob" {
     var res = try roundTrip(port, "GET /have?path=sub HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
     defer res.deinit(gpa);
     try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
+    const gpa = std.testing.allocator;
+    // haveFromHead is fetchHave minus the dial: replies are driven through a
+    // socketpair like every other response-parser test here.
+    {
+        const head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Piece-Size: 4194304\r\nConnection: close\r\n\r\n";
+        const pair = try responsePair(head ++ "ab");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        const rep = try haveFromHead(gpa, pair[1], head ++ "ab", head.len, head.len + 2);
+        defer gpa.free(rep.bits);
+        try std.testing.expectEqualStrings("ab", rep.bits);
+        try std.testing.expectEqual(@as(u32, 4 * 1024 * 1024), rep.piece_size);
+    }
+    // No header (an older peer): piece size unknown (0), bits still served.
+    {
+        const head = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n";
+        const pair = try responsePair(head ++ "z");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        const rep = try haveFromHead(gpa, pair[1], head ++ "z", head.len, head.len + 1);
+        defer gpa.free(rep.bits);
+        try std.testing.expectEqual(@as(u32, 0), rep.piece_size);
+    }
+    // A malformed header fails the probe like any other bad reply so it is
+    // never cached and retried on the next piece.
+    {
+        const head = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: huge\r\nConnection: close\r\n\r\nz";
+        const pair = try responsePair(head);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, pair[1], head, head.len, head.len));
+    }
 }
 
 test "peer http dispatch answers ping, wrong method, and unknown paths" {
@@ -1737,4 +1822,65 @@ test "fillFromPeers probes concurrently and streams piece into out" {
     // No candidate has the piece: NoPeer surfaces (caller falls back to NFS).
     try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "missing.bin", 0, 16, &out, &srv.store.stats));
     try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
+}
+
+test "fillFromPeers excludes peers whose advertised piece size differs" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-ffp-o-grid");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var pattern: [16]u8 = undefined;
+    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 41 + 3);
+    var fbuf: [192]u8 = undefined;
+    var fz: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fbuf, "{s}/grid.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
+
+    // Misaligned peer: same origin file cached on a 64M grid, listed first.
+    // Its bitmap's bit 0 covers bytes 0..64M of its grid while ours covers
+    // 0..16M, so consulting it would route fills by bits that mean different
+    // byte ranges per node; it must read as no-answer instead.
+    var mb: [128]u8 = undefined;
+    const cache_mis = try sys.scratchDir(&mb, "modelfs-ffp-c-mis");
+    defer sys.deleteTree(std.testing.io, cache_mis);
+    const srv_mis = try TestServer.start(gpa, origin_d, cache_mis, 64 * 1024 * 1024, "secret");
+    defer srv_mis.stop();
+    const warm = try fetchRange(gpa, "secret", "127.0.0.1", srv_mis.port(), "grid.bin", 0, 15);
+    gpa.free(warm);
+
+    // Aligned peer on our own grid, serving identical bytes from the shared
+    // origin: despite the misaligned peer listing first, this one serves.
+    var nb: [128]u8 = undefined;
+    const cache_ok = try sys.scratchDir(&nb, "modelfs-ffp-c-ok");
+    defer sys.deleteTree(std.testing.io, cache_ok);
+    const srv_ok = try TestServer.start(gpa, origin_d, cache_ok, 16, "secret");
+    defer srv_ok.stop();
+    const warm2 = try fetchRange(gpa, "secret", "127.0.0.1", srv_ok.port(), "grid.bin", 0, 15);
+    gpa.free(warm2);
+
+    var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    try cat.paths.append(gpa, .{
+        .peer_id = "mis",
+        .ip = "127.0.0.1",
+        .port = srv_mis.port(),
+        .ewma_bps = 1e9,
+        .hops = 0,
+    });
+    try cat.paths.append(gpa, .{
+        .peer_id = "ok",
+        .ip = "127.0.0.1",
+        .port = srv_ok.port(),
+        .ewma_bps = 1e9,
+        .hops = 0,
+    });
+
+    var out: [16]u8 = undefined;
+    try fillFromPeers(gpa, "secret", &cat, "grid.bin", 0, 16, &out, null);
+    try std.testing.expectEqualSlices(u8, &pattern, &out);
+
+    // With only the misaligned holder listed, nothing may answer at all:
+    // NoPeer surfaces and the caller falls through to the origin tier.
+    _ = cat.paths.pop();
+    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "grid.bin", 0, 16, &out, null));
 }

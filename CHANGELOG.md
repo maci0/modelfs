@@ -1,5 +1,8 @@
 # Changelog & Autoresearch Notebook
 
+## [Design review pass] - 2026-08-25
+- **`/have` answers now advertise their piece grid (`X-Piece-Size`)**: the bitmap body was raw bits with no context, so bit i meant "my piece i" under the *answering* node's `--piece` while the fetcher indexed it against its own; a fleet running mixed piece sizes silently misread every answer and routed fills by bits covering different byte ranges per node. The fetch client now excludes peers whose advertised grid differs from local (unknown, i.e. header absent from an older peer, still assumes aligned), matching the defense the local layer already had (`Bitfield.decode` resets sidecars whose stored piece size differs). Response parsing moved into one shared `finishBodyAlloc`/`haveFromHead` seam so the length-matching contract cannot drift between `/have` and `/data` readers. Mixed grids degrade to origin traffic, never to wrong data; covered at the parser, the cache roundtrip, and end to end through two live servers on different grids.
+
 ## [Portability review pass] - 2026-08-25
 - **The documented aarch64 cross-build had no CI coverage**: README and docs/architecture.md name `aarch64-linux-gnu` as the spark deployment target, but CI only ever built x86_64-native, so a broken arm64 compile would ship unnoticed. New `cross-aarch64` CI job extracts the committed, hash-pinned libfuse3 debs (`dpkg-deb -x`, exactly the `.deps/fuse3-arm64/README.md` recipe; `build.zig` re-verifies both digests) and compiles `-Dtarget=aarch64-linux-gnu.2.39`, asserting the ELF machine type. Verified locally: the extraction reproduces the vendored trees byte-for-byte and the build links an ARM aarch64 binary.
 
