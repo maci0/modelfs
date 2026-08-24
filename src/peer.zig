@@ -235,7 +235,7 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     const method = it.next() orelse return;
     const target = it.next() orelse return;
     if (!std.mem.eql(u8, method, "GET")) {
-        replyStatus(fd, "405 Method Not Allowed");
+        replyStatus(self, fd, "405 Method Not Allowed");
         return;
     }
     const auth = proto.headerGet(head, "Authorization") orelse "";
@@ -244,7 +244,8 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
         // unauthenticated prober is invisible to the operator. Bounded by the
         // accept loop's inflight cap, so it cannot flood faster than 16/s.
         std.log.warn("peer http: rejected unauthorized request", .{});
-        replyStatus(fd, "401 Unauthorized");
+        _ = self.store.stats.http_unauthorized.fetchAdd(1, .monotonic);
+        replyStatus(self, fd, "401 Unauthorized");
         return;
     }
     const path = proto.pathOnly(target);
@@ -254,13 +255,13 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     }
     var rel_buf: [4096]u8 = undefined;
     const rel = decodePath(target, &rel_buf) catch {
-        replyStatus(fd, "400 Bad Request");
+        replyStatus(self, fd, "400 Bad Request");
         return;
     };
     // Remote-supplied paths join the origin/cache roots downstream; a ".."
     // component here would read (and via cache hydration, write) outside them.
     if (!store_mod.relOk(rel)) {
-        replyStatus(fd, "400 Bad Request");
+        replyStatus(self, fd, "400 Bad Request");
         return;
     }
     if (std.mem.eql(u8, path, "/have")) {
@@ -269,17 +270,17 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     }
     if (std.mem.eql(u8, path, "/data")) {
         const rh = proto.headerGet(head, "Range") orelse {
-            replyStatus(fd, "400 Bad Request");
+            replyStatus(self, fd, "400 Bad Request");
             return;
         };
         const rg = proto.parseRange(rh) orelse {
-            replyStatus(fd, "400 Bad Request");
+            replyStatus(self, fd, "400 Bad Request");
             return;
         };
         serveData(self, fd, rel, rg);
         return;
     }
-    replyStatus(fd, "404 Not Found");
+    replyStatus(self, fd, "404 Not Found");
 }
 
 fn decodePath(target: []const u8, out: []u8) ![]u8 {
@@ -291,18 +292,18 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
     var st: sys.c.struct_stat = undefined;
     const rc = self.store.statOrigin(rel, &st);
     if (rc != 0) {
-        replyOriginStat(fd, rel, rc);
+        replyOriginStat(self, fd, rel, rc);
         return;
     }
     if ((st.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) {
-        replyStatus(fd, "404 Not Found");
+        replyStatus(self, fd, "404 Not Found");
         return;
     }
     const file = self.store.get(rel, @intCast(st.st_size)) catch {
         // The fetching peer only sees 500; without this line the serving
         // node's log says nothing about why.
         std.log.warn("cache entry open failed for {s}; replying 500", .{rel});
-        replyStatus(fd, "500 Internal Server Error");
+        replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
     defer self.store.releaseFile(file);
@@ -313,7 +314,7 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
     const snap = self.gpa.dupe(u8, file.bits.bytes) catch {
         file.mu.unlock(self.io);
         std.log.warn("have bits snapshot failed for {s}; replying 500", .{rel});
-        replyStatus(fd, "500 Internal Server Error");
+        replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
     file.mu.unlock(self.io);
@@ -348,12 +349,12 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             if (pbuf == null)
                 pbuf = self.gpa.alloc(u8, piece_size) catch {
                     std.log.warn("hydration buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, pi });
-                    replyStatus(fd, "500 Internal Server Error");
+                    replyStatus(self, fd, "500 Internal Server Error");
                     return false;
                 };
             const cl = self.store.beginFill(file, pi) catch {
                 std.log.warn("fill claim failed for {s} piece {d}; replying 500", .{ file.rel, pi });
-                replyStatus(fd, "500 Internal Server Error");
+                replyStatus(self, fd, "500 Internal Server Error");
                 return false;
             };
             switch (cl) {
@@ -374,7 +375,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                             // !hasPiece check would reply 404 and make the
                             // fetching peer believe the path is gone.
                             std.log.warn("cache write failed for {s} piece {d} (errno {d}); replying 500", .{ file.rel, pi, -w });
-                            replyStatus(fd, "500 Internal Server Error");
+                            replyStatus(self, fd, "500 Internal Server Error");
                             return false;
                         }
                     } else {
@@ -385,14 +386,14 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                         // the 502 alone leaves the local operator no trace of why
                         // hydration failed.
                         std.log.warn("origin pread failed for {s} piece {d} (rc {d}); replying 502", .{ file.rel, pi, -got });
-                        replyStatus(fd, "502 Bad Gateway");
+                        replyStatus(self, fd, "502 Bad Gateway");
                         return false;
                     }
                 },
             }
         }
         if (!self.store.hasPiece(file, pi)) {
-            replyStatus(fd, "404 Not Found");
+            replyStatus(self, fd, "404 Not Found");
             return false;
         }
     }
@@ -421,7 +422,12 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
                 // resending would duplicate them. Drop the connection and let
                 // the peer treat it as a failed fetch. A failed FIRST chunk
                 // still falls back to user-space streaming below.
-                if (sent > 0 or done > 0) return;
+                if (sent > 0 or done > 0) {
+                    // The fetching peer only sees a truncated body; this line
+                    // is the sender-side trace of where the transfer died.
+                    std.log.warn("sendfile short send for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, start + done, sent, take });
+                    return;
+                }
                 break;
             }
             done += take;
@@ -442,7 +448,12 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     while (remaining > 0) {
         const take = @min(remaining, buf.len);
         const n = self.store.readCache(file, buf[0..take], off);
-        if (n < 0 or @as(u64, @intCast(n)) != take) return;
+        if (n < 0 or @as(u64, @intCast(n)) != take) {
+            // Same contract as the sendfile path: the peer sees a truncated
+            // body, so the local log must carry where and why.
+            std.log.warn("cache short read for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, off, n, take });
+            return;
+        }
         if (sys.writeAll(fd, buf[0..take]) < 0) return;
         off += take;
         remaining -= take;
@@ -453,12 +464,12 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     var st: sys.c.struct_stat = undefined;
     const src = self.store.statOrigin(rel, &st);
     if (src != 0) {
-        replyOriginStat(fd, rel, src);
+        replyOriginStat(self, fd, rel, src);
         return;
     }
     const size: u64 = @intCast(st.st_size);
     if (rg.start >= size or rg.end < rg.start) {
-        replyStatus(fd, "416 Range Not Satisfiable");
+        replyStatus(self, fd, "416 Range Not Satisfiable");
         return;
     }
     // An end position past the last byte still names a satisfiable range
@@ -470,7 +481,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
         // Same operator-trace contract as serveHave's 500: the peer sees the
         // status alone, so the local log must carry the cause.
         std.log.warn("cache entry open failed for {s}; replying 500", .{rel});
-        replyStatus(fd, "500 Internal Server Error");
+        replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
     defer self.store.releaseFile(file);
@@ -498,8 +509,12 @@ fn reply(fd: std.posix.fd_t, s: []const u8) void {
     _ = sys.writeAll(fd, s);
 }
 
-/// Empty-body response; every error path shares this framing.
-fn replyStatus(fd: std.posix.fd_t, status: []const u8) void {
+/// Empty-body response; every error path shares this framing. 5xx replies
+/// feed the store's http_5xx counter so a failing node is visible in
+/// status.json without grepping the journal.
+fn replyStatus(self: *Server, fd: std.posix.fd_t, status: []const u8) void {
+    if (status.len > 0 and status[0] == '5')
+        _ = self.store.stats.http_5xx.fetchAdd(1, .monotonic);
     var buf: [96]u8 = undefined;
     const res = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{status}) catch return;
     reply(fd, res);
@@ -508,12 +523,12 @@ fn replyStatus(fd: std.posix.fd_t, status: []const u8) void {
 /// 404 when the origin reports the path truly absent, 502 when the origin
 /// itself failed (NFS I/O error, stale mount): a fetching peer and an
 /// operator must be able to tell a missing file from an unavailable one.
-fn replyOriginStat(fd: std.posix.fd_t, rel: []const u8, rc: i32) void {
+fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) void {
     if (rc == -sys.c.ENOENT or rc == -sys.c.ENOTDIR) {
-        replyStatus(fd, "404 Not Found");
+        replyStatus(self, fd, "404 Not Found");
     } else {
         std.log.warn("origin stat failed for {s} (errno {d})", .{ rel, -rc });
-        replyStatus(fd, "502 Bad Gateway");
+        replyStatus(self, fd, "502 Bad Gateway");
     }
 }
 
@@ -858,6 +873,7 @@ pub fn fillFromPeers(
     idx: u32,
     piece_size: u32,
     out: []u8,
+    stats: ?*store_mod.Stats,
 ) !void {
     const cands = try probeCandidates(gpa, psk, cat, rel, idx);
     defer {
@@ -877,7 +893,16 @@ pub fn fillFromPeers(
         const t0 = sys.monoNs();
         // Stream the body straight into out: no piece-sized allocation or
         // copy on the fetch path.
-        fetchRangeInto(gpa, psk, win.ip, win.port, rel, start, end, out) catch {
+        fetchRangeInto(gpa, psk, win.ip, win.port, rel, start, end, out) catch |err| {
+            // The loop falls through to the next candidate (then the caller
+            // falls back to the origin), but without this line nothing
+            // records which dependency failed and why -- the read would
+            // simply come back slow from NFS with no trace of the peer that
+            // should have served it. Counted here rather than at the caller
+            // so "nobody had the piece" (NoPeer with no attempt made) stays
+            // out of the failure counters.
+            std.log.warn("piece fetch failed on {s}:{d} for {s} piece {d}: {t}", .{ win.ip, win.port, rel, idx, err });
+            if (stats) |s| _ = s.fill_err_peer.fetchAdd(1, .monotonic);
             _ = cat.inflight(win.ip, win.port, -1);
             remaining[bi].have = false;
             continue;
@@ -1653,16 +1678,29 @@ test "fillFromPeers probes concurrently and streams piece into out" {
     });
 
     var out: [16]u8 = undefined;
-    try fillFromPeers(gpa, "secret", &cat, "one.bin", 0, 16, &out);
+    try fillFromPeers(gpa, "secret", &cat, "one.bin", 0, 16, &out, &srv.store.stats);
     try std.testing.expectEqualSlices(u8, &pattern, &out);
 
     // Regression: a zero-length out (reachable only when a truncate raced
     // hydration) must fail cleanly instead of underflowing the requested
     // range end and aborting the daemon. The winning peer answers 206 with
     // Content-Length 1 against a 0-byte destination, the fetch fails with
-    // LengthMismatch, and the candidate loop drains to NoPeer.
-    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "one.bin", 0, 16, &.{}));
+    // LengthMismatch, and the candidate loop drains to NoPeer. The failed
+    // attempt now also logs its warn; raising the print threshold keeps
+    // that expected line off the runner's stderr. Restored on scope exit.
+    {
+        const prev_log_level = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = prev_log_level;
+        try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "one.bin", 0, 16, &.{}, &srv.store.stats));
+        // An attempted-and-failed transfer lands in the error counters that
+        // status.json publishes; a benign NoPeer with no attempt (the
+        // missing.bin case below) must not.
+        try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
+    }
+    try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
 
     // No candidate has the piece: NoPeer surfaces (caller falls back to NFS).
-    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "missing.bin", 0, 16, &out));
+    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "missing.bin", 0, 16, &out, &srv.store.stats));
+    try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
 }

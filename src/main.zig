@@ -524,6 +524,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         },
         .psk = psk,
         .direct_io = opts.direct_io,
+        .start_secs = sys.monoSec(),
     };
     st.server.store = &st.store;
     st.store.water = opts.water;

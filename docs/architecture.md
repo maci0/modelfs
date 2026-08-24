@@ -72,7 +72,7 @@ sudo chown 1000:1000 /models /net/192.168.0.100/models /var/cache/modelfs
   --psk /etc/modelfs.psk
 ```
 
-Foreground (systemd `Type=simple`). Logs: `advertise ip:port`, `piece k path nfs|peer`, `cull piece k path`.
+Foreground (systemd `Type=simple`). Per-event logs are failure-only: unauthorized peer requests, failed piece fetches (with `ip:port` and error), origin/cache errors, cull-watermark trouble. Steady state is summarized instead: one `tick:` line per discovery interval while any counter moved (reads, writes, fills by source, fill errors, MiB, culled, http401/5xx), so an idle node logs nothing.
 
 ```
 modelfs status
@@ -81,7 +81,7 @@ modelfs pin gguf/foo.gguf
 modelfs unpin gguf/foo.gguf
 ```
 
-`status` prints the daemon's `status.json` from the cache dir (`id`, `pid`, live peer count, piece size); a missing file means the mount is not running. `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live.
+`status` prints the daemon's `status.json` from the cache dir; a missing file means the mount is not running. It carries liveness (`id`, `pid`, `uptime_s`), topology (`peers`, `piece`, `inflight` HTTP handlers), and lifetime counters (`stats`: reads/writes with errors, piece fills by source (peer vs origin) with byte totals, fill failures per tier, pieces culled, rejected auths, 5xx replies). `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live.
 
 Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_ID`.
 

@@ -6,6 +6,77 @@ const cull = @import("cull.zig");
 const sys = @import("sys.zig");
 const c = sys.c;
 
+/// Process-lifetime operation counters, published in status.json every
+/// discovery tick (plus one summary log line per tick while anything moved).
+/// This is the daemon's metrics surface: per-event logs would flood the
+/// journal at piece granularity, so steady-state work lands here instead and
+/// only failures stay in the log. Atomics because FUSE handlers, peer HTTP
+/// handlers, and background workers all bump them concurrently.
+pub const Stats = struct {
+    reads_ok: std.atomic.Value(u64) = .init(0),
+    reads_err: std.atomic.Value(u64) = .init(0),
+    bytes_read: std.atomic.Value(u64) = .init(0),
+    writes_ok: std.atomic.Value(u64) = .init(0),
+    writes_err: std.atomic.Value(u64) = .init(0),
+    bytes_written: std.atomic.Value(u64) = .init(0),
+    /// Piece hydration outcomes by source: peer fetch vs origin pread.
+    fills_peer: std.atomic.Value(u64) = .init(0),
+    fills_origin: std.atomic.Value(u64) = .init(0),
+    bytes_from_peer: std.atomic.Value(u64) = .init(0),
+    bytes_from_origin: std.atomic.Value(u64) = .init(0),
+    /// Fill failures by tier: peer fetch failed (fell through to origin or
+    /// EIO), origin read failed, cache write refused hydrated bytes.
+    fill_err_peer: std.atomic.Value(u64) = .init(0),
+    fill_err_origin: std.atomic.Value(u64) = .init(0),
+    fill_err_cache: std.atomic.Value(u64) = .init(0),
+    pieces_culled: std.atomic.Value(u64) = .init(0),
+    /// Peer HTTP server: rejected bearer tokens and 5xx replies served.
+    http_unauthorized: std.atomic.Value(u64) = .init(0),
+    http_5xx: std.atomic.Value(u64) = .init(0),
+
+    /// Consistent copy of every counter for diffing between discovery ticks
+    /// and for status.json formatting.
+    pub const Snap = struct {
+        reads_ok: u64 = 0,
+        reads_err: u64 = 0,
+        bytes_read: u64 = 0,
+        writes_ok: u64 = 0,
+        writes_err: u64 = 0,
+        bytes_written: u64 = 0,
+        fills_peer: u64 = 0,
+        fills_origin: u64 = 0,
+        bytes_from_peer: u64 = 0,
+        bytes_from_origin: u64 = 0,
+        fill_err_peer: u64 = 0,
+        fill_err_origin: u64 = 0,
+        fill_err_cache: u64 = 0,
+        pieces_culled: u64 = 0,
+        http_unauthorized: u64 = 0,
+        http_5xx: u64 = 0,
+    };
+
+    pub fn snap(self: *const Stats) Snap {
+        return .{
+            .reads_ok = self.reads_ok.load(.monotonic),
+            .reads_err = self.reads_err.load(.monotonic),
+            .bytes_read = self.bytes_read.load(.monotonic),
+            .writes_ok = self.writes_ok.load(.monotonic),
+            .writes_err = self.writes_err.load(.monotonic),
+            .bytes_written = self.bytes_written.load(.monotonic),
+            .fills_peer = self.fills_peer.load(.monotonic),
+            .fills_origin = self.fills_origin.load(.monotonic),
+            .bytes_from_peer = self.bytes_from_peer.load(.monotonic),
+            .bytes_from_origin = self.bytes_from_origin.load(.monotonic),
+            .fill_err_peer = self.fill_err_peer.load(.monotonic),
+            .fill_err_origin = self.fill_err_origin.load(.monotonic),
+            .fill_err_cache = self.fill_err_cache.load(.monotonic),
+            .pieces_culled = self.pieces_culled.load(.monotonic),
+            .http_unauthorized = self.http_unauthorized.load(.monotonic),
+            .http_5xx = self.http_5xx.load(.monotonic),
+        };
+    }
+};
+
 /// ENOENT is the expected already-gone case; any other unlink failure would
 /// leave stale cache artifacts that a same-size recreate can resurrect.
 fn unlinkOrWarn(path_z: [*:0]const u8, what: []const u8, rel: []const u8) void {
@@ -28,6 +99,7 @@ pub const Store = struct {
     cache: []const u8,
     piece_size: u32,
     water: cull.Water = .{},
+    stats: Stats = .{},
     mu: std.Io.Mutex = .init,
     files: std.StringHashMap(*Cached),
     /// Bumped under mu after every mutation of on-disk cache artifacts
@@ -800,7 +872,10 @@ pub const Store = struct {
             _ = self.saveBits(file, false);
             return false;
         }
-        std.log.info("cull piece {d} {s}", .{ idx, file.rel });
+        // Counted, not logged: sustained culling evicts one piece per round,
+        // and a per-piece info line floods the journal; the total lands in
+        // status.json and the discovery tick's summary instead.
+        _ = self.stats.pieces_culled.fetchAdd(1, .monotonic);
         return true;
     }
 
@@ -1046,7 +1121,7 @@ pub const Store = struct {
         if (self.purge_epoch != epoch0) return false;
         if (sys.punchHole(fd, off, ln) != 0) return false;
         self.purge_epoch += 1;
-        std.log.info("cull piece {d} {s}", .{ idx, rel });
+        _ = self.stats.pieces_culled.fetchAdd(1, .monotonic);
         return true;
     }
 };
@@ -1629,6 +1704,9 @@ test "punchDisk punches an orphaned rel and publishes cleared bits" {
     const e0 = st.purge_epoch;
     try std.testing.expect(st.punchDisk("orph.bin"));
     try std.testing.expectEqual(e0 + 1, st.purge_epoch);
+    // A successful punch must land in the counters status.json publishes:
+    // culling volume is otherwise invisible (the per-piece log line is gone).
+    try std.testing.expectEqual(@as(u64, 1), st.stats.pieces_culled.load(.monotonic));
 
     // The sidecar rewrite precedes the epoch bump, so any builder sampling
     // the new epoch reads post-punch bits: a fresh entry must not believe
