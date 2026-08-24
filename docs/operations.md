@@ -34,6 +34,15 @@ firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=192.16
 firewall-cmd --reload
 ```
 
+Maintenance nothing else schedules:
+
+```bash
+systemctl enable --now zfs-scrub-monthly@tank.timer   # ships with OpenZFS >= 2.1
+systemctl enable --now smartd                         # disks complain before they die
+```
+
+Reads of cold weight files never surface silent bit rot; scrubs do.
+
 `*` on `showmount` is world-writable as root. The rich rule limits NFS to `192.168.0.0/24`. Or `sharenfs=off` and `/etc/exports`:
 
 ```
@@ -160,3 +169,7 @@ One node downloads a repo at a time. Docker/enroot: `-e` those vars, bind `/mode
 | cannot write | not uid 1000, or sudo-created files |
 | `nobody:nobody` | idmap; disable nfs4 idmapping |
 | NAS down | `soft` → `EIO`; automount waits ≤15s |
+
+Deleted or corrupted models, a dead pool, a dead NAS: [recovery.md](recovery.md) owns backups and restores.
+
+Durability caveat kept as-is on purpose: `sharenfs="rw,async"` lets the NAS acknowledge writes before stable storage (bounded by the txg interval), so a crash can lose writes clients saw succeed; the `soft` client mounts turn NAS trouble into `EIO` after 2 retrans instead of hanging. Synced exports would trade ingest throughput for that window; not changed here.

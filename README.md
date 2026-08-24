@@ -113,6 +113,7 @@ Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); instal
 
 * [docs/architecture.md](docs/architecture.md) — how it actually behaves: cache layers, discovery, path scoring, auth, culling, write races.
 * [docs/operations.md](docs/operations.md) — the ZFS/NFS/FS-Cache setup underneath, and Hugging Face downloads.
+* [docs/recovery.md](docs/recovery.md) — what survives which disaster: backups, per-case restore steps, RPO/RTO, restore drills.
 * [docs/benchmarks.md](docs/benchmarks.md) — numbers, with the caveats that qualify them.
 * [docs/audits.md](docs/audits.md) — review findings and their fixes; [docs/review-guides/](docs/review-guides/) holds the checklists they came from.
 * [docs/design.md](docs/design.md) — the original sketch, kept for history. It marks what never shipped.
