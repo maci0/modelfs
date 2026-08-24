@@ -14,7 +14,6 @@ import tempfile
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
-from typing import Any
 import matplotlib.pyplot as plt
 
 BENCH_PSK = "bench_psk_key_123456789"
@@ -27,7 +26,7 @@ def unmount(mount_dir: str) -> None:
     subprocess.run(cmd, capture_output=True, check=False)
 
 
-def stop_mount(p: subprocess.Popen[Any], mount_dir: str) -> None:
+def stop_mount(p: subprocess.Popen[bytes], mount_dir: str) -> None:
     """Tear down one benchmark mount daemon on every exit path.
 
     terminate() without wait() would leave an unreaped child holding its peer

@@ -8,14 +8,27 @@ target-version = "py310"
 # pylint's defect-oriented subset, and ruff-specific hygiene.
 # Plus defect-oriented groups: builtin shadowing (A), unused arguments
 # (ARG), comprehension pitfalls (C4), naive datetimes (DTZ),
-# private-member access (SLF), and committed debuggers (T10).
-select = ["E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ", "SLF", "T10"]
+# private-member access (SLF), committed debuggers (T10), correctness
+# around yields (YTT) and implicit string concatenation (ISC),
+# suppression hygiene (PGH), performance anti-patterns (PERF),
+# refactoring/modernization (FURB), redundant constructs (PIE),
+# return simplification (RET), dead commented-out code (ERA),
+# import hygiene (TID), and implicit namespace packages (INP).
+select = [
+    "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
+    "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
+    "TID", "INP",
+]
 
 [tool.mypy]
 strict = true
 # Beyond the strict bundle: flag unreachable code and redundant/truthiness
-# mistakes, require code-scoped ignores, and catch possibly-undefined names.
+# mistakes, require code-scoped ignores, catch possibly-undefined names,
+# overriding methods that widen mutable base attributes, use of APIs
+# deprecated in the stdlib, and explicit "Any" annotations (escape
+# hatches must be inferred-and-narrowed, not spelled out).
 warn_unreachable = true
+disallow_any_explicit = true
 enable_error_code = [
     "redundant-expr",
     "redundant-self",
@@ -23,6 +36,8 @@ enable_error_code = [
     "truthy-iterable",
     "ignore-without-code",
     "possibly-undefined",
+    "mutable-override",
+    "deprecated",
 ]
 
 [[tool.mypy.overrides]]
