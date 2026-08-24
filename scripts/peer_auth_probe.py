@@ -23,7 +23,9 @@ def main(argv: list[str]) -> int:
     headers = {"Authorization": "Bearer WRONG_TOKEN"}
     req = urllib.request.Request(url, headers=headers)
     try:
-        urllib.request.urlopen(req)
+        # Same 30s budget as the other script probes: a peer that accepts but
+        # never answers must fail the probe, not hang the suite.
+        urllib.request.urlopen(req, timeout=30)
         print("Error: Unauthenticated request was allowed!")
         return 1
     except urllib.error.HTTPError as e:

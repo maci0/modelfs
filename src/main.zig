@@ -366,6 +366,46 @@ fn leaseAddrs(gpa: std.mem.Allocator, opts: Opts, local_ips: []const []const u8,
     return addrs;
 }
 
+/// Seed addresses for Catalog: "--seed HOST[:PORT]" entries. HOST is
+/// documented to work, but peer dials only accept dotted quads (inet_pton),
+/// so a name must be resolved exactly once here at mount setup, where an
+/// unresolvable host can fail the mount loudly instead of silently dead-
+/// seeding every discovery tick's dial.
+const SeedList = struct {
+    addrs: std.ArrayList(proto.LeaseAddr) = .empty,
+    /// Backing storage for names resolved at startup; the Catalog borrows
+    /// `addrs` for the process lifetime and frees nothing.
+    owned_ips: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *SeedList, gpa: std.mem.Allocator) void {
+        for (self.owned_ips.items) |ip| gpa.free(ip);
+        self.owned_ips.deinit(gpa);
+        self.addrs.deinit(gpa);
+    }
+};
+
+fn buildSeeds(gpa: std.mem.Allocator, specs: []const []const u8) !SeedList {
+    var out: SeedList = .{};
+    errdefer out.deinit(gpa);
+    for (specs) |s| {
+        const hp = try parseHostPort(s, proto.default_port);
+        var quad: [4]u8 = undefined;
+        if (discover.parseV4(hp.ip, &quad)) {
+            try out.addrs.append(gpa, hp);
+            continue;
+        }
+        var rb: [64]u8 = undefined;
+        const rip = sys.resolveIpv4(hp.ip, &rb) orelse {
+            if (!builtin.is_test) std.log.err("--seed {s}: host {s} does not resolve to an IPv4 address", .{ s, hp.ip });
+            return error.SeedUnresolved;
+        };
+        const owned = try gpa.dupe(u8, rip);
+        try out.owned_ips.append(gpa, owned);
+        try out.addrs.append(gpa, .{ .ip = owned, .port = hp.port, .mbps = 0 });
+    }
+    return out;
+}
+
 fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     const gpa = init.gpa;
     const origin_raw = opts.origin orelse {
@@ -422,18 +462,22 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     var addrs = try leaseAddrs(gpa, opts, local_ips, eff_port);
     defer addrs.deinit(gpa);
 
-    var seeds: std.ArrayList(proto.LeaseAddr) = .empty;
-    defer seeds.deinit(gpa);
-    for (opts.seed.items) |s| {
-        try seeds.append(gpa, try parseHostPort(s, proto.default_port));
-    }
+    var seed_list = buildSeeds(gpa, opts.seed.items) catch |err| switch (err) {
+        // Already reported with the offending flag inside buildSeeds.
+        error.SeedUnresolved => return 1,
+        else => {
+            std.log.err("build seeds: {t}", .{err});
+            return 1;
+        },
+    };
+    defer seed_list.deinit(gpa);
 
     const st = try gpa.create(fuse_fs.State);
     st.* = .{
         .gpa = gpa,
         .io = init.io,
         .store = store_mod.Store.init(gpa, init.io, origin, cache, opts.piece),
-        .catalog = discover.Catalog.init(gpa, init.io, origin, id, addrs.items, local_ips, seeds.items),
+        .catalog = discover.Catalog.init(gpa, init.io, origin, id, addrs.items, local_ips, seed_list.addrs.items),
         .server = .{
             .gpa = gpa,
             .io = init.io,
@@ -796,6 +840,33 @@ test "loadPsk refuses empty secrets and trims file contents" {
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "\n\t  \n"));
         try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, .{ .psk_file = fp }));
     }
+}
+
+test "buildSeeds passes numeric ips through and resolves names" {
+    const gpa = std.testing.allocator;
+    // Numeric form: the common case, untouched, nothing owned.
+    {
+        var sl = try buildSeeds(gpa, &.{"127.0.0.1:19099"});
+        defer sl.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), sl.addrs.items.len);
+        try std.testing.expectEqualStrings("127.0.0.1", sl.addrs.items[0].ip);
+        try std.testing.expectEqual(@as(u16, 19099), sl.addrs.items[0].port);
+        try std.testing.expectEqual(@as(usize, 0), sl.owned_ips.items.len);
+    }
+    // Name form: documented "--seed HOST[:PORT]". Resolved here (localhost
+    // via /etc/holds no-network hosts file) and owned by the list.
+    {
+        var sl = try buildSeeds(gpa, &.{"localhost"});
+        defer sl.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), sl.addrs.items.len);
+        try std.testing.expectEqualStrings("127.0.0.1", sl.addrs.items[0].ip);
+        try std.testing.expectEqual(@as(u16, proto.default_port), sl.addrs.items[0].port);
+        try std.testing.expectEqual(@as(usize, 1), sl.owned_ips.items.len);
+    }
+    // Malformed specs keep parseArgs' named failure path (port overflow
+    // surfaces as the underlying parse error, as parseHostPort has always
+    // propagated it).
+    try std.testing.expectError(error.Overflow, buildSeeds(gpa, &.{"h:70000"}));
 }
 
 test "leaseAddrs follows --listen and falls back to loopback" {

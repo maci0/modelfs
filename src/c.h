@@ -11,6 +11,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <netdb.h>
 #include <errno.h>
 #include <poll.h>
 #include <ifaddrs.h>

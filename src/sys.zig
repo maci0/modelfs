@@ -389,6 +389,37 @@ pub fn setSockBuffers(fd: c_int, size_bytes: c_int) void {
     _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_SNDBUF, &size_bytes, @sizeOf(c_int));
 }
 
+/// Resolves a host name to its first IPv4 address, writing the dotted quad
+/// into out_ip. Numeric dotted quads resolve through getaddrinfo without a
+/// DNS trip. Null when resolution fails or yields no IPv4 address; the
+/// peer dial path only accepts dotted quads (inet_pton), so callers that
+/// accept host names must convert here or the address dies silently later.
+pub fn resolveIpv4(host: []const u8, out_ip: []u8) ?[]const u8 {
+    var hz: [256]u8 = undefined;
+    const h = toZ(&hz, host) catch return null;
+    var hints: c.struct_addrinfo = std.mem.zeroes(c.struct_addrinfo);
+    hints.ai_family = c.AF_INET;
+    hints.ai_socktype = c.SOCK_STREAM;
+    hints.ai_flags = c.AI_ADDRCONFIG;
+    var res: [*c]c.struct_addrinfo = null;
+    if (c.getaddrinfo(h, null, &hints, &res) != 0) return null;
+    defer c.freeaddrinfo(res);
+    var it: [*c]c.struct_addrinfo = res;
+    while (it != null) : (it = it.*.ai_next) {
+        if (it.*.ai_family != c.AF_INET) continue;
+        if (it.*.ai_addrlen < @sizeOf(c.struct_sockaddr_in)) continue;
+        const sin: *const c.struct_sockaddr_in = @ptrCast(@alignCast(it.*.ai_addr));
+        const raw = std.mem.bigToNative(u32, sin.sin_addr.s_addr);
+        return std.fmt.bufPrint(out_ip, "{d}.{d}.{d}.{d}", .{
+            @as(u8, @truncate(raw >> 24)),
+            @as(u8, @truncate(raw >> 16)),
+            @as(u8, @truncate(raw >> 8)),
+            @as(u8, @truncate(raw)),
+        }) catch null;
+    }
+    return null;
+}
+
 pub fn setTcpNoDelay(fd: c_int, enable: bool) void {
     var flag: c_int = @intFromBool(enable);
     _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_NODELAY, &flag, @sizeOf(c_int));
@@ -472,6 +503,22 @@ test "connectIn bounds a dead dial" {
     const rc = connectIn(fd, &addr, 250);
     try std.testing.expect(rc != 0);
     try std.testing.expect(monoSec() - t0 <= 5);
+}
+
+test "resolveIpv4 passes numeric quads and resolves localhost" {
+    var out: [64]u8 = undefined;
+    // Numeric form: what every existing seed uses; must not change.
+    try std.testing.expectEqualStrings("127.0.0.1", resolveIpv4("127.0.0.1", &out).?);
+    try std.testing.expectEqualStrings("192.168.0.100", resolveIpv4("192.168.0.100", &out).?);
+    // Name form: documented "--seed HOST[:PORT]" (here via /etc/hosts, so
+    // the assertion holds without network access).
+    const resolved = resolveIpv4("localhost", &out).?;
+    try std.testing.expectEqualStrings("127.0.0.1", resolved);
+    // A host that cannot fit the NUL-terminated staging buffer is a miss,
+    // not a truncation.
+    var big: [300]u8 = undefined;
+    @memset(&big, 'a');
+    try std.testing.expect(resolveIpv4(&big, &out) == null);
 }
 
 test "sendfileAll zero copy" {
