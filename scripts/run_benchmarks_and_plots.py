@@ -52,7 +52,14 @@ plt.rcParams["axes.linewidth"] = 0.8
 
 def build_modelfs() -> str:
     print("=== Building modelfs binary ===")
-    res = subprocess.run(["zig", "build"], capture_output=True, text=True, check=False)
+    # ReleaseFast: these figures document the daemon operators run (README
+    # builds -Doptimize=ReleaseFast). A Debug build carries full safety checks
+    # and no optimization, inflating per-request fixed cost and understating
+    # sendfile throughput; the piece-size sweep's shape depends on exactly
+    # that fixed cost.
+    res = subprocess.run(
+        ["zig", "build", "-Doptimize=ReleaseFast"], capture_output=True, text=True, check=False
+    )
     if res.returncode != 0:
         print("Build failed:", res.stderr)
         sys.exit(1)
