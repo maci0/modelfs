@@ -51,3 +51,38 @@ jobs:
       # shellcheck is preinstalled on ubuntu-latest runners.
       - name: Static analysis gate
         run: ./scripts/check.sh
+
+  # The sparks deploy as aarch64: README documents the cross-build against the
+  # vendored arm64 libfuse3, but nothing else here exercises that target, so a
+  # broken aarch64 compile would ship unnoticed. Compile-only gate: the runner
+  # has no /dev/fuse and no aarch64 runtime, so link success plus the ELF
+  # machine type is the whole assertion.
+  cross-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      # The extracted root/ and lib/ trees are gitignored build inputs;
+      # recreate them from the committed .deb files exactly as
+      # .deps/fuse3-arm64/README.md prescribes. build.zig verifies both
+      # sha256 digests before any compilation, so drifted vendored input
+      # fails this job rather than producing an unchecked binary.
+      - name: Extract vendored arm64 libfuse3 from the committed debs
+        run: |
+          cd .deps/fuse3-arm64
+          dpkg-deb -x libfuse3-3_3.14.0-5build1_arm64.deb root/
+          dpkg-deb -x libfuse3-dev_3.14.0-5build1_arm64.deb root/
+          mkdir -p lib
+          ln -s libfuse3.so.3 lib/libfuse3.so
+          ln -s ../root/lib/aarch64-linux-gnu/libfuse3.so.3.14.0 lib/libfuse3.so.3
+
+      - name: Cross-compile the spark-node binary
+        run: |
+          zig build -Dtarget=aarch64-linux-gnu.2.39 \
+            -Dfuse-include=.deps/fuse3-arm64/root/usr/include/fuse3 \
+            -Dfuse-lib=.deps/fuse3-arm64/lib
+          file zig-out/bin/modelfs | grep -q 'ARM aarch64'

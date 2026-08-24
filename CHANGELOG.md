@@ -1,5 +1,8 @@
 # Changelog & Autoresearch Notebook
 
+## [Portability review pass] - 2026-08-25
+- **The documented aarch64 cross-build had no CI coverage**: README and docs/architecture.md name `aarch64-linux-gnu` as the spark deployment target, but CI only ever built x86_64-native, so a broken arm64 compile would ship unnoticed. New `cross-aarch64` CI job extracts the committed, hash-pinned libfuse3 debs (`dpkg-deb -x`, exactly the `.deps/fuse3-arm64/README.md` recipe; `build.zig` re-verifies both digests) and compiles `-Dtarget=aarch64-linux-gnu.2.39`, asserting the ELF machine type. Verified locally: the extraction reproduces the vendored trees byte-for-byte and the build links an ARM aarch64 binary.
+
 ## [Recovery review pass] - 2026-08-25
 - **Origin had no backup story at all**: `tank/models` holds the only copy of every weight file, `unlink` through the mount lands there immediately, and the repo contained zero snapshots, replicas, or restore steps. New docs/recovery.md owns the durability posture: state inventory (caches and leases are derived/ephemeral, everything else is not), a sanoid/syncoid snapshot + replica schedule with failure alerting instead of exit-code trust, per-disaster restore procedures including the wipe-all-caches-before-remount ordering trap after any rollback (the stale-piece rule would otherwise serve post-rollback bytes), stated RPO/RTO per disaster, and a monthly timed restore drill.
 - **Silent bit rot had no detector**: operations.md now schedules the monthly `zpool scrub` timer and smartd; cold weight files can carry checksum errors that no read will ever surface.
