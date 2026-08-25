@@ -251,7 +251,13 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     const line = head[0..line_end];
     var it = std.mem.splitScalar(u8, line, ' ');
     const method = it.next() orelse return;
-    const target = it.next() orelse return;
+    const target = it.next() orelse {
+        // A completed head whose request line names no target ("HELP\r\n")
+        // is the same scanner noise the timeout/oversize paths count; a
+        // bare drop here would make those probes invisible to status.json.
+        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
+        return;
+    };
     if (!std.mem.eql(u8, method, "GET")) {
         // RFC 9110 §15.5.5: a 405 must name the methods the resource
         // supports, so a probing client can discover the shape of the API.
@@ -351,7 +357,10 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
         return;
     };
     _ = sys.writeAll(fd, h);
-    _ = sys.writeAll(fd, snap);
+    if (sys.writeAll(fd, snap) < 0)
+        // The 200 header is already on the wire, so the fetching peer only
+        // sees a truncated body; this line is the sender-side trace of why.
+        std.log.warn("have bits send failed for {s}; dropping peer transfer", .{rel});
 }
 
 /// Hydrates every piece the range touches before streaming; unhydrated
@@ -485,7 +494,13 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
             std.log.warn("cache short read for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, off, n, take });
             return;
         }
-        if (sys.writeAll(fd, buf[0..take]) < 0) return;
+        if (sys.writeAll(fd, buf[0..take]) < 0) {
+            // Same contract as the sendfile and short-read paths above: the
+            // peer sees a truncated body, so the local log must carry where
+            // the transfer died.
+            std.log.warn("peer send failed for {s} at offset {d}; dropping peer transfer", .{ file.rel, off });
+            return;
+        }
         off += take;
         remaining -= take;
     }
@@ -792,6 +807,12 @@ const ProbeCtx = struct {
     slots: []?discover.HaveBits,
     cat: *discover.Catalog,
     stats: ?*store_mod.Stats = null,
+    /// The fill's one edge instant (see probeSlots): fresh answers are put
+    /// into the have cache stamped with the same sample the cache-hit
+    /// decisions ran on, so every TTL entry this fill writes is a pure
+    /// function of the tick's clock sample, never of when each worker
+    /// happened to win its slot.
+    now_ms: i64,
     next: std.atomic.Value(u32) = .init(0),
 };
 
@@ -818,7 +839,7 @@ fn probeWorker(ctx: *ProbeCtx) void {
                 continue;
             };
             ctx.slots[gi] = rep;
-            ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size, sys.monoMs());
+            ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size, ctx.now_ms);
             break;
         }
     }
@@ -842,7 +863,9 @@ fn probeSlots(
     var todo: std.ArrayList(usize) = .empty;
     defer todo.deinit(gpa);
     // One edge instant for the whole fill: cache-hit decisions across groups
-    // share the same clock sample instead of drifting mid-walk.
+    // share the same clock sample instead of drifting mid-walk, and the
+    // probe workers stamp their fresh answers into the have cache with this
+    // same sample (see ProbeCtx.now_ms).
     const now_ms = sys.monoMs();
     for (groups, 0..) |g, gi| {
         var answered = false;
@@ -868,6 +891,7 @@ fn probeSlots(
         .slots = slots,
         .cat = cat,
         .stats = stats,
+        .now_ms = now_ms,
     };
     // Cap at the server's own inflight limit: probing harder than a peer
     // accepts would only buy rejections.
@@ -1481,6 +1505,42 @@ fn roundTrip(port: u16, req: []const u8) !std.ArrayList(u8) {
         if (out.items.len > 64 * 1024) return error.ResponseTooBig;
     }
     return out;
+}
+
+test "handleConn counts a targetless request line as malformed" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-notarget");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-notarget");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+
+    // A completed head whose request line names no target ("HELP") is the
+    // scanner noise the timeout and oversize paths count; it must land in
+    // http_malformed too instead of dropping invisibly.
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, srv.port());
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    try std.testing.expect(fd >= 0);
+    defer sys.close(fd);
+    sys.setSockTimeout(fd, 5000);
+    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(fd, &addr, 5000));
+    const before = srv.store.stats.http_malformed.load(.monotonic);
+    _ = try std.testing.expectEqual(@as(isize, 8), sys.writeAll(fd, "HELP\r\n\r\n"));
+    // The handler replies nothing and closes; EOF is the signal it finished
+    // with our connection (the counter bump precedes the deferred close).
+    var sink: [64]u8 = undefined;
+    while (true) {
+        const n = sys.readOnce(fd, &sink) catch break;
+        if (n == 0) break;
+    }
+    try std.testing.expectEqual(before + 1, srv.store.stats.http_malformed.load(.monotonic));
 }
 
 test "serveHave answers with the exact cached bitfield blob" {

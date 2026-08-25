@@ -47,11 +47,12 @@ const usage =
     \\  --bstop N             Cull hard below N% free (default 3)
     \\  --allow-other         -o allow_other (needs user_allow_other)
     \\  --detach              Background after mount
-    \\  --foreground          Stay in the foreground (default)
+    \\  -f, --foreground      Stay in the foreground (default)
     \\
     \\status/peers/pin take only the flags shown on their Usage line plus
     \\the shared --origin/--cache/--psk/--psk-value values; mount-only
-    \\options are refused elsewhere. Every command also accepts -h/--help.
+    \\options are refused elsewhere. Every command also accepts -h/--help,
+    \\and -V/--version prints the release.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_ID set the same
     \\values as their flags; an explicit flag wins.
@@ -181,7 +182,13 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     if (environ.get("MODELFS_ORIGIN")) |v| opts.origin = v;
     if (environ.get("MODELFS_CACHE")) |v| opts.cache = v;
     if (environ.get("MODELFS_PSK")) |v| opts.psk_file = v;
-    if (environ.get("MODELFS_ID")) |v| opts.id = v;
+    // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin
+    // never read the id, so an ambient shell-wide variable must neither leak
+    // into them nor fail them with BadId the way the explicit flag is
+    // refused by rejectOutsideMount.
+    if (std.mem.eql(u8, cmd, "mount")) {
+        if (environ.get("MODELFS_ID")) |v| opts.id = v;
+    }
 
     var i: usize = 1;
     var rest: std.ArrayList([]const u8) = .empty;
@@ -394,11 +401,18 @@ pub fn main(init: std.process.Init) !u8 {
     }
     // Bare global forms live at position 0, where parseArgs sees a command
     // name, so they are answered here alongside their subcommand spellings.
+    // Like every other subcommand they refuse extra positional arguments
+    // instead of silently ignoring them.
     const first = argv.items[0];
     if (std.mem.eql(u8, first, "help") or
         std.mem.eql(u8, first, "-h") or
         std.mem.eql(u8, first, "--help"))
     {
+        if (argv.items.len != 1) {
+            std.log.err("help takes no arguments", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
         writeOut(init.io, usage);
         return 0;
     }
@@ -406,6 +420,11 @@ pub fn main(init: std.process.Init) !u8 {
         std.mem.eql(u8, first, "-V") or
         std.mem.eql(u8, first, "--version"))
     {
+        if (argv.items.len != 1) {
+            std.log.err("version takes no arguments", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
         printOut(init.io, "modelfs {s}\n", .{build_options.version});
         return 0;
     }
@@ -648,8 +667,8 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         teardownMount(st);
         return 1;
     }
-    st.catalog.publish();
-    st.catalog.refresh();
+    st.catalog.publish(sys.nowSec());
+    st.catalog.refresh(sys.nowSec());
     st.server.bindAll(addrs.items) catch |err| {
         std.log.err("bind peer http: {t}", .{err});
         teardownMount(st);
@@ -751,7 +770,12 @@ const StatusLiveness = struct { pid: i64 };
 
 fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
-    const p = sys.joinZ(&z, opts.cache, fuse_fs.status_file) catch return 1;
+    const p = sys.joinZ(&z, opts.cache, fuse_fs.status_file) catch {
+        // Same audience as the "not running" prints below: a bare exit 1
+        // would leave the operator guessing which path was refused.
+        std.debug.print("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, fuse_fs.status_file });
+        return 1;
+    };
     const blob = sys.readFileAlloc(gpa, p, 4096) catch {
         std.debug.print("modelfs: not running (no {s}/{s})\n", .{ opts.cache, fuse_fs.status_file });
         return 1;
@@ -782,8 +806,19 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     };
+    // Same reachability gate mount applies to --origin: a typo'd path must
+    // fail loudly instead of reading as an empty cluster through the
+    // missing-.cluster branch below.
+    const real = sys.realpathAlloc(gpa, origin) catch {
+        if (!builtin.is_test) std.log.err("origin {s} is not reachable", .{origin});
+        return 1;
+    };
+    gpa.free(real);
     var dbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const dirz = sys.joinZ(&dbuf, origin, discover.cluster_dir) catch return 1;
+    const dirz = sys.joinZ(&dbuf, origin, discover.cluster_dir) catch {
+        std.log.err("origin path too long to name {s}/{s}", .{ origin, discover.cluster_dir });
+        return 1;
+    };
     if (sys.c.opendir(dirz)) |dir| {
         defer _ = sys.c.closedir(dir);
         const now = sys.nowSec();
@@ -869,9 +904,10 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         }
         if (!any) printOut(io, "no leases\n", .{});
     } else {
-        // A missing/unreadable .cluster dir is an empty cluster, not an
-        // error: same exit-0 empty output as below, with the reason on stdout
-        // next to where the listing would have been.
+        // The origin itself was verified reachable above, so a missing or
+        // unreadable .cluster dir here is a fresh/empty cluster, not an
+        // error: same exit-0 empty output as below, with the reason on
+        // stdout next to where the listing would have been.
         printOut(io, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir });
     }
     return 0;
@@ -977,6 +1013,23 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     // An unparseable leftover gets the same verdict as an absent one.
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "not json"));
     try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+}
+
+test "cmdPeers separates unreachable origins from empty clusters" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&cb, "modelfs-peers-empty");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    // An existing origin with no .cluster dir yet is a fresh cluster:
+    // listing succeeds with empty output.
+    try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
+
+    // A typo'd/unreachable path must not read as "no leases": same exit-1
+    // verdict mount gives an unreachable --origin.
+    var nb: [160]u8 = undefined;
+    const absent = try std.fmt.bufPrint(&nb, "{s}/does-not-exist", .{origin_d});
+    try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = absent }));
 }
 
 fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {
@@ -1105,6 +1158,23 @@ test "parseArgs defaults come from the environ map" {
     defer freeParsed(parsed, gpa);
     try std.testing.expectEqualStrings("/env/origin", parsed.opts.origin.?);
     try std.testing.expectEqualStrings("spark-env", parsed.opts.id.?);
+}
+
+test "env MODELFS_ID follows the --id mount-only scope" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    // Outside mount the ambient id is neither applied nor refused: status
+    // never reads it, so a shell-wide MODELFS_ID must not break the command
+    // (the explicit flag is rejected there by rejectOutsideMount instead).
+    try environ.put("MODELFS_ID", "x\"y");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"status"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expect(parsed.opts.id == null);
+    }
+    // On mount it answers to the same validation gate as the flag.
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
 }
 
 test "embedded version parses as semver" {

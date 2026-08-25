@@ -24,6 +24,9 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Fail a hung run (stuck apt, wedged compile or test) instead of burning
+    # the 6-hour runner default; typical runs finish well inside this.
+    timeout-minutes: 30
     steps:
       # Actions are pinned to full commit SHAs (tag in comment): a moved tag
       # cannot silently change what CI executes.
@@ -53,11 +56,13 @@ jobs:
       # Python tooling exactly as pinned in requirements-dev.lock.txt
       # (hash-verified install, per README). activate-environment creates
       # .venv and puts it on PATH; the uv download/toolchain cache is on by
-      # default and keyed on requirements*.txt.
+      # default and keyed below on the requirements files, because setup-uv's
+      # **/uv.lock default glob matches nothing in this repo.
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           python-version: "3.12"
           activate-environment: true
+          cache-dependency-glob: requirements*.txt
 
       - name: Install pinned Python tooling
         # check.sh invokes ruff/mypy by name from the activated venv.
@@ -74,6 +79,8 @@ jobs:
   # machine type is the whole assertion.
   cross-aarch64:
     runs-on: ubuntu-latest
+    # Same hang guard as the check job.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 

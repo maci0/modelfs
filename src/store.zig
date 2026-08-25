@@ -50,9 +50,10 @@ pub const Stats = struct {
     /// Peer HTTP server: rejected bearer tokens and 5xx replies served.
     http_unauthorized: std.atomic.Value(u64) = .init(0),
     http_5xx: std.atomic.Value(u64) = .init(0),
-    /// Connections whose request head never completed: scanners that
-    /// connect-and-drop, dribbled heads past the deadline, oversized heads.
-    /// Counted rather than logged; the accept cap bounds the rate anyway.
+    /// Connections whose head never became a routable request: scanners
+    /// that connect-and-drop, dribbled heads past the deadline, oversized
+    /// heads, request lines without a target. Counted rather than logged;
+    /// the accept cap bounds the rate anyway.
     http_malformed: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks
@@ -374,8 +375,26 @@ pub const Store = struct {
     fn loadBits(self: *Store, rel: []const u8, file_size: u64) !piece.Bitfield {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = try self.cacheMetaPath(&buf, rel);
-        const blob = sys.readFileAlloc(self.gpa, p, 8 * 1024 * 1024) catch {
-            return piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+        var open_errno: i32 = 0;
+        const blob = sys.readFileAllocOpenErrno(self.gpa, p, 8 * 1024 * 1024, &open_errno) catch |err| switch (err) {
+            // Missing sidecar is every file's first touch: start empty.
+            error.OpenFailed => {
+                if (open_errno != c.ENOENT)
+                    std.log.warn("cannot read piece sidecar for {s} (errno {d}); treating cache as empty", .{ rel, open_errno });
+                return piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+            },
+            // Allocation failure propagates: callers turn it into EIO/500
+            // instead of a cold entry pretending nothing was stored (the
+            // same policy as beginFill's claim OOM).
+            error.OutOfMemory => return error.OutOfMemory,
+            // An unreadable or oversized sidecar degrades to "nothing
+            // cached" like the corrupt case below, but the reason must
+            // reach the log or a failing meta tree looks exactly like an
+            // always-cold cache.
+            else => {
+                std.log.warn("cannot read piece sidecar for {s}: {t}; treating cache as empty", .{ rel, err });
+                return piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+            },
         };
         defer self.gpa.free(blob);
         // A truncated or corrupt sidecar (torn writeFile, crash mid-save) must
@@ -1439,6 +1458,42 @@ test "corrupt sidecar degrades to empty bitfield" {
     try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
     st.releaseFile(f1);
     st.releaseFile(f2);
+}
+
+test "unreadable sidecar degrades to empty bitfield with a named warning" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-unreadable");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-unreadable");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // A regular file parked where a meta subdirectory belongs makes every
+    // sidecar open under it fail ENOTDIR deterministically (even under
+    // root), the way an EACCES/EIO meta tree would. The entry must still
+    // build (empty), and loadBits must name the read failure -- regression:
+    // any unreadable sidecar reset the cache silently, so a failing meta fs
+    // looked exactly like an always-cold one.
+    var zb: [192]u8 = undefined;
+    var zz: [192]u8 = undefined;
+    const blocker = try std.fmt.bufPrint(&zb, "{s}/meta/blocker", .{cache_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zz, blocker), "x"));
+
+    // Expected-path warning; keep it off the runner's stderr like sibling
+    // fault-injection tests do. Restored on scope exit.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    const f = try st.get("blocker/x.bin", 64);
+    defer st.releaseFile(f);
+    try std.testing.expectEqual(@as(u32, 4), f.bits.nbits);
+    try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
 }
 
 test "forget evicts after release and reapIdle frees idle empty entries" {

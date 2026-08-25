@@ -188,7 +188,7 @@ Trust placed in client-side enforcement: none found. The server validates path, 
 ## Response readiness (notes only)
 
 - **Audit trail:** per-node journald logs carry failure-only events (401s, failed fetches with ip:port, origin errors) plus the tick counters; status.json exposes lifetime aggregates (src/fuse_fs.zig:642-753). No persistent, centralized, or attributable record exists (R8); o11y-review owns log structure.
-- **Vulnerability-handling path:** none documented. There is no SECURITY.md, no disclosed contact, no supported-versions statement, and no documented route from "vulnerability reported" to "fix shipped". docs/audits.md records internal review history only, and docs/design.md §9 contains historical mitigation claims (now annotated) that should not be cited as current posture.
+- **Vulnerability-handling path:** documented in [SECURITY.md](../SECURITY.md): GitHub private vulnerability reporting, a supported-version statement (none released yet; fixes land on main), and the route from "vulnerability reported" to "fix shipped" (advisory thread to fix on main to CHANGELOG entry). Until a first tag exists there is still no patched release to point users at. docs/audits.md records internal review history only, and docs/design.md §9 contains historical mitigation claims (now annotated) that should not be cited as current posture.
 - **Compromise recovery sketch that exists today:** PSK regeneration guidance lives in docs/recovery.md (regenerate and redistribute after site loss); cache wiping before remount after rollback is documented there too, which doubles as the poison-recovery step for R2.
 
 ---

@@ -358,7 +358,12 @@ pub const Catalog = struct {
     /// missed republish does not expire this node out of every peer's list.
     const lease_ttl_secs: i64 = 30;
 
-    pub fn publish(self: *Catalog) void {
+    /// Publishes this node's lease with `until = now_sec + lease_ttl_secs`.
+    /// The caller's wall-clock instant (epoch seconds: leases are compared
+    /// across machines) keeps the document a pure function of state plus
+    /// instant, so tests pin the exact expiry instead of racing a second
+    /// boundary between two clock reads.
+    pub fn publish(self: *Catalog, now_sec: i64) void {
         // A node whose lease never lands disappears from the cluster for
         // every other peer; every skip below must reach the operator's log.
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
@@ -379,7 +384,7 @@ pub const Catalog = struct {
             return;
         };
         var json_buf: [2048]u8 = undefined;
-        const until = sys.nowSec() + lease_ttl_secs;
+        const until = now_sec + lease_ttl_secs;
         const json = proto.formatLease(&json_buf, self.self_id, until, self.addrs) catch {
             std.log.warn("lease publish skipped: {d} addresses do not fit the lease document", .{self.addrs.len});
             return;
@@ -400,7 +405,11 @@ pub const Catalog = struct {
             std.log.warn("lease publish rename failed at {s}", .{zpath});
     }
 
-    pub fn refresh(self: *Catalog) void {
+    /// Rebuilds the peer list from origin/.cluster, dropping leases expired
+    /// at `now_sec` (the caller's wall-clock instant, as in publish). One
+    /// sample per tick: every expiry decision below sees the same instant
+    /// instead of drifting across the directory walk.
+    pub fn refresh(self: *Catalog, now_sec: i64) void {
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
         const dirz = self.clusterDir(&dbuf) catch return;
         const dir = c.opendir(dirz) orelse {
@@ -412,7 +421,7 @@ pub const Catalog = struct {
 
         var new_arena = std.heap.ArenaAllocator.init(self.gpa);
         var new_paths: std.ArrayList(Path) = .empty;
-        const now = sys.nowSec();
+        const now = now_sec;
 
         while (c.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
@@ -478,16 +487,18 @@ pub const Catalog = struct {
     }
 
     /// Removes stale external claims from origin/.cluster: lease files whose
-    /// mtime is older than sweep_min_age_secs (a live node rewrites its lease
-    /// every publish tick) and abandoned .tmp staging files from crashed
-    /// publishes. Our own lease is never swept even when our own writes are
-    /// failing; that state must stay visible in the log, not vanish quietly.
-    pub fn sweepLeases(self: *Catalog) void {
+    /// mtime is older than sweep_min_age_secs at `now_sec` (a live node
+    /// rewrites its lease every publish tick) and abandoned .tmp staging
+    /// files from crashed publishes. Our own lease is never swept even when
+    /// our own writes are failing; that state must stay visible in the log,
+    /// not vanish quietly. The caller's instant keeps the cutoff virtual,
+    /// like refresh's expiry filter.
+    pub fn sweepLeases(self: *Catalog, now_sec: i64) void {
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
         const dirz = self.clusterDir(&dbuf) catch return;
         const dir = c.opendir(dirz) orelse return;
         defer _ = c.closedir(dir);
-        const cutoff = sys.nowSec() - sweep_min_age_secs;
+        const cutoff = now_sec - sweep_min_age_secs;
         while (c.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
             if (name.len == 0 or name[0] == '.') continue;
@@ -780,9 +791,13 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, me_fp), lease_json));
 
     // Age dead.json, crashed.json.tmp and me.json beyond the sweep cutoff.
+    // One edge instant drives both the mtime stamps and the sweep call, so
+    // every file sits exactly sweep_min_age_secs outside the cutoff no
+    // matter how long the test takes between those steps.
+    const sweep_now = sys.nowSec();
     const past = [2]std.os.linux.timespec{
-        .{ .sec = sys.nowSec() - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-        .{ .sec = sys.nowSec() - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
+        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
+        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
     };
     for ([_][]const u8{ old_fp, tmp_fp, me_fp }) |fp| {
         var zb: [192]u8 = undefined;
@@ -793,7 +808,7 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     const addrs = [_]proto.LeaseAddr{};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
     defer cat.deinit();
-    cat.sweepLeases();
+    cat.sweepLeases(sweep_now);
 
     var stbuf: c.struct_stat = undefined;
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
@@ -900,7 +915,8 @@ test "publish stages a parseable lease, leaves no tmp, and replaces in place" {
     };
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
     defer cat.deinit();
-    cat.publish();
+    const pub_now = sys.nowSec();
+    cat.publish(pub_now);
 
     // The lease lands at <id>.json under .cluster with no .json.tmp staging
     // file left behind, and refresh's parser accepts exactly what publish
@@ -919,11 +935,9 @@ test "publish stages a parseable lease, leaves no tmp, and replaces in place" {
     const parsed = try proto.parseLease(gpa, blob);
     defer parsed.deinit();
     try std.testing.expectEqualStrings("me", parsed.value.id);
-    // until is publish-time nowSec() + lease_ttl_secs; allow one second of drift so a
-    // second boundary between the two clock reads cannot flip the test.
-    const now = sys.nowSec();
-    try std.testing.expect(parsed.value.until >= now + 29);
-    try std.testing.expect(parsed.value.until <= now + 31);
+    // until is exactly the caller's instant plus the TTL: publish takes the
+    // clock sample in, so the boundary is pinned with no drift allowance.
+    try std.testing.expectEqual(pub_now + Catalog.lease_ttl_secs, parsed.value.until);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.addrs.len);
     try std.testing.expectEqualStrings("192.168.100.10", parsed.value.addrs[0].ip);
     try std.testing.expectEqual(@as(u16, 18080), parsed.value.addrs[0].port);
@@ -936,7 +950,7 @@ test "publish stages a parseable lease, leaves no tmp, and replaces in place" {
     const addrs2 = [_]proto.LeaseAddr{.{ .ip = "10.9.9.9", .port = 19100, .mbps = 10000 }};
     var cat2 = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs2, &.{}, &.{});
     defer cat2.deinit();
-    cat2.publish();
+    cat2.publish(pub_now);
     const blob2 = try sys.readFileAlloc(gpa, try sys.toZ(&zbuf, lease_fp), 4096);
     defer gpa.free(blob2);
     const parsed2 = try proto.parseLease(gpa, blob2);
@@ -977,7 +991,7 @@ test "refresh skips self and expired leases" {
     const local_ips = [_][]const u8{"192.168.100.77"};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &local_ips, &.{});
     defer cat.deinit();
-    cat.refresh();
+    cat.refresh(sys.nowSec());
 
     const snap = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap);
@@ -1017,7 +1031,7 @@ test "refresh uses seeds only while cluster is empty" {
     const local_ips = [_][]const u8{"192.168.100.77"};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &local_ips, &seeds);
     defer cat.deinit();
-    cat.refresh();
+    cat.refresh(sys.nowSec());
 
     const snap = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap);
@@ -1035,7 +1049,7 @@ test "refresh uses seeds only while cluster is empty" {
     const fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
     const live = "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.9.9.9\",\"port\":18080,\"mbps\":0}]}";
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live));
-    cat.refresh();
+    cat.refresh(sys.nowSec());
 
     const snap2 = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap2);
@@ -1061,7 +1075,7 @@ test "refresh carries learned goodput and inflight across ticks" {
     const addrs = [_]proto.LeaseAddr{};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &seeds);
     defer cat.deinit();
-    cat.refresh();
+    cat.refresh(sys.nowSec());
     try std.testing.expectEqual(@as(f64, 1e8), cat.paths.items[0].ewma_bps);
 
     // Learn something about the seed address: one measured transfer plus an
@@ -1074,7 +1088,7 @@ test "refresh carries learned goodput and inflight across ticks" {
     // A later tick republishes leases; the same address must keep its
     // measured goodput and its in-flight slot instead of restarting from
     // the prior.
-    cat.refresh();
+    cat.refresh(sys.nowSec());
     try std.testing.expectEqual(@as(usize, 1), cat.paths.items.len);
     try std.testing.expectEqual(learned, cat.paths.items[0].ewma_bps);
     try std.testing.expectEqual(@as(u32, 1), cat.paths.items[0].inflight.load(.monotonic));

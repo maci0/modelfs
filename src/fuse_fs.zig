@@ -622,9 +622,13 @@ fn discLoop(st: *State) void {
     // what happened since daemon start.
     var last_stats = st.store.stats.snap();
     while (st.running.load(.acquire)) {
-        st.catalog.publish();
-        st.catalog.refresh();
-        st.catalog.sweepLeases();
+        // One wall-clock instant per tick: publish, refresh's expiry filter,
+        // and the sweep cutoff all decide against the same sample instead of
+        // three reads drifting across the tick.
+        const now = sys.nowSec();
+        st.catalog.publish(now);
+        st.catalog.refresh(now);
+        st.catalog.sweepLeases(now);
         writeStatus(st);
         logStatsTick(st, &last_stats);
         napMs(st, 10_000);

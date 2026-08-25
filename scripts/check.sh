@@ -15,9 +15,6 @@ fail() {
 echo "=== zig fmt --check ==="
 zig fmt --check src/ build.zig || fail "zig fmt --check reported unformatted files"
 
-echo "=== zig build test ==="
-zig build test || fail "zig build test failed"
-
 echo "=== shellcheck ==="
 shellcheck scripts/*.sh || fail "shellcheck reported violations"
 
@@ -29,5 +26,10 @@ ruff format --check scripts/ || fail "ruff format reported unformatted files"
 
 echo "=== mypy ==="
 mypy scripts/ || fail "mypy reported errors"
+
+# Slowest step last: the linters above are instant, so a lint failure never
+# pays for the full compile first.
+echo "=== zig build test ==="
+zig build test || fail "zig build test failed"
 
 echo "=== All static analysis checks passed ==="
