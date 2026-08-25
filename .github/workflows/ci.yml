@@ -98,18 +98,13 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
 
       # The extracted root/ and lib/ trees are gitignored build inputs;
-      # recreate them from the committed .deb files exactly as
-      # .deps/fuse3-arm64/README.md prescribes. build.zig verifies both
-      # sha256 digests before any compilation, so drifted vendored input
-      # fails this job rather than producing an unchecked binary.
+      # recreate them from the committed .deb files with the same extractor
+      # script local builds run (one recipe, not two to keep in sync).
+      # build.zig verifies both sha256 digests before any compilation, so
+      # drifted vendored input fails this job rather than producing an
+      # unchecked binary.
       - name: Extract vendored arm64 libfuse3 from the committed debs
-        run: |
-          cd .deps/fuse3-arm64
-          dpkg-deb -x libfuse3-3_3.14.0-5build1_arm64.deb root/
-          dpkg-deb -x libfuse3-dev_3.14.0-5build1_arm64.deb root/
-          mkdir -p lib
-          ln -s libfuse3.so.3 lib/libfuse3.so
-          ln -s ../root/lib/aarch64-linux-gnu/libfuse3.so.3.14.0 lib/libfuse3.so.3
+        run: ./scripts/extract_fuse3_arm64.sh
 
       # ReleaseFast: the deployment build README documents, not Debug, so the
       # gate exercises the codegen that actually ships.

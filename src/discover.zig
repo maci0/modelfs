@@ -828,6 +828,80 @@ test "validId gates the lease file name and JSON document" {
     try std.testing.expect(!validId("h\xc3\xa9llo"));
 }
 
+/// One cluster-id candidate in the corpus framing the harness reads: u32
+/// length prefix, then the raw id bytes.
+fn idEntry(comptime s: []const u8) [4 + s.len]u8 {
+    var out: [4 + s.len]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(s.len), .little);
+    for (s, 0..) |b, i| out[4 + i] = b;
+    return out;
+}
+
+const seed_id_plain = idEntry("spark1");
+const seed_id_dotted = idEntry("node-9.a");
+const seed_id_punct = idEntry("x~!@#$%^&*()+=[]{};',<>?|`");
+const seed_id_empty = idEntry("");
+const seed_id_leading_dot = idEntry(".hidden");
+const seed_id_dotdot = idEntry("..");
+const seed_id_separator = idEntry("a/b");
+const seed_id_quote = idEntry("a\"b");
+const seed_id_backslash = idEntry("a\\b");
+const seed_id_newline = idEntry("a\nb");
+const seed_id_nul = idEntry("a\x00b");
+const seed_id_non_ascii = idEntry("h\xc3\xa9llo");
+const seed_id_space = idEntry("spark 1");
+
+const fuzz_id_corpus = [_][]const u8{
+    &seed_id_plain,
+    &seed_id_dotted,
+    &seed_id_punct,
+    &seed_id_empty,
+    &seed_id_leading_dot,
+    &seed_id_dotdot,
+    &seed_id_separator,
+    &seed_id_quote,
+    &seed_id_backslash,
+    &seed_id_newline,
+    &seed_id_nul,
+    &seed_id_non_ascii,
+    &seed_id_space,
+};
+
+/// Lease ids arrive as other nodes' JSON on shared NFS storage and fan out
+/// into three sinks: the lease file name, the verbatim JSON string this node
+/// republishes, and daemon log lines. The harness pins all three edges:
+/// validId must equal an independent restatement of its published contract
+/// (so a table or loop drift cannot self-confirm); accepted ids are always
+/// printable, so displayName echoes them verbatim; and every accepted id
+/// survives the write/read pair publish() and refresh() perform -- embedded
+/// by formatLease, parsed back by parseLease byte-exact. Rejected ids
+/// legitimately skip that last leg (the writer never publishes them).
+fn fuzzIdGateOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [128]u8 = undefined;
+    const id = buf[0..smith.slice(&buf)];
+    const ok = validId(id);
+
+    var ref = id.len > 0 and id[0] != '.';
+    for (id) |ch| {
+        if (ch < 0x20 or ch > 0x7e or ch == '/' or ch == '"' or ch == '\\') ref = false;
+    }
+    try std.testing.expectEqual(ref, ok);
+
+    try std.testing.expectEqual(printable(id), std.mem.eql(u8, id, displayName(id)));
+    if (!ok) return;
+
+    var doc_buf: [512]u8 = undefined;
+    const addrs = [_]proto.LeaseAddr{.{ .ip = "192.168.0.11", .port = proto.default_port }};
+    const doc = try proto.formatLease(&doc_buf, id, 1710000060, &addrs);
+    const parsed = try proto.parseLease(std.testing.allocator, doc);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(id, parsed.value.id);
+}
+
+test "fuzz cluster id gate keeps ids name-safe log-safe and json round-trippable" {
+    try std.testing.fuzz({}, fuzzIdGateOne, .{ .corpus = &fuzz_id_corpus });
+}
+
 test "sweepLeases removes stale claims, keeps fresh and own" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;

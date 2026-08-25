@@ -131,6 +131,94 @@ test "relFromFuse rejects .." {
     try std.testing.expect(!isCluster("/gguf/a.gguf"));
 }
 
+/// One mount-side path candidate in the corpus framing the harness reads:
+/// u32 length prefix, then the raw path bytes.
+fn pathEntry(comptime p: []const u8) [4 + p.len]u8 {
+    var out: [4 + p.len]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(p.len), .little);
+    for (p, 0..) |b, i| out[4 + i] = b;
+    return out;
+}
+
+const seed_path_root = pathEntry("/");
+const seed_path_model = pathEntry("/gguf/a.gguf");
+const seed_path_cluster_dir = pathEntry("/.cluster");
+const seed_path_cluster_file = pathEntry("/.cluster/spark1.json");
+const seed_path_dotdot = pathEntry("/../etc/passwd");
+const seed_path_inner_dotdot = pathEntry("/a/../b");
+const seed_path_dot_seg = pathEntry("/a/./b");
+const seed_path_dot_name = pathEntry("/...");
+const seed_path_double_slash = pathEntry("/gguf//a.gguf");
+const seed_path_trailing_slash = pathEntry("/gguf/");
+const seed_path_control = pathEntry("/a\x1b[31mb\x7f");
+const seed_path_empty = pathEntry("");
+const seed_path_unicode = pathEntry("/权重/mödel.gguf");
+
+const fuzz_path_corpus = [_][]const u8{
+    &seed_path_root,
+    &seed_path_model,
+    &seed_path_cluster_dir,
+    &seed_path_cluster_file,
+    &seed_path_dotdot,
+    &seed_path_inner_dotdot,
+    &seed_path_dot_seg,
+    &seed_path_dot_name,
+    &seed_path_double_slash,
+    &seed_path_trailing_slash,
+    &seed_path_control,
+    &seed_path_empty,
+    &seed_path_unicode,
+};
+
+/// Every FUSE operation hands this gate a path any local process chose, so
+/// the harness treats it as untrusted wire input. Asserts the gate's
+/// published contract end to end: the boolean pre-check and extracting
+/// wrapper agree on every input; cluster control paths are denied under
+/// both handler shapes (lookup ENOENT, mutation EPERM) whatever rides
+/// behind them; results are deterministic across repeated calls; and the
+/// one invariant every downstream handler leans on holds -- an accepted rel
+/// is either the mount root itself or store.relOk-clean, so its join with
+/// the origin/cache roots cannot escape either directory.
+fn fuzzPathGateOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const p = buf[0..smith.slice(&buf)];
+
+    const gated = relFromFuse(p);
+    try std.testing.expectEqual(fuseRelOk(p), gated != null);
+
+    if (isCluster(p)) {
+        var rel: []const u8 = "";
+        try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), resolveRel(p, -sys.c.ENOENT, &rel));
+        try std.testing.expectEqual(@as(c_int, -sys.c.EPERM), resolveRel(p, -sys.c.EPERM, &rel));
+        return;
+    }
+
+    const again = relFromFuse(p);
+    if (gated) |rel| {
+        try std.testing.expect(again != null);
+        try std.testing.expectEqualStrings(rel, again.?);
+    } else {
+        try std.testing.expect(again == null);
+    }
+
+    var rel: []const u8 = "";
+    const rc = resolveRel(p, -sys.c.ENOENT, &rel);
+    try std.testing.expectEqual(gated != null, rc == 0);
+    if (rc != 0) return;
+
+    if (rel.len == 0) {
+        // Only "" and "/" name the root; anything else must produce a real
+        // relative path.
+        try std.testing.expect(p.len == 0 or std.mem.eql(u8, p, "/"));
+        return;
+    }
+    try std.testing.expect(store_mod.relOk(rel));
+}
+
+test "fuzz fuse path gate denies cluster and traversal paths for every input" {
+    try std.testing.fuzz({}, fuzzPathGateOne, .{ .corpus = &fuzz_path_corpus });
+}
+
 /// Collects what readdirResume emits, honoring a per-call quota standing in
 /// for the kernel reply buffer (run returns false once it is spent).
 const DirSink = struct {

@@ -9,6 +9,9 @@ version, so the whole history since the initial commit is one pre-release delta 
 When the first tag lands it belongs on top of this section with the entries it
 covers regrouped under its version number.
 
+## [Infra review pass] - 2026-08-26
+- **The vendored arm64 libfuse3 recipe lives in exactly one place**: the extraction steps (extract both `.deb`s into `root/`, recreate the two `lib/` symlinks) existed as three hand-synced copies in `.github/workflows/ci.yml`'s cross-aarch64 job, README's Build section, and `.deps/fuse3-arm64/README.md`, so an edit to one silently diverged from the others. They all now run the new `scripts/extract_fuse3_arm64.sh`, which is idempotent (symlink replacement instead of a failing `ln -s` on re-run after a refresh), names the missing `.deb` with where to re-fetch it instead of a bare extraction error, and falls back to `ar` + zstd-capable `tar` on hosts without dpkg (previously documented only as prose in the .deps README).
+
 ## [CLI review pass 2] - 2026-08-26
 - **The suite compiles again**: the idempotency pass's "write-through copied twice" test called `Store.copyIntoCache` with a fourth argument the function has never taken, so `zig build test` failed at compile time for every change since. The three call sites now match the real signature; the twice-versus-once assertions are unchanged.
 - **A flag missing its value names where to look next**: `--origin` with nothing after it printed only "--origin needs a value"; like the unknown-flag message, it now points at `'modelfs help'` (still exit 2).

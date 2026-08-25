@@ -3,33 +3,25 @@
 Target-root libfuse3 for cross-building modelfs on aarch64 spark nodes
 (Ubuntu 24.04 "noble"). The host build uses the system libfuse3; point a
 cross build at this tree instead. On a fresh clone only the two `.deb`
-files exist (`root/` and `lib/` are gitignored), so extract them per
-[Refreshing](#refreshing) before building (`dpkg-deb -x`, which ships with
-Debian-family systems; other distros: [Extracting on non-Debian
-hosts](#extracting-on-non-debian-hosts)):
+files exist (`root/` and `lib/` are gitignored), so extract them before
+building by running [scripts/extract_fuse3_arm64.sh](../../scripts/extract_fuse3_arm64.sh),
+the same extractor CI's cross-aarch64 job runs (it prefers `dpkg-deb`,
+which ships with Debian-family systems; other distros:
+[extracting without dpkg-deb](#extracting-without-dpkg-deb)):
 
 ```
 zig build -Dtarget=aarch64-linux-gnu.2.39 -Dfuse-include=<repo>/.deps/fuse3-arm64/root/usr/include/fuse3 \
   -Dfuse-lib=<repo>/.deps/fuse3-arm64/lib
 ```
 
-## Extracting on non-Debian hosts
+## Extracting without dpkg-deb
 
-`dpkg-deb` is part of Debian-family `dpkg`. Any Linux with binutils and a
-zstd-capable tar produces the identical trees straight from the `.deb`s
-(a `.deb` is an `ar` archive whose `data.tar.zst` holds the filesystem);
-run from this directory:
-
-```
-mkdir -p root lib
-for deb in libfuse3-3_*.deb libfuse3-dev_*.deb; do
-    ar x "$deb" data.tar.zst
-    tar --zstd -xf data.tar.zst -C root/
-    rm data.tar.zst
-done
-ln -s ../root/lib/aarch64-linux-gnu/libfuse3.so.3.14.0 lib/libfuse3.so.3
-ln -s libfuse3.so.3 lib/libfuse3.so
-```
+[scripts/extract_fuse3_arm64.sh](../../scripts/extract_fuse3_arm64.sh) handles
+this itself: a `.deb` is an `ar` archive whose `data.tar.zst` holds the
+filesystem, so where `dpkg-deb` is absent the script unpacks each `.deb` with
+binutils `ar` plus a zstd-capable `tar` into `root/`, then recreates the
+`lib/` symlinks. The only requirements are `ar` and `tar --zstd`; there is no
+manual recipe to follow.
 
 ## Provenance
 
@@ -60,7 +52,7 @@ in `build.zig`.
 ## Refreshing
 
 Bump to a newer noble security update by replacing both `.deb`s with the
-same-versioned builds from the pool, re-extracting into `root/`
-(`dpkg-deb -x <deb> root/`, or the non-Debian recipe above), recreating
-the `lib/` symlinks, and updating the digests above in this README and in
-`build.zig`.
+same-versioned builds from the pool and re-running
+[scripts/extract_fuse3_arm64.sh](../../scripts/extract_fuse3_arm64.sh), which
+re-extracts into `root/` and refreshes the `lib/` symlinks in place, then
+updating the digests above in this README and in `build.zig`.

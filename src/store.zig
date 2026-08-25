@@ -418,13 +418,13 @@ pub const Store = struct {
     /// component on every piece fill and write-through for the life of the
     /// daemon. Failure semantics match the old best-effort mkdir: a parent
     /// that cannot be created surfaces as the retried write's errno.
-    fn writeFileMakingParent(path_z: [*:0]const u8, parent: []const u8, data: []const u8, durable: bool) i32 {
+    fn writeFileMakingParent(path_z: [*:0]const u8, data: []const u8, durable: bool) i32 {
         const w = if (durable)
             sys.writeFileDurable(path_z, data)
         else
             sys.writeFileNoFollow(path_z, data);
         if (w != -c.ENOENT) return w;
-        _ = sys.mkdirAll(parent, 0o755);
+        _ = sys.mkdirAll(sys.parentOf(std.mem.span(path_z)), 0o755);
         return if (durable)
             sys.writeFileDurable(path_z, data)
         else
@@ -450,8 +450,7 @@ pub const Store = struct {
         };
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cacheMetaPath(&buf, file.rel) catch return false;
-        const parent = sys.parentOf(std.mem.span(p));
-        if (writeFileMakingParent(p, parent, blob.items, durable) != 0) {
+        if (writeFileMakingParent(p, blob.items, durable) != 0) {
             std.log.warn("bitfield save failed for {s}; cache state resets on restart", .{file.rel});
             return false;
         }
@@ -1241,8 +1240,7 @@ pub const Store = struct {
         defer self.mu.unlock(self.io);
         if (self.files.contains(rel)) return false;
         if (self.purge_epoch != epoch0) return false;
-        const parent = sys.parentOf(std.mem.span(mp));
-        if (writeFileMakingParent(mp, parent, blob.items, true) != 0) {
+        if (writeFileMakingParent(mp, blob.items, true) != 0) {
             std.log.warn("bitfield save failed for {s}; unclaimed bytes stay cached", .{rel});
             return false;
         }

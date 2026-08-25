@@ -29,8 +29,8 @@ with "libfuse3 headers not found", install the package it names (or point
 
 Formatting, unit tests, shellcheck, ruff, and mypy: exactly what the `check`
 CI job runs. CI additionally cross-compiles for aarch64 against the vendored
-libfuse3 debs; reproduce it with the extraction and build commands in
-[.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md).
+libfuse3 debs; reproduce it with `./scripts/extract_fuse3_arm64.sh` plus the
+build command in [.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md).
 
 ## Edit-test loop
 

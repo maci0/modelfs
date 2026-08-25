@@ -145,11 +145,13 @@ pub fn close(fd: c_int) void {
     if (fd >= 0) _ = c.close(fd);
 }
 
-pub fn pread(fd: c_int, buf: []u8, off: u64) isize {
+/// One pread/pwrite call. Internal step of the *All loops below; every
+/// caller outside them wants the EINTR-retrying loop instead.
+fn pread(fd: c_int, buf: []u8, off: u64) isize {
     return c.pread(fd, buf.ptr, buf.len, @intCast(off));
 }
 
-pub fn pwrite(fd: c_int, buf: []const u8, off: u64) isize {
+fn pwrite(fd: c_int, buf: []const u8, off: u64) isize {
     return c.pwrite(fd, buf.ptr, buf.len, @intCast(off));
 }
 

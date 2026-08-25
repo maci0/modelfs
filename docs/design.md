@@ -98,7 +98,7 @@ Ceph, Lustre, BeeGFS, and 3FS are shared-storage systems. They solve "many write
 
 3FS in particular turns cache off and uses direct I/O, because its workload is training sample scans. That is the wrong default here.
 
-JuiceFS, Nydus, Dragonfly, and CVMFS are closer. Section 11 maps them onto these requirements. None of them hit G3+G4+G7+G8+G10 together without a custom agent. That agent is ModelFS.
+JuiceFS, Nydus, Dragonfly, and CVMFS are closer. Section 6 maps them onto these requirements. None of them hit G3+G4+G7+G8+G10 together without a custom agent. That agent is ModelFS.
 
 ---
 
