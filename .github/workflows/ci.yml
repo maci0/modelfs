@@ -57,10 +57,11 @@ jobs:
       # (hash-verified install, per README). activate-environment creates
       # .venv and puts it on PATH; the uv download/toolchain cache is on by
       # default and keyed below on the requirements files, because setup-uv's
-      # **/uv.lock default glob matches nothing in this repo.
+      # **/uv.lock default glob matches nothing in this repo. With no explicit
+      # python-version input, setup-uv resolves the interpreter from
+      # .python-version, the same single knob local uv uses.
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
-          python-version: "3.12"
           activate-environment: true
           cache-dependency-glob: requirements*.txt
 
@@ -110,9 +111,11 @@ jobs:
           ln -s libfuse3.so.3 lib/libfuse3.so
           ln -s ../root/lib/aarch64-linux-gnu/libfuse3.so.3.14.0 lib/libfuse3.so.3
 
+      # ReleaseFast: the deployment build README documents, not Debug, so the
+      # gate exercises the codegen that actually ships.
       - name: Cross-compile the spark-node binary
         run: |
-          zig build -Dtarget=aarch64-linux-gnu.2.39 \
+          zig build -Dtarget=aarch64-linux-gnu.2.39 -Doptimize=ReleaseFast \
             -Dfuse-include=.deps/fuse3-arm64/root/usr/include/fuse3 \
             -Dfuse-lib=.deps/fuse3-arm64/lib
           file zig-out/bin/modelfs | grep -q 'ARM aarch64'

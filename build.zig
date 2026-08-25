@@ -147,12 +147,26 @@ pub fn build(b: *std.Build) void {
     linkFuse(exe_mod, fuse_lib);
     exe_mod.addIncludePath(.{ .cwd_relative = fuse_inc });
 
+    // Stack canaries in every mode: Zig enables them by default only in safe
+    // modes, so an unhardened -Doptimize=ReleaseFast ship build would link
+    // without any. Debug info stays on for Debug development but is stripped
+    // from anything shippable: DWARF records absolute build paths
+    // (DW_AT_comp_dir), which is what makes two builds of the same tree from
+    // different directories produce different bytes.
+    exe_mod.stack_protector = true;
+    if (optimize != .Debug) {
+        exe_mod.strip = true;
+    }
+
     const exe = b.addExecutable(.{
         .name = "modelfs",
         .root_module = exe_mod,
         .use_llvm = true,
         .use_lld = true,
     });
+    // ASLR for the main image: without this Zig links ET_EXEC, so the
+    // long-lived networked daemon runs at a fixed address.
+    exe.pie = true;
     b.installArtifact(exe);
 
     const test_mod = b.createModule(.{
@@ -160,6 +174,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        // Exercise the same canary-instrumented code the executable ships.
+        .stack_protector = true,
     });
     linkFuse(test_mod, fuse_lib);
     test_mod.addIncludePath(.{ .cwd_relative = fuse_inc });

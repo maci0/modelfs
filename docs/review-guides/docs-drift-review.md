@@ -2,9 +2,9 @@
 
 You are a senior engineer whose task is to review whether this repository's own documentation still matches the code it describes.
 
-Your goal is to find documented claims that have drifted from shipped behavior: architecture, threat-model, operations, and recovery statements a reader would act on and be wrong. This differs from a copy edit: the subject is factual agreement between `docs/` and `src/`/`scripts/`, checked claim by claim. It does not grade prose quality and does not review the agent prompts in `docs/review-guides/`.
+Your goal is to find documented claims that have drifted from shipped behavior: architecture, threat-model, operations, recovery, and contributing build-gate statements a reader would act on and be wrong. This differs from a copy edit: the subject is factual agreement between the repository's own documents (`docs/`, `README.md`, `CONTRIBUTING.md`) and `src/`/`scripts/`/CI config, checked claim by claim. It does not grade prose quality and does not review the agent prompts in `docs/review-guides/`.
 
-First decide if this review applies. Confirm this is the modelfs cache tree: `README.md`, `docs/architecture.md`, `src/main.zig`, and the five further docs the items below depend on (`docs/THREAT_MODEL.md`, `docs/operations.md`, `docs/recovery.md`, `docs/design.md`, `docs/audits.md`) must exist. On any miss, print the skip result and stop.
+First decide if this review applies. Confirm this is the modelfs cache tree: `README.md`, `CONTRIBUTING.md`, `.github/workflows/ci.yml`, `docs/architecture.md`, `src/main.zig`, and the five further docs the items below depend on (`docs/THREAT_MODEL.md`, `docs/operations.md`, `docs/recovery.md`, `docs/design.md`, `docs/audits.md`) must exist. On any miss, print the skip result and stop.
 
 ## Review the following
 
@@ -15,8 +15,9 @@ First decide if this review applies. Confirm this is the modelfs cache tree: `RE
 5. Cross-document contradictions: two docs stating different values for the same default, limit, or path; resolve in favor of whichever the code confirms, and fix both if neither matches.
 6. Stale internal links: relative links from any doc to another doc, script, or source file that no longer resolves at the linked path.
 7. History sections (`docs/design.md`, `docs/audits.md`) only when they assert current behavior in the present tense without their shipped/unshipped or historical markers; both files carry disclaimers, so respect marked history and flag only unmarked present-tense claims.
+8. Contributing build-gate claims: every command, flag, version pin, path, and CI assertion in `CONTRIBUTING.md` traces to what exists or runs: setup and check steps against `scripts/check.sh` and `build.zig.zon` (e.g. `minimum_zig_version`), CI job references against jobs actually defined in `.github/workflows/ci.yml`, and release steps against `build.zig` and the CLI parsed in `src/main.zig`; a step that cannot run as written, or a job name the workflow does not define, is a finding.
 
-If available, use: `rg -n` to locate each claimed symbol, flag string, port, path literal, or numeric constant in `src/` and `scripts/` before judging a claim drifted; a search miss alone is not proof (the value may be computed or aliased), so read the surrounding code and then record the finding with both citations.
+If available, use: `rg -n` to locate each claimed symbol, flag string, port, path literal, or numeric constant in `src/`, `scripts/`, and the build/CI config (`build.zig`, `build.zig.zon`, `.github/workflows/ci.yml`) before judging a claim drifted; a search miss alone is not proof (the value may be computed or aliased), so read the surrounding code and then record the finding with both citations.
 
 ## Finding template
 

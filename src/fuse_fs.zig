@@ -323,7 +323,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         return rc;
     }
-    const got = st.store.readCache(file, buf[0..n], uoff);
+    const got = st.store.readServed(file, buf[0..n], uoff);
     if (got < 0) {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
     } else {

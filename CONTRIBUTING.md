@@ -79,6 +79,12 @@ sync:
    zig build -Doptimize=ReleaseFast && ./zig-out/bin/modelfs version
    ```
 
+Release artifacts are reproducible: non-Debug builds are stripped of the debug
+info that records absolute build paths, so building the same tree from a
+different directory, host, locale, or timezone produces identical bytes. Verify
+a release candidate by building it twice from two different paths and comparing
+`sha256sum zig-out/bin/modelfs` output.
+
 There is no publish step beyond the tag: consumers fetch this repository as a
 Zig package (the tarball is whatever `.paths` lists) or build from the tagged
 commit.

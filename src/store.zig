@@ -642,35 +642,6 @@ pub const Store = struct {
         return self.openCacheUnlocked(file);
     }
 
-    /// Claims exclusive fill of piece idx. False when already filled,
-    /// including by a concurrent filler that finishes while we wait. A
-    /// persistent allocation failure surfaces as an error instead of
-    /// spinning forever: an unbounded retry here would wedge the reader
-    /// (FUSE read, peer hydrate) with no timeout and no signal.
-    fn claimPiece(self: *Store, file: *Cached, idx: u32) !bool {
-        while (true) {
-            file.mu.lockUncancelable(self.io);
-            if (file.bits.get(idx)) {
-                file.mu.unlock(self.io);
-                return false;
-            }
-            if (file.filling.contains(idx)) {
-                file.mu.unlock(self.io);
-                sys.sleepMs(2);
-                continue;
-            }
-            file.filling.put(idx, {}) catch |err| {
-                file.mu.unlock(self.io);
-                return err;
-            };
-            // A fill in flight is access: it must keep punchPiece (which
-            // rechecks recency under the same lock) from culling under it.
-            file.last_access.store(sys.monoSec(), .monotonic);
-            file.mu.unlock(self.io);
-            return true;
-        }
-    }
-
     pub fn finishPiece(self: *Store, file: *Cached, idx: u32, ok: bool) void {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
@@ -694,20 +665,6 @@ pub const Store = struct {
         _ = self.saveBits(file, false);
     }
 
-    /// Length of piece idx sampled under file.mu immediately after a
-    /// successful claimPiece. file.size moves only under that lock (truncate,
-    /// reconcileSize, cacheFill), so an unlocked read could make the length
-    /// disagree with the bit finishPiece sets and serve hole zeros. Returns 0
-    /// when a truncate raced the claim and shrank the file below the piece:
-    /// the caller must finishPiece(.., false) and skip it instead of marking
-    /// an empty piece filled (a later grow preserves marks, so the bogus bit
-    /// would survive).
-    fn claimedPieceLen(self: *Store, file: *Cached, idx: u32) u32 {
-        file.mu.lockUncancelable(self.io);
-        defer file.mu.unlock(self.io);
-        return piece.len(file.size, idx, self.piece_size);
-    }
-
     /// Outcome of claiming one piece for a fill (the claim/sample contract
     /// both fill paths -- FUSE read hydration and peer /data hydration --
     /// must share, kept here so they cannot drift apart):
@@ -715,30 +672,52 @@ pub const Store = struct {
         /// Already filled, including by a concurrent filler that finished
         /// while we waited on its claim.
         filled,
-        /// A truncate raced the claim and shrank the file below the piece:
-        /// the claim was dropped with finishPiece(.., false) and the piece
-        /// stays unmarked; the caller moves on without treating it as an
-        /// error or as data.
+        /// A truncate shrank the file below this piece: the caller moves on
+        /// without treating it as an error or as data; the piece stays
+        /// unmarked (a later grow preserves marks, so a bogus bit would
+        /// survive).
         raced,
-        /// Byte length to fill, valid because file.size was sampled under
-        /// file.mu together with the bit check.
+        /// Byte length to fill.
         len: u32,
     };
 
-    /// Claims exclusive fill of piece idx and samples its byte length under
-    /// file.mu in one step. The raced outcome already drops the claim
-    /// unmarked; callers keep their own policy for it versus .filled instead
-    /// of re-deriving the pair from claimPiece plus claimedPieceLen (and
-    /// possibly finishing or skipping wrong). An allocation failure while
-    /// taking the claim surfaces as an error instead of spinning forever.
+    /// Claims exclusive fill of piece idx and samples its byte length in one
+    /// file.mu window: the bit check, the length sample, and the claim land
+    /// together, so a concurrent truncate cannot open a gap where the length
+    /// disagrees with the bit finishPiece will set. A persistent allocation
+    /// failure surfaces as an error instead of spinning forever: an unbounded
+    /// retry here would wedge the reader (FUSE read, peer hydrate) with no
+    /// timeout and no signal.
     pub fn beginFill(self: *Store, file: *Cached, idx: u32) !FillClaim {
-        if (!try self.claimPiece(file, idx)) return .filled;
-        const ln = self.claimedPieceLen(file, idx);
-        if (ln == 0) {
-            self.finishPiece(file, idx, false);
-            return .raced;
+        while (true) {
+            file.mu.lockUncancelable(self.io);
+            if (file.bits.get(idx)) {
+                file.mu.unlock(self.io);
+                return .filled;
+            }
+            if (file.filling.contains(idx)) {
+                file.mu.unlock(self.io);
+                sys.sleepMs(2);
+                continue;
+            }
+            file.filling.put(idx, {}) catch |err| {
+                file.mu.unlock(self.io);
+                return err;
+            };
+            // A fill in flight is access: it must keep punchPiece (which
+            // rechecks recency under the same lock) from culling under it.
+            file.last_access.store(sys.monoSec(), .monotonic);
+            const ln = piece.len(file.size, idx, self.piece_size);
+            if (ln == 0) {
+                // The truncate won: drop the claim unmarked, persist nothing
+                // (the bits did not change).
+                _ = file.filling.remove(idx);
+                file.mu.unlock(self.io);
+                return .raced;
+            }
+            file.mu.unlock(self.io);
+            return .{ .len = ln };
         }
-        return .{ .len = ln };
     }
 
     /// Lands one claimed fill: writes buf at the piece offset and marks the
@@ -780,6 +759,20 @@ pub const Store = struct {
         if (fd < 0) return fd;
         file.last_access.store(sys.monoSec(), .monotonic);
         return sys.preadAll(fd, buf, off);
+    }
+
+    /// Serves one read range from the cache copy, falling back to the
+    /// authoritative origin bytes when the cache tier answers nothing at all
+    /// (open or pread failure: broken or full cache fs). The miss path
+    /// already degrades to origin service; failing a warm read instead would
+    /// turn a dead cache mount into a total read outage for every file with
+    /// cached pieces. Each fallback is warned: without the line a silently
+    /// degraded node is indistinguishable from normal service.
+    pub fn readServed(self: *Store, file: *Cached, buf: []u8, off: u64) isize {
+        const n = self.readCache(file, buf, off);
+        if (n >= 0) return n;
+        std.log.warn("cache read failed for {s} (errno {d}); serving from origin", .{ file.rel, -n });
+        return self.originPread(file.rel, buf, off);
     }
 
     pub fn originPread(self: Store, rel: []const u8, buf: []u8, off: u64) isize {
@@ -1163,7 +1156,7 @@ pub const Store = struct {
         self.mu.unlock(self.io);
         var bits = self.loadBits(rel, size) catch return false;
         defer bits.deinit(self.gpa);
-        const idx = bits.lastSet() orelse return false;
+        const idx = bits.lastSet() orelse return self.punchDiskUnclaimed(rel, fd, size, bits, epoch0);
         const off = piece.offset(idx, self.piece_size);
         const ln = piece.len(size, idx, self.piece_size);
         bits.clear(idx);
@@ -1207,6 +1200,51 @@ pub const Store = struct {
             return false;
         }
         if (sys.punchHole(fd, off, ln) != 0) return false;
+        self.purge_epoch += 1;
+        _ = self.stats.pieces_culled.fetchAdd(1, .monotonic);
+        return true;
+    }
+
+    /// Reclaims a data file that no sidecar vouches for: the decoded field
+    /// is empty because the sidecar is missing (crash between the data write
+    /// and its first save), stale against the current piece grid or file
+    /// size (decode resets on ps/fs mismatch), or already cleared while
+    /// blocks remain allocated (crash between a durable clear and the
+    /// punch). No mark claims these bytes, so hole-punching the whole extent
+    /// cannot serve hole zeros behind a bit; leaving them, however, makes
+    /// them invisible to every later cull round -- lastSet finds nothing to
+    /// punch and this scan used to bail -- so sustained pressure could hold
+    /// the watermark below bcull forever against victims that free nothing.
+    /// Same write-ahead contract as the per-piece path: the cleared field is
+    /// persisted durably before any destructive step, under the same
+    /// store.mu window and builder-epoch guard.
+    fn punchDiskUnclaimed(self: *Store, rel: []const u8, fd: c_int, size: u64, bits: piece.Bitfield, epoch0: u64) bool {
+        if (size == 0) return false;
+        var blob: std.ArrayList(u8) = .empty;
+        defer blob.deinit(self.gpa);
+        bits.encode(self.piece_size, size, &blob, self.gpa) catch {
+            std.log.warn("bitfield encode failed for {s}; unclaimed bytes stay cached", .{rel});
+            return false;
+        };
+        var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+        const mp = self.cacheMetaPath(&mbuf, rel) catch return false;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.files.contains(rel)) return false;
+        if (self.purge_epoch != epoch0) return false;
+        const parent = sys.parentOf(std.mem.span(mp));
+        if (writeFileMakingParent(mp, parent, blob.items, true) != 0) {
+            std.log.warn("bitfield save failed for {s}; unclaimed bytes stay cached", .{rel});
+            return false;
+        }
+        const punched = sys.punchHole(fd, 0, size);
+        if (punched != 0) {
+            // The durable sidecar above already clears every mark, so reads
+            // refill over these bytes on demand; a failed punch only delays
+            // the space reclaim to the next sampled round.
+            std.log.warn("unclaimed-byte punch failed for {s} (errno {d}); bytes stay until the next round", .{ rel, -punched });
+            return false;
+        }
         self.purge_epoch += 1;
         _ = self.stats.pieces_culled.fetchAdd(1, .monotonic);
         return true;
@@ -2050,6 +2088,139 @@ test "punchDisk punches an orphaned rel and publishes cleared bits" {
     const f = try st.get("orph.bin", pattern.len);
     defer st.releaseFile(f);
     try std.testing.expect(!f.bits.get(0));
+}
+
+test "punchDisk reclaims a data file no sidecar vouches for" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pd-void");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pd-void");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Orphan of the crash-before-first-save shape: allocated bytes on disk,
+    // no sidecar. walkData samples it (blocks > 0), but lastSet finds
+    // nothing to punch; regression: the disk scan bailed here forever, so
+    // such blocks were invisible to every cull round and could strand the
+    // watermark below bcull with victims that never free anything.
+    const pattern = "0123456789abcdef0123456789abcdef";
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.cacheDataPath(&db, "orphan.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(dp, pattern));
+
+    // A rel with a live map entry is still refused, empty bits or not:
+    // the membership gate protects the unclaimed path like the marked one.
+    const kept = try st.get("kept.bin", 16);
+    defer st.releaseFile(kept);
+    var kb: [sys.c.PATH_MAX]u8 = undefined;
+    const kp = try st.cacheDataPath(&kb, "kept.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(kp, pattern[0..16]));
+    try std.testing.expect(!st.punchDisk("kept.bin"));
+
+    const e0 = st.purge_epoch;
+    try std.testing.expect(st.punchDisk("orphan.bin"));
+    try std.testing.expectEqual(e0 + 1, st.purge_epoch);
+    try std.testing.expectEqual(@as(u64, 1), st.stats.pieces_culled.load(.monotonic));
+
+    // The cleared field was published durably under the file's real
+    // geometry: a fresh entry must start empty instead of trusting anything.
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, "orphan.bin");
+    const blob = try sys.readFileAlloc(gpa, mp, 4096);
+    defer gpa.free(blob);
+    var decoded = try piece.Bitfield.decode(gpa, blob, st.piece_size, pattern.len);
+    defer decoded.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 0), decoded.filled());
+
+    // KEEP_SIZE punch: the skeleton stays at its old length, now blockless,
+    // so later walkData samples skip it instead of repunching every round.
+    var sb: c.struct_stat = undefined;
+    try std.testing.expect(sys.statPath(dp, &sb) == 0);
+    try std.testing.expectEqual(@as(u64, pattern.len), @as(u64, @intCast(sb.st_size)));
+}
+
+test "punchDisk reclaims a data file whose sidecar names another geometry" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pd-grid");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pd-grid");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Stale-grid shape (e.g. --piece changed across restarts): decode resets
+    // on the ps/fs mismatch, so the marks are untrusted and the whole file
+    // must be reclaimable rather than stranded.
+    const pattern = "0123456789abcdef";
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.cacheDataPath(&db, "stale.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(dp, pattern));
+    try writeFilledSidecar(&st, "stale.bin", 4 * 1024 * 1024, &.{0});
+
+    try std.testing.expect(st.punchDisk("stale.bin"));
+
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, "stale.bin");
+    const blob = try sys.readFileAlloc(gpa, mp, 4096);
+    defer gpa.free(blob);
+    var decoded = try piece.Bitfield.decode(gpa, blob, st.piece_size, pattern.len);
+    defer decoded.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 0), decoded.filled());
+}
+
+test "readServed falls back to origin when the cache tier cannot answer" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-rsrv");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-rsrv");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const pattern = "0123456789abcdef";
+    var zbuf: [192]u8 = undefined;
+    var fbuf: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&zbuf, "{s}/fb.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fbuf, fp), ""));
+    try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), st.originPwrite("fb.bin", pattern, 0));
+    const f = try st.get("fb.bin", pattern.len);
+    defer st.releaseFile(f);
+
+    // Break the cache tier for this file: a directory planted at the data
+    // path refuses the cache fd open (EISDIR). A warm read must degrade to
+    // origin service -- regression: it surfaced the cache error as EIO,
+    // turning a dead cache mount into a total read outage for every file
+    // with cached pieces while the origin stayed perfectly healthy.
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.cacheDataPath(&db, "fb.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(dp), 0o755));
+
+    var rb: [16]u8 = undefined;
+    // The expected fallback warn is below the raised threshold; restored on
+    // scope exit so unexpected warnings from later tests still surface.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+    const n = st.readServed(f, &rb, 0);
+    try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
+    try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
+
+    // The plain cache read still reports the failure itself: the fallback
+    // must not swallow the errno from callers that want it.
+    try std.testing.expect(st.readCache(f, &rb, 0) < 0);
 }
 
 test "considerVictim keeps a bounded oldest-first sample" {
