@@ -228,6 +228,16 @@ pub fn statPath(path: [*:0]const u8, st: *c.struct_stat) i32 {
     return 0;
 }
 
+/// stat(2) without following a final symlink. Walks over attacker-writable
+/// trees (the cache data dir) must sample what the NAME names, not what a
+/// planted symlink points at; intermediate components still resolve, which
+/// is why walkers combine this with their own depth cap and treat S_IFLNK
+/// entries as skippable.
+pub fn lstatPath(path: [*:0]const u8, st: *c.struct_stat) i32 {
+    if (c.fstatat(c.AT_FDCWD, path, st, c.AT_SYMLINK_NOFOLLOW) != 0) return negErrno();
+    return 0;
+}
+
 pub fn ftruncate(fd: c_int, size: u64) i32 {
     if (c.ftruncate(fd, @intCast(size)) != 0) return negErrno();
     return 0;

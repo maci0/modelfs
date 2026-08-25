@@ -1103,9 +1103,12 @@ pub const Store = struct {
     }
 
     /// Deepest data/<a>/<b>/... nesting the on-disk cull scan will enter.
-    /// statPath follows symlinks, so a directory symlink loop planted in a
-    /// writable cache tree would otherwise recurse until the stack dies;
-    /// past this bound entries are simply invisible to disk culling.
+    /// Entries are sampled with lstat (no final-symlink follow): a symlink
+    /// planted in a writable cache tree must neither be descended into as a
+    /// directory nor sampled as a cull victim, or punchDisk would resolve
+    /// rels whose INTERMEDIATE components leave the tree and fallocate-hole
+    /// an arbitrary daemon-writable file outside the cache. Past the depth
+    /// bound entries are simply invisible to disk culling.
     const walk_max_depth: u32 = 64;
 
     fn walkData(self: *Store, dir_path: []const u8, rel: []const u8, victims: *[walk_sample_cap]DiskVictim, count: *usize, depth: u32) void {
@@ -1120,7 +1123,7 @@ pub const Store = struct {
             var child: [sys.c.PATH_MAX]u8 = undefined;
             const cp = sys.joinZ(&child, dir_path, name) catch continue;
             var st: c.struct_stat = undefined;
-            if (sys.statPath(cp, &st) != 0) continue;
+            if (sys.lstatPath(cp, &st) != 0) continue;
             var nrel_buf: [sys.c.PATH_MAX]u8 = undefined;
             const nrel_z = if (rel.len == 0)
                 sys.toZ(&nrel_buf, name) catch continue
@@ -2144,6 +2147,61 @@ test "walkData samples oldest-first disk-only files across subdirs" {
         try std.testing.expectEqualStrings(w, victims[i].rel[0..victims[i].len]);
         if (i > 0) try std.testing.expect(victims[i - 1].at <= victims[i].at);
     }
+}
+
+test "walkData never samples or descends planted symlinks" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-walk-link");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, "/unused", cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Real cached files the walk must still sample, plus two planted
+    // symlinks in the same writable tree a local writer would use: one at
+    // a regular file, one at a directory OUTSIDE data/ holding another aged
+    // file. Both symlinks must be invisible to the scan: sampling the first
+    // would let punchDisk punch through a name resolving outside the tree,
+    // and descending the second would do the same via intermediate
+    // components.
+    const entries = [_][]const u8{ "real.bin", "hidden/target.bin", "../outside/escaped.bin" };
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    for (entries) |e| {
+        var fb: [320]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fb, "{s}/data/{s}", .{ cache_d, e });
+        try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(sys.parentOf(fp), 0o755));
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "cached"));
+    }
+    var lbuf: [sys.c.PATH_MAX]u8 = undefined;
+    var tbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const sneaky = try std.fmt.bufPrint(&lbuf, "{s}/data/sneaky.bin", .{cache_d});
+    const target = try std.fmt.bufPrint(&tbuf, "{s}/data/real.bin", .{cache_d});
+    try std.testing.expect(c.symlink(try sys.toZ(&zbuf, target), try sys.toZ(&zbuf, sneaky)) == 0);
+    const dirlink = try std.fmt.bufPrint(&lbuf, "{s}/data/dirlink", .{cache_d});
+    const outside = try std.fmt.bufPrint(&tbuf, "{s}/outside", .{cache_d});
+    try std.testing.expect(c.symlink(try sys.toZ(&zbuf, outside), try sys.toZ(&zbuf, dirlink)) == 0);
+
+    var rb: [sys.c.PATH_MAX]u8 = undefined;
+    const root = try sys.joinZ(&rb, cache_d, "data");
+    var victims: [Store.walk_sample_cap]Store.DiskVictim = undefined;
+    var count: usize = 0;
+    st.walkData(std.mem.span(root), "", &victims, &count, 0);
+
+    try std.testing.expectEqual(@as(usize, 2), count);
+    var saw_real = false;
+    var saw_hidden = false;
+    for (victims[0..count]) |v| {
+        const got = v.rel[0..v.len];
+        if (std.mem.eql(u8, got, "real.bin")) saw_real = true;
+        if (std.mem.eql(u8, got, "hidden/target.bin")) saw_hidden = true;
+        // Neither link may appear, in sampled or traversed form.
+        try std.testing.expect(std.mem.indexOf(u8, got, "sneaky") == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "dirlink") == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "escaped") == null);
+    }
+    try std.testing.expect(saw_real and saw_hidden);
 }
 
 test "get survives concurrent artifact invalidation between loadBits and insert" {

@@ -94,6 +94,26 @@ fn resolveRel(p: []const u8, cluster_rc: c_int, rel: *[]const u8) c_int {
     return 0;
 }
 
+/// Client-supplied create/mkdir modes carry permission bits only. The FUSE
+/// authority transition makes the daemon the owner of everything created
+/// through the mount, and Linux honors S_ISUID/S_ISGID in open(2)/mkdir(2)
+/// create modes, so passing the caller's mode verbatim would let any writer
+/// to a mount directory plant a setuid/setgid executable owned by the daemon
+/// uid -- root on an allow_other root mount. Nothing this filesystem stores
+/// (model weights, cache artifacts) has a use for special bits.
+fn clientCreateMode(mode: fuse.mode_t) fuse.mode_t {
+    return mode & 0o777;
+}
+
+test "clientCreateMode strips setuid, setgid, and sticky bits" {
+    try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o4755));
+    try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o2755));
+    try std.testing.expectEqual(@as(fuse.mode_t, 0o777), clientCreateMode(0o1777));
+    try std.testing.expectEqual(@as(fuse.mode_t, 0o600), clientCreateMode(0o4600));
+    try std.testing.expectEqual(@as(fuse.mode_t, 0o644), clientCreateMode(0o644));
+    try std.testing.expectEqual(@as(fuse.mode_t, 0), clientCreateMode(0));
+}
+
 test "resolveRel denies cluster and traversal paths" {
     var rel: []const u8 = "";
     try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), resolveRel("/.cluster", -sys.c.ENOENT, &rel));
@@ -163,7 +183,7 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     if (rerr != 0) return rerr;
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC, mode);
+    const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC, clientCreateMode(mode));
     if (fd < 0) return sys.negErrno();
     sys.close(fd);
     // The origin create above already landed: failing the syscall here (entry
@@ -446,7 +466,7 @@ export fn mf_mkdir(path: [*c]const u8, mode: fuse.mode_t) callconv(.c) c_int {
     if (rerr != 0) return rerr;
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    if (std.c.mkdir(op, mode) != 0) return sys.negErrno();
+    if (std.c.mkdir(op, clientCreateMode(mode)) != 0) return sys.negErrno();
     return 0;
 }
 
@@ -592,9 +612,16 @@ fn cullLoop(st: *State) void {
     const reap_idle_secs: i64 = 300;
     var last_reap = sys.monoSec();
     while (st.running.load(.acquire)) {
-        if (sys.monoSec() - last_reap >= reap_every_secs) {
-            st.store.reapIdle(sys.monoSec(), reap_idle_secs);
-            last_reap = sys.monoSec();
+        // One monotonic instant per round: the reap gate, reapIdle's cutoff,
+        // its reschedule stamp, and every cullOne recency decision below run
+        // on this sample instead of four reads drifting across the round.
+        // punchPiece/cullOne/reapIdle take the instant in precisely so their
+        // decisions stay pure functions of state plus one clock sample
+        // (see store.zig), which only holds if the driver samples once.
+        const now = sys.monoSec();
+        if (now - last_reap >= reap_every_secs) {
+            st.store.reapIdle(now, reap_idle_secs);
+            last_reap = now;
         }
         const free_pct = st.store.freePercentChecked() orelse {
             if (!statfs_failing) std.log.err("cache statvfs failed on {s}; culling suspended", .{st.store.cache});
@@ -608,7 +635,7 @@ fn cullLoop(st: *State) void {
         if (culling) {
             var n: u32 = 0;
             while (n < 16) : (n += 1) {
-                if (!st.store.cullOne(sys.monoSec())) break;
+                if (!st.store.cullOne(now)) break;
             }
             napMs(st, if (ph == .stop) 500 else 1000);
             continue;

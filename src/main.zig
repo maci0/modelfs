@@ -97,7 +97,7 @@ const Opts = struct {
     direct_io: bool = true,
     allow_other: bool = false,
     detach: bool = false,
-    listen: ?[]const u8 = null,
+    listen_port: ?u16 = null,
     advertise: std.ArrayList(proto.LeaseAddr) = .empty,
     seed: std.ArrayList([]const u8) = .empty,
 };
@@ -115,22 +115,17 @@ fn parseHostPort(s: []const u8, default_port: u16) !proto.LeaseAddr {
     return .{ .ip = s, .port = default_port, .mbps = 0 };
 }
 
-fn isDigits(s: []const u8) bool {
-    if (s.len == 0) return false;
-    for (s) |ch| {
-        if (ch < '0' or ch > '9') return false;
-    }
-    return true;
-}
-
-/// "--listen [IP:]PORT": a bare numeric value is a port, any other bare value
-/// is a host that keeps the default port. Binding is always wildcard.
-fn listenPort(spec: []const u8, default_port: u16) !u16 {
+/// "--listen [IP:]PORT": only the port is consumed (binding is always
+/// wildcard), so a bare numeric value is a port and any HOST:PORT form is
+/// honored for its explicit port. A bare word or empty value names no port
+/// at all; defaulting it would silently mount on 18080 while the caller
+/// believes their spec took effect, so it is refused where the flag is
+/// parsed, like every other malformed flag value.
+fn listenPort(spec: []const u8) !u16 {
     if (std.mem.findScalarLast(u8, spec, ':')) |i| {
         return std.fmt.parseInt(u16, spec[i + 1 ..], 10);
     }
-    if (isDigits(spec)) return std.fmt.parseInt(u16, spec, 10);
-    return default_port;
+    return std.fmt.parseInt(u16, spec, 10);
 }
 
 /// Consumes the value after a flag; names the flag when it is missing one.
@@ -258,7 +253,11 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             opts.detach = false;
         } else if (std.mem.eql(u8, a, "--listen")) {
             try rejectOutsideMount(cmd, a);
-            opts.listen = try takeValue(args, a, &i);
+            const raw = try takeValue(args, a, &i);
+            opts.listen_port = listenPort(raw) catch {
+                if (!builtin.is_test) std.debug.print("--listen {s}: bad endpoint (want [IP:]PORT)\n", .{raw});
+                return error.BadListen;
+            };
         } else if (std.mem.eql(u8, a, "--advertise")) {
             try rejectOutsideMount(cmd, a);
             const v = try takeValue(args, a, &i);
@@ -511,7 +510,7 @@ fn leaseAddrs(gpa: std.mem.Allocator, opts: Opts, local_ips: []const []const u8,
     errdefer addrs.deinit(gpa);
     if (opts.advertise.items.len > 0) {
         try addrs.appendSlice(gpa, opts.advertise.items);
-        if (opts.listen != null) {
+        if (opts.listen_port != null) {
             for (addrs.items) |*a| {
                 if (a.port == proto.default_port) a.port = eff_port;
             }
@@ -614,16 +613,9 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
 
     // Effective listening port: an explicit --listen wins over the default,
     // including for --advertise entries that did not spell out their own
-    // ":PORT" (they carry 18080 from parsing).
-    const eff_port: u16 = blk: {
-        if (opts.listen) |l| {
-            break :blk listenPort(l, proto.default_port) catch {
-                std.log.err("bad --listen {s} (want [IP:]PORT)", .{l});
-                return 1;
-            };
-        }
-        break :blk proto.default_port;
-    };
+    // ":PORT" (they carry 18080 from parsing). The spec itself was validated
+    // at flag-parse time, so nothing can fail here.
+    const eff_port: u16 = opts.listen_port orelse proto.default_port;
 
     var addrs = try leaseAddrs(gpa, opts, local_ips, eff_port);
     defer addrs.deinit(gpa);
@@ -667,8 +659,13 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         teardownMount(st);
         return 1;
     }
-    st.catalog.publish(sys.nowSec());
-    st.catalog.refresh(sys.nowSec());
+    // One wall-clock instant for both lease steps, like every discovery tick
+    // (discLoop): publish's until stamp and refresh's expiry filter decide
+    // against the same sample instead of two reads drifting across startup,
+    // which could persist a lease a same-tick refresh would call expired.
+    const cluster_now = sys.nowSec();
+    st.catalog.publish(cluster_now);
+    st.catalog.refresh(cluster_now);
     st.server.bindAll(addrs.items) catch |err| {
         std.log.err("bind peer http: {t}", .{err});
         teardownMount(st);
@@ -958,13 +955,20 @@ test "parseHostPort splits and defaults" {
 
 test "listenPort accepts bare port per --listen [IP:]PORT" {
     // bare port must win, not fall back to the default (regression: it did)
-    try std.testing.expectEqual(@as(u16, 19090), try listenPort("19090", 18080));
-    try std.testing.expectEqual(@as(u16, 19090), try listenPort("127.0.0.1:19090", 18080));
-    try std.testing.expectEqual(@as(u16, 18080), try listenPort("spark1", 18080));
-    try std.testing.expectEqual(@as(u16, 18080), try listenPort("", 18080));
+    try std.testing.expectEqual(@as(u16, 19090), try listenPort("19090"));
+    try std.testing.expectEqual(@as(u16, 19090), try listenPort("127.0.0.1:19090"));
+    // the host part is never consumed (binding is always wildcard), so a
+    // name there is tolerated as long as the explicit port rides along
+    try std.testing.expectEqual(@as(u16, 19090), try listenPort("spark1:19090"));
+    try std.testing.expectEqual(@as(u16, 19090), try listenPort(":19090"));
+    // a bare word or empty value names no port: defaulting it would mount on
+    // 18080 while the caller believes their spec took effect
+    try std.testing.expectError(error.InvalidCharacter, listenPort("spark1"));
+    try std.testing.expectError(error.InvalidCharacter, listenPort(""));
+    try std.testing.expectError(error.InvalidCharacter, listenPort("spark1:"));
     // numeric garbage must fail loudly, not silently become the default
-    try std.testing.expectError(error.Overflow, listenPort("70000", 18080));
-    try std.testing.expectError(error.Overflow, listenPort("h:70000", 18080));
+    try std.testing.expectError(error.Overflow, listenPort("70000"));
+    try std.testing.expectError(error.Overflow, listenPort("h:70000"));
 }
 
 test "pidAlive answers for live and exited processes" {
@@ -1089,7 +1093,8 @@ test "parseArgs mount flags" {
     try std.testing.expectEqualStrings("/mnt/models", parsed.rest[0]);
     try std.testing.expectEqualStrings("/srv/origin", parsed.opts.origin.?);
     try std.testing.expectEqual(@as(u32, 4 * 1024 * 1024), parsed.opts.piece);
-    try std.testing.expectEqualStrings("127.0.0.1:19090", parsed.opts.listen.?);
+    // --listen is fully parsed at the flag boundary; only the port survives
+    try std.testing.expectEqual(@as(u16, 19090), parsed.opts.listen_port.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.opts.seed.items.len);
     try std.testing.expectEqualStrings("10.0.0.9:19099", parsed.opts.seed.items[0]);
     try std.testing.expectEqual(@as(u32, 12), parsed.opts.water.brun);
@@ -1116,6 +1121,14 @@ test "parseArgs rejects bad values" {
     // malformed seed/advertise addresses are named, not bare parseInt failures
     try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--seed", "h:70000" }));
     try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "10.0.0.1:99999" }));
+    // --listen is validated at the flag like its sibling value flags: a bare
+    // word or empty spec names no port and must not silently mount on 18080
+    // (regression: both were accepted-and-defaulted, exiting 1 only after the
+    // origin/cache/mountpoint had already been created)
+    try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "spark1" }));
+    try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "" }));
+    try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "abc:def" }));
+    try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "70000" }));
     // an empty address (bare comma split) is refused at the flag, not at bind
     try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "," }));
     // host names in --advertise would publish addresses no peer can dial
@@ -1315,7 +1328,7 @@ test "leaseAddrs follows --listen and falls back to loopback" {
     // the default and an explicit --listen overrides it.
     {
         var opts = Opts{};
-        opts.listen = "0.0.0.0:19091";
+        opts.listen_port = 19091;
         try opts.advertise.append(gpa, .{ .ip = "10.0.0.1", .port = proto.default_port });
         try opts.advertise.append(gpa, .{ .ip = "10.0.0.2", .port = 19090 });
         defer opts.advertise.deinit(gpa);

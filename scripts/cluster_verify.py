@@ -6,6 +6,7 @@ Pings every node, then reads /have bitfields round-robin across the nodes
 benchmark log. Exits nonzero on the first failure.
 """
 
+import os
 import sys
 import time
 import urllib.parse
@@ -74,7 +75,12 @@ def main(argv: list[str]) -> int:
 
     # Query /have across the cluster
     t0 = time.monotonic()
-    path_enc = urllib.parse.quote(rel, safe="")
+    # Paths are bytes on the daemon side (relOk passes non-UTF-8 names
+    # through byte-exact), so encode from the raw argv bytes: os.fsencode
+    # reverses surrogateescape back to the original octets, and
+    # quote_from_bytes percent-encodes each one. quote(rel) on the str
+    # would raise UnicodeEncodeError on a legal non-UTF-8 file name.
+    path_enc = urllib.parse.quote_from_bytes(os.fsencode(rel), safe="")
 
     for p_idx in range(total_pieces):
         target_node = (p_idx % num_nodes) + 1
