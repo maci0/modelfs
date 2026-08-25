@@ -9,6 +9,20 @@ pub const Water = struct {
     bstop: u32 = 3,
 };
 
+/// True when the watermarks are strictly ordered brun > bcull > bstop, the
+/// only arrangement phase() hysteresis works for. Out of order, the failure
+/// is deterministic, not merely suboptimal:
+///   * bstop >= bcull makes .stop win on every sample at or below bstop, so
+///     hard culling runs far above the intended floor and keeps the cache
+///     capped under bstop% used no matter how empty the disk is;
+///   * brun <= bcull makes the band [brun, bcull] enter culling one tick and
+///     leave it the next (free >= brun ends it, free <= bcull restarts it),
+///     punching candidates every round while free space sits still.
+/// cachefilesd documents the same ordering constraint on its config values.
+pub fn ordered(w: Water) bool {
+    return w.brun > w.bcull and w.bcull > w.bstop;
+}
+
 pub const Phase = enum { run, cull, stop };
 
 pub fn phase(free_pct: u32, w: Water, culling: bool) Phase {
@@ -38,6 +52,20 @@ test "phase matches cachefilesd watermarks" {
     try std.testing.expectEqual(Phase.stop, phase(0, w, true));
     try std.testing.expectEqual(Phase.cull, phase(8, w, true));
     try std.testing.expectEqual(Phase.run, phase(10, w, true));
+}
+
+test "ordered rejects the orderings that break phase hysteresis" {
+    // Defaults and any strict ordering are valid.
+    try std.testing.expect(ordered(.{}));
+    try std.testing.expect(ordered(.{ .brun = 100, .bcull = 99, .bstop = 0 }));
+    // bstop >= bcull: .stop pins at every sample <= bstop, hard-culling the
+    // cache down toward bstop% used regardless of bcull's intent.
+    try std.testing.expect(!ordered(.{ .brun = 90, .bcull = 70, .bstop = 80 }));
+    try std.testing.expect(!ordered(.{ .brun = 7, .bcull = 3, .bstop = 3 }));
+    // brun <= bcull: the [brun, bcull] band flaps run/cull every tick,
+    // punching candidates each round while free space never moves.
+    try std.testing.expect(!ordered(.{ .brun = 5, .bcull = 10, .bstop = 3 }));
+    try std.testing.expect(!ordered(.{ .brun = 7, .bcull = 7, .bstop = 3 }));
 }
 
 test "freePercent" {

@@ -280,6 +280,16 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             return error.BadId;
         }
     }
+    // Cross-field gate on the cull watermarks: each value is individually a
+    // percentage (takePercent), but only the strict ordering brun > bcull >
+    // bstop gives phase() working hysteresis. Out of order, the daemon
+    // hard-culls far above the intended floor (bstop >= bcull) or punches
+    // candidates every tick in the run/cull flap band (brun <= bcull).
+    if (!cull.ordered(opts.water)) {
+        if (!builtin.is_test)
+            std.debug.print("watermarks out of order (brun {d}, bcull {d}, bstop {d}): need brun > bcull > bstop\n", .{ opts.water.brun, opts.water.bcull, opts.water.bstop });
+        return error.BadWatermarks;
+    }
     return .{ .cmd = cmd, .opts = opts, .rest = try rest.toOwnedSlice(gpa) };
 }
 
@@ -988,11 +998,19 @@ test "parseArgs rejects bad values" {
     // values above 100 would pin the cull phase permanently
     try std.testing.expectError(error.BadWatermark, parseArgs(gpa, &environ, &.{ "mount", "--brun", "101" }));
     try std.testing.expectError(error.BadWatermark, parseArgs(gpa, &environ, &.{ "mount", "--bstop", "4294967295" }));
+    // Boundary percentages are accepted when the set stays ordered.
     try std.testing.expectEqual(@as(u32, 100), blk: {
-        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--bcull", "100" });
+        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--brun", "100", "--bcull", "99", "--bstop", "0" });
         defer freeParsed(parsed, gpa);
-        break :blk parsed.opts.water.bcull;
+        try std.testing.expectEqual(@as(u32, 99), parsed.opts.water.bcull);
+        break :blk parsed.opts.water.brun;
     });
+    // Only strict ordering gives phase() hysteresis: bstop >= bcull pins .stop
+    // (hard-culling toward bstop% used no matter how empty the disk), and
+    // brun <= bcull flaps run/cull every tick across [brun, bcull].
+    try std.testing.expectError(error.BadWatermarks, parseArgs(gpa, &environ, &.{ "mount", "--brun", "5", "--bcull", "10" }));
+    try std.testing.expectError(error.BadWatermarks, parseArgs(gpa, &environ, &.{ "mount", "--brun", "7", "--bcull", "7" }));
+    try std.testing.expectError(error.BadWatermarks, parseArgs(gpa, &environ, &.{ "mount", "--brun", "90", "--bcull", "70", "--bstop", "80" }));
     // An id that cannot ride in the lease file name or JSON document would
     // make every peer's parser refuse this node's lease (or skip it as a
     // dot file): rejected at the flag boundary like --advertise's quads.
