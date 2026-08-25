@@ -3,8 +3,13 @@
 Benchmark & Figure Generator for modelfs
 Runs real latency, throughput, and cluster scaling benchmarks across modelfs peer nodes
 and plots publication-grade figures using matplotlib.
+
+Numbers come from the machine running the script, so by default the report and
+figures land in .scratch/benchmarks/ (gitignored); pass --update-docs to
+regenerate the tracked docs/benchmarks.md and docs/figures/.
 """
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -294,9 +299,11 @@ def plot_figures(
     latencies_ms: list[float],
     chunk_labels: list[str],
     throughputs_mbps: list[float],
+    out_dir: Path,
 ) -> None:
     print("=== Generating Publication-Quality Benchmark Charts ===")
-    os.makedirs("docs/figures", exist_ok=True)
+    figures_dir = out_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
 
     # Figure 1: Cluster Latency Scaling
     fig, ax = plt.subplots(figsize=(6.5, 4), dpi=300)
@@ -321,7 +328,7 @@ def plot_figures(
     ax.grid(visible=True, linestyle="--", alpha=0.5)
     ax.legend(frameon=True, facecolor="white", framealpha=0.9)
     plt.tight_layout()
-    fig1_path = "docs/figures/fig1_cluster_latency_scaling.png"
+    fig1_path = str(figures_dir / "fig1_cluster_latency_scaling.png")
     fig.savefig(fig1_path, dpi=300)
     plt.close(fig)
     print(f"✓ Saved Figure 1: {fig1_path}")
@@ -361,7 +368,7 @@ def plot_figures(
         )
 
     plt.tight_layout()
-    fig2_path = "docs/figures/fig2_throughput_vs_piece_size.png"
+    fig2_path = str(figures_dir / "fig2_throughput_vs_piece_size.png")
     fig.savefig(fig2_path, dpi=300)
     plt.close(fig)
     print(f"✓ Saved Figure 2: {fig2_path}")
@@ -404,7 +411,7 @@ def plot_figures(
         )
 
     plt.tight_layout()
-    fig3_path = "docs/figures/fig3_tier_latency_comparison.png"
+    fig3_path = str(figures_dir / "fig3_tier_latency_comparison.png")
     fig.savefig(fig3_path, dpi=300)
     plt.close(fig)
     print(f"✓ Saved Figure 3: {fig3_path}")
@@ -415,6 +422,7 @@ def generate_report(
     latencies_ms: list[float],
     chunk_labels: list[str],
     throughputs_mbps: list[float],
+    out_dir: Path,
 ) -> None:
     latency_table = "\n".join(
         f"| {n} | {ms} ms |" for n, ms in zip(node_counts, latencies_ms, strict=True)
@@ -485,7 +493,8 @@ peer latency.
 
 ![Tier latency comparison](figures/fig3_tier_latency_comparison.png)
 """
-    report_path = "docs/benchmarks.md"
+    report_path = out_dir / "benchmarks.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_content)
     print(f"✓ Generated Benchmark Report: {report_path}")
@@ -494,11 +503,29 @@ peer latency.
 def main() -> None:
     reexec_under_venv()
     require_fuse()
+    parser = argparse.ArgumentParser(
+        description="Run the modelfs benchmarks and render report + figures."
+    )
+    parser.add_argument(
+        "--update-docs",
+        action="store_true",
+        help="overwrite the tracked docs/benchmarks.md and docs/figures/ "
+        "(default: write to .scratch/benchmarks/, since every run records "
+        "the local machine's numbers)",
+    )
+    args = parser.parse_args()
+    out_dir = Path("docs") if args.update_docs else Path(".scratch") / "benchmarks"
     bin_path = build_modelfs()
     node_counts, latencies_ms = run_cluster_latency_benchmark(bin_path)
     chunk_labels, throughputs_mbps = run_throughput_vs_piece_size_benchmark(bin_path)
-    plot_figures(node_counts, latencies_ms, chunk_labels, throughputs_mbps)
-    generate_report(node_counts, latencies_ms, chunk_labels, throughputs_mbps)
+    plot_figures(node_counts, latencies_ms, chunk_labels, throughputs_mbps, out_dir)
+    generate_report(node_counts, latencies_ms, chunk_labels, throughputs_mbps, out_dir)
+    if not args.update_docs:
+        print(
+            f"Outputs in {out_dir} (gitignored): these are this machine's numbers. "
+            "To regenerate the tracked docs/benchmarks.md and docs/figures/, rerun "
+            "with --update-docs from representative hardware."
+        )
     print("=== All Benchmarks and Figure Generations Completed Successfully ===")
 
 

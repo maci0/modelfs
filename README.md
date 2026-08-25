@@ -89,8 +89,13 @@ zig build test -Dtest-filter=store        # one module's unit tests only (substr
 ./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end
 ./scripts/run_cluster_e2e_9nodes.sh       # 9-instance block exchange
 ./scripts/test_fault_tolerance.sh         # peer loss and lease expiry
-python3 scripts/run_benchmarks_and_plots.py
+python3 scripts/run_benchmarks_and_plots.py  # live benchmarks -> .scratch/benchmarks/
 ```
+
+The benchmark script measures the machine it runs on: it writes to gitignored
+`.scratch/benchmarks/` unless you pass `--update-docs`, which is how
+[docs/benchmarks.md](docs/benchmarks.md) and its figures are regenerated from
+representative hardware.
 
 Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); install the hash-verified lock with `uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt`.
 

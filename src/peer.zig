@@ -2549,30 +2549,99 @@ const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_dup_header,
 };
 
+/// Connected socketpair with `wire` already written into fds[0]: a
+/// deterministic stand-in for the peer side of the response parsers. False
+/// when the pair could not be created or the bytes could not be staged.
+fn stageWire(wire: []const u8, out: *[2]c_int) bool {
+    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, out) != 0) return false;
+    const staged = sys.writeAll(out[0], wire) == @as(isize, @intCast(wire.len));
+    sys.close(out[0]);
+    return staged;
+}
+
 fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const gpa = std.testing.allocator;
     var wire_buf: [2048]u8 = undefined;
     const wire = wire_buf[0..smith.slice(&wire_buf)];
-    var fds: [2]c_int = undefined;
-    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.Socket;
-    defer sys.close(fds[1]);
-    const staged = sys.writeAll(fds[0], wire) == @as(isize, @intCast(wire.len));
-    sys.close(fds[0]);
-    if (!staged) return;
-    var head_buf: [8192]u8 = undefined;
-    var head_len: usize = 0;
-    var total_read: usize = 0;
-    readHeadFull(fds[1], &head_buf, &head_len, &total_read) catch return;
-    const rep = haveFromHead(gpa, fds[1], &head_buf, head_len, total_read) catch return;
-    defer gpa.free(rep.bits);
-    const head = head_buf[0..head_len];
-    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
-    const want_len = std.fmt.parseInt(usize, cl_str, 10) catch 0;
-    try std.testing.expectEqual(want_len, rep.bits.len);
-    try std.testing.expect(total_read >= head_len + rep.bits.len);
-    try std.testing.expectEqualSlices(u8, wire[head_len..][0..rep.bits.len], rep.bits);
-    const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
-    try std.testing.expectEqual(try std.fmt.parseInt(u32, ps_str, 10), rep.piece_size);
+
+    // fetchHave leg: the bitmap answer rides an allocation sized by
+    // Content-Length. A reply this parser rejects skips the assertions that
+    // need a parsed value; the dest leg below still runs on every input.
+    {
+        var fds: [2]c_int = undefined;
+        defer sys.close(fds[1]);
+        if (stageWire(wire, &fds)) {
+            var head_buf: [8192]u8 = undefined;
+            var head_len: usize = 0;
+            var total_read: usize = 0;
+            if (readHeadFull(fds[1], &head_buf, &head_len, &total_read)) |_| {
+                if (haveFromHead(gpa, fds[1], &head_buf, head_len, total_read)) |rep| {
+                    defer gpa.free(rep.bits);
+                    const head = head_buf[0..head_len];
+                    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
+                    const want_len = std.fmt.parseInt(usize, cl_str, 10) catch 0;
+                    try std.testing.expectEqual(want_len, rep.bits.len);
+                    try std.testing.expect(total_read >= head_len + rep.bits.len);
+                    try std.testing.expectEqualSlices(u8, wire[head_len..][0..rep.bits.len], rep.bits);
+                    const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
+                    try std.testing.expectEqual(try std.fmt.parseInt(u32, ps_str, 10), rep.piece_size);
+                } else |_| {}
+            } else |_| {}
+        }
+    }
+
+    // /data fetch leg (fetchRangeInto): the same wire against a
+    // caller-supplied destination whose length must match Content-Length
+    // exactly -- the piece-fill trust boundary where a fetched piece may be
+    // marked filled only over bytes actually received. Runs on every input,
+    // including replies the /have leg rejects.
+    {
+        var dest_fds: [2]c_int = undefined;
+        defer sys.close(dest_fds[1]);
+        if (stageWire(wire, &dest_fds)) {
+            var dest_head_buf: [8192]u8 = undefined;
+            var dest_head_len: usize = 0;
+            var dest_total: usize = 0;
+            if (readHeadFull(dest_fds[1], &dest_head_buf, &dest_head_len, &dest_total)) |_| {
+                const dest_head = dest_head_buf[0..dest_head_len];
+                const status_end = std.mem.find(u8, dest_head, "\r\n") orelse return;
+                const status_ok = std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 200") or
+                    std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 206");
+                const dest_cl_str = proto.headerGet(dest_head, "Content-Length") orelse "0";
+                const dest_want: ?usize = std.fmt.parseInt(usize, dest_cl_str, 10) catch null;
+
+                var dest_buf: [64]u8 = undefined;
+                const dest_len: usize = @intCast(smith.value(usize) % (dest_buf.len + 1));
+                const dest_call = finishBodyAlloc(gpa, dest_fds[1], &dest_head_buf, dest_head_len, dest_total, dest_buf[0..dest_len], null);
+                if (!status_ok) {
+                    try std.testing.expectError(error.HttpStatus, dest_call);
+                    return;
+                }
+                const want = dest_want orelse {
+                    try std.testing.expectError(error.BadContentLength, dest_call);
+                    return;
+                };
+                if (dest_len != want) {
+                    // A mismatching destination is refused before any byte
+                    // moves, whatever the body looks like behind the head.
+                    try std.testing.expectError(error.LengthMismatch, dest_call);
+                    return;
+                }
+                _ = dest_call catch |err| switch (err) {
+                    error.ReadIncomplete => {
+                        // EOF before Content-Length is data loss: refused
+                        // outright, never a short success the fill path
+                        // would mark filled over hole zeros.
+                        try std.testing.expect(wire.len - dest_head_len < want);
+                        return;
+                    },
+                    else => return err,
+                };
+                try std.testing.expect(wire.len - dest_head_len >= want);
+                try std.testing.expectEqualSlices(u8, wire[dest_head_len..][0..want], dest_buf[0..want]);
+            } else |_| {}
+        }
+    }
 }
 
 test "fuzz peer reply parsing accepts well-formed replies and fails closed" {

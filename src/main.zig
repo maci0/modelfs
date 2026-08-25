@@ -703,7 +703,6 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
             .psk = psk,
             .store = undefined,
         },
-        .psk = psk,
         .direct_io = opts.direct_io,
         .start_secs = sys.monoSec(),
     };
@@ -1059,6 +1058,145 @@ test "parseSize accepts plain and suffixed values" {
     try std.testing.expectEqual(@as(u64, 3145728), try parseSize("3 MB"));
     // u64 max is exactly representable
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), try parseSize("18446744073709551615"));
+}
+
+/// One flag value in the corpus framing the harness reads: u32 length
+/// prefix, then the raw bytes.
+fn argvEntry(comptime s: []const u8) [4 + s.len]u8 {
+    var out: [4 + s.len]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(s.len), .little);
+    for (s, 0..) |b, i| out[4 + i] = b;
+    return out;
+}
+
+const seed_argv_plain = argvEntry("512");
+const seed_argv_suffixed = argvEntry("16M");
+const seed_argv_spaced_unit = argvEntry("3 MB");
+const seed_argv_lower_suffix = argvEntry("4kb");
+const seed_argv_trailing_b = argvEntry("12 B");
+const seed_argv_trailing_garbage = argvEntry("16Mi");
+const seed_argv_two_tokens = argvEntry("1KB2");
+const seed_argv_leading_space = argvEntry(" 16");
+const seed_argv_word = argvEntry("abc");
+const seed_argv_empty = argvEntry("");
+const seed_argv_digit_run_overflow = argvEntry("99999999999999999999999");
+const seed_argv_max_u64 = argvEntry("18446744073709551615");
+const seed_argv_suffix_mul_overflow = argvEntry("18446744073709551615G");
+const seed_argv_host_port = argvEntry("192.168.0.100:18080");
+const seed_argv_host_only = argvEntry("spark9.example");
+const seed_argv_colon_only = argvEntry(":18081");
+const seed_argv_trailing_colon = argvEntry("spark1:");
+const seed_argv_port_zero = argvEntry("10.0.0.9:0");
+const seed_argv_port_max = argvEntry("10.0.0.9:65535");
+const seed_argv_port_overflow = argvEntry("10.0.0.9:65536");
+const seed_argv_double_colon = argvEntry("a:b:19090");
+const seed_argv_pct_low = argvEntry("50");
+const seed_argv_pct_edge = argvEntry("100");
+const seed_argv_pct_over = argvEntry("101");
+const seed_argv_pct_negative = argvEntry("-1");
+const seed_argv_pct_overflow = argvEntry("99999999999999999999");
+
+const fuzz_argv_corpus = [_][]const u8{
+    &seed_argv_plain,
+    &seed_argv_suffixed,
+    &seed_argv_spaced_unit,
+    &seed_argv_lower_suffix,
+    &seed_argv_trailing_b,
+    &seed_argv_trailing_garbage,
+    &seed_argv_two_tokens,
+    &seed_argv_leading_space,
+    &seed_argv_word,
+    &seed_argv_empty,
+    &seed_argv_digit_run_overflow,
+    &seed_argv_max_u64,
+    &seed_argv_suffix_mul_overflow,
+    &seed_argv_host_port,
+    &seed_argv_host_only,
+    &seed_argv_colon_only,
+    &seed_argv_trailing_colon,
+    &seed_argv_port_zero,
+    &seed_argv_port_max,
+    &seed_argv_port_overflow,
+    &seed_argv_double_colon,
+    &seed_argv_pct_low,
+    &seed_argv_pct_edge,
+    &seed_argv_pct_over,
+    &seed_argv_pct_negative,
+    &seed_argv_pct_overflow,
+};
+
+/// Independent restatement of parseSize's published contract ("plain byte
+/// counts or one 1024-based K/M/G suffix; anything else is trailing
+/// garbage"), using std.fmt.parseInt's overflow machinery instead of the
+/// hand-rolled mul/add ladder so a corrupted ladder cannot self-confirm.
+fn refParseSize(s: []const u8) ?u64 {
+    var i: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+    if (i == 0) return null;
+    const n = std.fmt.parseInt(u64, s[0..i], 10) catch return null;
+    var rest = std.mem.trim(u8, s[i..], " \t");
+    if (rest.len > 0 and (rest[rest.len - 1] == 'B' or rest[rest.len - 1] == 'b')) rest = rest[0 .. rest.len - 1];
+    if (rest.len == 0) return n;
+    if (rest.len != 1) return null;
+    const mul: u64 = switch (rest[0]) {
+        'K', 'k' => 1024,
+        'M', 'm' => 1024 * 1024,
+        'G', 'g' => 1024 * 1024 * 1024,
+        else => return null,
+    };
+    return std.math.mul(u64, n, mul) catch null;
+}
+
+/// The flag-value parsers are the CLI's untrusted-input boundary: every
+/// --piece/--seed/--listen/watermark value is operator or script text that
+/// must fail loudly rather than panic, wrap, or silently mean something
+/// else. Unit tests pin the documented shapes; this harness walks the whole
+/// input space asserting each parser against an independent restatement,
+/// the canonical-form reparse (overflow refuses, never wraps into a small
+/// accepted size), and the port agreement between --seed and --listen on
+/// HOST:PORT specs.
+fn fuzzFlagValuesOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [64]u8 = undefined;
+    const s = buf[0..smith.slice(&buf)];
+
+    const size: ?u64 = parseSize(s) catch null;
+    try std.testing.expectEqual(refParseSize(s), size);
+    if (size) |n| {
+        var canon_buf: [24]u8 = undefined;
+        const canon = try std.fmt.bufPrint(&canon_buf, "{d}", .{n});
+        try std.testing.expectEqual(n, try parseSize(canon));
+    }
+
+    // Watermark gate: an unsigned integer 0..100, nothing else.
+    const pct_raw: ?u32 = std.fmt.parseInt(u32, s, 10) catch null;
+    const want_pct: ?u32 = if (pct_raw) |p| (if (p <= 100) p else null) else null;
+    var val_i: usize = 0;
+    const args = [_][]const u8{ "--brun", s };
+    const pct: ?u32 = takePercent(&args, "--brun", &val_i) catch null;
+    try std.testing.expectEqual(want_pct, pct);
+    try std.testing.expectEqual(@as(usize, 1), val_i);
+
+    // --seed consumes HOST[:PORT]; --listen consumes [IP:]PORT. On any spec
+    // both accept as a HOST:PORT form, they must name the same explicit
+    // port; on a bare host --seed defaults while --listen only takes a bare
+    // numeric port.
+    const hp: ?proto.LeaseAddr = parseHostPort(s, proto.default_port) catch null;
+    const lp: ?u16 = listenPort(s) catch null;
+    if (hp) |a| {
+        try std.testing.expectEqual(@as(u32, 0), a.mbps);
+        if (std.mem.findScalarLast(u8, s, ':')) |ci| {
+            try std.testing.expect(ci > 0);
+            try std.testing.expectEqual(@as(?u16, a.port), lp);
+        } else {
+            try std.testing.expectEqualStrings(s, a.ip);
+            try std.testing.expectEqual(@as(u16, proto.default_port), a.port);
+            try std.testing.expectEqual(std.fmt.parseInt(u16, s, 10) catch null, lp);
+        }
+    }
+}
+
+test "fuzz cli flag value parsers fail loudly without wrapping or panicking" {
+    try std.testing.fuzz({}, fuzzFlagValuesOne, .{ .corpus = &fuzz_argv_corpus });
 }
 
 test "pidAlive answers for live and exited processes" {

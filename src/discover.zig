@@ -547,8 +547,17 @@ pub const Catalog = struct {
             var st: c.struct_stat = undefined;
             if (sys.statPath(fp, &st) != 0) continue;
             if (st.st_mtim.tv_sec > cutoff) continue;
+            // Every node runs this sweep each discovery tick, so a stale
+            // claim usually has several removers racing: losing the race is
+            // ENOENT between our stat above and the unlink, and that is the
+            // swept outcome already reached, not a failure. Only a real
+            // unlink error gets an operator line (same policy as store.zig's
+            // unlinkOrWarn); the info line stays tied to actually sweeping.
             if (c.unlink(fp) != 0) {
-                std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ displayName(name), sys.errno() });
+                const e = sys.errno();
+                if (e != c.ENOENT) {
+                    std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ displayName(name), e });
+                }
                 continue;
             }
             std.log.info("swept stale cluster lease {s}", .{displayName(name)});
@@ -978,6 +987,17 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     cat.sweepLeases(sweep_now);
 
     var stbuf: c.struct_stat = undefined;
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
+
+    // Re-execution is the sweep's normal shape: every node runs one per
+    // discovery tick, so the same stale directory is swept repeatedly and
+    // concurrently. A second pass over the already-swept tree must converge
+    // on exactly the first pass's outcome -- no further removals, survivors
+    // untouched -- instead of erroring or resurrecting anything.
+    cat.sweepLeases(sweep_now);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);

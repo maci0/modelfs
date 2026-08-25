@@ -18,7 +18,6 @@ pub const State = struct {
     store: store_mod.Store,
     catalog: discover.Catalog,
     server: peer.Server,
-    psk: []const u8,
     direct_io: bool,
     /// monotonic-seconds stamp of daemon start; uptime_s in status.json.
     start_secs: i64,
@@ -448,7 +447,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     // Miss latency is claim-to-cache-write: exactly the stall the reader
     // eats for this piece. Failed fills keep their error counts and no time.
     const fill_t0 = sys.monoNs();
-    peer.fillFromPeers(st.gpa, st.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
+    peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
         from_peer = false;
         const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
         if (n != @as(isize, @intCast(ln))) {
@@ -1128,7 +1127,6 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
         .store = store_mod.Store.init(gpa, std.testing.io, "/unused", cache_d, 4096),
         .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
         .server = undefined,
-        .psk = "",
         .direct_io = true,
         .start_secs = sys.monoSec(),
     };
@@ -1212,7 +1210,6 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
         .store = store_mod.Store.init(gpa, std.testing.io, "/unused", cache_d, 4096),
         .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
         .server = undefined,
-        .psk = "",
         .direct_io = true,
         .start_secs = sys.monoSec(),
     };
