@@ -230,7 +230,12 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     sys.setSockTimeout(fd, sock_timeout_ms);
     sys.setTcpNoDelay(fd, true);
     sys.setSockBuffers(fd, sock_buf_bytes);
-    var head_buf: [8192]u8 = undefined;
+    // Sized to hold the largest request sendRequest can emit: a PATH_MAX
+    // rel whose bytes all need escaping encodes to three times its length,
+    // so the wire form of a legal deeply-nested non-ASCII path runs past the
+    // old 8 KiB budget -- a smaller head buffer here would drop those
+    // connections as malformed instead of serving them.
+    var head_buf: [4096 * 3 + 512]u8 = undefined;
     var n: usize = 0;
     var total_read: usize = 0;
     readHeadFull(fd, &head_buf, &n, &total_read) catch {
@@ -288,7 +293,7 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
         replyStatus(self, fd, "400 Bad Request");
         return;
     }
-    if (path[1] == 'h') {
+    if (std.mem.eql(u8, path, "/have")) {
         serveHave(self, fd, rel);
         return;
     }
@@ -1920,6 +1925,43 @@ test "serveData counts as access for cull recency" {
     const f = srv.store.lookupRef("rec.bin").?;
     defer srv.store.releaseFile(f);
     try std.testing.expect(sys.monoSec() - f.last_access.load(.monotonic) < 10);
+}
+
+test "serveData serves a legal path whose encoded form exceeds 8KiB" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-longname");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-longname");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // A deeply nested non-ASCII rel: each "é/" component is 3 raw bytes but
+    // 9 percent-encoded bytes (%C3%A9%2F), so ~1000 components push the
+    // request line past the old 8 KiB server head budget while staying
+    // inside sendRequest's documented maximum (and PATH_MAX joins).
+    var rel_buf: [4096]u8 = undefined;
+    var rl: usize = 0;
+    while (rl + "f.bin".len + 3 <= 3000) : (rl += 3) {
+        @memcpy(rel_buf[rl..][0..3], "\xc3\xa9/");
+    }
+    @memcpy(rel_buf[rl..][0.."f.bin".len], "f.bin");
+    rl += "f.bin".len;
+    const rel = rel_buf[0..rl];
+    try std.testing.expect(store_mod.relOk(rel));
+
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const fp = try sys.joinZ(&pbuf, origin_d, rel);
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(sys.parentOf(std.mem.span(fp)), 0o755));
+    const body = "payload";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(fp, body));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+
+    const got = try fetchRange(gpa, "secret", "127.0.0.1", srv.port(), rel, 0, body.len - 1);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(body, got);
 }
 
 test "serveData refuses ranges starting past EOF with 416" {

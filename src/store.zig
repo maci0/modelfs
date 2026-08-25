@@ -357,16 +357,23 @@ pub const Store = struct {
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
         const mp = self.cacheMetaPath(&mbuf, rel) catch return;
         self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        // Sidecar unlink and mark wipe share one file.mu window (same shape
+        // as forget): a finishPiece or copyIntoCache saving between a plain
+        // unlink and the wipe would write the pre-write marks back over the
+        // dropped sidecar -- trust in pre-write bytes resurrected on disk
+        // for a file whose origin content just changed, loaded again by the
+        // next entry build. Holding store.mu across both steps also keeps
+        // the entry in the map for their duration, so no reference juggling
+        // is needed.
+        const f = self.files.get(rel);
+        if (f) |file| file.mu.lockUncancelable(self.io);
+        defer if (f) |file| file.mu.unlock(self.io);
         unlinkOrWarn(mp, "meta", rel);
         // Same builder-invalidation contract as forget: a builder whose
         // sidecar read raced this unlink must not publish its stale bits.
         self.purge_epoch += 1;
-        self.mu.unlock(self.io);
-        const f = self.lookupRef(rel) orelse return;
-        defer self.releaseFile(f);
-        f.mu.lockUncancelable(self.io);
-        @memset(f.bits.bytes, 0);
-        f.mu.unlock(self.io);
+        if (f) |file| @memset(file.bits.bytes, 0);
     }
 
     fn loadBits(self: *Store, rel: []const u8, file_size: u64) !piece.Bitfield {
@@ -1568,6 +1575,69 @@ test "distrust drops sidecar and live marks but keeps data bytes and pins" {
     f3.mu.lockUncancelable(std.testing.io);
     try std.testing.expectEqual(@as(u32, 0), f3.bits.filled());
     f3.mu.unlock(std.testing.io);
+}
+
+test "a finisher racing distrust never republishes the wiped marks" {
+    // Regression harness for distrust's lock window: the sidecar unlink and
+    // the live entry's mark wipe must sit in one file.mu section, the same
+    // contract forget's dead stamp gives late finishers. Old shape ran them
+    // apart, so a finishPiece saving in between wrote the pre-write marks
+    // back over the dropped sidecar -- any schedule below leaving bits 0 or
+    // 1 on disk trips the assertion.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-dt-race");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-dt-race");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("dt.bin", 64);
+    defer st.releaseFile(f);
+    try std.testing.expect(st.openCache(f) >= 0);
+
+    var stop = std.atomic.Value(bool).init(false);
+    const filler = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Store, file: *Store.Cached, halt: *std.atomic.Value(bool)) void {
+            while (!halt.load(.acquire)) {
+                // Piece 3 is the concurrent filler's own fresh post-write
+                // hydration: re-marking it across a distrust is legitimate.
+                if ((s.beginFill(file, 3) catch return) == .len)
+                    s.finishPiece(file, 3, true);
+            }
+        }
+    }.run, .{ &st, f, &stop });
+    defer {
+        stop.store(true, .release);
+        filler.join();
+    }
+
+    var round: usize = 0;
+    while (round < 50) : (round += 1) {
+        // Seed the exact state distrust erases: pre-write marks in memory
+        // and persisted.
+        f.mu.lockUncancelable(std.testing.io);
+        f.bits.set(0);
+        f.bits.set(1);
+        f.mu.unlock(std.testing.io);
+        _ = st.saveBits(f, false);
+
+        st.distrust("dt.bin");
+
+        var mb: [sys.c.PATH_MAX]u8 = undefined;
+        const mp = try st.cacheMetaPath(&mb, "dt.bin");
+        var blob_buf: [4096]u8 = undefined;
+        if (sys.readFileBuf(&blob_buf, mp)) |blob| {
+            var decoded = try piece.Bitfield.decode(gpa, blob, st.piece_size, 64);
+            defer decoded.deinit(gpa);
+            try std.testing.expect(!decoded.get(0));
+            try std.testing.expect(!decoded.get(1));
+        } else |_| {}
+    }
 }
 
 test "punchPiece refuses while a peer transfer is inflight" {

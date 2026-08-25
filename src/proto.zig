@@ -59,6 +59,11 @@ pub fn urlEncode(out: []u8, s: []const u8) ![]u8 {
     return out[0..n];
 }
 
+/// Strict RFC 3986 percent-decoding for the peer protocol's path parameter.
+/// No form-style "+"-as-space translation: this carries a file name, where a
+/// literal '+' and an encoded space (%20) are different bytes -- collapsing
+/// them would let two spellings reach one file while the real "a+b.gguf"
+/// misses.
 pub fn urlDecode(out: []u8, s: []const u8) ![]u8 {
     var n: usize = 0;
     var i: usize = 0;
@@ -70,10 +75,6 @@ pub fn urlDecode(out: []u8, s: []const u8) ![]u8 {
             out[n] = (hi << 4) | lo;
             n += 1;
             i += 3;
-        } else if (s[i] == '+') {
-            out[n] = ' ';
-            n += 1;
-            i += 1;
         } else {
             out[n] = s[i];
             n += 1;
@@ -221,9 +222,25 @@ test "url encode decode" {
     try std.testing.expectEqualStrings("gguf%2Ffoo.gguf", e);
     const d = try urlDecode(&dbuf, e);
     try std.testing.expectEqualStrings("gguf/foo.gguf", d);
-    // form-style space, uppercase hex, and every unreserved passthrough
-    try std.testing.expectEqualStrings("a b", try urlDecode(&dbuf, "a+b"));
+    // Strict percent-decoding only: '+' is a literal plus in a path (form
+    // encoding's space meaning would conflate it with %20), uppercase hex,
+    // and every unreserved passthrough
+    try std.testing.expectEqualStrings("a+b", try urlDecode(&dbuf, "a+b"));
+    try std.testing.expectEqualStrings("a b", try urlDecode(&dbuf, "a%20b"));
     try std.testing.expectEqualStrings("/", try urlDecode(&dbuf, "%2f"));
+}
+
+test "url codec round-trips multi-byte UTF-8 names byte for byte" {
+    // A non-ASCII model file name with a space and a slash: every byte above
+    // the unreserved set escapes as %XX and decodes back to the identical
+    // byte sequence -- no split multi-byte sequence, no case or plus folding.
+    const name = "gguf/llama 70B/权重.gguf";
+    var ebuf: [128]u8 = undefined;
+    var dbuf: [128]u8 = undefined;
+    const enc = try urlEncode(&ebuf, name);
+    try std.testing.expect(std.mem.indexOf(u8, enc, " ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, enc, "/") == null);
+    try std.testing.expectEqualStrings(name, try urlDecode(&dbuf, enc));
 }
 
 test "url codec rejects bad hex and undersized buffers" {

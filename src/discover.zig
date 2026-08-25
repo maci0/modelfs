@@ -354,6 +354,10 @@ pub const Catalog = struct {
         return sys.joinZ(buf, self.origin, cluster_dir);
     }
 
+    /// Lease lifetime in seconds: several discovery ticks wide, so one
+    /// missed republish does not expire this node out of every peer's list.
+    const lease_ttl_secs: i64 = 30;
+
     pub fn publish(self: *Catalog) void {
         // A node whose lease never lands disappears from the cluster for
         // every other peer; every skip below must reach the operator's log.
@@ -375,7 +379,7 @@ pub const Catalog = struct {
             return;
         };
         var json_buf: [2048]u8 = undefined;
-        const until = sys.nowSec() + 30;
+        const until = sys.nowSec() + lease_ttl_secs;
         const json = proto.formatLease(&json_buf, self.self_id, until, self.addrs) catch {
             std.log.warn("lease publish skipped: {d} addresses do not fit the lease document", .{self.addrs.len});
             return;
@@ -915,7 +919,7 @@ test "publish stages a parseable lease, leaves no tmp, and replaces in place" {
     const parsed = try proto.parseLease(gpa, blob);
     defer parsed.deinit();
     try std.testing.expectEqualStrings("me", parsed.value.id);
-    // until is publish-time nowSec() + 30; allow one second of drift so a
+    // until is publish-time nowSec() + lease_ttl_secs; allow one second of drift so a
     // second boundary between the two clock reads cannot flip the test.
     const now = sys.nowSec();
     try std.testing.expect(parsed.value.until >= now + 29);
