@@ -26,12 +26,13 @@ required-version = ">=0.16,<0.17"
 # exception-handling anti-patterns (TRY), exception messages that hide
 # context in inline literals (EM), executable-bit vs shebang mismatches
 # (EXE), boolean-trap positional flags (FBT), import sorting/ordering (I),
-# join-to-f-string simplification (FLY), and conventional import aliases (ICN).
+# join-to-f-string simplification (FLY), conventional import aliases (ICN),
+# and TODO-comment hygiene (TD).
 select = [
     "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
     "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
     "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE", "TRY", "EM",
-    "EXE", "FBT", "I", "FLY", "ICN",
+    "EXE", "FBT", "I", "FLY", "ICN", "TD",
 ]
 
 [tool.ruff.format]
@@ -62,6 +63,9 @@ extra_checks = true
 disallow_any_explicit = true
 disallow_any_unimported = true
 disallow_untyped_globals = true
+# A decorator whose signature erases to Any must not silently untype the
+# decorated function; the strict bundle does not cover this.
+disallow_any_decorated = true
 strict_equality_for_none = true
 warn_unreachable = true
 # Not part of --strict: a dead or mistyped key in this very file must fail
