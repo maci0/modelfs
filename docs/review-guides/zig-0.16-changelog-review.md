@@ -193,7 +193,7 @@ directly**. More removals are planned."
 - `indexOf*` -> `find*` family (`find`, `findPos`, `findScalar`, `findAny`,
   `findNone`, ...). The `indexOf*` names remain as aliases, so they compile;
   new/touched code must use `find*`.
-- New `cut`/`cutPrefix`/`cutSuffix`/`cutScalar`/`cutLast`/`cutLastScalar` are
+- New `cut`/`cutPrefix`/`cutSuffix`/`cutScalar`/`cutLast`/`cutScalarLast` are
   the idiom for split-at-substring; prefer them in new code.
 
 ### I. Formatting (changelog "Replace {D} format specifier with Io.Duration format method")

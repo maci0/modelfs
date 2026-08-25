@@ -1,5 +1,5 @@
 //! CLI entry point: argument parsing, command dispatch (mount/status/peers/
-//! pin), and mount wiring into the FUSE loop plus background workers.
+//! pin/unpin), and mount wiring into the FUSE loop plus background workers.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");

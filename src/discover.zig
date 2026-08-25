@@ -322,6 +322,14 @@ pub const Catalog = struct {
 
     /// Appends one address as a Path, duping id/ip into the given arena.
     /// The arena owns the dupes; on failure the entry is simply skipped.
+    /// Addresses failing the dotted-quad gate are skipped too: every dialer
+    /// inet_pton's the ip field, so a non-quad could never be reached, and
+    /// lease ips arrive as other nodes' JSON off shared NFS storage -- an
+    /// arbitrary string here would otherwise ride the fetch-failure log
+    /// line (its CR/LF or terminal escapes included) while dialing it. The
+    /// gate accepts digits and dots only, so nothing unprintable survives
+    /// it; legitimate publishers emit inet_ntop output, never hostnames
+    /// (--advertise refuses those at the flag for the same reason).
     fn pushPath(
         self: *Catalog,
         list: *std.ArrayList(Path),
@@ -329,6 +337,8 @@ pub const Catalog = struct {
         peer_id: []const u8,
         addr: proto.LeaseAddr,
     ) void {
+        var quad: [4]u8 = undefined;
+        if (!parseV4(addr.ip, &quad)) return;
         const id = arena.dupe(u8, peer_id) catch return;
         const ip = arena.dupe(u8, addr.ip) catch return;
         var hops: u32 = 1;
@@ -658,7 +668,9 @@ pub fn hostname(buf: []u8) []const u8 {
     // input, and one with a quote or slash would publish a lease document
     // or file name every peer's parser refuses.
     if (s.len == 0 or s.len >= buf.len or !validId(s)) {
-        std.log.warn("hostname \"{s}\" unusable as cluster id; using \"node\"", .{s});
+        // Same echo policy as refresh/sweepLeases: a name failing the
+        // printable gate must not forge log lines or inject terminal escapes.
+        std.log.warn("hostname \"{s}\" unusable as cluster id; using \"node\"", .{displayName(s)});
         return "node";
     }
     @memcpy(buf[0..s.len], s);
@@ -1012,6 +1024,40 @@ test "refresh skips self and expired leases" {
 
     try std.testing.expectEqual(@as(u32, 1), cat.inflight("10.0.0.1", 18080, 1));
     try std.testing.expectEqual(@as(u32, 0), cat.inflight("10.0.0.1", 18080, -1));
+}
+
+test "refresh drops lease addresses that are not dialable dotted quads" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-addr");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    // A forged lease off shared storage: its first address carries CR plus
+    // a forged journal line, its second a hostname no dialer can resolve.
+    // Both must die at ingestion -- every dialer inet_pton's the field, and
+    // the control bytes would otherwise ride the fetch-failure log line
+    // verbatim. Only the trailing dotted quad survives.
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/forged.json", .{cluster_d});
+    const forged = "{\"id\":\"forged\",\"until\":4102444800,\"addrs\":[" ++
+        "{\"ip\":\"10.0.0.1\\r2026-08-26 ERROR forged\",\"port\":18080,\"mbps\":0}," ++
+        "{\"ip\":\"spark9.example\",\"port\":18080,\"mbps\":0}," ++
+        "{\"ip\":\"10.0.0.9\",\"port\":18080,\"mbps\":0}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), forged));
+
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+    cat.refresh(sys.nowSec());
+
+    const snap = try cat.snapshot(gpa);
+    defer Catalog.freeSnapshot(gpa, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("10.0.0.9", snap[0].ip);
 }
 
 test "refresh uses seeds only while cluster is empty" {

@@ -243,6 +243,18 @@ test "url codec round-trips multi-byte UTF-8 names byte for byte" {
     try std.testing.expectEqualStrings(name, try urlDecode(&dbuf, enc));
 }
 
+test "url codec round-trips bytes that are not valid UTF-8" {
+    // Filesystem paths are bytes and need not be UTF-8 at all: the wire
+    // codec must escape-carriage arbitrary high bytes exactly like the
+    // multi-byte UTF-8 case, with no validation or lossy replacement --
+    // a peer serving such a legal name must stay reachable byte-exact.
+    const name = "raw \xff\xfe bytes.bin";
+    var ebuf: [64]u8 = undefined;
+    var dbuf: [64]u8 = undefined;
+    const enc = try urlEncode(&ebuf, name);
+    try std.testing.expectEqualStrings(name, try urlDecode(&dbuf, enc));
+}
+
 test "url codec rejects bad hex and undersized buffers" {
     var buf: [32]u8 = undefined;
     // invalid escape digit after a syntactically complete %XX position
@@ -325,4 +337,100 @@ test "lease json roundtrip" {
     // ...while malformed JSON is rejected, not half-parsed.
     try std.testing.expectError(error.UnexpectedEndOfInput, parseLease(std.testing.allocator, "{\"id\":"));
     try std.testing.expectError(error.SyntaxError, parseLease(std.testing.allocator, "not json at all"));
+}
+
+/// One lease document in the corpus framing the fuzz harness reads: u32
+/// length prefix, then the raw JSON bytes.
+fn leaseEntry(comptime doc: []const u8) [4 + doc.len]u8 {
+    var out: [4 + doc.len]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(doc.len), .little);
+    for (doc, 0..) |b, i| out[4 + i] = b;
+    return out;
+}
+
+const seed_lease_ok = leaseEntry("{\"id\":\"spark1\",\"until\":1710000060,\"addrs\":[{\"ip\":\"192.168.100.1\",\"port\":18080,\"mbps\":200000},{\"ip\":\"192.168.0.11\",\"port\":18080,\"mbps\":10000}]}");
+const seed_lease_unknown_field = leaseEntry("{\"id\":\"n1\",\"until\":5,\"addrs\":[],\"proto_version\":9}");
+const seed_lease_truncated = leaseEntry("{\"id\":");
+const seed_lease_not_json = leaseEntry("not json at all");
+const seed_lease_quote_id = leaseEntry("{\"id\":\"a\\\"b\\\\c\",\"until\":1,\"addrs\":[]}");
+const seed_lease_escape_id = leaseEntry("{\"id\":\"a\\nb\",\"until\":1,\"addrs\":[]}");
+const seed_lease_until_overflow = leaseEntry("{\"id\":\"x\",\"until\":18446744073709551615,\"addrs\":[]}");
+const seed_lease_dup_keys = leaseEntry("{\"id\":\"a\",\"id\":\"b\",\"until\":7,\"addrs\":[]}");
+const seed_lease_deep_unknown = leaseEntry("{\"id\":\"d\",\"until\":1,\"addrs\":[],\"z\":[[[[[[[[]]]]]]]]}");
+const seed_lease_extreme_addrs = leaseEntry("{\"id\":\"m\",\"until\":-5,\"addrs\":[{\"ip\":\"\",\"port\":0,\"mbps\":4294967295}]}");
+
+const fuzz_lease_corpus = [_][]const u8{
+    &seed_lease_ok,
+    &seed_lease_unknown_field,
+    &seed_lease_truncated,
+    &seed_lease_not_json,
+    &seed_lease_quote_id,
+    &seed_lease_escape_id,
+    &seed_lease_until_overflow,
+    &seed_lease_dup_keys,
+    &seed_lease_deep_unknown,
+    &seed_lease_extreme_addrs,
+};
+
+/// True when s survives formatLease's verbatim embedding: the writer does
+/// no JSON escaping, so a quote, backslash, or C0 byte would publish a
+/// document every peer's parser refuses. Producers gate ids through
+/// discover.validId; this mirrors just the JSON-hostile part of that gate.
+fn leaseJsonClean(s: []const u8) bool {
+    for (s) |ch| {
+        if (ch < 0x20 or ch == '"' or ch == '\\') return false;
+    }
+    return true;
+}
+
+/// Lease documents cross a trust boundary twice: written by one node onto
+/// shared NFS storage, parsed by every peer (refresh, `modelfs peers`).
+/// The harness asserts fail-closed parsing, determinism across re-reads,
+/// and the writer contract: any parsed document whose strings carry no
+/// JSON-hostile bytes must survive a formatLease/parseLease cycle with all
+/// values intact. Documents with hostile ids legitimately skip that leg.
+fn fuzzLeaseDocOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var doc_buf: [512]u8 = undefined;
+    const json = doc_buf[0..smith.slice(&doc_buf)];
+    const parsed = parseLease(gpa, json) catch return;
+    defer parsed.deinit();
+    const lease = parsed.value;
+
+    {
+        const again = try parseLease(gpa, json);
+        defer again.deinit();
+        try std.testing.expectEqualStrings(lease.id, again.value.id);
+        try std.testing.expectEqual(lease.until, again.value.until);
+        try std.testing.expectEqual(lease.addrs.len, again.value.addrs.len);
+        for (lease.addrs, again.value.addrs) |a, b| {
+            try std.testing.expectEqualStrings(a.ip, b.ip);
+            try std.testing.expectEqual(a.port, b.port);
+            try std.testing.expectEqual(a.mbps, b.mbps);
+        }
+    }
+
+    if (!leaseJsonClean(lease.id)) return;
+    for (lease.addrs) |a| {
+        if (!leaseJsonClean(a.ip)) return;
+    }
+    var size: usize = 64 + lease.id.len;
+    for (lease.addrs) |a| size += a.ip.len + 48;
+    const out = try gpa.alloc(u8, size);
+    defer gpa.free(out);
+    const formatted = formatLease(out, lease.id, lease.until, lease.addrs) catch return;
+    const reparsed = try parseLease(gpa, formatted);
+    defer reparsed.deinit();
+    try std.testing.expectEqualStrings(lease.id, reparsed.value.id);
+    try std.testing.expectEqual(lease.until, reparsed.value.until);
+    try std.testing.expectEqual(lease.addrs.len, reparsed.value.addrs.len);
+    for (lease.addrs, reparsed.value.addrs) |a, b| {
+        try std.testing.expectEqualStrings(a.ip, b.ip);
+        try std.testing.expectEqual(a.port, b.port);
+        try std.testing.expectEqual(a.mbps, b.mbps);
+    }
+}
+
+test "fuzz lease document parsing fails closed and round-trips clean docs" {
+    try std.testing.fuzz({}, fuzzLeaseDocOne, .{ .corpus = &fuzz_lease_corpus });
 }

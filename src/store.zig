@@ -1340,6 +1340,24 @@ test "relOk rejects traversal and absolute paths" {
     try std.testing.expect(!relOk("a\x7fb"));
 }
 
+test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
+    // Paths are bytes at every boundary here: identity is byte equality all
+    // the way down (kernel, cache keys, URL codec), nothing normalizes or
+    // folds. So NFC and NFD spellings of the same display name are two
+    // different files, and a name that is not valid UTF-8 at all is still
+    // legal on Linux filesystems. The gate refuses only control bytes; these
+    // cases pin that a future Unicode-awareness pass cannot quietly start
+    // rejecting or rewriting legal names.
+    try std.testing.expect(relOk("gguf/权重.gguf"));
+    try std.testing.expect(relOk("caf\u{e9}.bin"));
+    // Same display name in NFD (e + combining acute): distinct bytes, kept.
+    try std.testing.expect(relOk("cafe\u{301}.bin"));
+    // Astral-plane emoji (UTF-16 surrogate pair in other encodings).
+    try std.testing.expect(relOk("\u{1f512}locked.bin"));
+    // Bare high bytes, not valid UTF-8.
+    try std.testing.expect(relOk("\xff\xfe.bin"));
+}
+
 test "store get file size update and pin" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;

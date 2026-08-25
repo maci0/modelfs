@@ -444,3 +444,97 @@ test "cover saturation near max int" {
     try std.testing.expectEqual(@as(u32, 0), past.start);
     try std.testing.expectEqual(@as(u32, 0), past.end);
 }
+
+/// One sidecar blob as it lands on shared storage, wrapped in the corpus
+/// framing the decode harness reads: u32 length prefix, blob bytes, then the
+/// u64 geometry selector drawn after the blob.
+fn decodeEntry(comptime blob: []const u8, comptime geo: u64) [4 + blob.len + 8]u8 {
+    var out: [4 + blob.len + 8]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(blob.len), .little);
+    @memcpy(out[4..][0..blob.len], blob);
+    std.mem.writeInt(u64, out[4 + blob.len ..][0..8], geo, .little);
+    return out;
+}
+
+/// A well-formed sidecar body: MFS1 magic, little-endian piece size and file
+/// size, then the raw bit bytes.
+fn sidecarBody(comptime ps: u32, comptime fs: u64, comptime bits: []const u8) [16 + bits.len]u8 {
+    var b: [16 + bits.len]u8 = undefined;
+    @memcpy(b[0..4], magic);
+    std.mem.writeInt(u32, b[4..8], ps, .little);
+    std.mem.writeInt(u64, b[8..16], fs, .little);
+    @memcpy(b[16..], bits);
+    return b;
+}
+
+// Caller-side geometries the harness draws from: small enough that decode's
+// allocation stays tiny, yet covering pow2, odd, zero-file, and the unit
+// tests' canonical shape. Indices appear in the seeds below.
+const decode_geos = [_]struct { ps: u32, fs: u64 }{
+    .{ .ps = 1, .fs = 0 }, // empty field
+    .{ .ps = 1, .fs = 512 }, // largest field the harness allows
+    .{ .ps = 7, .fs = 1001 }, // non-power-of-two piece size
+    .{ .ps = 8, .fs = 520 },
+    .{ .ps = 512, .fs = 8192 },
+    .{ .ps = 4096, .fs = 40960 }, // matches the unit tests' shape
+};
+
+const seed_sidecar_clean = decodeEntry(&sidecarBody(4096, 40960, &.{ 0x05, 0x80 }), 5);
+const seed_sidecar_pad_corrupt = decodeEntry(&sidecarBody(4096, 40960, &.{ 0x05, 0xff }), 5);
+const seed_sidecar_stale_geo = decodeEntry(&sidecarBody(4096, 40960, &.{ 0x05, 0x80 }), 4);
+const seed_sidecar_short_body = decodeEntry(&sidecarBody(8, 520, &.{ 0xff, 0xff, 0xff }), 3);
+const seed_sidecar_bad_magic = decodeEntry("XXXX\x00\x10\x00\x00" ++ "\x00" ** 8 ++ "\x01", 3);
+const seed_sidecar_truncated_header = decodeEntry("MFS1\x00", 1);
+const seed_sidecar_empty = decodeEntry("", 0);
+
+const fuzz_decode_corpus = [_][]const u8{
+    &seed_sidecar_clean,
+    &seed_sidecar_pad_corrupt,
+    &seed_sidecar_stale_geo,
+    &seed_sidecar_short_body,
+    &seed_sidecar_bad_magic,
+    &seed_sidecar_truncated_header,
+    &seed_sidecar_empty,
+};
+
+/// Sidecars ride on shared storage where crashes and co-tenants corrupt
+/// them; every pad-bit regression this module fixed came through decode.
+/// The harness asserts a complete oracle, not just crash-freedom: the field
+/// shape follows the caller's geometry (never the blob's claims), an exact
+/// header match reproduces the stored bits up to the copied region with pad
+/// bits masked, and anything else comes back empty rather than half-applied.
+fn fuzzBitfieldDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var blob_buf: [96]u8 = undefined;
+    const blob = blob_buf[0..smith.slice(&blob_buf)];
+    const gi: usize = @intCast(smith.value(u64) % decode_geos.len);
+    const geo = decode_geos[gi];
+
+    var bf = Bitfield.decode(gpa, blob, geo.ps, geo.fs) catch return;
+    defer bf.deinit(gpa);
+
+    try std.testing.expectEqual(count(geo.fs, geo.ps), bf.nbits);
+    try std.testing.expectEqual(Bitfield.bytesLen(bf.nbits), bf.bytes.len);
+    try std.testing.expect(bf.filled() <= bf.nbits);
+    if (bf.lastSet()) |ls| try std.testing.expect(ls < bf.nbits);
+
+    if (blob.len >= 16 and std.mem.eql(u8, blob[0..4], magic) and
+        std.mem.readInt(u32, blob[4..8], .little) == geo.ps and
+        std.mem.readInt(u64, blob[8..16], .little) == geo.fs)
+    {
+        const src = blob[16..];
+        const copy = @min(Bitfield.bytesLen(bf.nbits), src.len);
+        var i: u32 = 0;
+        while (i < bf.nbits) : (i += 1) {
+            const kept = i / 8 < copy and (src[i / 8] >> @as(u3, @intCast(i % 8))) & 1 != 0;
+            try std.testing.expectEqual(kept, bf.get(i));
+        }
+    } else {
+        try std.testing.expectEqual(@as(u32, 0), bf.filled());
+        try std.testing.expect(bf.lastSet() == null);
+    }
+}
+
+test "fuzz bitfield sidecar decode matches stored bits or resets empty" {
+    try std.testing.fuzz({}, fuzzBitfieldDecodeOne, .{ .corpus = &fuzz_decode_corpus });
+}

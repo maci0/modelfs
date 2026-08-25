@@ -1,5 +1,5 @@
-//! Peer HTTP server (/have, /data) and the matching fetch client: bearer
-//! auth, bounded head reads, range hydration, and zero-copy streaming.
+//! Peer HTTP server (/ping, /have, /data) and the matching fetch client:
+//! bearer auth, bounded head reads, range hydration, and zero-copy streaming.
 const std = @import("std");
 const piece = @import("piece.zig");
 const proto = @import("proto.zig");
