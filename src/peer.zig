@@ -413,10 +413,14 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                     }
                 },
             }
-        }
-        if (!self.store.hasPiece(file, pi)) {
-            replyStatus(self, fd, "404 Not Found");
-            return false;
+            // Only pieces that entered a fill claim need revalidation: a piece
+            // already cached above skips this entirely, halving the per-piece
+            // lock traffic on fully-warm transfers. Punches cannot land under
+            // us either way -- serveData holds xfer across the whole response.
+            if (!self.store.hasPiece(file, pi)) {
+                replyStatus(self, fd, "404 Not Found");
+                return false;
+            }
         }
     }
     return true;
@@ -710,7 +714,13 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const
     }
 
     const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
-    const want_len = std.fmt.parseInt(usize, cl_str, 10) catch 0;
+    // A malformed or overflowing length is a broken reply, not a zero-byte
+    // one: coercing it to 0 would let e.g. "Content-Length: 16Mi" succeed as
+    // an empty body, and the /have caller would then cache an empty bitmap
+    // and route every fill away from a healthy peer for the probe TTL. Same
+    // policy as haveFromHead's X-Piece-Size parse. An absent header keeps its
+    // legacy 0 reading; the dest-length contract below still fails those.
+    const want_len = std.fmt.parseInt(usize, cl_str, 10) catch return error.BadContentLength;
 
     // A caller-supplied buffer streams straight into it (no piece-sized
     // allocation and copy per fetch); its length must match exactly. With a
@@ -1176,6 +1186,28 @@ test "readFlexBodyAlloc keeps the dest contract when Content-Length is absent" {
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         _ = try readFlexBodyAlloc(gpa, pair[1], &.{});
+    }
+}
+
+test "readFlexBodyAlloc rejects a malformed Content-Length instead of coercing to 0" {
+    const gpa = std.testing.allocator;
+    // Regression: an unparsable or overflowing length used to read as 0, so
+    // a 200 reply with e.g. "Content-Length: 16Mi" succeeded as an empty
+    // body and fetchHave cached an empty bitmap for the probe TTL, routing
+    // every fill away from a healthy peer. It must fail like any other
+    // malformed reply so it stays uncached and retried.
+    {
+        const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: 16Mi\r\nConnection: close\r\n\r\n0123456789abcdef");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, pair[1], null));
+    }
+    // Digit runs beyond usize must fail too, not wrap into a small length.
+    {
+        const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Length: 99999999999999999999999\r\nConnection: close\r\n\r\n");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, pair[1], null));
     }
 }
 

@@ -131,7 +131,7 @@ A path is `(peer id, ip, port)`.
 score = ewma_goodput_bps / (1 + hops) / (1 + inflight)
 ```
 
-- **goodput**: EWMA of Range replies (bytes / wall time), in B/s. Prior until the first probe is 100 MB/s; a lease `mbps` (Mbit/s) is converted to B/s instead when nonzero.
+- **goodput**: EWMA of Range replies (bytes / wall time), in B/s. The prior until the first measured transfer (a successful piece fetch, not a `/have` probe) is 100 MB/s; a lease `mbps` (Mbit/s) is converted to B/s instead when nonzero.
 - **hops**: 0 if same IPv4 /24 as a local addr, else 1.
 - **inflight**: pieces already assigned to that path.
 

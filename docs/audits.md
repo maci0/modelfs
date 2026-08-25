@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Historical record. Current behavior is [architecture.md](architecture.md) |
-| Covers | 2026-08-22 review passes; the 2026-08-23 passes are in [../CHANGELOG.md](../CHANGELOG.md) |
+| Covers | 2026-08-22 review passes; the 2026-08-23 and later passes are in [../CHANGELOG.md](../CHANGELOG.md) |
 
 Six review passes were run against the guides in [review-guides/](review-guides/), one pass per guide. Every finding below was fixed and covered by a regression test in the same pass; the fixes are in the code, so this file is kept for the reasoning, not as a to-do list. Descriptions are as recorded at the time and some name APIs that later changed (`@cImport` in `src/c.zig` moved into `build.zig`'s `translateC` step; `nowSec`/`sleepMs` went from `std.time` to `std.os.linux`).
 

@@ -15,7 +15,7 @@ The origin (`tank/models` on the NAS) holds the **only copy** of every weight fi
 |---|---|---|---|
 | `tank/models/hf,gguf,lora` | weights, adapters, HF hub caches | **authoritative, unique** | yes (NAS) |
 | `tank/models/.cluster/*.json` | node leases | ephemeral, republish in 10 s | irrelevant |
-| `/var/cache/modelfs` (sparks) | pieces, bitfields, `status.json` | derived, culled anyway | no: re-hydrates from origin |
+| `/var/cache/modelfs` (sparks) | pieces, bitfields, `pin/` markers, `status.json` | pieces derived, culled anyway; pins are operator state | no for bytes: re-hydrates from origin. Pins die with the cache dir: re-run `modelfs pin` after any cache loss |
 | `/var/cache/fscache` (desktop) | FS-Cache pages | derived | no |
 | `/etc/modelfs.psk` (every node) | peer auth secret | regenerable | only with total site loss; regenerate with `openssl rand -hex 32` and redistribute to all nodes |
 | `$HOME` HF token | hub auth | not on the origin | re-login |
@@ -90,7 +90,7 @@ In order of likelihood.
 
 ### A. A spark or its NVMe died
 
-Nothing to restore. Rebuild per [architecture.md](architecture.md) (Run), remount the origin per [operations.md](operations.md), start `modelfs`. Cache warms on demand. Leases republish themselves; `--seed` bootstraps `.cluster` if it is empty.
+Nothing to restore. Rebuild per [architecture.md](architecture.md) (Run), remount the origin per [operations.md](operations.md), start `modelfs`. Cache warms on demand. Leases republish themselves; `--seed` bootstraps `.cluster` if it is empty. Re-apply any pins: the markers lived under `/var/cache/modelfs/pin/`, so without them the cull treats every previously pinned file as an ordinary LRU candidate.
 
 ### B. Files deleted or corrupted (point in time)
 

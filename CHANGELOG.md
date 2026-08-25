@@ -1,5 +1,17 @@
 # Changelog & Autoresearch Notebook
 
+## [Unreleased]
+No version has been tagged or released yet: `build.zig.zon` declares `0.1.0`, that
+declaration has not moved since the initial commit, and the repository holds no git
+tags or published artifacts. Every entry below is unreleased work toward that first
+version, so the whole history since the initial commit is one pre-release delta onto
+`0.1.0`; nothing documented here has ever shipped to a consumer between entries.
+When the first tag lands it belongs on top of this section with the entries it
+covers regrouped under its version number.
+
+## [Release review pass] - 2026-08-26
+- **The release state is now stated instead of implied**: the changelog grouped everything by dated review pass with no version anchor, so nothing distinguished released change from work-in-progress even though `build.zig.zon` has declared `0.1.0` since the initial commit and no tag exists. An `[Unreleased]` section now says exactly that up front, README points at it, and the compatibility surfaces this pass verified stay as they are: cache sidecars are self-describing (`MFS1` magic plus piece and file size in `src/piece.zig`, stale sidecars reset rather than misread), mixed piece-size fleets degrade to origin traffic via `X-Piece-Size` (`docs/architecture.md`), lease JSON tolerates unknown fields for forward compatibility, and `modelfs version` reads the one declared version through build options with its semver shape pinned by test.
+
 ## [Functional review pass] - 2026-08-25
 - **Peer `/data` answers 404 for non-regular files, like `/have` already did**: `serveData` skipped the regular-file gate its sibling has, so a directory at the requested path passed the range checks with its directory `st_size`, created a bogus cache entry, and hydration's pread on the dir fd turned the request into a 502 Bad Gateway plus a `fill_err_origin` bump -- one resource state answering two different statuses across endpoints, and the documented table ("404: the origin has no regular file at path") violated. The gate now sits before any cache work; covered end to end next to the existing `/have` directory case.
 - **Mount-only flags are refused on status/peers/pin, as the help text always claimed**: every flag was parsed for every command, so `status --detach`, `peers --piece 4M`, or `pin x --id n1` exited 0 while silently doing nothing. Each mount-only option (`--piece`, watermarks, socket/detach/id knobs) is now rejected at parse with a named message and exit 2; the shared `--origin`/`--cache`/`--psk` values stay legal everywhere (the e2e suites pass them to pin and peers). Positional shapes now follow the Usage lines too (`mount a b`, `unpin a b`, and `status junk` used to drop the extras silently).

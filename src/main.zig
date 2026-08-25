@@ -34,7 +34,8 @@ const usage =
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
     \\  --id NAME             Override node id (default: hostname)
     \\  --listen [IP:]PORT    Peer HTTP port (default 18080); binds all interfaces
-    \\  --advertise ADDRS     Extra addresses IP[:PORT], comma separated (default: all non-loopback IPv4)
+    \\  --advertise ADDRS     Extra addresses IP[:PORT], comma separated
+    \\                        (default: every local IPv4 except loopback and 169.254)
     \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
     \\  --psk-value STR       Shared secret inline (dev; leaks via /proc cmdline)
     \\  --seed HOST[:PORT]    Peer seed if origin/.cluster is empty; repeatable

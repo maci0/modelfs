@@ -391,6 +391,25 @@ pub const Store = struct {
         };
     }
 
+    /// Writes data at path under root/sub, creating the parent directory only
+    /// when the first open reports ENOENT. Steady-state saves pay zero mkdir
+    /// syscalls: an unconditional mkdirAll here cost one failed mkdir per path
+    /// component on every piece fill and write-through for the life of the
+    /// daemon. Failure semantics match the old best-effort mkdir: a parent
+    /// that cannot be created surfaces as the retried write's errno.
+    fn writeFileMakingParent(path_z: [*:0]const u8, parent: []const u8, data: []const u8, durable: bool) i32 {
+        const w = if (durable)
+            sys.writeFileDurable(path_z, data)
+        else
+            sys.writeFileNoFollow(path_z, data);
+        if (w != -c.ENOENT) return w;
+        _ = sys.mkdirAll(parent, 0o755);
+        return if (durable)
+            sys.writeFileDurable(path_z, data)
+        else
+            sys.writeFileNoFollow(path_z, data);
+    }
+
     /// Persists the entry's current bits. Caller must hold file.mu: encode
     /// reads bits/size under it. False means the sidecar was not updated
     /// (encode failure, unwritable path, torn write); callers that gate
@@ -411,12 +430,7 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cacheMetaPath(&buf, file.rel) catch return false;
         const parent = sys.parentOf(std.mem.span(p));
-        _ = sys.mkdirAll(parent, 0o755);
-        const w = if (durable)
-            sys.writeFileDurable(p, blob.items)
-        else
-            sys.writeFileNoFollow(p, blob.items);
-        if (w != 0) {
+        if (writeFileMakingParent(p, parent, blob.items, durable) != 0) {
             std.log.warn("bitfield save failed for {s}; cache state resets on restart", .{file.rel});
             return false;
         }
@@ -920,8 +934,14 @@ pub const Store = struct {
         // O_NOFOLLOW on the data file: it is opened O_RDWR|O_CREAT and then
         // ftruncate'd/pwritten, so a symlink planted at this name in a
         // writable cache tree would turn the daemon into an arbitrary-file
-        // truncate/write primitive.
-        const fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, 0o644);
+        // truncate/write primitive. The parent directory is created only when
+        // the first open misses it (same shape as writeFileMakingParent): a
+        // reopen after the reaper closed the fd pays no mkdir walk.
+        var fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, 0o644);
+        if (fd < 0 and sys.errno() == c.ENOENT) {
+            _ = sys.mkdirAll(parent, 0o755);
+            fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, 0o644);
+        }
         if (fd < 0) return sys.negErrno();
         if (sys.ftruncate(fd, file.size) != 0) {
             const e = sys.negErrno();
@@ -2037,6 +2057,55 @@ test "beginFill surfaces allocation failure instead of spinning" {
     f.filling.deinit();
     f.filling = std.AutoHashMap(u32, void).init(failing.allocator());
     try std.testing.expectError(error.OutOfMemory, st.beginFill(f, 0));
+}
+
+test "sidecar save and cache open recreate a deleted parent directory" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-mkdir");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-mkdir");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Regression: saveBits and openCache ran an unconditional mkdirAll walk
+    // (one failed mkdir per component) before every write and open. The
+    // retry-on-ENOENT shape they replaced must still create the directory
+    // when it is genuinely missing.
+    const f = try st.get("deep/sub/x.bin", 64);
+    defer st.releaseFile(f);
+    try std.testing.expect(st.openCache(f) >= 0);
+
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, "deep/sub/x.bin");
+    var db2: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.cacheDataPath(&db2, "deep/sub/x.bin");
+    var stbuf: c.struct_stat = undefined;
+
+    // Remove both artifact subtrees; the next save and open must rebuild them.
+    {
+        var pb: [sys.c.PATH_MAX]u8 = undefined;
+        const meta_parent = try std.fmt.bufPrint(&pb, "{s}/meta/deep", .{cache_d});
+        sys.deleteTree(std.testing.io, meta_parent);
+        var qb: [sys.c.PATH_MAX]u8 = undefined;
+        const data_parent = try std.fmt.bufPrint(&qb, "{s}/data/deep", .{cache_d});
+        sys.deleteTree(std.testing.io, data_parent);
+    }
+
+    try std.testing.expect(st.saveBits(f, false));
+    try std.testing.expect(sys.statPath(mp, &stbuf) == 0);
+    // Drop the live fd the way reapIdle does, so the reopen below actually
+    // goes to disk instead of returning the cached descriptor.
+    f.mu.lockUncancelable(std.testing.io);
+    sys.close(f.cache_fd);
+    f.cache_fd = -1;
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(st.openCache(f) >= 0);
+    try std.testing.expect(sys.statPath(dp, &stbuf) == 0);
 }
 
 test "late finisher on a forgotten entry does not resurrect the sidecar" {

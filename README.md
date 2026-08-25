@@ -16,6 +16,8 @@ A read that misses blocks until that one piece is filled from a single source. T
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
 
+Releases: none yet. `build.zig.zon` declares `0.1.0`, there are no tags, and [CHANGELOG.md](CHANGELOG.md) records everything as unreleased pass notes; pin a commit hash if you need a reproducible binary.
+
 ---
 
 ## Requirements

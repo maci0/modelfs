@@ -193,6 +193,10 @@ pub const Bitfield = struct {
     }
 
     pub fn encode(self: Bitfield, piece_size: u32, file_size: u64, out: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
+        // Exact size up front: saves run per piece fill and per punch, and an
+        // empty-list append chain would otherwise realloc-copy the growing
+        // blob several times per save.
+        try out.ensureTotalCapacity(gpa, out.items.len + magic.len + 12 + self.bytes.len);
         try out.appendSlice(gpa, magic);
         var ps: [4]u8 = undefined;
         std.mem.writeInt(u32, &ps, piece_size, .little);

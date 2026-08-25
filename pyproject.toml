@@ -13,11 +13,14 @@ target-version = "py310"
 # suppression hygiene (PGH), performance anti-patterns (PERF),
 # refactoring/modernization (FURB), redundant constructs (PIE),
 # return simplification (RET), dead commented-out code (ERA),
-# import hygiene (TID), and implicit namespace packages (INP).
+# import hygiene (TID), implicit namespace packages (INP), naming
+# conventions (N), typing-only imports left at runtime (TC), function
+# complexity (C90), blocking calls inside asyncio loops (ASYNC),
+# blind exception catches (BLE), and redundant raise parens (RSE).
 select = [
     "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
     "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
-    "TID", "INP",
+    "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE",
 ]
 
 [tool.mypy]
@@ -25,10 +28,19 @@ strict = true
 # Beyond the strict bundle: flag unreachable code and redundant/truthiness
 # mistakes, require code-scoped ignores, catch possibly-undefined names,
 # overriding methods that widen mutable base attributes, use of APIs
-# deprecated in the stdlib, and explicit "Any" annotations (escape
-# hatches must be inferred-and-narrowed, not spelled out).
-warn_unreachable = true
+# deprecated in the stdlib, explicit "Any" annotations (escape
+# hatches must be inferred-and-narrowed, not spelled out), Any leaking in
+# from untyped imports or module globals, None-vs-type overlap checks,
+# overrides missing @override, empty bodies hiding unimplemented logic,
+# and abstract types used where a concrete instance is required.
 disallow_any_explicit = true
+disallow_any_unimported = true
+disallow_untyped_globals = true
+strict_equality_for_none = true
+warn_unreachable = true
+# Not part of --strict: a dead or mistyped key in this very file must fail
+# the check instead of silently doing nothing.
+warn_unused_configs = true
 enable_error_code = [
     "redundant-expr",
     "redundant-self",
@@ -38,5 +50,8 @@ enable_error_code = [
     "possibly-undefined",
     "mutable-override",
     "deprecated",
+    "explicit-override",
+    "empty-body",
+    "type-abstract",
 ]
 
