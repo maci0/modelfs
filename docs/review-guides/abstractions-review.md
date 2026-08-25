@@ -416,7 +416,7 @@ Severity:
 ### Bad: wrapper with no policy
 
 ```text
-// pub fn loadBlocks(...) { return maxdamage.tryLoad(...); }
+// pub fn loadBlocks(...) { return assets.tryLoad(...); }
 // Why: indirection without a rule; call tryLoad directly
 ```
 

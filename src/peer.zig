@@ -174,6 +174,16 @@ const dial_timeout_ms: u32 = 15_000;
 /// sending a partial head slower than the timeout.
 const head_deadline_ms: i64 = 10_000;
 
+/// Largest request head the protocol can produce: a PATH_MAX rel whose bytes
+/// all need percent-escaping encodes to three times its length, and the
+/// bearer token rides verbatim up to proto.max_psk_bytes, with method,
+/// target framing, Host, Range, and Connection overhead under the slack.
+/// sendRequest builds into this budget and the server reads heads into it,
+/// so every request a client can legally emit fits one head read on both
+/// sides; sizing either side smaller would drop those requests instead of
+/// serving them.
+const max_head_bytes: usize = 4096 * 3 + proto.max_psk_bytes + 512;
+
 /// Wall-clock budget for one response body, read or served: a base allowance
 /// plus 1s per expected MiB (Content-Length is known before any body byte
 /// moves). Same per-transfer-reset hole as the head budget covers: SO_RCVTIMEO
@@ -259,12 +269,10 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
     sys.setSockTimeout(fd, sock_timeout_ms);
     sys.setTcpNoDelay(fd, true);
     sys.setSockBuffers(fd, sock_buf_bytes);
-    // Sized to hold the largest request sendRequest can emit: a PATH_MAX
-    // rel whose bytes all need escaping encodes to three times its length,
-    // so the wire form of a legal deeply-nested non-ASCII path runs past the
-    // old 8 KiB budget -- a smaller head buffer here would drop those
-    // connections as malformed instead of serving them.
-    var head_buf: [4096 * 3 + 512]u8 = undefined;
+    // Sized to max_head_bytes: the wire form of a legal deeply-nested
+    // non-ASCII path plus a full-size bearer token must complete here, or
+    // the connection is dropped as malformed instead of served.
+    var head_buf: [max_head_bytes]u8 = undefined;
     var n: usize = 0;
     var total_read: usize = 0;
     readHeadFull(fd, &head_buf, &n, &total_read) catch {
@@ -689,7 +697,7 @@ fn haveFromHead(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8
 fn sendRequest(psk: []const u8, ip: []const u8, port: u16, rel: []const u8, range: ?proto.Range) !c_int {
     var qbuf: [4096 * 3]u8 = undefined;
     const enc = try proto.urlEncode(&qbuf, rel);
-    var req: [4096 * 3 + 512]u8 = undefined;
+    var req: [max_head_bytes]u8 = undefined;
     const s = if (range) |rg|
         try std.fmt.bufPrint(&req, "GET /data?path={s} HTTP/1.1\r\nHost: {s}:{d}\r\nAuthorization: Bearer {s}\r\nRange: bytes={d}-{d}\r\nConnection: close\r\n\r\n", .{
             enc, ip, port, psk, rg.start, rg.end,
@@ -1755,7 +1763,7 @@ test "handleConn counts a targetless request line as malformed" {
     defer sys.close(cfd2);
     sys.setSockTimeout(cfd2, 5000);
     try std.testing.expectEqual(@as(i32, 0), sys.connectIn(cfd2, &addr, 5000));
-    var flood: [4096 * 3 + 512]u8 = undefined;
+    var flood: [max_head_bytes]u8 = undefined;
     @memset(&flood, 'A');
     _ = try std.testing.expectEqual(@as(isize, @intCast(flood.len)), sys.writeAll(cfd2, &flood));
     while (true) {
@@ -2292,10 +2300,16 @@ test "serveData serves a legal path whose encoded form exceeds 8KiB" {
     const body = "payload";
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(fp, body));
 
-    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    // A loadPsk-maximum secret rides along: the request frame must carry
+    // the escaped PATH_MAX rel AND a proto.max_psk_bytes token together.
+    // Regression: the builder budgeted only fixed overhead past the encoded
+    // path, so exactly this combination overflowed sendRequest and silently
+    // disabled the peer tier for nodes with long secrets.
+    const psk = "k" ** proto.max_psk_bytes;
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, psk);
     defer srv.stop();
 
-    const got = try fetchRange(gpa, "secret", "127.0.0.1", srv.port(), rel, 0, body.len - 1);
+    const got = try fetchRange(gpa, psk, "127.0.0.1", srv.port(), rel, 0, body.len - 1);
     defer gpa.free(got);
     try std.testing.expectEqualStrings(body, got);
 }

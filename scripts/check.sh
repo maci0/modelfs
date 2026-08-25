@@ -42,10 +42,12 @@ zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported u
 echo "=== shellcheck ==="
 # Defect-oriented optional checks the tree already passes: every case
 # statement must handle an unmatched input, bare [ $x ] conditions are
-# ambiguous, which(1) is not portable, and variables stay quoted even where
-# currently safe. The style-only brace/double-bracket checks stay off: this
-# tree does not follow those conventions.
-shellcheck -o add-default-case,avoid-nullary-conditions,deprecate-which,quote-safe-variables scripts/*.sh || fail "shellcheck reported violations"
+# ambiguous, which(1) is not portable, variables stay quoted even where
+# currently safe, a suppressed `set -e` cannot silently downgrade error
+# handling, and an uppercase-looking assignment is always set before use.
+# The style-only brace/double-bracket checks stay off: this tree does not
+# follow those conventions.
+shellcheck -o add-default-case,avoid-nullary-conditions,deprecate-which,quote-safe-variables,check-set-e-suppressed,check-unassigned-uppercase scripts/*.sh || fail "shellcheck reported violations"
 
 echo "=== ruff ==="
 ruff check scripts/ || fail "ruff reported violations"

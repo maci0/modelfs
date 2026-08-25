@@ -838,10 +838,12 @@ const OriginDirNames = struct {
     }
 };
 
-/// Hands each planned entry to libfuse's filler. False ends the walk, both
-/// on a full reply buffer (filler nonzero) and for a name that cannot ride
-/// the fixed staging buffer; either way the kernel resumes from the last
-/// ordinal actually emitted.
+/// Hands each planned entry to libfuse's filler. False ends the walk when
+/// the reply buffer is full (filler nonzero), and the kernel resumes from
+/// the last ordinal actually emitted. An entry longer than the staging
+/// buffer is skipped instead: Linux NAME_MAX caps directory components at
+/// 255 bytes and namez holds 256, so the branch is defense against a
+/// hostile origin filesystem, not a state the walk can reach on a real one.
 const DirFiller = struct {
     buf: ?*anyopaque,
     fill: fuse.fuse_fill_dir_t,

@@ -39,7 +39,7 @@ Severity guide:
 
 ## Output format
 
-Write or update `docs/reviews/ZIG_SRC_REVIEW.md` with scope (files covered, date), a findings table using the template above, counts by severity, and an ordered fix plan (P0 first). Add a short chat note with the top findings and whether `scripts/check.sh` was run after any fix. Unless the user sets another budget, fix at most five distinct findings and skip any single-file fix expected to exceed 200 changed lines.
+Write or update `docs/reviews/ZIG_SRC_REVIEW.md` with scope (files covered, date), a findings table using the template above, counts by severity, and an ordered fix plan (P0 first). Add a short chat note with the top findings and whether `scripts/check.sh` was run after any fix. Unless the user sets another budget, fix at most five distinct findings, P0 first, and skip any single-file fix expected to exceed 200 changed lines.
 
 ## Important
 

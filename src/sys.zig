@@ -470,6 +470,11 @@ test "joinZ" {
     try std.testing.expectEqualStrings("/mnt/nas/models", std.mem.span(b));
     const d = try joinZ(&buf, "/mnt/nas/models", "/gguf/foo.gguf");
     try std.testing.expectEqualStrings("/mnt/nas/models/gguf/foo.gguf", std.mem.span(d));
+    // The join that does not fit must be refused before any byte lands:
+    // these results name artifact paths, and a silent truncation would
+    // point sidecars and data files at the wrong keys.
+    try std.testing.expectError(error.NameTooLong, joinZ(buf[0..16], "/mnt/nas/models", "gguf/foo.gguf"));
+    try std.testing.expectError(error.NameTooLong, joinZ(buf[0..29], "/mnt/nas/models", "gguf/foo.gguf"));
 }
 
 test "monoSec never goes backwards" {
@@ -483,6 +488,13 @@ test "parentOf" {
     try std.testing.expectEqualStrings("/a/b", parentOf("/a/b/c"));
     try std.testing.expectEqualStrings("/", parentOf("/a"));
     try std.testing.expectEqualStrings(".", parentOf("c"));
+    // Trailing slashes name the directory itself: the parent of "/a/b/" is
+    // "/a", never "" or "/a/b/".
+    try std.testing.expectEqualStrings("/a/b", parentOf("/a/b/c/"));
+    try std.testing.expectEqualStrings("/", parentOf("/a/"));
+    // The root is its own parent; so is any all-slash path.
+    try std.testing.expectEqualStrings("/", parentOf("/"));
+    try std.testing.expectEqualStrings("/", parentOf("///"));
 }
 
 test "connectIn succeeds against a local listener" {

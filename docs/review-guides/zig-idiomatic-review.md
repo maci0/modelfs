@@ -648,6 +648,5 @@ _ = parse(...) catch {}; // applied nothing, caller thinks success
 - "Comptime focus: package maps and binary layouts."
 - "Hot path only: fail every heap alloc / growing list on tick and interest."
 - "Apply Zig Zen as the primary rubric; cite which zen line each P0/P1 maps to."
-- "Compare to agave AGENTS.md habits where they do not conflict with modelfs."
 - "Produce ast-grep rules for catch-empty, linux.open, and allocator.alloc in ecs/wire."
 - "Do not edit game.zig; findings only."

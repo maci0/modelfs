@@ -405,7 +405,7 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
     const p = try sys.toZ(&z, opts.psk_file);
     var open_errno: i32 = 0;
-    const raw = sys.readFileAllocOpenErrno(gpa, p, 4096, &open_errno) catch |err| switch (err) {
+    const raw = sys.readFileAllocOpenErrno(gpa, p, proto.max_psk_bytes, &open_errno) catch |err| switch (err) {
         // Remediation output for operators, like every other usage print in
         // this file: suppressed under test so the named errors stay
         // assertable without tripping the runner's error-log counter. A

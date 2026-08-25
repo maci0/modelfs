@@ -567,9 +567,16 @@ pub const Catalog = struct {
             out.deinit(gpa);
         }
         for (self.paths.items) |p| {
+            // Own each string before the struct literal: a failed ip dupe must
+            // free the id copy instead of leaking it past the errdefer above
+            // (which only sees appended items).
+            const peer_id = try gpa.dupe(u8, p.peer_id);
+            errdefer gpa.free(peer_id);
+            const ip = try gpa.dupe(u8, p.ip);
+            errdefer gpa.free(ip);
             try out.append(gpa, .{
-                .peer_id = try gpa.dupe(u8, p.peer_id),
-                .ip = try gpa.dupe(u8, p.ip),
+                .peer_id = peer_id,
+                .ip = ip,
                 .port = p.port,
                 .ewma_bps = p.ewma_bps,
                 .hops = p.hops,
@@ -587,6 +594,26 @@ pub const Catalog = struct {
             gpa.free(p.ip);
         }
         gpa.free(paths);
+    }
+
+    test "snapshot frees both strings when any allocation fails" {
+        const gpa = std.testing.allocator;
+        const addrs = [_]proto.LeaseAddr{};
+        var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &addrs, &.{}, &.{});
+        defer cat.deinit();
+        try cat.paths.append(gpa, .{ .peer_id = "a", .ip = "10.0.0.1", .port = 1, .ewma_bps = 0, .hops = 0 });
+        try cat.paths.append(gpa, .{ .peer_id = "b", .ip = "10.0.0.2", .port = 2, .ewma_bps = 0, .hops = 0 });
+
+        const Runner = struct {
+            fn run(alloc: std.mem.Allocator, catalog: *Catalog) !void {
+                const snap = try catalog.snapshot(alloc);
+                Catalog.freeSnapshot(alloc, snap);
+            }
+        };
+        // Walks every allocation index of snapshot, including the ip dupe
+        // that lands after the id copy: regression, a failure there used to
+        // leak the id copy because the errdefer only saw appended items.
+        try std.testing.checkAllAllocationFailures(gpa, Runner.run, .{&cat});
     }
 
     pub fn updateGoodput(self: *Catalog, ip: []const u8, port: u16, bps: f64) void {
@@ -1301,6 +1328,86 @@ test "refresh drops lease addresses that are not dialable dotted quads" {
     defer Catalog.freeSnapshot(gpa, snap);
     try std.testing.expectEqual(@as(usize, 1), snap.len);
     try std.testing.expectEqualStrings("10.0.0.9", snap[0].ip);
+}
+
+test "refresh keeps the previous peer list while .cluster is unreadable" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-keep");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
+    const live = "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.1\",\"port\":18080,\"mbps\":0}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live));
+
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+    cat.refresh(sys.nowSec());
+
+    // A transient origin outage (NFS unmounted, control dir swept) makes
+    // opendir fail. Regression shape: rebuilding from an empty walk here
+    // would silently go peerless and drop every fill to the origin tier for
+    // a full tick; the documented degrade keeps the last known membership.
+    {
+        const prev_log_level = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = prev_log_level;
+        sys.deleteTree(std.testing.io, cluster_d);
+        cat.refresh(sys.nowSec());
+    }
+
+    const snap = try cat.snapshot(gpa);
+    defer Catalog.freeSnapshot(gpa, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("spark9", snap[0].peer_id);
+    try std.testing.expectEqualStrings("10.0.0.1", snap[0].ip);
+}
+
+test "refresh skips unreadable and corrupt leases without dropping healthy peers" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-corrupt");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    // Truncated JSON off shared storage (crash mid-rename is impossible with
+    // staging, but a co-tenant's torn write is not): skipped, not fatal.
+    const bad_fp = try std.fmt.bufPrint(&pbuf, "{s}/corrupt.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, bad_fp), "{oops"));
+    // A directory parked at a lease name makes every read of it fail with
+    // EISDIR (works even as root): the non-ENOENT warn branch, still a skip.
+    const dir_fp = try std.fmt.bufPrint(&pbuf, "{s}/dir.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(dir_fp, 0o755));
+    // One healthy lease among them: it must survive the walk.
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
+    const live = "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.1\",\"port\":18080,\"mbps\":0}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live));
+
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+
+    // Expected-path warns for both broken entries; restored on scope exit so
+    // unexpected warnings from later tests still surface.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+    cat.refresh(sys.nowSec());
+
+    const snap = try cat.snapshot(gpa);
+    defer Catalog.freeSnapshot(gpa, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("spark9", snap[0].peer_id);
 }
 
 test "refresh uses seeds only while cluster is empty" {

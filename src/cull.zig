@@ -74,4 +74,10 @@ test "freePercent" {
     try std.testing.expectEqual(@as(u32, 7), freePercent(7, 100));
     // clamps at 100 instead of overflowing
     try std.testing.expectEqual(@as(u32, 100), freePercent(150, 100));
+    // bavail * 100 exceeds u64 at these magnitudes: the widening must keep
+    // the percentage exact instead of wrapping (safe builds panic otherwise).
+    const max = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(u32, 0), freePercent(1, max));
+    try std.testing.expectEqual(@as(u32, 50), freePercent(max / 2 + 1, max));
+    try std.testing.expectEqual(@as(u32, 100), freePercent(max, max));
 }

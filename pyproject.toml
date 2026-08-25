@@ -27,12 +27,14 @@ required-version = ">=0.16,<0.17"
 # context in inline literals (EM), executable-bit vs shebang mismatches
 # (EXE), boolean-trap positional flags (FBT), import sorting/ordering (I),
 # join-to-f-string simplification (FLY), conventional import aliases (ICN),
-# and TODO-comment hygiene (TD).
+# TODO-comment hygiene (TD), annotation completeness including Any spelled
+# out by hand (ANN), stale FIXME/TBD/HACK comments (FIX), logging call
+# hygiene (G), and logging setup anti-patterns (LOG).
 select = [
     "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
     "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
     "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE", "TRY", "EM",
-    "EXE", "FBT", "I", "FLY", "ICN", "TD",
+    "EXE", "FBT", "I", "FLY", "ICN", "TD", "ANN", "FIX", "G", "LOG",
 ]
 
 [tool.ruff.format]
@@ -67,6 +69,9 @@ disallow_untyped_globals = true
 # decorated function; the strict bundle does not cover this.
 disallow_any_decorated = true
 strict_equality_for_none = true
+# bytes accepts only bytes, not str-like objects: the py314 semantics pulled
+# forward so a bytes/str mixup cannot hide behind implicit coercions.
+strict_bytes = true
 warn_unreachable = true
 # Not part of --strict: a dead or mistyped key in this very file must fail
 # the check instead of silently doing nothing.

@@ -135,6 +135,14 @@ pub fn bearerOk(got: []const u8, want: []const u8) bool {
     return std.crypto.timing_safe.eql([32]u8, ha, hb);
 }
 
+/// Upper bound on a bearer token in bytes: main.zig's loadPsk reads at most
+/// this much and trims it, so it is also the token budget every request
+/// builder and request-head buffer must reserve beyond the encoded path.
+/// One constant here keeps the loader's cap and the wire budgets from
+/// drifting apart (a longer legal secret would otherwise overflow
+/// sendRequest's frame and silently disable the peer tier for that node).
+pub const max_psk_bytes: usize = 4096;
+
 /// Default TCP port of the peer HTTP protocol; every --listen/--advertise/
 /// --seed address without an explicit ":PORT" resolves to it.
 pub const default_port: u16 = 18080;
@@ -288,6 +296,10 @@ test "lease json roundtrip" {
     // ...while malformed JSON is rejected, not half-parsed.
     try std.testing.expectError(error.UnexpectedEndOfInput, parseLease(std.testing.allocator, "{\"id\":"));
     try std.testing.expectError(error.SyntaxError, parseLease(std.testing.allocator, "not json at all"));
+    // Well-formed JSON missing the required addrs list is malformed too:
+    // a peer publishing such a document must fail closed here, never read
+    // downstream as an empty-address (unreachable) or empty-cluster node.
+    try std.testing.expectError(error.MissingField, parseLease(std.testing.allocator, "{\"id\":\"n1\",\"until\":5}"));
 }
 
 /// One lease document in the corpus framing the fuzz harness reads: u32
