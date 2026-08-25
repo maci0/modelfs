@@ -1,4 +1,4 @@
-# Changelog & Autoresearch Notebook
+# Changelog
 
 ## [Unreleased]
 No version has been tagged or released yet: `build.zig.zon` declares `0.1.0`, that
@@ -8,6 +8,11 @@ version, so the whole history since the initial commit is one pre-release delta 
 `0.1.0`; nothing documented here has ever shipped to a consumer between entries.
 When the first tag lands it belongs on top of this section with the entries it
 covers regrouped under its version number.
+
+## [Release process review pass] - 2026-08-26
+- **Cutting the first release no longer relies on memory**: every mechanic existed (`build.zig.zon`'s `.version` is the single source `modelfs version` prints through `build_options`, its semver shape pinned by test; the `[Unreleased]` note already said the first tag regroups these entries under its version), but no document tied them together, so manifest, changelog, and tag could drift apart at the first cut. CONTRIBUTING.md gained the four-step release procedure (bump the manifest, regroup covered entries under the version, tag `v<version>` exactly matching the manifest, confirm the built binary answers with it) and now states that CI builds with exactly 0.16.0 while `minimum_zig_version` is only the floor.
+- **CONTRIBUTING's changelog guidance matches how entries are actually added**: it pointed behavior changes at an `[Unreleased]` subsection nobody uses; each change set in practice adds its own dated section, all unreleased until the first tag. The instruction now says that.
+- **The changelog consumers pull is titled like one**: `build.zig.zon` `.paths` ships CHANGELOG.md inside the package tarball, but its header still read "Changelog & Autoresearch Notebook"; it is just "# Changelog" now, with the early autoresearch session notes kept as history below.
 
 ## [DX review pass] - 2026-08-26
 - **A single module's tests no longer cost the whole suite**: `zig build test` always built and ran all 128 tests (~40 s of run time alone), so contributors batched changes. `build.zig` now takes `-Dtest-filter=<substring>` (wired to the test runner's native filter), making `zig build test -Dtest-filter=piece` a seconds-long loop; documented in README and CONTRIBUTING.
@@ -21,6 +26,7 @@ covers regrouped under its version number.
 - **Help documents the `-f` short form** (parsed since the start, never listed next to `--foreground`) **and `-V/--version`** alongside the `-h/--help` note.
 - **Bare global forms refuse extra arguments**: `modelfs help junk` / `modelfs version junk` exited 0 while dropping the extras, unlike every other subcommand's strict positional shape; both now exit 2 with usage.
 - **`--listen` is validated at the flag like its sibling value flags**: a malformed spec (`--listen abc:def`) was only rejected after the mountpoint, cache, and PSK had already been set up, and as exit 1 (runtime class) instead of the exit 2 every other malformed value gets; worse, a bare word (`--listen spark1`) or empty value was accepted-and-defaulted, silently mounting on 18080 while the caller believes their spec took effect. The port is now parsed where the flag is read (named message, exit 2, no side effects); `PORT`, `[HOST]:PORT`, and `:PORT` forms keep working, since only the port was ever consumed (binding stays wildcard).
+- **A typo'd subcommand can no longer succeed by carrying `-h`**: `modelfs frobnicate -h` printed the help text and exited 0, because `-h` preempted command dispatch inside the argument scan; only the bare form (`modelfs frobnicate`) was refused. parseArgs now rejects unknown command words before any flag handling (same named message, exit 2), so scripts keying on the exit code no longer read a misspelled invocation as success; `-V/--version` on an unknown command gets the same verdict. Dispatch's trailing unknown-command branch became unreachable by construction, with the refusal owned by the single knownCommand list both paths share.
 
 ## [Release review pass] - 2026-08-26
 - **The release state is now stated instead of implied**: the changelog grouped everything by dated review pass with no version anchor, so nothing distinguished released change from work-in-progress even though `build.zig.zon` has declared `0.1.0` since the initial commit and no tag exists. An `[Unreleased]` section now says exactly that up front, README points at it, and the compatibility surfaces this pass verified stay as they are: cache sidecars are self-describing (`MFS1` magic plus piece and file size in `src/piece.zig`, stale sidecars reset rather than misread), mixed piece-size fleets degrade to origin traffic via `X-Piece-Size` (`docs/architecture.md`), lease JSON tolerates unknown fields for forward compatibility, and `modelfs version` reads the one declared version through build options with its semver shape pinned by test.

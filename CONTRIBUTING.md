@@ -7,7 +7,8 @@ what passes locally is what passes on push.
 ## Setup, once per clone
 
 Requirements: Linux, **Zig 0.16.0 or newer** (`minimum_zig_version` in
-[build.zig.zon](build.zig.zon) enforces this), libfuse3 headers
+[build.zig.zon](build.zig.zon) enforces this; CI builds with exactly
+0.16.0), libfuse3 headers
 (`libfuse3-dev` / `fuse3-devel`), and shellcheck. The Python tooling is pinned;
 install it with uv:
 
@@ -50,7 +51,34 @@ zig build test -Dtest-filter=store     # only tests whose name matches (substrin
 
 The blocking requirement is green CI: `./scripts/check.sh` plus the
 `cross-aarch64` compile job. There are no sign-off or changelog-entry gates,
-but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) under
-`[Unreleased]`, and changes to [requirements-dev.txt](requirements-dev.txt)
-must be reflected in the hash-pinned lock (regeneration command in the lock's
-header).
+but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) as their own
+dated section (everything there is unreleased until the first tag; see
+Cutting a release below), and changes to
+[requirements-dev.txt](requirements-dev.txt) must be reflected in the
+hash-pinned lock (regeneration command in the lock's header).
+
+## Cutting a release
+
+`.version` in [build.zig.zon](build.zig.zon) is the single source: `build.zig`
+extracts it into `build_options`, `modelfs version` prints it, and the
+"embedded version parses as semver" unit test rejects a malformed value.
+Nothing else carries a version, so a release is four steps that must stay in
+sync:
+
+1. Bump `.version` in [build.zig.zon](build.zig.zon).
+2. Regroup [CHANGELOG.md](CHANGELOG.md): every entry there is unreleased work;
+   move the entries this release covers under a heading named after the new
+   version and today's date, per the `[Unreleased]` note at the top of the
+   file.
+3. Tag `v<version>`, exactly matching the manifest (`v0.1.0` for
+   `.version = "0.1.0"`), so a checkout can be matched to a version.
+4. Confirm the built binary answers with the declared version before
+   announcing:
+
+   ```bash
+   zig build -Doptimize=ReleaseFast && ./zig-out/bin/modelfs version
+   ```
+
+There is no publish step beyond the tag: consumers fetch this repository as a
+Zig package (the tarball is whatever `.paths` lists) or build from the tagged
+commit.

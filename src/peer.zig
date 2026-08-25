@@ -617,7 +617,7 @@ fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) 
 /// reads as 0, meaning unknown; consumers assume alignment for those. A
 /// malformed header fails the probe like any other bad reply so failures
 /// stay uncached and retried.
-pub fn fetchHave(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !discover.HaveBits {
+fn fetchHave(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !discover.HaveBits {
     const fd = try sendRequest(psk, ip, port, rel, null);
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
@@ -670,7 +670,7 @@ fn sendRequest(psk: []const u8, ip: []const u8, port: u16, rel: []const u8, rang
     return fd;
 }
 
-pub fn fetchRange(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64) ![]u8 {
+fn fetchRange(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64) ![]u8 {
     const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end });
     defer sys.close(fd);
     return readFlexBodyAlloc(gpa, fd, null);
@@ -679,7 +679,7 @@ pub fn fetchRange(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port:
 /// Like fetchRange, but streams the body directly into `out` (whose length
 /// must match the peer's Content-Length): one fewer piece-sized allocation
 /// and copy per fetched piece.
-pub fn fetchRangeInto(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8) !void {
+fn fetchRangeInto(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8) !void {
     const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end });
     defer sys.close(fd);
     _ = try readFlexBodyAlloc(gpa, fd, out);

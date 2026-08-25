@@ -173,8 +173,8 @@ pub fn fadviseDontneed(fd: c_int, off: u64, len: u64) void {
     _ = c.posix_fadvise(fd, @intCast(off), @intCast(len), c.POSIX_FADV_DONTNEED);
 }
 
-pub const FALLOC_FL_KEEP_SIZE: c_int = 0x01;
-pub const FALLOC_FL_PUNCH_HOLE: c_int = 0x02;
+const FALLOC_FL_KEEP_SIZE: c_int = 0x01;
+const FALLOC_FL_PUNCH_HOLE: c_int = 0x02;
 
 pub fn punchHole(fd: c_int, off: u64, len: u64) i32 {
     const rc = c.fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, @intCast(off), @intCast(len));

@@ -168,9 +168,30 @@ fn takePercent(args: []const []const u8, flag: []const u8, i: *usize) !u32 {
     return pct;
 }
 
+/// The command words main() dispatches on; the bare help/version forms are
+/// answered before parseArgs ever runs. Keeping one list means a newly added
+/// command missing from it fails loudly everywhere instead of slipping past
+/// this gate into the help answer below.
+fn knownCommand(cmd: []const u8) bool {
+    inline for (.{ "mount", "status", "peers", "pin", "unpin" }) |c| {
+        if (std.mem.eql(u8, cmd, c)) return true;
+    }
+    return false;
+}
+
 fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, args: []const []const u8) !struct { cmd: []const u8, opts: Opts, rest: []const []const u8 } {
     if (args.len == 0) return error.Help;
     const cmd = args[0];
+    // Refuse an unknown command word before any flag scanning: otherwise
+    // `modelfs typo-cmd -h` answered with the help text and exit 0, because
+    // -h preempted dispatch, so a script's misspelled invocation read as a
+    // success. Same verdict as the post-parse refusal this replaces, just
+    // reached before -h/-V get their turn.
+    if (!knownCommand(cmd)) {
+        if (!builtin.is_test)
+            std.debug.print("unknown command \"{s}\" (want mount, status, peers, pin, unpin, version, help)\n", .{cmd});
+        return error.UnknownCommand;
+    }
     var opts = Opts{};
     // 0.16: environment variables are only reachable via the main function's
     // process.Init; the map is threaded in instead of reading global environ.
@@ -481,9 +502,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         return cmdPin(init.io, gpa, parsed.opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
     }
-    std.log.err("unknown command \"{s}\" (want mount, status, peers, pin, unpin, version, help)", .{parsed.cmd});
-    std.debug.print("{s}", .{usage});
-    return 2;
+    // parseArgs refuses anything outside the commands dispatched above, so
+    // this point is unreachable unless the knownCommand list and this
+    // dispatch drift apart; failing loudly here surfaces that immediately.
+    unreachable;
 }
 
 /// realpath of path, creating the directory first when missing. label names
@@ -1168,6 +1190,16 @@ test "parseArgs rejects bad values" {
     // The env source answers to the same gate.
     try environ.put("MODELFS_ID", "x\"y");
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
+}
+
+test "parseArgs refuses unknown commands before flag scanning" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try std.testing.expectError(error.UnknownCommand, parseArgs(gpa, &environ, &.{"frobnicate"}));
+    // A trailing -h must not turn a typo'd command into a successful help
+    // request (regression: it printed the usage and exited 0).
+    try std.testing.expectError(error.UnknownCommand, parseArgs(gpa, &environ, &.{ "frobnicate", "-h", "--origin", "/o" }));
 }
 
 test "parseArgs rejects mount-only flags on other commands" {

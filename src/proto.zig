@@ -434,3 +434,111 @@ fn fuzzLeaseDocOne(_: void, smith: *std.testing.Smith) anyerror!void {
 test "fuzz lease document parsing fails closed and round-trips clean docs" {
     try std.testing.fuzz({}, fuzzLeaseDocOne, .{ .corpus = &fuzz_lease_corpus });
 }
+
+// The URL codec is one wire contract split across the peer trust boundary:
+// clients escape model paths into the query string (sendRequest) and servers
+// decode them back (the relOk gate). Only the decode half sits inside the
+// request-head harness, so an encoder/decoder drift there -- say a "+"
+// folding or case-insensitive hex change on one side alone -- would silently
+// split one file into two spellings instead of failing loudly. This harness
+// pins the pair end to end.
+
+/// RFC 3986 unreserved set, derived independently of urlEncode's lookup
+/// table so a corrupted table cannot self-confirm the length oracle below.
+fn codecUnreserved(ch: u8) bool {
+    return switch (ch) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~' => true,
+        else => false,
+    };
+}
+
+fn expectedEncodedLen(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |ch| n += if (codecUnreserved(ch)) 1 else 3;
+    return n;
+}
+
+/// Two framed slices per corpus entry: the path the client encodes, then an
+/// arbitrary wire form fed straight into the decoder.
+fn codecEntry(comptime name: []const u8, comptime wire: []const u8) [8 + name.len + wire.len]u8 {
+    var out: [8 + name.len + wire.len]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(name.len), .little);
+    @memcpy(out[4..][0..name.len], name);
+    std.mem.writeInt(u32, out[4 + name.len ..][0..4], @intCast(wire.len), .little);
+    @memcpy(out[8 + name.len ..], wire);
+    return out;
+}
+
+const seed_codec_plain = codecEntry("gguf/model.gguf", "%zz");
+const seed_codec_spaced = codecEntry("llama 70B/v2.gguf", "%2");
+const seed_codec_utf8 = codecEntry("权重/mödel.gguf", "100%");
+const seed_codec_raw_bytes = codecEntry("raw \xff\xfe.bin", "a+b%20c");
+const seed_codec_control = codecEntry("\x00\x1b\x7f", "%41%4");
+const seed_codec_empty = codecEntry("", "");
+const seed_codec_escapes_only = codecEntry("%%%", "%25%25%25");
+
+const fuzz_codec_corpus = [_][]const u8{
+    &seed_codec_plain,
+    &seed_codec_spaced,
+    &seed_codec_utf8,
+    &seed_codec_raw_bytes,
+    &seed_codec_control,
+    &seed_codec_empty,
+    &seed_codec_escapes_only,
+};
+
+/// Asserts the codec contract from both ends of the trust boundary: the
+/// encoded form's length matches an independent RFC 3986 oracle exactly
+/// (tight buffer succeeds, one byte short refuses), carries only unreserved
+/// bytes and complete uppercase-hex escapes, decodes back to the original
+/// bytes, and the decoder alone never asks for more room than its input --
+/// so server-side callers sizing buffers off the query length cannot be
+/// made to fail by any crafted request line.
+fn fuzzUrlCodecOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var name_buf: [256]u8 = undefined;
+    const name = name_buf[0..smith.slice(&name_buf)];
+
+    const want_len = expectedEncodedLen(name);
+    var enc_buf: [3 * 256]u8 = undefined;
+    const enc = try urlEncode(&enc_buf, name);
+    try std.testing.expectEqual(want_len, enc.len);
+
+    var tight: [enc_buf.len]u8 = undefined;
+    try std.testing.expectEqualStrings(enc, try urlEncode(tight[0..want_len], name));
+    if (want_len > 0)
+        try std.testing.expectError(error.NoSpaceLeft, urlEncode(tight[0 .. want_len - 1], name));
+
+    var i: usize = 0;
+    while (i < enc.len) {
+        if (codecUnreserved(enc[i])) {
+            i += 1;
+            continue;
+        }
+        try std.testing.expect(enc[i] == '%');
+        try std.testing.expect(i + 3 <= enc.len);
+        try std.testing.expect(hexVal(enc[i + 1]) != null);
+        try std.testing.expect(hexVal(enc[i + 2]) != null);
+        i += 3;
+    }
+
+    var dec_buf: [enc_buf.len]u8 = undefined;
+    const dec = try urlDecode(dec_buf[0..enc.len], enc);
+    try std.testing.expectEqualStrings(name, dec);
+
+    var wire_buf: [256]u8 = undefined;
+    const wire = wire_buf[0..smith.slice(&wire_buf)];
+    var out_buf: [256]u8 = undefined;
+    const got = urlDecode(out_buf[0..wire.len], wire) catch |err| switch (err) {
+        error.BadUrl => return,
+        else => return err,
+    };
+    var reenc_buf: [enc_buf.len]u8 = undefined;
+    const re_enc = try urlEncode(&reenc_buf, got);
+    var again_buf: [256]u8 = undefined;
+    const again = try urlDecode(again_buf[0..re_enc.len], re_enc);
+    try std.testing.expectEqualStrings(got, again);
+}
+
+test "fuzz url codec round-trips across the peer trust boundary" {
+    try std.testing.fuzz({}, fuzzUrlCodecOne, .{ .corpus = &fuzz_codec_corpus });
+}

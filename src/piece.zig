@@ -30,7 +30,7 @@ pub fn len(file_size: u64, index: u32, piece_size: u32) u32 {
     return @intCast(@min(remain, piece_size));
 }
 
-pub fn indexAt(file_off: u64, piece_size: u32) u32 {
+fn indexAt(file_off: u64, piece_size: u32) u32 {
     if (piece_size == 0) return 0;
     const idx = if (@popCount(piece_size) == 1)
         file_off >> @intCast(@ctz(piece_size))
@@ -537,4 +537,110 @@ fn fuzzBitfieldDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
 test "fuzz bitfield sidecar decode matches stored bits or resets empty" {
     try std.testing.fuzz({}, fuzzBitfieldDecodeOne, .{ .corpus = &fuzz_decode_corpus });
+}
+
+/// One op sequence as a corpus entry: u32 length prefix, then one byte per
+/// op (low 2 bits pick set/clear/grow/shrink, the rest carry the index).
+fn opsEntry(comptime ops: []const u8) [4 + ops.len]u8 {
+    var out: [4 + ops.len]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(ops.len), .little);
+    @memcpy(out[4..], ops);
+    return out;
+}
+
+const seed_ops_sets = opsEntry(&.{ 0x08, 0x10, 0x18, 0xff });
+const seed_ops_grow_set = opsEntry(&.{ 0x22, 0x2a, 0x06 });
+const seed_ops_shrink = opsEntry(&.{ 0x23, 0x2f, 0x37, 0x03 });
+const seed_ops_mixed = opsEntry(&.{ 0x08, 0x22, 0x1a, 0x23, 0x11, 0x2b });
+const seed_ops_pad_shape = opsEntry(&.{ 0x22, 0x08, 0x12, 0x1c }); // stops at nbits=5, a pad-bit boundary
+
+const fuzz_persist_corpus = [_][]const u8{
+    &seed_ops_sets,
+    &seed_ops_grow_set,
+    &seed_ops_shrink,
+    &seed_ops_mixed,
+    &seed_ops_pad_shape,
+};
+
+/// The sidecar is a persistence pair, not just a parser: writers build the
+/// field through set/clear/resize and encode, readers take decode at the
+/// stored geometry. Every pad-bit regression this module fixed lived in the
+/// gap between those halves, invisible to a decode-only harness. This drives
+/// random op sequences against a shadow model and asserts, after the
+/// encode/decode round trip through shared-storage framing, that filled(),
+/// lastSet(), and every get() reproduce the model exactly -- while a stale
+/// geometry still resets empty rather than half-applying old bits.
+fn fuzzBitfieldPersistOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    const bits_cap: u32 = 128;
+
+    var bf = try Bitfield.init(gpa, 1);
+    defer bf.deinit(gpa);
+    var expect = [_]bool{false} ** bits_cap;
+    var nbits: u32 = 1;
+
+    var ops_buf: [24]u8 = undefined;
+    const ops = ops_buf[0..smith.slice(&ops_buf)];
+    for (ops) |op| {
+        const idx: u32 = op >> 2;
+        switch (@as(u2, @truncate(op & 3))) {
+            0 => if (idx < nbits) {
+                bf.set(idx);
+                expect[idx] = true;
+            },
+            1 => if (idx < nbits) {
+                bf.clear(idx);
+                expect[idx] = false;
+            },
+            2 => {
+                const new_nbits = @min(nbits + 1 + idx % 5, bits_cap);
+                if (new_nbits != nbits) {
+                    try bf.resize(gpa, new_nbits);
+                    for (expect[nbits..new_nbits]) |*e| e.* = false;
+                    nbits = new_nbits;
+                }
+            },
+            else => if (nbits > 1) {
+                nbits = @max(1, nbits - 1 - idx % 5);
+                try bf.resize(gpa, nbits);
+            },
+        }
+    }
+
+    var want_filled: u32 = 0;
+    var want_last: ?u32 = null;
+    for (expect[0..nbits], 0..) |set_at, i| {
+        try std.testing.expectEqual(set_at, bf.get(@intCast(i)));
+        if (set_at) {
+            want_filled += 1;
+            want_last = @intCast(i);
+        }
+    }
+    try std.testing.expectEqual(want_filled, bf.filled());
+    try std.testing.expectEqual(want_last, bf.lastSet());
+
+    // Persist with the caller's geometry (piece size 1 keeps count() equal to
+    // the file size) and read it back exactly.
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(gpa);
+    try bf.encode(1, nbits, &blob, gpa);
+    var back = try Bitfield.decode(gpa, blob.items, 1, nbits);
+    defer back.deinit(gpa);
+    try std.testing.expectEqual(nbits, back.nbits);
+    var i: u32 = 0;
+    while (i < nbits) : (i += 1) try std.testing.expectEqual(expect[i], back.get(i));
+    try std.testing.expectEqual(want_filled, back.filled());
+    try std.testing.expectEqual(want_last, back.lastSet());
+
+    // A reader with any other geometry must see an empty field, never a
+    // half-applied one sized from the blob's stale header claims.
+    var stale = try Bitfield.decode(gpa, blob.items, 1, nbits + 1);
+    defer stale.deinit(gpa);
+    try std.testing.expectEqual(count(nbits + 1, 1), stale.nbits);
+    try std.testing.expectEqual(@as(u32, 0), stale.filled());
+    try std.testing.expect(stale.lastSet() == null);
+}
+
+test "fuzz bitfield persist cycle reproduces the shadow model exactly" {
+    try std.testing.fuzz({}, fuzzBitfieldPersistOne, .{ .corpus = &fuzz_persist_corpus });
 }

@@ -39,7 +39,7 @@ pub fn parseV4(s: []const u8, out: *[4]u8) bool {
     return true;
 }
 
-pub fn hopsBetween(local_ip: []const u8, remote_ip: []const u8) u32 {
+fn hopsBetween(local_ip: []const u8, remote_ip: []const u8) u32 {
     // L2 neighbor heuristic: same IPv4 /24 => 0 hops, else routed.
     var a: [4]u8 = undefined;
     var b: [4]u8 = undefined;
@@ -646,7 +646,7 @@ pub fn localIpv4(gpa: std.mem.Allocator) ![][]const u8 {
     return list.toOwnedSlice(gpa);
 }
 
-pub fn shouldAdvertise(ip: []const u8) bool {
+fn shouldAdvertise(ip: []const u8) bool {
     var oct: [4]u8 = undefined;
     if (!parseV4(ip, &oct)) return false;
     if (oct[0] == 127) return false;
@@ -654,7 +654,7 @@ pub fn shouldAdvertise(ip: []const u8) bool {
     return true;
 }
 
-pub fn shortName(s: []const u8) []const u8 {
+fn shortName(s: []const u8) []const u8 {
     if (std.mem.findScalar(u8, s, '.')) |i| {
         if (i > 0) return s[0..i];
     }
