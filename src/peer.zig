@@ -183,6 +183,18 @@ const head_deadline_ms: i64 = 10_000;
 const body_deadline_base_ms: i64 = 60_000;
 const body_deadline_per_mib_ms: i64 = 1_000;
 
+/// Wall-clock budget for serving one /data response body, same shape and
+/// scaling as the client-side body budget above. SO_SNDTIMEO is per-send
+/// and resets whenever the receiver drains any bytes, so without a total cap
+/// a peer reading one byte per timeout window pins an inflight handler slot
+/// (plus thread, socket, and entry reference) forever -- sixteen of them
+/// deaden the peer service permanently. The same scaling argument applies:
+/// a 16 MiB range gets 76s, ~0.2 MB/s, before the connection is dropped.
+fn serveBodyDeadlineFor(want_len: u64) i64 {
+    const mibs: i64 = @intCast(want_len / (1024 * 1024));
+    return sys.monoMs() + body_deadline_base_ms + mibs * body_deadline_per_mib_ms;
+}
+
 /// Cap on a peer-chosen Content-Length driving an allocation in
 /// readFlexBodyAlloc. Caller-supplied destinations bypass it: their length is
 /// verified against Content-Length instead.
@@ -469,12 +481,25 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
 /// the wire here, so any failure must just drop the connection: a second
 /// status line would be parsed as body bytes and corrupt the response. The
 /// user-space fallback streams fixed chunks so a large range cannot drive a
-/// want-sized allocation.
-fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64) void {
+/// want-sized allocation. `deadline_ms` bounds the whole send (see
+/// serveBodyDeadlineFor): SO_SNDTIMEO resets on every drained byte, so the
+/// per-chunk clamp to its remainder is what keeps a dribbling receiver from
+/// holding an inflight slot forever.
+fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, deadline_ms: i64) void {
     const cfd = self.store.openCache(file);
     if (cfd >= 0) {
         var done: u64 = 0;
         while (done < want) {
+            const remain_ms = deadline_ms - sys.monoMs();
+            if (remain_ms <= 0) {
+                std.log.warn("range send budget expired for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, start + done, done, want });
+                return;
+            }
+            // The last blocking send must wake at the deadline, not at the
+            // full socket timeout; the connection closes once this returns,
+            // so the clamp never needs restoring.
+            if (remain_ms < sock_timeout_ms)
+                sys.setSockTimeout(fd, @intCast(remain_ms));
             file.last_access.store(sys.monoSec(), .monotonic);
             const take: usize = @intCast(@min(want - done, @as(u64, self.store.piece_size)));
             const sent = sys.sendfileAll(fd, cfd, start + done, take);
@@ -507,6 +532,13 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     var off = start;
     var remaining = want;
     while (remaining > 0) {
+        const remain_ms = deadline_ms - sys.monoMs();
+        if (remain_ms <= 0) {
+            std.log.warn("range send budget expired for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, off, want - remaining, want });
+            return;
+        }
+        if (remain_ms < sock_timeout_ms)
+            sys.setSockTimeout(fd, @intCast(remain_ms));
         const take = @min(remaining, buf.len);
         const n = self.store.readCache(file, buf[0..take], off);
         if (n < 0 or @as(u64, @intCast(n)) != take) {
@@ -579,7 +611,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     }) catch return;
     _ = sys.writeAll(fd, h);
 
-    streamRange(self, fd, file, rg.start, want);
+    streamRange(self, fd, file, rg.start, want, serveBodyDeadlineFor(want));
 }
 
 fn reply(fd: std.posix.fd_t, s: []const u8) void {
@@ -1310,6 +1342,64 @@ test "readFlexBodyAllocDeadline aborts a dribbled body at the deadline" {
     const err = readFlexBodyAllocDeadline(std.testing.allocator, pair[1], null, t0 + 150);
     try std.testing.expectError(error.BodyTimeout, err);
     try std.testing.expect(sys.monoMs() - t0 <= 2000);
+}
+
+test "streamRange honors the response body budget in both directions" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-budget");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-budget");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Two pieces at piece size 16, warmed so streamRange takes the sendfile
+    // path against a real cache data file.
+    var pattern: [32]u8 = undefined;
+    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 57 + 5);
+    var fbuf: [192]u8 = undefined;
+    var fz: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fbuf, "{s}/budget.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+
+    const warm = try fetchRange(gpa, "secret", "127.0.0.1", srv.port(), "budget.bin", 0, 31);
+    gpa.free(warm);
+
+    const f = srv.store.lookupRef("budget.bin").?;
+    defer srv.store.releaseFile(f);
+
+    // Expired budget: the send must refuse before writing a byte and return
+    // immediately instead of holding the inflight slot for a receiver that
+    // drains one byte per timeout window (SO_SNDTIMEO resets on every such
+    // drain; only the total budget ends the transfer). Expected-path warning
+    // kept off the runner's stderr like the sibling fault-tolerance tests.
+    {
+        const prev_log_level = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = prev_log_level;
+        const pair = try responsePair("");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        const t0 = sys.monoMs();
+        streamRange(&srv.server, pair[1], f, 0, pattern.len, t0 - 1);
+        try std.testing.expect(sys.monoMs() - t0 <= 2000);
+        var probe: [1]u8 = undefined;
+        try std.testing.expect(c.recv(pair[0], &probe, probe.len, c.MSG_PEEK | c.MSG_DONTWAIT) < 0);
+    }
+    // Live budget: the same range streams in full.
+    {
+        const pair = try responsePair("");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        streamRange(&srv.server, pair[1], f, 0, pattern.len, sys.monoMs() + 60_000);
+        var got: [pattern.len]u8 = undefined;
+        const n = sys.readOnce(pair[0], &got) catch 0;
+        try std.testing.expectEqual(@as(usize, got.len), n);
+        try std.testing.expectEqualSlices(u8, &pattern, &got);
+    }
 }
 
 test "server start and stop" {

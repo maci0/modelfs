@@ -496,19 +496,16 @@ pub const Store = struct {
     /// releaseFile it. References are taken under store.mu so an entry cannot
     /// be evicted between lookup and refcount bump.
     pub fn get(self: *Store, rel: []const u8, file_size: u64) !*Cached {
-        // Fast path: map probe only, never disk I/O under the global lock.
-        self.mu.lockUncancelable(self.io);
-        if (self.files.get(rel)) |hit| return self.refHitUnlocking(hit, file_size);
-        self.mu.unlock(self.io);
-
-        // Slow path: build the entry (sidecar read + decode) outside the
-        // global lock so one cold open cannot serialize every other
-        // get/forget/cull behind disk I/O. A racing builder loses the insert
-        // below and discards its copy. A racing artifact mutation (forget,
-        // reap purge, disk punch) bumps purge_epoch between the sample and
-        // the insert check; that build is then discarded -- its bits could
-        // describe pieces whose bytes were just unlinked or holed -- and the
-        // attempt restarts from a fresh map probe and epoch sample.
+        // Every pass probes the map first and serves a hit without any disk
+        // I/O under the global lock; warm callers end there. A miss builds
+        // the entry (sidecar read + decode) outside the lock so one cold
+        // open cannot serialize every other get/forget/cull behind disk I/O.
+        // A racing builder loses the insert below and discards its copy. A
+        // racing artifact mutation (forget, reap purge, disk punch) bumps
+        // purge_epoch between the sample and the insert check; that build is
+        // then discarded -- its bits could describe pieces whose bytes were
+        // just unlinked or holed -- and the attempt restarts from a fresh
+        // map probe and epoch sample.
         while (true) {
             self.mu.lockUncancelable(self.io);
             if (self.files.get(rel)) |hit| return self.refHitUnlocking(hit, file_size);
@@ -812,7 +809,6 @@ pub const Store = struct {
         };
         defer self.releaseFile(file);
 
-        var resized = false;
         file.mu.lockUncancelable(self.io);
         if (end > file.size) {
             // Our own append: earlier piece marks stay valid.
@@ -822,7 +818,6 @@ pub const Store = struct {
                 std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
             };
             file.size = end;
-            resized = true;
         } else if (end < file.size) {
             // Entry is longer than the observed origin: someone truncated
             // externally. Reset like reconcileSize instead of keeping marks
@@ -831,7 +826,6 @@ pub const Store = struct {
                 var ob = file.bits;
                 file.bits = nb;
                 file.size = end;
-                resized = true;
                 ob.deinit(self.gpa);
             } else |_| {
                 std.log.warn("bitfield shrink failed for {s}; stale tail pieces refill", .{rel});
@@ -840,22 +834,25 @@ pub const Store = struct {
         file.last_access.store(sys.monoSec(), .monotonic);
         file.mu.unlock(self.io);
 
-        _ = self.copyIntoCache(file, off, data, if (resized) end else null);
+        _ = self.copyIntoCache(file, off, data);
     }
 
     /// Copies a landed origin write into the cache fd and marks the pieces it
     /// fully spans, so reads serve the copy instead of re-hydrating over NFS.
-    /// Grows the cache file to `truncate_to` first when set (a reused fd
-    /// predates the caller's growth). Returns false when the copy did not
-    /// land or pieces could not be marked; reads then fall back to origin
-    /// rather than serve hole zeros.
-    pub fn copyIntoCache(self: *Store, file: *Cached, off: u64, data: []const u8, truncate_to: ?u64) bool {
+    /// Returns false when the copy did not land or pieces could not be marked;
+    /// reads then fall back to origin rather than serve hole zeros.
+    /// The copy never truncates the cache fd: concurrent fills of one entry
+    /// land overlapping appends outside any shared lock, and an absolute
+    /// ftruncate here could shrink the shared descriptor below bytes another
+    /// writer had already committed, leaving filled bits naming holes it cut.
+    /// pwrite extends the fd to its own end by itself, so growth needs no
+    /// truncate; a fresh openCache sizes the descriptor under file.mu.
+    pub fn copyIntoCache(self: *Store, file: *Cached, off: u64, data: []const u8) bool {
         const cfd = self.openCache(file);
         if (cfd < 0) {
             std.log.warn("cache fill skipped for {s} (errno {d}); reads fall back to origin", .{ file.rel, -cfd });
             return false;
         }
-        if (truncate_to) |sz| _ = sys.ftruncate(cfd, sz);
         const w = sys.pwriteAll(cfd, data, off);
         if (w != @as(isize, @intCast(data.len))) {
             std.log.warn("cache fill failed for {s} (errno {d}); reads fall back to origin", .{ file.rel, -w });
@@ -949,7 +946,6 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cacheDataPath(&buf, file.rel) catch return -c.ENAMETOOLONG;
         const parent = sys.parentOf(std.mem.span(p));
-        _ = sys.mkdirAll(parent, 0o755);
         // O_NOFOLLOW on the data file: it is opened O_RDWR|O_CREAT and then
         // ftruncate'd/pwritten, so a symlink planted at this name in a
         // writable cache tree would turn the daemon into an arbitrary-file
@@ -1355,6 +1351,55 @@ test "cacheFill grows entry preserving earlier piece marks" {
     try std.testing.expectEqualSlices(u8, &w1, rd[0..16]);
     try std.testing.expectEqualSlices(u8, &w2_full, rd[16..40]);
     try std.testing.expectEqualSlices(u8, &w3, rd[40..48]);
+}
+
+test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-nocut");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-nocut");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Two writers appending through mf_write/cacheFill concurrently. Writer 1
+    // grows the entry to its end (16) under file.mu; writer 2 then appends
+    // past it (end 40) and its copy lands fully; writer 1's copy lands last.
+    // Regression: copyIntoCache ran an absolute ftruncate(truncate_to) before
+    // its pwrite outside any lock, so writer 1's cut shrank the shared cache
+    // fd below writer 2's committed bytes while bit 1 stayed set -- reads
+    // served hole zeros as cached model data. pwrite extends the fd on its
+    // own, so the fill must never truncate.
+    var w1: [16]u8 = undefined;
+    @memset(&w1, 0xAA);
+    var w2: [24]u8 = undefined;
+    @memset(&w2, 0xBB);
+
+    st.cacheFill("app.bin", 16, 0, &w1);
+    st.cacheFill("app.bin", 40, 16, &w2);
+    {
+        const f = st.lookupRef("app.bin").?;
+        defer st.releaseFile(f);
+        try std.testing.expect(st.copyIntoCache(f, 0, &w1));
+
+        var stbuf: c.struct_stat = undefined;
+        try std.testing.expectEqual(@as(i32, 0), sys.fstat(f.cache_fd, &stbuf));
+        try std.testing.expect(@as(u64, @intCast(stbuf.st_size)) >= 40);
+
+        f.mu.lockUncancelable(std.testing.io);
+        const bit1 = f.bits.get(1);
+        f.mu.unlock(std.testing.io);
+        try std.testing.expect(bit1);
+
+        var rd: [40]u8 = undefined;
+        try std.testing.expectEqual(@as(isize, 40), st.readCache(f, &rd, 0));
+        try std.testing.expectEqualSlices(u8, &w1, rd[0..16]);
+        try std.testing.expectEqualSlices(u8, &w2, rd[16..40]);
+    }
 }
 
 test "relOk rejects traversal and absolute paths" {
@@ -2733,7 +2778,7 @@ test "late finisher on a forgotten entry does not resurrect the sidecar" {
     try std.testing.expect(st.openCache(f2) >= 0);
     st.forget("late2.bin");
     const mp2 = try st.cacheMetaPath(&mb, "late2.bin");
-    try std.testing.expect(!st.copyIntoCache(f2, 0, "0123456789abcdef", null));
+    try std.testing.expect(!st.copyIntoCache(f2, 0, "0123456789abcdef"));
     try std.testing.expect(sys.statPath(mp2, &stbuf) != 0);
 
     // The dead stamp must be visible to any file.mu holder that follows the

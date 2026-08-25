@@ -73,6 +73,8 @@ Failure visibility: a green exit code proves nothing. Give the timers teeth:
 ```ini
 # /etc/systemd/system/sanoid.timer.d/fail.conf
 [Unit]
+# The target unit must exist on the NAS, or the failure notification has
+# nowhere to go; name your existing email/webhook notifier if there is one.
 OnFailure=notify-admin@%n.service
 ```
 

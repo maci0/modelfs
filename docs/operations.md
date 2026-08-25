@@ -37,7 +37,7 @@ firewall-cmd --reload
 Maintenance nothing else schedules:
 
 ```bash
-systemctl enable --now zfs-scrub-monthly@tank.timer   # ships with OpenZFS >= 2.1
+systemctl enable --now zfs-scrub-monthly@tank.timer   # ships with OpenZFS >= 2.1.3
 systemctl enable --now smartd                         # disks complain before they die
 ```
 
@@ -103,7 +103,7 @@ chown -R 1000:1000 /net/192.168.0.100/models/hf \
                    /net/192.168.0.100/models/lora
 ```
 
-Download as uid 1000, not sudo. `nobody:nobody`: `sysctl -w nfs.nfs4_disable_idmapping=1`.
+Download as uid 1000, not sudo. `nobody:nobody`: `echo Y > /sys/module/nfs/parameters/nfs4_disable_idmapping` (a kernel module parameter, not a sysctl; persist with `options nfs nfs4_disable_idmapping=Y` in `/etc/modprobe.d/nfs.conf`).
 
 Desktop: `pgrep -a cachefilesd` must show a process. `findmnt /models | grep fsc`. Default `dir /var/cache/fscache`. `iflag=direct` skips FS-Cache. Cull is LRU at ~7% free.
 

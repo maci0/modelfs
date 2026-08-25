@@ -4,6 +4,10 @@ line-length = 100
 # Matches .python-version and the CI interpreter: the only runtimes these
 # scripts are ever installed and run under.
 target-version = "py312"
+# Same bounds as requirements-dev.txt: a bare ruff outside the pinned venv
+# with different semantics must refuse to run instead of silently
+# disagreeing with the CI gate.
+required-version = ">=0.16,<0.17"
 
 [tool.ruff.lint]
 # pycodestyle errors/warnings, pyflakes, bugbear, pyupgrade, simplify,
@@ -29,6 +33,11 @@ select = [
     "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE", "TRY", "EM",
     "EXE", "FBT", "I", "FLY", "ICN",
 ]
+
+[tool.ruff.format]
+# Formatter also normalizes Python snippets inside docstrings, so examples
+# cannot drift below the same bar as real code.
+docstring-code-format = true
 
 [tool.mypy]
 strict = true
