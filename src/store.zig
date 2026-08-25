@@ -13,9 +13,18 @@ const c = sys.c;
 /// only failures stay in the log. Atomics because FUSE handlers, peer HTTP
 /// handlers, and background workers all bump them concurrently.
 pub const Stats = struct {
+    /// FUSE read outcomes. reads_err counts service-side failures only:
+    /// origin stat failure, cache-entry OOM, hydration failure, or a failed
+    /// cache read. Caller misuse (traversal paths, bad offsets, EISDIR) stays
+    /// uncounted so the error rate tracks service health, not client bugs.
     reads_ok: std.atomic.Value(u64) = .init(0),
     reads_err: std.atomic.Value(u64) = .init(0),
     bytes_read: std.atomic.Value(u64) = .init(0),
+    /// Cumulative wall time inside mf_read, every op included (warm path
+    /// pays two clock reads). Divided by attempted reads it is the average
+    /// read latency the tick line publishes; nothing else in this daemon
+    /// answers "reads got slow".
+    read_nanos: std.atomic.Value(u64) = .init(0),
     writes_ok: std.atomic.Value(u64) = .init(0),
     writes_err: std.atomic.Value(u64) = .init(0),
     bytes_written: std.atomic.Value(u64) = .init(0),
@@ -24,15 +33,27 @@ pub const Stats = struct {
     fills_origin: std.atomic.Value(u64) = .init(0),
     bytes_from_peer: std.atomic.Value(u64) = .init(0),
     bytes_from_origin: std.atomic.Value(u64) = .init(0),
+    /// Cumulative wall time per piece fill by tier, claim through cache
+    /// write. This is exactly the stall a reader eats on a miss.
+    fill_peer_nanos: std.atomic.Value(u64) = .init(0),
+    fill_origin_nanos: std.atomic.Value(u64) = .init(0),
     /// Fill failures by tier: peer fetch failed (fell through to origin or
     /// EIO), origin read failed, cache write refused hydrated bytes.
     fill_err_peer: std.atomic.Value(u64) = .init(0),
     fill_err_origin: std.atomic.Value(u64) = .init(0),
     fill_err_cache: std.atomic.Value(u64) = .init(0),
+    /// /have probes that failed for reasons other than a healthy 404 miss
+    /// (dead peer, auth mismatch, malformed reply). A fleet silently
+    /// degraded to NFS-only shows here while reads keep succeeding.
+    probe_err: std.atomic.Value(u64) = .init(0),
     pieces_culled: std.atomic.Value(u64) = .init(0),
     /// Peer HTTP server: rejected bearer tokens and 5xx replies served.
     http_unauthorized: std.atomic.Value(u64) = .init(0),
     http_5xx: std.atomic.Value(u64) = .init(0),
+    /// Connections whose request head never completed: scanners that
+    /// connect-and-drop, dribbled heads past the deadline, oversized heads.
+    /// Counted rather than logged; the accept cap bounds the rate anyway.
+    http_malformed: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks
     /// and for status.json formatting.
@@ -40,6 +61,7 @@ pub const Stats = struct {
         reads_ok: u64 = 0,
         reads_err: u64 = 0,
         bytes_read: u64 = 0,
+        read_nanos: u64 = 0,
         writes_ok: u64 = 0,
         writes_err: u64 = 0,
         bytes_written: u64 = 0,
@@ -47,12 +69,16 @@ pub const Stats = struct {
         fills_origin: u64 = 0,
         bytes_from_peer: u64 = 0,
         bytes_from_origin: u64 = 0,
+        fill_peer_nanos: u64 = 0,
+        fill_origin_nanos: u64 = 0,
         fill_err_peer: u64 = 0,
         fill_err_origin: u64 = 0,
         fill_err_cache: u64 = 0,
+        probe_err: u64 = 0,
         pieces_culled: u64 = 0,
         http_unauthorized: u64 = 0,
         http_5xx: u64 = 0,
+        http_malformed: u64 = 0,
     };
 
     pub fn snap(self: *const Stats) Snap {
@@ -60,6 +86,7 @@ pub const Stats = struct {
             .reads_ok = self.reads_ok.load(.monotonic),
             .reads_err = self.reads_err.load(.monotonic),
             .bytes_read = self.bytes_read.load(.monotonic),
+            .read_nanos = self.read_nanos.load(.monotonic),
             .writes_ok = self.writes_ok.load(.monotonic),
             .writes_err = self.writes_err.load(.monotonic),
             .bytes_written = self.bytes_written.load(.monotonic),
@@ -67,12 +94,16 @@ pub const Stats = struct {
             .fills_origin = self.fills_origin.load(.monotonic),
             .bytes_from_peer = self.bytes_from_peer.load(.monotonic),
             .bytes_from_origin = self.bytes_from_origin.load(.monotonic),
+            .fill_peer_nanos = self.fill_peer_nanos.load(.monotonic),
+            .fill_origin_nanos = self.fill_origin_nanos.load(.monotonic),
             .fill_err_peer = self.fill_err_peer.load(.monotonic),
             .fill_err_origin = self.fill_err_origin.load(.monotonic),
             .fill_err_cache = self.fill_err_cache.load(.monotonic),
+            .probe_err = self.probe_err.load(.monotonic),
             .pieces_culled = self.pieces_culled.load(.monotonic),
             .http_unauthorized = self.http_unauthorized.load(.monotonic),
             .http_5xx = self.http_5xx.load(.monotonic),
+            .http_malformed = self.http_malformed.load(.monotonic),
         };
     }
 };

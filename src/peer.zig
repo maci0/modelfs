@@ -138,7 +138,8 @@ fn acceptLoop(self: *Server, fd: c_int) void {
             sys.close(cfd);
             continue;
         }
-        const t = std.Thread.spawn(.{}, handleConn, .{ self, cfd }) catch {
+        const t = std.Thread.spawn(.{}, handleConn, .{ self, cfd }) catch |err| {
+            std.log.warn("peer http: connection handler spawn failed ({t}); dropping fd {d}", .{ err, cfd });
             _ = self.http_inflight.fetchSub(1, .monotonic);
             sys.close(cfd);
             continue;
@@ -232,7 +233,14 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     var head_buf: [8192]u8 = undefined;
     var n: usize = 0;
     var total_read: usize = 0;
-    readHeadFull(fd, &head_buf, &n, &total_read) catch return;
+    readHeadFull(fd, &head_buf, &n, &total_read) catch {
+        // Connect-and-drop scanners, dribbled heads, oversized heads: the
+        // request never became routable, so there is nothing to answer and
+        // logging each one would only hand scanners a log-flooding lever.
+        // Counted so a probe storm is still visible in status.json.
+        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
+        return;
+    };
     const head = head_buf[0..n];
     const line_end = std.mem.find(u8, head, "\r\n") orelse return;
     const line = head[0..line_end];
@@ -561,7 +569,15 @@ pub fn fetchHave(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: 
 fn haveFromHead(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize) !discover.HaveBits {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
-    if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 200")) return error.HttpStatus;
+    if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 200")) {
+        // A 404 is a healthy peer answering "not cached here" -- the normal
+        // shape of a fleet where replicas differ. It gets its own error so
+        // the probe-failure counter can exclude it and stay meaningful;
+        // everything else (auth rejected, peer broken, malformed reply)
+        // means this node cannot actually talk to the cluster.
+        if (std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 404")) return error.PeerMiss;
+        return error.HttpStatus;
+    }
     const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
     const piece_size = std.fmt.parseInt(u32, ps_str, 10) catch return error.BadPieceSize;
     const bits = try finishBodyAlloc(gpa, fd, head_buf, head_len, total_read, null, null);
@@ -741,6 +757,7 @@ const ProbeCtx = struct {
     todo: []const usize,
     slots: []?discover.HaveBits,
     cat: *discover.Catalog,
+    stats: ?*store_mod.Stats = null,
     next: std.atomic.Value(u32) = .init(0),
 };
 
@@ -750,7 +767,9 @@ const ProbeCtx = struct {
 /// preferred address falls through to the same node's remaining interfaces
 /// instead of hiding the whole node behind one unreachable NIC. Successes
 /// feed the catalog's short-TTL have cache so later pieces of the same file
-/// skip the probe entirely.
+/// skip the probe entirely. A failed address is counted unless it answered
+/// 404 (a healthy peer without the file): without this count, PSK drift or
+/// a partitioned peer silently degrades every fill to the origin tier.
 fn probeWorker(ctx: *ProbeCtx) void {
     while (true) {
         const t = ctx.next.fetchAdd(1, .monotonic);
@@ -758,7 +777,12 @@ fn probeWorker(ctx: *ProbeCtx) void {
         const gi = ctx.todo[t];
         for (ctx.groups[gi]) |pi| {
             const p = ctx.paths[pi];
-            const rep = fetchHave(ctx.gpa, ctx.psk, p.ip, p.port, ctx.rel) catch continue;
+            const rep = fetchHave(ctx.gpa, ctx.psk, p.ip, p.port, ctx.rel) catch |err| {
+                if (err != error.PeerMiss) {
+                    if (ctx.stats) |s| _ = s.probe_err.fetchAdd(1, .monotonic);
+                }
+                continue;
+            };
             ctx.slots[gi] = rep;
             ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size);
             break;
@@ -779,6 +803,7 @@ fn probeSlots(
     paths: []const discover.Path,
     groups: []const []const usize,
     slots: []?discover.HaveBits,
+    stats: ?*store_mod.Stats,
 ) !void {
     var todo: std.ArrayList(usize) = .empty;
     defer todo.deinit(gpa);
@@ -805,6 +830,7 @@ fn probeSlots(
         .todo = todo.items,
         .slots = slots,
         .cat = cat,
+        .stats = stats,
     };
     // Cap at the server's own inflight limit: probing harder than a peer
     // accepts would only buy rejections.
@@ -880,7 +906,7 @@ fn groupPathsByPeerId(gpa: std.mem.Allocator, paths: []const discover.Path) ![][
 /// node's grid; a peer whose advertised grid differs answers unusable bits,
 /// so its candidates are marked !have rather than routing fills by them.
 /// Caller frees the returned slice with gpa.
-fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32, local_piece_size: u32) ![]discover.PathCand {
+fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32, local_piece_size: u32, stats: ?*store_mod.Stats) ![]discover.PathCand {
     const paths = try cat.snapshot(gpa);
     defer discover.Catalog.freeSnapshot(gpa, paths);
 
@@ -913,7 +939,7 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
 
     // One concurrent best-first probe per unique peer id, so a sequential
     // fill of one file probes once per peer per TTL instead of once per piece.
-    try probeSlots(gpa, psk, cat, rel, paths, groups, slots);
+    try probeSlots(gpa, psk, cat, rel, paths, groups, slots, stats);
 
     var cands: std.ArrayList(discover.PathCand) = .empty;
     errdefer {
@@ -960,7 +986,7 @@ pub fn fillFromPeers(
     out: []u8,
     stats: ?*store_mod.Stats,
 ) !void {
-    const cands = try probeCandidates(gpa, psk, cat, rel, idx, piece_size);
+    const cands = try probeCandidates(gpa, psk, cat, rel, idx, piece_size, stats);
     defer {
         for (cands) |cand| gpa.free(cand.ip);
         gpa.free(cands);
@@ -1273,10 +1299,16 @@ test "fault tolerance: traversal path is rejected with 400" {
     const port = srv.port();
 
     // /have and /data with a ".." component must fail at the boundary.
+    // The wire carries these percent-encoded (urlEncode escapes "/"), and
+    // the server decodes exactly once, so this arrives back as ".." and is
+    // refused with 400.
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "correct_secret", "127.0.0.1", port, "../secret.txt"));
     try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "correct_secret", "127.0.0.1", port, "../secret.txt", 0, 8));
-    // URL-encoded variants hit the same check after decoding.
-    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "correct_secret", "127.0.0.1", port, "%2e%2e/secret.txt"));
+    // Pre-encoded dots survive the single-pass decode as a literal "%2e%2e"
+    // filename: no traversal component, so the boundary passes it through
+    // and the origin simply misses (404, seen here as PeerMiss). Nothing
+    // outside the origin is reachable either way.
+    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, "correct_secret", "127.0.0.1", port, "%2e%2e/secret.txt"));
     // Absolute paths are refused too, not silently re-rooted into the origin.
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "correct_secret", "127.0.0.1", port, "/etc/passwd"));
 }
@@ -1454,6 +1486,15 @@ test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
         const rep = try haveFromHead(gpa, pair[1], head ++ "z", head.len, head.len + 1);
         defer gpa.free(rep.bits);
         try std.testing.expectEqual(@as(u32, 0), rep.piece_size);
+    }
+    // A healthy peer answering "not cached here" is its own outcome, distinct
+    // from broken peers so the probe-failure counter can exclude it.
+    {
+        const head = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const pair = try responsePair(head);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.PeerMiss, haveFromHead(gpa, pair[1], head, head.len, head.len));
     }
     // A malformed header fails the probe like any other bad reply so it is
     // never cached and retried on the next piece.
@@ -1876,6 +1917,10 @@ test "fillFromPeers probes concurrently and streams piece into out" {
     var out: [16]u8 = undefined;
     try fillFromPeers(gpa, "secret", &cat, "one.bin", 0, 16, &out, &srv.store.stats);
     try std.testing.expectEqualSlices(u8, &pattern, &out);
+    // The empty peer answered /have with a healthy 404 (PeerMiss): a normal
+    // fleet miss, never a probe failure. The counter must stay at zero here
+    // or it would cry wolf on every replica-skewed cluster.
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.probe_err.load(.monotonic));
 
     // Regression: a zero-length out (reachable only when a truncate raced
     // hydration) must fail cleanly instead of underflowing the requested
@@ -1899,6 +1944,51 @@ test "fillFromPeers probes concurrently and streams piece into out" {
     // No candidate has the piece: NoPeer surfaces (caller falls back to NFS).
     try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "missing.bin", 0, 16, &out, &srv.store.stats));
     try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
+}
+
+test "fillFromPeers counts failed /have probes but not healthy misses" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-probe-o");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-probe-c");
+    defer sys.deleteTree(std.testing.io, cache_d);
+    var st = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+
+    // Reserve a free port, then release it: dialing it fails with Connect,
+    // the wire shape of a dead or partitioned peer.
+    const dead_port = blk: {
+        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        try std.testing.expect(lfd >= 0);
+        defer sys.close(lfd);
+        var addr = std.mem.zeroes(c.struct_sockaddr_in);
+        addr.sin_family = c.AF_INET;
+        addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001);
+        try std.testing.expectEqual(@as(i32, 0), c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)));
+        var got = std.mem.zeroes(c.struct_sockaddr_in);
+        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        try std.testing.expectEqual(@as(i32, 0), c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen));
+        break :blk std.mem.bigToNative(u16, got.sin_port);
+    };
+
+    var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    try cat.paths.append(gpa, .{
+        .peer_id = "dead",
+        .ip = "127.0.0.1",
+        .port = dead_port,
+        .ewma_bps = 1e9,
+        .hops = 0,
+    });
+
+    // The probe failure must land in the counter status.json publishes:
+    // without it a PSK drift or a partitioned peer silently degrades every
+    // fill to the origin tier while reads keep succeeding.
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "x.bin", 0, 16, &out, &st.stats));
+    try std.testing.expectEqual(@as(u64, 1), st.stats.probe_err.load(.monotonic));
 }
 
 test "fillFromPeers excludes peers whose advertised piece size differs" {

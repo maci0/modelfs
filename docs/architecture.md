@@ -72,7 +72,7 @@ sudo chown 1000:1000 /models /net/192.168.0.100/models /var/cache/modelfs
   --psk /etc/modelfs.psk
 ```
 
-Foreground (systemd `Type=simple`). Per-event logs are failure-only: unauthorized peer requests, failed piece fetches (with `ip:port` and error), origin/cache errors, cull-watermark trouble. Steady state is summarized instead: one `tick:` line per discovery interval while any counter moved (reads, writes, fills by source, fill errors, MiB, culled, http401/5xx), so an idle node logs nothing.
+Foreground (systemd `Type=simple`). Per-event logs are failure-only: unauthorized peer requests, failed piece fetches (with `ip:port` and error), origin/cache errors, cull-watermark trouble. Steady state is summarized instead: one `tick:` line per discovery interval while any counter moved (reads, writes, fills by source, fill errors, MiB, culled, http401/5xx), so an idle node logs nothing. The tick line also carries the only latency signal: `rd_us` is the average wall time of a FUSE read over the interval, and `fill_ms peer/nfs` the average per-piece hydration stall by tier (a miss blocks the reader for one whole piece, so these two numbers are how "reads got slow" is diagnosed from the journal). `probe_err` counts `/have` probes that failed for reasons other than a healthy 404 miss (dead peer, PSK drift, malformed reply) — the signature of a cluster silently degraded to NFS-only; `httpbad` counts connections whose request head never completed.
 
 ```
 modelfs status
@@ -81,7 +81,7 @@ modelfs pin gguf/foo.gguf
 modelfs unpin gguf/foo.gguf
 ```
 
-`status` prints the daemon's `status.json` from the cache dir; a missing file means the mount is not running, and so does a leftover naming an exited pid (the crash case: the artifact is only served while its writer process still exists). It carries liveness (`id`, `pid`, `uptime_s`), topology (`peers`, `piece`, `inflight` HTTP handlers), and lifetime counters (`stats`: reads/writes with errors, piece fills by source (peer vs origin) with byte totals, fill failures per tier, pieces culled, rejected auths, 5xx replies). `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live.
+`status` prints the daemon's `status.json` from the cache dir; a missing file means the mount is not running, and so does a leftover naming an exited pid (the crash case: the artifact is only served while its writer process still exists). It carries liveness (`id`, `pid`, `uptime_s`), topology (`peers`, `piece`, `inflight` HTTP handlers), saturation (`cache_free_pct`, the same sample culling runs on; `-1` when statvfs fails, i.e. culling suspended), and lifetime counters (`stats`: reads/writes with errors, cumulative read and per-fill durations in nanoseconds, piece fills by source (peer vs origin) with byte totals, fill failures per tier, failed `/have` probes (`probe_err`, healthy 404 misses excluded), pieces culled, rejected auths, 5xx replies, malformed request heads). `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live.
 
 Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_ID`.
 

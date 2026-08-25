@@ -197,6 +197,9 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     };
     const buf = scratch[0..ln];
     var from_peer = true;
+    // Miss latency is claim-to-cache-write: exactly the stall the reader
+    // eats for this piece. Failed fills keep their error counts and no time.
+    const fill_t0 = sys.monoNs();
     peer.fillFromPeers(st.gpa, st.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
         from_peer = false;
         const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
@@ -211,14 +214,17 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     // of pieces, and the totals land in status.json and the discovery tick's
     // summary line. Failures keep their own warns at the failure sites.
     const s = &st.store.stats;
+    const rc = st.store.completeFill(file, idx, buf);
+    const fill_dt: u64 = @intCast(sys.monoNs() - fill_t0);
     if (from_peer) {
         _ = s.fills_peer.fetchAdd(1, .monotonic);
         _ = s.bytes_from_peer.fetchAdd(ln, .monotonic);
+        _ = s.fill_peer_nanos.fetchAdd(fill_dt, .monotonic);
     } else {
         _ = s.fills_origin.fetchAdd(1, .monotonic);
         _ = s.bytes_from_origin.fetchAdd(ln, .monotonic);
+        _ = s.fill_origin_nanos.fetchAdd(fill_dt, .monotonic);
     }
-    const rc = st.store.completeFill(file, idx, buf);
     if (rc != 0) _ = s.fill_err_cache.fetchAdd(1, .monotonic);
     return rc;
 }
@@ -249,6 +255,10 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     _ = fi;
     if (buf == null) return -sys.c.EFAULT;
     const st = statePtr();
+    // Latency covers the whole handler: warm reads too, so the tick line's
+    // average tracks real reader-perceived latency, not just miss stalls.
+    const rd_t0 = sys.monoNs();
+    defer _ = st.store.stats.read_nanos.fetchAdd(@intCast(sys.monoNs() - rd_t0), .monotonic);
     var rel: []const u8 = "";
     const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
     if (rerr != 0) return rerr;
@@ -256,9 +266,18 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     // into EISDIR would send readers hunting for a directory that is not there.
     var ost: sys.c.struct_stat = undefined;
     const src = st.store.statOrigin(rel, &ost);
-    if (src != 0) return src;
+    if (src != 0) {
+        // An origin outage fails every uncached read here before any tier
+        // runs; without this count reads_err stays flat while clients see
+        // an EIO storm.
+        _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
+        return src;
+    }
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return -sys.c.EISDIR;
-    const file = st.store.get(rel, @intCast(ost.st_size)) catch return -sys.c.ENOMEM;
+    const file = st.store.get(rel, @intCast(ost.st_size)) catch {
+        _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
+        return -sys.c.ENOMEM;
+    };
     defer st.store.releaseFile(file);
     const want = @min(size, @as(usize, std.math.maxInt(c_int)));
     if (off < 0) return -sys.c.EINVAL;
@@ -277,7 +296,13 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     if (uoff >= fsize) return 0;
     const n = @min(want, @as(usize, @intCast(fsize - uoff)));
     const rc = ensureRange(st, file, fsize, uoff, n);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        // The failing tier kept its own fill_err_* count; the op-level
+        // counter must still see the read fail, or error-rate alerts keying
+        // on reads_err miss exactly the EIO storms users feel.
+        _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
+        return rc;
+    }
     const got = st.store.readCache(file, buf[0..n], uoff);
     if (got < 0) {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
@@ -611,7 +636,9 @@ fn discLoop(st: *State) void {
 /// would flood the journal (one model read covers hundreds of pieces), so
 /// steady-state work is aggregated here while failures keep their own
 /// immediate warns. Deltas name the last interval, so a stalled ingest or a
-/// read storm is visible straight from the journal.
+/// read storm is visible straight from the journal; rd_us and the fill_ms
+/// pair are per-op averages over those deltas, the only latency signal this
+/// daemon publishes.
 fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     const cur = st.store.stats.snap();
     defer prev.* = cur;
@@ -621,25 +648,36 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     }
     if (std.meta.eql(d, store_mod.Stats.Snap{})) return;
     const mib = 1024 * 1024;
+    const reads_attempted = d.reads_ok + d.reads_err;
+    const rd_us = if (reads_attempted > 0) d.read_nanos / (reads_attempted * std.time.ns_per_us) else 0;
+    const fill_ms_peer = if (d.fills_peer > 0) d.fill_peer_nanos / (d.fills_peer * std.time.ns_per_ms) else 0;
+    const fill_ms_origin = if (d.fills_origin > 0) d.fill_origin_nanos / (d.fills_origin * std.time.ns_per_ms) else 0;
     std.log.info(
-        "tick: reads={d} err={d} read_mib={d} writes={d} err={d} write_mib={d} fills peer={d} nfs={d} fill_err peer/nfs/cache={d}/{d}/{d} peer_mib={d} origin_mib={d} culled={d} http401={d} http5xx={d}",
+        "tick: reads={d} err={d} read_mib={d} rd_us={d} writes={d} err={d} write_mib={d}" ++
+            " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache={d}/{d}/{d}" ++
+            " probe_err={d} peer_mib={d} origin_mib={d} culled={d} http401={d} http5xx={d} httpbad={d}",
         .{
             d.reads_ok,
             d.reads_err,
             d.bytes_read / mib,
+            rd_us,
             d.writes_ok,
             d.writes_err,
             d.bytes_written / mib,
             d.fills_peer,
             d.fills_origin,
+            fill_ms_peer,
+            fill_ms_origin,
             d.fill_err_peer,
             d.fill_err_origin,
             d.fill_err_cache,
+            d.probe_err,
             d.bytes_from_peer / mib,
             d.bytes_from_origin / mib,
             d.pieces_culled,
             d.http_unauthorized,
             d.http_5xx,
+            d.http_malformed,
         },
     );
 }
@@ -661,24 +699,30 @@ fn statusJson(st: *State) !void {
         break :blk seen.count();
     };
     const s = st.store.stats.snap();
+    // Saturation signal for monitors: the same sample culling runs on.
+    // -1 means the cache filesystem could not be stat'ed (culling suspended).
+    const cache_free_pct: i32 = if (st.store.freePercentChecked()) |pct| @intCast(pct) else -1;
     // Single line like every other machine-read artifact here: consumers
     // tail/grep it and a multi-line document would break line-oriented
     // parsing (journalctl, jq -line, watch loops).
-    const json = try std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d}," ++
-        "\"stats\":{{\"reads_ok\":{d},\"reads_err\":{d},\"bytes_read\":{d}" ++
+    const json = try std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d}," ++
+        "\"stats\":{{\"reads_ok\":{d},\"reads_err\":{d},\"bytes_read\":{d},\"read_nanos\":{d}" ++
         ",\"writes_ok\":{d},\"writes_err\":{d},\"bytes_written\":{d}" ++
         ",\"fills_peer\":{d},\"fills_origin\":{d},\"bytes_from_peer\":{d},\"bytes_from_origin\":{d}" ++
+        ",\"fill_peer_nanos\":{d},\"fill_origin_nanos\":{d}" ++
         ",\"fill_err_peer\":{d},\"fill_err_origin\":{d},\"fill_err_cache\":{d}" ++
-        ",\"pieces_culled\":{d},\"http_unauthorized\":{d},\"http_5xx\":{d}}}}}\n", .{
+        ",\"probe_err\":{d},\"pieces_culled\":{d},\"http_unauthorized\":{d},\"http_5xx\":{d},\"http_malformed\":{d}}}}}\n", .{
         st.catalog.self_id,
         std.os.linux.getpid(),
         sys.monoSec() - st.start_secs,
         npeers,
         st.store.piece_size,
         st.server.http_inflight.load(.monotonic),
+        cache_free_pct,
         s.reads_ok,
         s.reads_err,
         s.bytes_read,
+        s.read_nanos,
         s.writes_ok,
         s.writes_err,
         s.bytes_written,
@@ -686,12 +730,16 @@ fn statusJson(st: *State) !void {
         s.fills_origin,
         s.bytes_from_peer,
         s.bytes_from_origin,
+        s.fill_peer_nanos,
+        s.fill_origin_nanos,
         s.fill_err_peer,
         s.fill_err_origin,
         s.fill_err_cache,
+        s.probe_err,
         s.pieces_culled,
         s.http_unauthorized,
         s.http_5xx,
+        s.http_malformed,
     });
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const p = try sys.joinZ(&pbuf, st.store.cache, status_file);
@@ -795,6 +843,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
         peers: u32,
         piece: u32,
         inflight: u32,
+        cache_free_pct: i32,
         stats: StatsDoc,
     };
     const doc = try std.json.parseFromSlice(StatusDoc, gpa, blob, .{});
@@ -805,6 +854,9 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expectEqual(@as(u32, 2), doc.value.peers);
     try std.testing.expectEqual(@as(u32, 4096), doc.value.piece);
     try std.testing.expectEqual(@as(u32, 0), doc.value.inflight);
+    // The saturation gauge rides along: statvfs works here, so a real
+    // percentage, not the -1 unknown marker.
+    try std.testing.expect(doc.value.cache_free_pct >= 0);
     // Counters ride along with the liveness fields: an operator answers
     // "is it serving, from where, is it failing" from one artifact.
     try std.testing.expectEqual(@as(u64, 0), doc.value.stats.reads_ok);
