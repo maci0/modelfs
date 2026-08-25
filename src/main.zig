@@ -48,8 +48,9 @@ const usage =
     \\  --detach              Background after mount
     \\  --foreground          Stay in the foreground (default)
     \\
-    \\status/peers/pin take only the flags shown on their Usage line; every
-    \\command also accepts -h/--help.
+    \\status/peers/pin take only the flags shown on their Usage line plus
+    \\the shared --origin/--cache/--psk/--psk-value values; mount-only
+    \\options are refused elsewhere. Every command also accepts -h/--help.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_ID set the same
     \\values as their flags; an explicit flag wins.
@@ -140,6 +141,18 @@ fn takeValue(args: []const []const u8, flag: []const u8, i: *usize) ![]const u8 
     return args[i.*];
 }
 
+/// Refuses mount-only knobs on the other commands, as the help text promises
+/// ("status/peers/pin take only the flags shown on their Usage line"):
+/// accepted-and-ignored they would silently do nothing (a `status --detach`,
+/// a `pin --piece 4M` that changes no piece grid), leaving the caller to
+/// believe an option took effect.
+fn rejectOutsideMount(cmd: []const u8, flag: []const u8) !void {
+    if (!std.mem.eql(u8, cmd, "mount")) {
+        if (!builtin.is_test) std.debug.print("{s} only applies to modelfs mount\n", .{flag});
+        return error.FlagOutsideMount;
+    }
+}
+
 /// Watermark percentages: parse failures name the flag instead of surfacing
 /// as a bare InvalidCharacter.
 fn takePercent(args: []const []const u8, flag: []const u8, i: *usize) !u32 {
@@ -187,12 +200,14 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         } else if (std.mem.eql(u8, a, "--cache")) {
             opts.cache = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--id")) {
+            try rejectOutsideMount(cmd, a);
             opts.id = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--psk")) {
             opts.psk_file = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--psk-value")) {
             opts.psk_value = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--piece")) {
+            try rejectOutsideMount(cmd, a);
             const raw = try takeValue(args, a, &i);
             const psz = proto.parseSize(raw) catch {
                 if (!builtin.is_test) std.debug.print("--piece {s}: bad size (want e.g. 16M)\n", .{raw});
@@ -210,24 +225,34 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             }
             opts.piece = @intCast(psz);
         } else if (std.mem.eql(u8, a, "--brun")) {
+            try rejectOutsideMount(cmd, a);
             opts.water.brun = try takePercent(args, a, &i);
         } else if (std.mem.eql(u8, a, "--bcull")) {
+            try rejectOutsideMount(cmd, a);
             opts.water.bcull = try takePercent(args, a, &i);
         } else if (std.mem.eql(u8, a, "--bstop")) {
+            try rejectOutsideMount(cmd, a);
             opts.water.bstop = try takePercent(args, a, &i);
         } else if (std.mem.eql(u8, a, "--direct-io")) {
+            try rejectOutsideMount(cmd, a);
             opts.direct_io = true;
         } else if (std.mem.eql(u8, a, "--kernel-cache")) {
+            try rejectOutsideMount(cmd, a);
             opts.direct_io = false;
         } else if (std.mem.eql(u8, a, "--allow-other")) {
+            try rejectOutsideMount(cmd, a);
             opts.allow_other = true;
         } else if (std.mem.eql(u8, a, "--detach")) {
+            try rejectOutsideMount(cmd, a);
             opts.detach = true;
         } else if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--foreground")) {
+            try rejectOutsideMount(cmd, a);
             opts.detach = false;
         } else if (std.mem.eql(u8, a, "--listen")) {
+            try rejectOutsideMount(cmd, a);
             opts.listen = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--advertise")) {
+            try rejectOutsideMount(cmd, a);
             const v = try takeValue(args, a, &i);
             var it = std.mem.splitScalar(u8, v, ',');
             while (it.next()) |one| {
@@ -249,6 +274,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 try opts.advertise.append(gpa, hp);
             }
         } else if (std.mem.eql(u8, a, "--seed")) {
+            try rejectOutsideMount(cmd, a);
             const s = try takeValue(args, a, &i);
             // Validate now with a named message instead of failing later in
             // mount setup with a bare parseInt error.
@@ -401,19 +427,36 @@ pub fn main(init: std.process.Init) !u8 {
         },
     };
     defer freeParsed(parsed, gpa);
+    // Positional shapes follow the Usage lines exactly; extra arguments were
+    // silently dropped before, so e.g. `status junk` and `mount a b` both
+    // looked like they succeeded with the extras meaning something.
     if (std.mem.eql(u8, parsed.cmd, "mount")) {
-        if (parsed.rest.len < 1) {
-            std.log.err("mount needs a directory", .{});
+        if (parsed.rest.len != 1) {
+            std.log.err("mount takes exactly one directory argument", .{});
             std.debug.print("{s}", .{usage});
             return 2;
         }
         return cmdMount(init, parsed.opts, parsed.rest[0]);
     }
-    if (std.mem.eql(u8, parsed.cmd, "status")) return cmdStatus(init.io, gpa, parsed.opts);
-    if (std.mem.eql(u8, parsed.cmd, "peers")) return cmdPeers(init.io, gpa, parsed.opts);
+    if (std.mem.eql(u8, parsed.cmd, "status")) {
+        if (parsed.rest.len != 0) {
+            std.log.err("status takes no arguments", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        return cmdStatus(init.io, gpa, parsed.opts);
+    }
+    if (std.mem.eql(u8, parsed.cmd, "peers")) {
+        if (parsed.rest.len != 0) {
+            std.log.err("peers takes no arguments", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        return cmdPeers(init.io, gpa, parsed.opts);
+    }
     if (std.mem.eql(u8, parsed.cmd, "pin") or std.mem.eql(u8, parsed.cmd, "unpin")) {
-        if (parsed.rest.len < 1) {
-            std.log.err("{s} needs a path relative to the mount", .{parsed.cmd});
+        if (parsed.rest.len != 1) {
+            std.log.err("{s} takes exactly one path relative to the mount", .{parsed.cmd});
             std.debug.print("{s}", .{usage});
             return 2;
         }
@@ -1027,6 +1070,28 @@ test "parseArgs rejects bad values" {
     // The env source answers to the same gate.
     try environ.put("MODELFS_ID", "x\"y");
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
+}
+
+test "parseArgs rejects mount-only flags on other commands" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    // The help text promises status/peers/pin take only their Usage-line
+    // flags; mount-only knobs must be refused, not accepted-and-ignored.
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--detach" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--kernel-cache" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "peers", "--origin", "/o", "--piece", "4M" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "peers", "--id", "spark9" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--listen", "19090" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "unpin", "x.bin", "-f" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "peers", "--seed", "10.0.0.9" }));
+    // Shared value flags stay legal on every command (the e2e suites pass
+    // --psk/--origin to pin and peers).
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--cache", "/c", "--origin", "/o", "--psk-value", "s" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/c", parsed.opts.cache);
+    }
 }
 
 test "parseArgs defaults come from the environ map" {

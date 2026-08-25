@@ -489,6 +489,16 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
         replyOriginStat(self, fd, rel, src);
         return;
     }
+    // Same answer as /have for the same resource state: a directory (or any
+    // non-regular file) at the path is a miss per the documented status
+    // table ("no regular file at path"), not an origin failure. Without this
+    // gate the directory's st_size passed the range checks and hydration's
+    // pread on the dir fd turned it into a 502 -- one resource, two answers,
+    // and fill_err_origin blaming the NFS tier for a client bug.
+    if ((st.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) {
+        replyStatus(self, fd, "404 Not Found");
+        return;
+    }
     const size: u64 = @intCast(st.st_size);
     if (rg.start >= size or rg.end < rg.start) {
         replyStatus(self, fd, "416 Range Not Satisfiable");
@@ -1580,6 +1590,15 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
             try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 206 Partial Content\r\n"));
             try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Type: application/octet-stream\r\n") != null);
             try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\ndata"));
+        }
+        // A directory at the path is the same miss /have reports (404), not
+        // an origin failure (502): hydration's pread on the dir fd must never
+        // be reached. Regression: serveData skipped the regular-file gate.
+        try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(try sys.joinZ(&fz, origin_d, "subdir")), 0o755));
+        {
+            var res = try roundTrip(port, "GET /data?path=subdir HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-15\r\nConnection: close\r\n\r\n");
+            defer res.deinit(gpa);
+            try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
         }
     }
 }

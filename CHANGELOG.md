@@ -1,5 +1,10 @@
 # Changelog & Autoresearch Notebook
 
+## [Functional review pass] - 2026-08-25
+- **Peer `/data` answers 404 for non-regular files, like `/have` already did**: `serveData` skipped the regular-file gate its sibling has, so a directory at the requested path passed the range checks with its directory `st_size`, created a bogus cache entry, and hydration's pread on the dir fd turned the request into a 502 Bad Gateway plus a `fill_err_origin` bump -- one resource state answering two different statuses across endpoints, and the documented table ("404: the origin has no regular file at path") violated. The gate now sits before any cache work; covered end to end next to the existing `/have` directory case.
+- **Mount-only flags are refused on status/peers/pin, as the help text always claimed**: every flag was parsed for every command, so `status --detach`, `peers --piece 4M`, or `pin x --id n1` exited 0 while silently doing nothing. Each mount-only option (`--piece`, watermarks, socket/detach/id knobs) is now rejected at parse with a named message and exit 2; the shared `--origin`/`--cache`/`--psk` values stay legal everywhere (the e2e suites pass them to pin and peers). Positional shapes now follow the Usage lines too (`mount a b`, `unpin a b`, and `status junk` used to drop the extras silently).
+- **Help text updated to match the enforced surface** (shared flags tolerated, mount-only refused), so the documented contract and the parser agree.
+
 ## [API review pass] - 2026-08-25
 - **Unknown peer paths now answer 404 consistently**: routing ran after path-parameter decoding, so `GET /nope` answered 400 Bad Request while `GET /nope?path=x.bin` answered 404 Not Found; one resource state had two answers depending on the query string. Dispatch now happens before any input decoding, and only `/have`/`/data` pay for it. Covered end to end (bare path, valid query, bad escape, traversal attempt behind an unknown path).
 - **405 responses name their method**: a non-GET request was refused with a bare status line; RFC 9110 §15.5.5 requires `Allow`, and without it a probing client has no way to learn the API shape. The refusal now carries `Allow: GET`.
