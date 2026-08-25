@@ -83,7 +83,7 @@ modelfs unpin gguf/foo.gguf
 
 `status` prints the daemon's `status.json` from the cache dir; a missing file means the mount is not running, and so does a leftover naming an exited pid (the crash case: the artifact is only served while its writer process still exists). It carries liveness (`id`, `pid`, `uptime_s`), topology (`peers`, `piece`, `inflight` HTTP handlers), saturation (`cache_free_pct`, the same sample culling runs on; `-1` when statvfs fails, i.e. culling suspended), and lifetime counters (`stats`: reads/writes with errors, cumulative read and per-fill durations in nanoseconds, piece fills by source (peer vs origin) with byte totals, fill failures per tier, failed `/have` probes (`probe_err`, healthy 404 misses excluded), pieces culled, rejected auths, 5xx replies, malformed request heads). `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live; an unreachable `--origin` fails with exit 1 (the same gate `mount` applies), while an existing origin without a `.cluster` dir yet lists as empty and exits 0.
 
-Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_ID`.
+Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_PSK_VALUE` `MODELFS_ID`.
 
 `--id`, `--advertise IP:PORT`, `--cache`, `--listen` override defaults. `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
 

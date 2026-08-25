@@ -52,7 +52,7 @@ Everything below accepts input from outside the process; each is where validatio
 | Lease files `<origin>/.cluster/<id>.json` written by other nodes | refresh src/discover.zig:430-504, sweep src/discover.zig:513-538 | JSON documents: ids, expiry timestamps, address lists (parsed src/proto.zig:180-182) |
 | Origin file tree (model data served to peers and locally) | statOrigin src/store.zig:248-252; hydration src/peer.zig:393-462 | File bytes and sizes as they are on the NFS export |
 | CLI subcommands and flags | src/main.zig:410-509 dispatch, parseArgs src/main.zig:182-348 | Paths, addresses, sizes, watermarks, id, PSK source |
-| Environment variables `MODELFS_ORIGIN/CACHE/PSK/ID` | src/main.zig:198-207 | Same values as their flags; explicit flag wins |
+| Environment variables `MODELFS_ORIGIN/CACHE/PSK/PSK_VALUE/ID` | src/main.zig:198-207 | Same values as their flags; explicit flag wins |
 | PSK file (`--psk`, default `/etc/modelfs.psk`) | loadPsk src/main.zig:350-408 | Up to 4096 bytes, whitespace-trimmed |
 | Cache-dir artifacts read back at runtime (`meta/*.pieces` bitfields, `pin/` markers, `status.json`) | store walk/load src/store.zig, status read src/main.zig:790-820 | On-disk state written by this same process; trusted structurally, not cryptographically |
 

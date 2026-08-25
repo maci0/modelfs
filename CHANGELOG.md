@@ -9,6 +9,11 @@ version, so the whole history since the initial commit is one pre-release delta 
 When the first tag lands it belongs on top of this section with the entries it
 covers regrouped under its version number.
 
+## [CLI review pass 2] - 2026-08-26
+- **The suite compiles again**: the idempotency pass's "write-through copied twice" test called `Store.copyIntoCache` with a fourth argument the function has never taken, so `zig build test` failed at compile time for every change since. The three call sites now match the real signature; the twice-versus-once assertions are unchanged.
+- **A flag missing its value names where to look next**: `--origin` with nothing after it printed only "--origin needs a value"; like the unknown-flag message, it now points at `'modelfs help'` (still exit 2).
+- **Every mention of the environment variables lists all five**: README, docs/architecture.md, and docs/THREAT_MODEL.md enumerated `MODELFS_ORIGIN/CACHE/PSK/ID` but omitted `MODELFS_PSK_VALUE`, which the CLI applies and `modelfs help` documents; the inline-secret env spelling was invisible everywhere but the help text.
+
 ## [Build review pass] - 2026-08-26
 - **The same tree now builds to the same bytes**: ReleaseFast artifacts carried DWARF debug info whose `DW_AT_comp_dir` records the absolute build directory, so two machines (or two checkouts) produced different binaries from identical source. Non-Debug builds are now stripped (`build.zig` sets `strip` for every optimize mode except Debug), which removes the leak and shrinks the shipped binary; Debug development keeps full symbols. Verified by building from two different directories with different `TZ`, `LC_ALL`, and `SOURCE_DATE_EPOCH`: both `zig-out/bin/modelfs` copies hash identically.
 - **The daemon image finally gets ASLR and canaries in every mode**: Zig linked an ET_EXEC non-PIE binary by default, so the long-lived networked process ran at a fixed load address (`exe.pie = true` fixes that), and stack protection defaults off in ReleaseFast/ReleaseSmall (`stack_protector = true` on the executable and test modules pins it on everywhere). Full RELRO, BIND_NOW, and the non-executable stack were already Zig defaults and stay.

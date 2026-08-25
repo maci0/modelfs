@@ -52,10 +52,11 @@ const usage =
     \\status/peers/pin take only the flags shown on their Usage line plus
     \\the shared --origin/--cache/--psk/--psk-value values; mount-only
     \\options are refused elsewhere. Every command also accepts -h/--help,
-    \\and -V/--version prints the release.
+    \\and -V/--version prints the release. "--" ends flag parsing: later
+    \\arguments are taken literally (paths starting with '-').
     \\
-    \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_ID set the same
-    \\values as their flags; an explicit flag wins.
+    \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
+    \\MODELFS_ID set the same values as their flags; an explicit flag wins.
     \\
     \\Examples:
     \\  modelfs mount /models --origin /net/192.168.0.100/models
@@ -132,7 +133,7 @@ fn listenPort(spec: []const u8) !u16 {
 fn takeValue(args: []const []const u8, flag: []const u8, i: *usize) ![]const u8 {
     i.* += 1;
     if (i.* >= args.len) {
-        if (!builtin.is_test) std.debug.print("{s} needs a value\n", .{flag});
+        if (!builtin.is_test) std.debug.print("{s} needs a value (see 'modelfs help')\n", .{flag});
         return error.MissingValue;
     }
     return args[i.*];
@@ -198,6 +199,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     if (environ.get("MODELFS_ORIGIN")) |v| opts.origin = v;
     if (environ.get("MODELFS_CACHE")) |v| opts.cache = v;
     if (environ.get("MODELFS_PSK")) |v| opts.psk_file = v;
+    // The inline secret's env spelling, like every other flag's: keeps it
+    // out of /proc/<pid>/cmdline for scripted mounts that cannot use a PSK
+    // file. An explicit --psk-value still wins.
+    if (environ.get("MODELFS_PSK_VALUE")) |v| opts.psk_value = v;
     // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin
     // never read the id, so an ambient shell-wide variable must neither leak
     // into them nor fail them with BadId the way the explicit flag is
@@ -219,6 +224,13 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         const a = args[i];
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return error.Help;
         if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) return error.Version;
+        // POSIX end-of-options: everything after "--" is positional, so
+        // pin/unpin relpaths and mount dirs that begin with "-" stay
+        // reachable instead of dying as unknown flags.
+        if (std.mem.eql(u8, a, "--")) {
+            try rest.appendSlice(gpa, args[i + 1 ..]);
+            break;
+        }
         if (std.mem.eql(u8, a, "--origin")) {
             opts.origin = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--cache")) {
@@ -953,7 +965,7 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     }
     const rc = store.setPin(rel, on);
     if (rc != 0) {
-        std.log.err("pin failed errno {d}", .{-rc});
+        std.log.err("{s} failed errno {d}", .{ if (on) "pin" else "unpin", -rc });
         return 1;
     }
     printOut(io, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel });
@@ -1223,6 +1235,53 @@ test "parseArgs rejects mount-only flags on other commands" {
         const parsed = try parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--cache", "/c", "--origin", "/o", "--psk-value", "s" });
         defer freeParsed(parsed, gpa);
         try std.testing.expectEqualStrings("/c", parsed.opts.cache);
+    }
+}
+
+test "parseArgs treats everything after -- as positional" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    // A relpath starting with '-' would otherwise die as an unknown flag;
+    // "--" hands it through verbatim.
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "--", "-weird.gguf" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqual(@as(usize, 1), parsed.rest.len);
+        try std.testing.expectEqualStrings("-weird.gguf", parsed.rest[0]);
+    }
+    // -h after -- is a positional, not a help request.
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--", "-h", "/mnt" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqual(@as(usize, 2), parsed.rest.len);
+        try std.testing.expectEqualStrings("-h", parsed.rest[0]);
+        try std.testing.expectEqualStrings("/mnt", parsed.rest[1]);
+    }
+    // Flags before -- still parse; a bare -- changes nothing.
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "--origin", "/o", "--" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/o", parsed.opts.origin.?);
+        try std.testing.expectEqual(@as(usize, 0), parsed.rest.len);
+    }
+}
+
+test "psk secret prefers the flag over MODELFS_PSK_VALUE" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("MODELFS_PSK_VALUE", "env-secret");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("env-secret", parsed.opts.psk_value.?);
+    }
+    // An explicit --psk-value wins, like every other flag over its env var.
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--psk-value", "flag-secret" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("flag-secret", parsed.opts.psk_value.?);
     }
 }
 

@@ -1886,6 +1886,162 @@ test "fill completion and piece probes refresh the cull recency window" {
     try std.testing.expect(!st.hasPiece(f, 0));
 }
 
+// Re-execution is the normal consequence of retries and redeliveries, so
+// the fill path's dedup contract gets a twice-versus-once proof: a second
+// completeFill of the same piece must be absorbed by the claim (the second
+// beginFill answers .filled, no re-fetch) and leave bitfield, sidecar
+// bytes, and cached bytes identical to a store where the fill ran once.
+test "a piece filled twice ends in the same state as filled once" {
+    const gpa = std.testing.allocator;
+    var ob1: [128]u8 = undefined;
+    var cb1: [128]u8 = undefined;
+    var ob2: [128]u8 = undefined;
+    var cb2: [128]u8 = undefined;
+    const origin_1 = try sys.scratchDir(&ob1, "modelfs-o-fill-once");
+    defer sys.deleteTree(std.testing.io, origin_1);
+    const cache_1 = try sys.scratchDir(&cb1, "modelfs-c-fill-once");
+    defer sys.deleteTree(std.testing.io, cache_1);
+    const origin_2 = try sys.scratchDir(&ob2, "modelfs-o-fill-twice");
+    defer sys.deleteTree(std.testing.io, origin_2);
+    const cache_2 = try sys.scratchDir(&cb2, "modelfs-c-fill-twice");
+    defer sys.deleteTree(std.testing.io, cache_2);
+
+    var once = Store.init(gpa, std.testing.io, origin_1, cache_1, 16);
+    defer once.deinit();
+    var twice = Store.init(gpa, std.testing.io, origin_2, cache_2, 16);
+    defer twice.deinit();
+    try std.testing.expectEqual(@as(i32, 0), once.ensureLayout());
+    try std.testing.expectEqual(@as(i32, 0), twice.ensureLayout());
+
+    const content = "0123456789abcdef";
+    const f1 = try once.get("fill.bin", 64);
+    defer once.releaseFile(f1);
+    const f2 = try twice.get("fill.bin", 64);
+    defer twice.releaseFile(f2);
+
+    // Once...
+    try std.testing.expect((try once.beginFill(f1, 0)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), once.completeFill(f1, 0, content));
+
+    // ...and twice. The second claim must answer .filled -- the dedup a
+    // retried fetch depends on: the piece is skipped, not re-fetched.
+    try std.testing.expect((try twice.beginFill(f2, 0)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), twice.completeFill(f2, 0, content));
+    try std.testing.expect((try twice.beginFill(f2, 0)) == .filled);
+
+    try std.testing.expect(once.hasPiece(f1, 0));
+    try std.testing.expect(twice.hasPiece(f2, 0));
+
+    var mbuf1: [sys.c.PATH_MAX]u8 = undefined;
+    var mbuf2: [sys.c.PATH_MAX]u8 = undefined;
+    const meta1 = try once.cacheMetaPath(&mbuf1, "fill.bin");
+    const meta2 = try twice.cacheMetaPath(&mbuf2, "fill.bin");
+    var blob1: [4096]u8 = undefined;
+    var blob2: [4096]u8 = undefined;
+    const side1 = try sys.readFileBuf(&blob1, meta1);
+    const side2 = try sys.readFileBuf(&blob2, meta2);
+    try std.testing.expectEqualSlices(u8, side1, side2);
+
+    var dbuf1: [content.len]u8 = undefined;
+    var dbuf2: [content.len]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, content.len), once.readCache(f1, &dbuf1, 0));
+    try std.testing.expectEqual(@as(isize, content.len), twice.readCache(f2, &dbuf2, 0));
+    try std.testing.expectEqualStrings(&dbuf1, &dbuf2);
+}
+
+// Same twice-versus-once proof for the write-through marking path: a
+// repeated copyIntoCache re-marks the same pieces and converges on the
+// identical persisted state instead of double-counting or corrupting.
+test "write-through copied twice marks the same pieces as one copy" {
+    const gpa = std.testing.allocator;
+    var ob1: [128]u8 = undefined;
+    var cb1: [128]u8 = undefined;
+    var ob2: [128]u8 = undefined;
+    var cb2: [128]u8 = undefined;
+    const origin_1 = try sys.scratchDir(&ob1, "modelfs-o-wt-once");
+    defer sys.deleteTree(std.testing.io, origin_1);
+    const cache_1 = try sys.scratchDir(&cb1, "modelfs-c-wt-once");
+    defer sys.deleteTree(std.testing.io, cache_1);
+    const origin_2 = try sys.scratchDir(&ob2, "modelfs-o-wt-twice");
+    defer sys.deleteTree(std.testing.io, origin_2);
+    const cache_2 = try sys.scratchDir(&cb2, "modelfs-c-wt-twice");
+    defer sys.deleteTree(std.testing.io, cache_2);
+
+    var once = Store.init(gpa, std.testing.io, origin_1, cache_1, 16);
+    defer once.deinit();
+    var twice = Store.init(gpa, std.testing.io, origin_2, cache_2, 16);
+    defer twice.deinit();
+    try std.testing.expectEqual(@as(i32, 0), once.ensureLayout());
+    try std.testing.expectEqual(@as(i32, 0), twice.ensureLayout());
+
+    const chunk = "abcdefghijklmnop";
+    const f1 = try once.get("wt.bin", 32);
+    defer once.releaseFile(f1);
+    const f2 = try twice.get("wt.bin", 32);
+    defer twice.releaseFile(f2);
+
+    try std.testing.expect(once.copyIntoCache(f1, 0, chunk));
+
+    // The retry lands the same bytes again: still true (marks reapplied),
+    // never a false negative that would send reads back to the origin.
+    try std.testing.expect(twice.copyIntoCache(f2, 0, chunk));
+    try std.testing.expect(twice.copyIntoCache(f2, 0, chunk));
+
+    try std.testing.expect(once.hasPiece(f1, 0));
+    try std.testing.expect(twice.hasPiece(f2, 0));
+    try std.testing.expect(!twice.hasPiece(f2, 1));
+
+    var mbuf1: [sys.c.PATH_MAX]u8 = undefined;
+    var mbuf2: [sys.c.PATH_MAX]u8 = undefined;
+    const meta1 = try once.cacheMetaPath(&mbuf1, "wt.bin");
+    const meta2 = try twice.cacheMetaPath(&mbuf2, "wt.bin");
+    var blob1: [4096]u8 = undefined;
+    var blob2: [4096]u8 = undefined;
+    const side1 = try sys.readFileBuf(&blob1, meta1);
+    const side2 = try sys.readFileBuf(&blob2, meta2);
+    try std.testing.expectEqualSlices(u8, side1, side2);
+}
+
+// A destructive job run twice in quick succession must change nothing the
+// first run did not: the second punch finds its own cleared mark and stops
+// before any hole cut, sidecar rewrite, or counter bump.
+test "a punched piece punched again stays culled with nothing rewritten" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pp-twice");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pp-twice");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("punch.bin", 64);
+    defer st.releaseFile(f);
+    try std.testing.expect((try st.beginFill(f, 0)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef"));
+
+    f.mu.lockUncancelable(std.testing.io);
+    f.last_access.store(sys.monoSec() - 3600, .monotonic);
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(st.punchPiece(f, 0, sys.monoSec()));
+
+    var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const meta = try st.cacheMetaPath(&mbuf, "punch.bin");
+    var before: [4096]u8 = undefined;
+    var after: [4096]u8 = undefined;
+    const side_before = try sys.readFileBuf(&before, meta);
+
+    try std.testing.expect(!st.punchPiece(f, 0, sys.monoSec()));
+    try std.testing.expect(!st.hasPiece(f, 0));
+
+    const side_after = try sys.readFileBuf(&after, meta);
+    try std.testing.expectEqualSlices(u8, side_before, side_after);
+    try std.testing.expectEqual(@as(u32, 1), st.stats.pieces_culled.load(.monotonic));
+}
+
 test "punchPiece refuses pinned and freshly accessed entries" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
