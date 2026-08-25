@@ -94,5 +94,8 @@ enable_error_code = [
     "unimported-reveal",
     # an awaited value assigned and dropped must not pass silently
     "unused-awaitable",
+    # a value narrowed to a type the declared annotation cannot hold is a
+    # latent AttributeError/TypeError at runtime, not a style nit
+    "narrowed-type-not-subtype",
 ]
 

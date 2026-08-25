@@ -44,10 +44,12 @@ echo "=== shellcheck ==="
 # statement must handle an unmatched input, bare [ $x ] conditions are
 # ambiguous, which(1) is not portable, variables stay quoted even where
 # currently safe, a suppressed `set -e` cannot silently downgrade error
-# handling, and an uppercase-looking assignment is always set before use.
+# handling, an uppercase-looking assignment is always set before use, and
+# a negated numeric comparison ([ ! "$x" -eq 1 ]) is written as its direct
+# operator (-ne) so the tested condition is the one a reader sees.
 # The style-only brace/double-bracket checks stay off: this tree does not
 # follow those conventions.
-shellcheck -o add-default-case,avoid-nullary-conditions,deprecate-which,quote-safe-variables,check-set-e-suppressed,check-unassigned-uppercase scripts/*.sh || fail "shellcheck reported violations"
+shellcheck -o add-default-case,avoid-nullary-conditions,avoid-negated-conditions,deprecate-which,quote-safe-variables,check-set-e-suppressed,check-unassigned-uppercase scripts/*.sh || fail "shellcheck reported violations"
 
 echo "=== ruff ==="
 ruff check scripts/ || fail "ruff reported violations"

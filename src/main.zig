@@ -57,6 +57,7 @@ const usage =
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID set the same values as their flags; an explicit flag wins.
+    \\An empty environment value counts as unset (defaults apply).
     \\
     \\Examples:
     \\  modelfs mount /models --origin /net/192.168.0.100/models
@@ -166,6 +167,18 @@ fn takeValue(args: []const []const u8, flag: []const u8, i: *usize) ![]const u8 
     return args[i.*];
 }
 
+/// An exported-but-empty variable ("export MODELFS_CACHE=" left behind by a
+/// script, a systemd Environment= line with no value) names no configuration:
+/// it falls through to the default like an unset variable instead of
+/// replacing a usable path with "" or bricking every mount with BadId on a
+/// value that never appears anywhere. Explicit empty flags keep their
+/// meaning -- `--id ""` is still refused, `--psk-value ""` still trips
+/// loadPsk's EmptyPsk gate.
+fn envValue(environ: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
+    const v = environ.get(name) orelse return null;
+    return if (v.len == 0) null else v;
+}
+
 /// Refuses mount-only knobs on the other commands, as the help text promises
 /// ("status/peers/pin take only the flags shown on their Usage line"):
 /// accepted-and-ignored they would silently do nothing (a `status --detach`,
@@ -223,19 +236,19 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     var opts = Opts{};
     // 0.16: environment variables are only reachable via the main function's
     // process.Init; the map is threaded in instead of reading global environ.
-    if (environ.get("MODELFS_ORIGIN")) |v| opts.origin = v;
-    if (environ.get("MODELFS_CACHE")) |v| opts.cache = v;
-    if (environ.get("MODELFS_PSK")) |v| opts.psk_file = v;
+    if (envValue(environ, "MODELFS_ORIGIN")) |v| opts.origin = v;
+    if (envValue(environ, "MODELFS_CACHE")) |v| opts.cache = v;
+    if (envValue(environ, "MODELFS_PSK")) |v| opts.psk_file = v;
     // The inline secret's env spelling, like every other flag's: keeps it
     // out of /proc/<pid>/cmdline for scripted mounts that cannot use a PSK
     // file. An explicit --psk-value still wins.
-    if (environ.get("MODELFS_PSK_VALUE")) |v| opts.psk_value = v;
+    if (envValue(environ, "MODELFS_PSK_VALUE")) |v| opts.psk_value = v;
     // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin
     // never read the id, so an ambient shell-wide variable must neither leak
     // into them nor fail them with BadId the way the explicit flag is
     // refused by rejectOutsideMount.
     if (std.mem.eql(u8, cmd, "mount")) {
-        if (environ.get("MODELFS_ID")) |v| opts.id = v;
+        if (envValue(environ, "MODELFS_ID")) |v| opts.id = v;
     }
 
     var i: usize = 1;
@@ -756,8 +769,14 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     try cargv.append(gpa, o_slice.ptr);
     try cargv.append(gpa, mount_z.ptr);
 
-    std.log.info("mount {s} origin={s} cache={s} id={s} piece={d}", .{
-        mount_abs, origin, cache, id, opts.piece,
+    // The whole effective configuration in one line: a cull/listen/io
+    // misconfiguration must be diagnosable from the journal alone, without
+    // reconstructing which flag or env var won. Secrets never appear here.
+    std.log.info("mount {s} origin={s} cache={s} id={s} piece={d} listen=:{d} io={s} water={d}/{d}/{d} allow_other={}", .{
+        mount_abs,                                  origin,           cache,
+        id,                                         opts.piece,       eff_port,
+        if (opts.direct_io) "direct" else "kernel", opts.water.brun,  opts.water.bcull,
+        opts.water.bstop,                           opts.allow_other,
     });
 
     var ops = fuse_fs.ops();
@@ -1390,14 +1409,57 @@ test "parseArgs rejects bad values" {
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "a/b" }));
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", ".lead" }));
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "a\nb" }));
-    // an empty id (flag or env) would collide every such node onto one lease;
-    // kept last because the env put below taints every later parse
+    // An empty id would collide every such node onto one lease, but from the
+    // environment it reads as unset (hostname fallback) instead of bricking
+    // mounts until the stray variable is unset; only the explicit flag is
+    // refused. Kept last because the env put below taints every later parse.
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "" }));
     try environ.put("MODELFS_ID", "");
-    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
-    // The env source answers to the same gate.
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expect(parsed.opts.id == null);
+    }
+    // A non-empty env id answers to the same gate.
     try environ.put("MODELFS_ID", "x\"y");
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
+}
+
+test "empty environment variables read as unset" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    // A leftover "export MODELFS_X=" must not replace defaults with unusable
+    // values: every variable falls back to its default exactly as if it had
+    // never been set.
+    try environ.put("MODELFS_ORIGIN", "");
+    try environ.put("MODELFS_CACHE", "");
+    try environ.put("MODELFS_PSK", "");
+    try environ.put("MODELFS_PSK_VALUE", "");
+    try environ.put("MODELFS_ID", "");
+    const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+    defer freeParsed(parsed, gpa);
+    try std.testing.expect(parsed.opts.origin == null);
+    try std.testing.expectEqualStrings("/var/cache/modelfs", parsed.opts.cache);
+    try std.testing.expectEqualStrings("/etc/modelfs.psk", parsed.opts.psk_file);
+    try std.testing.expect(parsed.opts.psk_value == null);
+    try std.testing.expect(parsed.opts.id == null);
+
+    // Non-empty values still apply, and an explicitly empty flag keeps its
+    // stricter meaning where one exists (--psk-value "" is refused by
+    // loadPsk, --id "" by the BadId gate above).
+    try environ.put("MODELFS_ORIGIN", "/env/origin");
+    try environ.put("MODELFS_CACHE", "/env/cache");
+    try environ.put("MODELFS_PSK", "/env/psk");
+    try environ.put("MODELFS_PSK_VALUE", "env-secret");
+    try environ.put("MODELFS_ID", "spark-env");
+    const parsed2 = try parseArgs(gpa, &environ, &.{"mount"});
+    defer freeParsed(parsed2, gpa);
+    try std.testing.expectEqualStrings("/env/origin", parsed2.opts.origin.?);
+    try std.testing.expectEqualStrings("/env/cache", parsed2.opts.cache);
+    try std.testing.expectEqualStrings("/env/psk", parsed2.opts.psk_file);
+    try std.testing.expectEqualStrings("env-secret", parsed2.opts.psk_value.?);
+    try std.testing.expectEqualStrings("spark-env", parsed2.opts.id.?);
 }
 
 test "parseArgs refuses unknown commands before flag scanning" {

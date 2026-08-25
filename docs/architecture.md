@@ -83,7 +83,7 @@ modelfs unpin gguf/foo.gguf
 
 `status` prints the daemon's `status.json` from the cache dir; a missing file means the mount is not running, and so does a leftover naming an exited pid (the crash case: the artifact is only served while its writer process still exists). It carries liveness (`id`, `pid`, `uptime_s`), topology (`peers`, `piece`, `inflight` HTTP handlers), saturation (`cache_free_pct`, the same sample culling runs on; `-1` when statvfs fails, i.e. culling suspended), and lifetime counters (`stats`: reads/writes with errors, cumulative read and per-fill durations in nanoseconds, piece fills by source (peer vs origin) with byte totals, fill failures per tier, failed `/have` probes (`probe_err`, healthy 404 misses excluded), pieces culled, rejected auths, 5xx replies, malformed request heads). `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live; an unreachable `--origin` fails with exit 1 (the same gate `mount` applies), while an existing origin without a `.cluster` dir yet lists as empty and exits 0.
 
-Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_PSK_VALUE` `MODELFS_ID`.
+Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_PSK_VALUE` `MODELFS_ID`; an explicit flag wins and an empty environment value counts as unset.
 
 `--id`, `--advertise IP:PORT`, `--cache`, `--listen` override defaults. `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
 
@@ -162,10 +162,10 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 | 200 | `/ping` (`text/plain`, body `ok`) or `/have` (`application/octet-stream` bitmap + `X-Piece-Size`) |
 | 206 | `/data` partial content (`Content-Range`, `application/octet-stream`) |
 | 400 | Undecodable or unsafe (`..`, absolute) `path`; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
-| 401 | Missing or wrong bearer token |
+| 401 | Missing or wrong bearer token (`WWW-Authenticate: Bearer`) |
 | 404 | Unknown path, or the origin has no regular file at `path` |
 | 405 | Any method other than GET (`Allow: GET`) |
-| 416 | `/data` range start at/after EOF (an over-long end clamps to EOF instead) |
+| 416 | `/data` range start at/after EOF, with `Content-Range: bytes */<size>` naming the complete length (an over-long end clamps to EOF instead) |
 | 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write) |
 | 502 | The origin is unreachable or failed (stat/pread error), i.e. retry another peer |
 

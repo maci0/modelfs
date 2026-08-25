@@ -311,7 +311,9 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         var abuf: [64]u8 = undefined;
         std.log.warn("peer http: rejected unauthorized request from {s}", .{peerAddrText(peer, &abuf)});
         _ = self.store.stats.http_unauthorized.fetchAdd(1, .monotonic);
-        replyStatus(self, fd, "401 Unauthorized");
+        // RFC 9110 §15.5.2: a 401 must carry a challenge naming the scheme
+        // a client should retry with; same empty-body framing as replyStatus.
+        reply(fd, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
     const path = proto.pathOnly(target);
@@ -588,7 +590,16 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     }
     const size: u64 = @intCast(st.st_size);
     if (rg.start >= size or rg.end < rg.start) {
-        replyStatus(self, fd, "416 Range Not Satisfiable");
+        // RFC 9110 §15.5.17/§14.4: a 416 should carry the selected
+        // representation's complete length, so a client can recompute a
+        // satisfiable range instead of probing. Falls back to the bare
+        // status framing if the header ever fails to render.
+        var rbuf: [128]u8 = undefined;
+        const r = std.fmt.bufPrint(&rbuf, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{d}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{size}) catch {
+            replyStatus(self, fd, "416 Range Not Satisfiable");
+            return;
+        };
+        reply(fd, r);
         return;
     }
     // An end position past the last byte still names a satisfiable range
@@ -1518,6 +1529,13 @@ test "fault tolerance: bad psk fetchHave fails with http status" {
     defer std.testing.log_level = prev_log_level;
     const err = fetchHave(gpa, "wrong_secret", "127.0.0.1", port, "foo.bin");
     try std.testing.expectError(error.HttpStatus, err);
+
+    // The rejection must land in the counter status.json publishes -- and
+    // only there: a 401 is auth noise, never a node-health 5xx -- or a
+    // wrong-PSK prober stays invisible to the operator between ticks.
+    // Reading the error reply above proves the handler finished its bump.
+    try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_unauthorized.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
 }
 
 test "fault tolerance: traversal path is rejected with 400" {
@@ -1597,9 +1615,19 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "secret", "127.0.0.1", port, "loop/x.bin"));
     try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "loop/x.bin", 0, 8));
 
+    // Both failures are server-side trouble: each must land in the http_5xx
+    // counter status.json publishes (one per reply, bumped before the head
+    // the client above already read), or an origin outage is indistinguishable
+    // from ordinary traffic between discovery ticks.
+    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_5xx.load(.monotonic));
+
     // A genuinely absent path stays a healthy miss (404 => PeerMiss), the
     // shape fillFromPeers relies on to keep probe_err clean on skewed fleets.
     try std.testing.expectError(error.PeerMiss, fetchHave(gpa, "secret", "127.0.0.1", port, "gone.bin"));
+
+    // The healthy miss must not have fed the failure gauge: 404s are fleet
+    // skew, not broken nodes.
+    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_5xx.load(.monotonic));
 }
 
 /// Read the kernel-assigned port back from a listening socket (for port 0).
@@ -1889,6 +1917,18 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 405 Method Not Allowed\r\n"));
         try std.testing.expect(std.mem.indexOf(u8, res.items, "Allow: GET\r\n") != null);
     }
+    // A missing bearer token is a 401 that names the scheme to retry with
+    // (RFC 9110 §15.5.2). The expected rejection warning stays off the
+    // runner's stderr like sibling fault-tolerance tests.
+    {
+        const prev_log_level = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = prev_log_level;
+        var res = try roundTrip(port, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 401 Unauthorized\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, res.items, "WWW-Authenticate: Bearer\r\n") != null);
+    }
     // Unknown paths are 404 regardless of the query string behind them.
     // Regression: routing used to run after path-parameter decoding, so an
     // unknown path without a decodable ?path= answered 400 while the same
@@ -1992,6 +2032,10 @@ test "serveData replies 500 when the cache refuses hydrated bytes" {
     try readHeadFull(fd, &head_buf, &head_len, &total_read);
     // The status must name the server-side cache failure (500), not 404.
     try std.testing.expect(std.mem.startsWith(u8, head_buf[0..head_len], "HTTP/1.1 500"));
+    // The same event feeds the http_5xx counter status.json publishes (the
+    // bump precedes the head this client just read): a cache tier refusing
+    // hydrated bytes must be visible without journal access.
+    try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_5xx.load(.monotonic));
 }
 
 test "serve joins its accept loops once stop shuts the listeners down" {
@@ -2338,6 +2382,13 @@ test "serveData refuses ranges starting past EOF with 416" {
     try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "tiny.bin", 100, 200));
     // Inverted range stays refused too.
     try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "tiny.bin", 2, 1));
+
+    // The 416 names the complete length (RFC 9110 §15.5.17/§14.4) so a
+    // client can recompute a satisfiable range instead of probing.
+    var res = try roundTrip(port, "GET /data?path=tiny.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=3-9\r\nConnection: close\r\n\r\n");
+    defer res.deinit(gpa);
+    try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 416 Range Not Satisfiable\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Range: bytes */3\r\n") != null);
 }
 
 test "fillFromPeers probes concurrently and streams piece into out" {

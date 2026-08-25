@@ -9,7 +9,7 @@ First decide if this review applies. Confirm this is the modelfs mount tree: `bu
 ## Review the following
 
 1. Peer auth gating: in `src/peer.zig` the bearer check (`proto.bearerOk` on the `Authorization` header) must return 401 before any route matching or query parsing, so every endpoint including future ones is authenticated by construction. A route reachable ahead of that return is P0.
-2. Path containment: remote-supplied paths must pass `proto.decodePath` and then `relOk` before touching origin or cache. Any consumer of the request target or query that slices a path directly, or joins one into a root without `relOk`, can read outside the trees and hydrate writes into them; that is P0.
+2. Path containment: remote-supplied paths must pass `decodePath` (`src/peer.zig`) and then `relOk` before touching origin or cache. Any consumer of the request target or query that slices a path directly, or joins one into a root without `relOk`, can read outside the trees and hydrate writes into them; that is P0.
 3. Bounded input reads: request heads go through `readHeadFull` with a hard byte cap, and oversized or dribbled probes land in the `http_malformed` counter. New header, query, or body parsing must not read into a buffer whose size a peer controls. An unbounded read keyed to peer bytes is P0.
 4. Malformed-input behavior: a bad peer request fails exactly that request with a counted drop (`http_malformed`, `http_unauthorized`); it must not take down the daemon. New `catch unreachable`, bare `unreachable`, or length asserts reachable from peer bytes are findings; the same shapes inside test blocks are exempt.
 5. Syscall-wrapper policy: raw `std.os.linux.*` and medium-level `std.posix` calls live behind `src/sys.zig`; application files call `sys.*` helpers or `std.Io`. A new direct call site either moves behind `sys.zig` or carries a comment naming why it stays put. Today's strays are the `utimensat` mtime pins in `src/store.zig` and `src/discover.zig` and the `getpid` status-doc and test sites; anything beyond those needs justification.
@@ -39,7 +39,7 @@ Severity guide:
 
 ## Output format
 
-Write or update `docs/reviews/ZIG_SRC_REVIEW.md` with scope (files covered, date), a findings table using the template above, counts by severity, and an ordered fix plan (P0 first). Add a short chat note with the top findings and whether `scripts/check.sh` was run after any fix. Unless the user sets another budget, fix at most five distinct findings, P0 first, and skip any single-file fix expected to exceed 200 changed lines.
+Write or update `docs/reviews/ZIG_SRC_REVIEW.md` with scope (files covered, date), a findings table using the template above, counts by severity, and an ordered fix plan (P0 first). Add a short chat note with the top findings and whether `scripts/check.sh` was run after any fix.
 
 ## Important
 
@@ -47,6 +47,7 @@ Write or update `docs/reviews/ZIG_SRC_REVIEW.md` with scope (files covered, date
 - The user's requested mode controls output. If it forbids a report, do not create or update `docs/reviews/ZIG_SRC_REVIEW.md`; give scope, findings, and counts in chat instead.
 - Before fixing, trace the real call path from entry point to the suspect line; an untraced plausible fix is worse than a finding left reported.
 - Do not weaken a check to make a finding disappear: auth gates, containment, caps, and counters stay; redesigns add enforcement elsewhere.
+- Unless the user sets another budget, fix at most five distinct findings, P0 first, and skip any single-file fix expected to exceed 200 changed lines.
 - Minimal diffs; never rewrite a file wholesale in one pass.
 - Out of scope: documented claims versus reality (`docs-drift-review.md`), shell and Python under `scripts/` (owned by the `check.sh` lint gates), and the six game-server guides' house rules.
 - Do not touch generated files, lockfiles, `.git`, `.deps/`, or anything outside this working tree.
