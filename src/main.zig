@@ -777,7 +777,7 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         return 1;
     };
     const blob = sys.readFileAlloc(gpa, p, 4096) catch {
-        std.debug.print("modelfs: not running (no {s}/{s})\n", .{ opts.cache, fuse_fs.status_file });
+        if (!builtin.is_test) std.debug.print("modelfs: not running (no {s}/{s})\n", .{ opts.cache, fuse_fs.status_file });
         return 1;
     };
     defer gpa.free(blob);
@@ -788,12 +788,12 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // writer exits; pid reuse can only ever false-positive, never hide a
     // genuinely running daemon behind a stale report.
     const doc = std.json.parseFromSlice(StatusLiveness, gpa, blob, .{ .ignore_unknown_fields = true }) catch {
-        std.debug.print("modelfs: not running ({s}/{s} is unreadable)\n", .{ opts.cache, fuse_fs.status_file });
+        if (!builtin.is_test) std.debug.print("modelfs: not running ({s}/{s} is unreadable)\n", .{ opts.cache, fuse_fs.status_file });
         return 1;
     };
     defer doc.deinit();
     if (!pidAlive(doc.value.pid)) {
-        std.debug.print("modelfs: not running (stale status.json names exited pid {d})\n", .{doc.value.pid});
+        if (!builtin.is_test) std.debug.print("modelfs: not running (stale status.json names exited pid {d})\n", .{doc.value.pid});
         return 1;
     }
     writeOut(io, blob);

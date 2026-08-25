@@ -1176,6 +1176,26 @@ pub const Store = struct {
         };
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
         const mp = self.cacheMetaPath(&mbuf, rel) catch return false;
+        // One store.mu window covers the liveness recheck, the durable
+        // sidecar save, the punch, and the builder-invalidation bump -- the
+        // same shape as forget/reapIdle purges. The save sits inside the
+        // window like finishPiece's dead-entry check: writing it outside the
+        // lock would let a concurrent forget purge the artifacts between the
+        // loadBits above and the save, and rewriting the sidecar anyway
+        // would recreate one naming filled pieces over data files that no
+        // longer exist, which a same-size recreate would trust and serve
+        // hole zeros as cached model data.
+        // A get() cannot insert an entry for rel inside this window
+        // (insertion takes store.mu), so a sampled victim can never grow a
+        // live entry mid-punch: one that inserted before the window makes
+        // contains() bail without saving or punching, and one whose sidecar
+        // read raced the rewrite discards at insert because the bump below
+        // follows the completed mutation -- sampling the new epoch
+        // guarantees the reader sees post-punch bits.
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.files.contains(rel)) return false;
+        if (self.purge_epoch != epoch0) return false;
         // Write-ahead (same contract as punchPiece): the cleared field is
         // persisted durably before any destructive step. A save failure leaves
         // the old sidecar standing and nothing punched; a crash after the save
@@ -1184,19 +1204,6 @@ pub const Store = struct {
             std.log.warn("bitfield save failed for {s}; piece {d} stays cached", .{ rel, idx });
             return false;
         }
-        // One store.mu window covers the liveness recheck, the punch, and the
-        // builder-invalidation bump -- the same shape as forget/reapIdle
-        // purges. A get() cannot insert an entry for rel inside this window
-        // (insertion takes store.mu), so a sampled victim can never grow a
-        // live entry mid-punch: one that inserted before the window makes
-        // contains() bail without punching, and one whose sidecar read raced
-        // the rewrite above discards at insert because the bump below follows
-        // the completed mutation -- sampling the new epoch guarantees the
-        // reader sees post-punch bits.
-        self.mu.lockUncancelable(self.io);
-        defer self.mu.unlock(self.io);
-        if (self.files.contains(rel)) return false;
-        if (self.purge_epoch != epoch0) return false;
         if (sys.punchHole(fd, off, ln) != 0) return false;
         self.purge_epoch += 1;
         _ = self.stats.pieces_culled.fetchAdd(1, .monotonic);

@@ -282,7 +282,7 @@ def plot_figures(
     ax.set_xlabel("Active Cluster Nodes (Count)", fontsize=10, labelpad=8)
     ax.set_ylabel("Total Query Latency (ms)", fontsize=10, labelpad=8)
     ax.set_xticks(node_counts)
-    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.grid(visible=True, linestyle="--", alpha=0.5)
     ax.legend(frameon=True, facecolor="white", framealpha=0.9)
     plt.tight_layout()
     fig1_path = "docs/figures/fig1_cluster_latency_scaling.png"

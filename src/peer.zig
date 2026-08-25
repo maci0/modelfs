@@ -109,7 +109,11 @@ pub const Server = struct {
 fn acceptLoop(self: *Server, fd: c_int) void {
     var failing = false;
     while (self.running.load(.acquire)) {
-        const cfd = c.accept(fd, .{ .__sockaddr__ = null }, null);
+        // The accepted address rides along so security-relevant events can
+        // name their source; connection handlers are the only consumers.
+        var peer: c.struct_sockaddr_in = undefined;
+        var peer_len: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        const cfd = c.accept(fd, .{ .__sockaddr__ = @ptrCast(&peer) }, &peer_len);
         if (cfd < 0) {
             if (!self.running.load(.acquire)) return;
             const e = sys.errno();
@@ -138,7 +142,7 @@ fn acceptLoop(self: *Server, fd: c_int) void {
             sys.close(cfd);
             continue;
         }
-        const t = std.Thread.spawn(.{}, handleConn, .{ self, cfd }) catch |err| {
+        const t = std.Thread.spawn(.{}, handleConn, .{ self, cfd, peer }) catch |err| {
             std.log.warn("peer http: connection handler spawn failed ({t}); dropping fd {d}", .{ err, cfd });
             _ = self.http_inflight.fetchSub(1, .monotonic);
             sys.close(cfd);
@@ -222,7 +226,21 @@ fn readHeadFullDeadline(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out
     return error.HeadTooBig;
 }
 
-fn handleConn(self: *Server, fd: std.posix.fd_t) void {
+/// "IP:port" text for a connected peer's address, for security-event log
+/// lines. Falls back to "unknown" rather than failing the caller: an
+/// unformattable address (never seen with AF_INET accepts) must still log.
+fn peerAddrText(peer: c.struct_sockaddr_in, buf: []u8) []const u8 {
+    const raw = std.mem.bigToNative(u32, peer.sin_addr.s_addr);
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+        @as(u8, @truncate(raw >> 24)),
+        @as(u8, @truncate(raw >> 16)),
+        @as(u8, @truncate(raw >> 8)),
+        @as(u8, @truncate(raw)),
+        std.mem.bigToNative(u16, peer.sin_port),
+    }) catch "unknown";
+}
+
+fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) void {
     defer {
         _ = self.http_inflight.fetchSub(1, .monotonic);
         sys.close(fd);
@@ -267,9 +285,12 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     const auth = proto.headerGet(head, "Authorization") orelse "";
     if (!proto.bearerOk(auth, self.psk)) {
         // Security-relevant event: without this line a wrong-PSK node or an
-        // unauthenticated prober is invisible to the operator. Bounded by the
-        // accept loop's inflight cap, so it cannot flood faster than 16/s.
-        std.log.warn("peer http: rejected unauthorized request", .{});
+        // unauthenticated prober is invisible to the operator, and without
+        // the source address a probing campaign leaves nothing to
+        // investigate after the fact. Bounded by the accept loop's inflight
+        // cap, so it cannot flood faster than 16/s.
+        var abuf: [64]u8 = undefined;
+        std.log.warn("peer http: rejected unauthorized request from {s}", .{peerAddrText(peer, &abuf)});
         _ = self.store.stats.http_unauthorized.fetchAdd(1, .monotonic);
         replyStatus(self, fd, "401 Unauthorized");
         return;
@@ -1139,6 +1160,23 @@ test "groupPathsByPeerId orders ties by ip and port, never by arrival order" {
     // (fabric address first, then the mgmt pair by ip/port).
     try std.testing.expectEqualSlices(usize, &.{0}, groups2[0]);
     try std.testing.expectEqualSlices(usize, &.{ 3, 2, 1 }, groups2[1]);
+}
+
+test "peerAddrText formats the accepted peer address for security logs" {
+    // The 401 rejection line names its source: a probing campaign must be
+    // attributable after the fact (THREAT_MODEL R8). Loopback and a routable
+    // address both format exactly, port included.
+    var buf: [64]u8 = undefined;
+    var lo = std.mem.zeroes(c.struct_sockaddr_in);
+    lo.sin_family = c.AF_INET;
+    lo.sin_port = std.mem.nativeToBig(u16, 18080);
+    lo.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    try std.testing.expectEqualStrings("127.0.0.1:18080", peerAddrText(lo, &buf));
+
+    var far = std.mem.zeroes(c.struct_sockaddr_in);
+    far.sin_port = std.mem.nativeToBig(u16, 65535);
+    far.sin_addr.s_addr = std.mem.nativeToBig(u32, 0xC0A80064); // 192.168.0.100
+    try std.testing.expectEqualStrings("192.168.0.100:65535", peerAddrText(far, &buf));
 }
 
 /// Connected socketpair with `response` already written into fds[0]: a

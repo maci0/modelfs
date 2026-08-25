@@ -16,15 +16,23 @@ target-version = "py310"
 # import hygiene (TID), implicit namespace packages (INP), naming
 # conventions (N), typing-only imports left at runtime (TC), function
 # complexity (C90), blocking calls inside asyncio loops (ASYNC),
-# blind exception catches (BLE), and redundant raise parens (RSE).
+# blind exception catches (BLE), redundant raise parens (RSE),
+# exception-handling anti-patterns (TRY), exception messages that hide
+# context in inline literals (EM), executable-bit vs shebang mismatches
+# (EXE), and boolean-trap positional flags (FBT).
 select = [
     "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
     "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
-    "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE",
+    "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE", "TRY", "EM",
+    "EXE", "FBT",
 ]
 
 [tool.mypy]
 strict = true
+# mypy's second bundle beyond --strict: everything under --extra-checks
+# (today overlapping the explicit error codes below; tomorrow it also picks
+# up new opt-in checks in the 2.x line instead of leaving them off).
+extra_checks = true
 # Beyond the strict bundle: flag unreachable code and redundant/truthiness
 # mistakes, require code-scoped ignores, catch possibly-undefined names,
 # overriding methods that widen mutable base attributes, use of APIs
@@ -53,5 +61,11 @@ enable_error_code = [
     "explicit-override",
     "empty-body",
     "type-abstract",
+    # match arms must cover every variant, not fall through silently
+    "exhaustive-match",
+    # reveal_type must be imported, not relied on leaking from a stub
+    "unimported-reveal",
+    # an awaited value assigned and dropped must not pass silently
+    "unused-awaitable",
 ]
 

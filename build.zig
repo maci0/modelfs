@@ -48,6 +48,22 @@ fn vendoredFuseMismatch(b: *std.Build) ?[]const u8 {
     return null;
 }
 
+/// Preflight for the most common first-build failure: without the libfuse3
+/// headers, translate-c fails with a clang "file not found" buried in compile
+/// noise. Name the missing package and the escape hatch instead.
+fn fuseHeadersMissing(b: *std.Build, fuse_inc: []const u8) ?[]const u8 {
+    std.Io.Dir.cwd().access(b.graph.io, fuse_inc, .{}) catch |err| {
+        // Unreadable for any other reason: let translate-c report what it sees.
+        if (err != error.FileNotFound) return null;
+        return std.fmt.allocPrint(
+            b.allocator,
+            "libfuse3 headers not found at {s}: install them from your package manager (libfuse3-dev on Debian/Ubuntu, fuse3-devel on Fedora/RHEL), or pass -Dfuse-include=<dir> if they live elsewhere",
+            .{fuse_inc},
+        ) catch @panic("out of memory");
+    };
+    return null;
+}
+
 /// One libfuse3 link contract for the executable and the test binary alike:
 /// an explicit -Dfuse-lib dir (cross builds, pkg-config disabled) or the
 /// system default.
@@ -75,6 +91,18 @@ pub fn build(b: *std.Build) void {
 
     const fuse_inc = b.option([]const u8, "fuse-include", "libfuse3 headers") orelse "/usr/include/fuse3";
     const fuse_lib = b.option([]const u8, "fuse-lib", "libfuse3 library dir");
+
+    // Edit-test loop: substring match on test names, so a contributor working
+    // in one module pays for that module's tests, not all of them.
+    // zig build test -Dtest-filter=store
+    const test_filter = b.option([]const u8, "test-filter", "only run unit tests whose name contains this substring");
+
+    if (fuseHeadersMissing(b, fuse_inc)) |msg| {
+        const fail = b.addFail(msg);
+        b.getInstallStep().dependOn(&fail.step);
+        test_step.dependOn(&fail.step);
+        return;
+    }
 
     // `modelfs version` reports the release from build.zig.zon, the single
     // source of truth; extracted here because 0.16 exposes no graph API for it.
@@ -142,6 +170,7 @@ pub fn build(b: *std.Build) void {
         .root_module = test_mod,
         .use_llvm = true,
         .use_lld = true,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_unit = b.addRunArtifact(unit);
     test_step.dependOn(&run_unit.step);

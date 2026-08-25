@@ -7,6 +7,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
 
+# CI installs the pinned Python tooling into .venv and puts it on PATH before
+# running this script; do the same locally so a created-but-not-activated
+# .venv is still what checks run with, matching CI exactly.
+if [[ -d "${ROOT_DIR}/.venv/bin" ]]; then
+    export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
+fi
+
 fail() {
     echo "FAIL: $1" >&2
     exit 1

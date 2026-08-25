@@ -69,18 +69,22 @@ pub const PathCand = struct {
     }
 };
 
-/// Total order for score ties: ip bytes, then port. Candidate lists arrive
-/// in lease-directory readdir order (addresses in the publisher's
-/// getifaddrs order), so an unspecified tie would let environment
-/// enumeration order decide which peer serves a piece; cold clusters start
-/// every path at the same prior, making ties the steady state until the
-/// first goodput samples land.
-fn candTieLess(a: PathCand, b: PathCand) bool {
-    switch (std.mem.order(u8, a.ip, b.ip)) {
+/// Total order for score ties over an (ip, port) address: ip bytes, then
+/// port. Candidate lists arrive in lease-directory readdir order (addresses
+/// in the publisher's getifaddrs order), so an unspecified tie would let
+/// environment enumeration order decide which peer serves a piece; cold
+/// clusters start every path at the same prior, making ties the steady state
+/// until the first goodput samples land.
+fn addrTieLess(a_ip: []const u8, a_port: u16, b_ip: []const u8, b_port: u16) bool {
+    switch (std.mem.order(u8, a_ip, b_ip)) {
         .lt => return true,
         .gt => return false,
-        .eq => return a.port < b.port,
+        .eq => return a_port < b_port,
     }
+}
+
+fn candTieLess(a: PathCand, b: PathCand) bool {
+    return addrTieLess(a.ip, a.port, b.ip, b.port);
 }
 
 /// The same tie-break over live catalog Paths: score descending, then ip
@@ -89,11 +93,7 @@ fn candTieLess(a: PathCand, b: PathCand) bool {
 /// document's address order, which is the publisher's getifaddrs
 /// enumeration and varies across reboots and machines.
 pub fn pathTieLess(a: Path, b: Path) bool {
-    switch (std.mem.order(u8, a.ip, b.ip)) {
-        .lt => return true,
-        .gt => return false,
-        .eq => return a.port < b.port,
-    }
+    return addrTieLess(a.ip, a.port, b.ip, b.port);
 }
 
 /// Highest score among candidates that have the piece. Null if none. Score

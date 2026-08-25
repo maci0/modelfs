@@ -26,8 +26,6 @@ def main(argv: list[str]) -> int:
         # Same 30s budget as the other script probes: a peer that accepts but
         # never answers must fail the probe, not hang the suite.
         urllib.request.urlopen(req, timeout=30)
-        print("Error: Unauthenticated request was allowed!")
-        return 1
     except urllib.error.HTTPError as e:
         if e.code != HTTP_UNAUTHORIZED:
             print(f"Error: Expected 401, got {e.code}")
@@ -40,6 +38,9 @@ def main(argv: list[str]) -> int:
             print(f"SKIP: no modelfs peer listening on {host}:{port}; start a cluster first")
             return 0
         print(f"Error: unexpected URL failure: {e}")
+        return 1
+    else:
+        print("Error: Unauthenticated request was allowed!")
         return 1
 
 
