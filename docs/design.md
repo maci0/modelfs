@@ -684,17 +684,19 @@ Kill-risk is step 4 with real llama.cpp and a real vLLM directory. If that is wr
 
 Threat model: trusted LAN cluster, untrusted origin possible (public S3, Hub).
 
-| Risk | Mitigation |
-|---|---|
-| Corrupt piece from a peer | blake3 on every chunk before CAS admit; never serve unverified bytes |
-| Namespace spoofing | Authenticate peers (shared token or mTLS on the QUIC/HTTP port) |
-| Origin tampering | Same hashes; origin is untrusted for integrity |
-| Path traversal in FUSE | Pin the tree to the namespace; no `..` out of mount |
-| Hub token leakage | Pull credentials stay in the agent, not in the mount |
-| Accidental world-writable models | Preserve mode from ingest; default 0644 / 0755 |
-| Disk fill | `--cache-size`, `--free-space-ratio`, staging on the CAS disk, never `/tmp` |
+The table below is the original sketch. Only two of its mitigations shipped as written: path-traversal pinning and peer authentication via a static shared token (bearer PSK over plaintext HTTP; mTLS did not ship). No content hashing exists anywhere: pieces fetched from peers are cached and re-served unverified, and origin bytes are trusted as-is. The current threat model, including what these gaps cost, is [THREAT_MODEL.md](THREAT_MODEL.md); do not cite rows below as shipped posture.
 
-v1 auth: static shared secret or mTLS. No anonymous P2P on a public interface.
+| Risk | Mitigation (sketch) | Shipped? |
+|---|---|---|
+| Corrupt piece from a peer | blake3 on every chunk before CAS admit; never serve unverified bytes | No. No hashes at all; see THREAT_MODEL.md gap R2 |
+| Namespace spoofing | Authenticate peers (shared token or mTLS on the QUIC/HTTP port) | Partially: bearer PSK on every endpoint (src/peer.zig), plaintext TCP, no mTLS |
+| Origin tampering | Same hashes; origin is untrusted for integrity | No. Origin bytes are served and cached without verification |
+| Path traversal in FUSE | Pin the tree to the namespace; no `..` out of mount | Yes: `relOk` gate at every external path boundary (src/store.zig `relOk`) |
+| Hub token leakage | Pull credentials stay in the agent, not in the mount | N/A: no pull agent or hub credential handling ships |
+| Accidental world-writable models | Preserve mode from ingest; default 0644 / 0755 | Yes, via passthrough: creation applies the client-requested mode on the origin (src/fuse_fs.zig `mf_create`); cache data is 0644 |
+| Disk fill | `--cache-size`, `--free-space-ratio`, staging on the CAS disk, never `/tmp` | Different mechanism: cachefilesd-style percent-free watermarks `--brun/--bcull/--bstop` (src/cull.zig) |
+
+v1 auth: static shared secret or mTLS. No anonymous P2P on a public interface. Shipped as the static shared secret half only.
 
 ---
 
