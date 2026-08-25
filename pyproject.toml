@@ -21,16 +21,23 @@ target-version = "py312"
 # blind exception catches (BLE), redundant raise parens (RSE),
 # exception-handling anti-patterns (TRY), exception messages that hide
 # context in inline literals (EM), executable-bit vs shebang mismatches
-# (EXE), and boolean-trap positional flags (FBT).
+# (EXE), boolean-trap positional flags (FBT), import sorting/ordering (I),
+# join-to-f-string simplification (FLY), and conventional import aliases (ICN).
 select = [
     "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
     "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
     "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE", "TRY", "EM",
-    "EXE", "FBT",
+    "EXE", "FBT", "I", "FLY", "ICN",
 ]
 
 [tool.mypy]
 strict = true
+# Analyze against the declared runtime (.python-version, CI's setup-uv
+# python-version): a bare mypy run under a different local interpreter must
+# not silently check different stdlib semantics than the gate does.
+python_version = "3.12"
+# Same target set scripts/check.sh passes, so a bare `mypy` matches the gate.
+files = ["scripts"]
 # mypy's second bundle beyond --strict: everything under --extra-checks
 # (today overlapping the explicit error codes below; tomorrow it also picks
 # up new opt-in checks in the 2.x line instead of leaving them off).

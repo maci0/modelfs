@@ -693,7 +693,7 @@ The table below is the original sketch. Only three of its mitigations have any s
 | Origin tampering | Same hashes; origin is untrusted for integrity | No. Origin bytes are served and cached without verification |
 | Path traversal in FUSE | Pin the tree to the namespace; no `..` out of mount | Yes: `relOk` gate at every external path boundary (src/store.zig `relOk`) |
 | Hub token leakage | Pull credentials stay in the agent, not in the mount | N/A: no pull agent or hub credential handling ships |
-| Accidental world-writable models | Preserve mode from ingest; default 0644 / 0755 | Yes, via passthrough: creation applies the client-requested mode on the origin (src/fuse_fs.zig `mf_create`); cache data is 0644 |
+| Accidental world-writable models | Preserve mode from ingest; default 0644 / 0755 | Yes, via passthrough: creation applies the caller's permission bits on the origin (src/fuse_fs.zig `clientCreateMode`; setuid/setgid/sticky stripped); cache data is 0644 |
 | Disk fill | `--cache-size`, `--free-space-ratio`, staging on the CAS disk, never `/tmp` | Different mechanism: cachefilesd-style percent-free watermarks `--brun/--bcull/--bstop` (src/cull.zig) |
 
 v1 auth: static shared secret or mTLS. No anonymous P2P on a public interface. Shipped as the static shared secret half only.

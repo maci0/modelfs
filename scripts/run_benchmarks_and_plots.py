@@ -6,14 +6,15 @@ and plots publication-grade figures using matplotlib.
 """
 
 import os
-import sys
-import time
-import subprocess
 import shutil
+import subprocess
+import sys
 import tempfile
-import urllib.request
+import time
 import urllib.parse
+import urllib.request
 from datetime import UTC, datetime
+
 import matplotlib.pyplot as plt
 
 BENCH_PSK = "bench_psk_key_123456789"

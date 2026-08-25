@@ -1620,6 +1620,27 @@ test "handleConn counts a targetless request line as malformed" {
         if (n == 0) break;
     }
     try std.testing.expectEqual(before + 1, srv.store.stats.http_malformed.load(.monotonic));
+
+    // Same counter on its other bump site: a head that fills the handler's
+    // buffer without ever completing (no "\r\n\r\n" anywhere) is scanner
+    // noise too. Sized to handleConn's own head budget so the test tracks
+    // it; every byte lands before the server can close (it must consume all
+    // of them to hit the limit), so no late write races the close. EOF ends
+    // the drain like above; a reset from the closed socket surfaces as an
+    // error instead.
+    const cfd2 = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    try std.testing.expect(cfd2 >= 0);
+    defer sys.close(cfd2);
+    sys.setSockTimeout(cfd2, 5000);
+    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(cfd2, &addr, 5000));
+    var flood: [4096 * 3 + 512]u8 = undefined;
+    @memset(&flood, 'A');
+    _ = try std.testing.expectEqual(@as(isize, @intCast(flood.len)), sys.writeAll(cfd2, &flood));
+    while (true) {
+        const n = sys.readOnce(cfd2, &sink) catch break;
+        if (n == 0) break;
+    }
+    try std.testing.expectEqual(before + 2, srv.store.stats.http_malformed.load(.monotonic));
 }
 
 test "serveHave answers with the exact cached bitfield blob" {

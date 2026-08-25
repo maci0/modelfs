@@ -19,6 +19,16 @@ fail() {
     exit 1
 }
 
+# Name every missing tool at once instead of dying mid-gate on a bare
+# "command not found"; CONTRIBUTING.md documents where each comes from.
+missing=""
+for tool in zig shellcheck ruff mypy; do
+    command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
+done
+if [[ -n "${missing}" ]]; then
+    fail "required tools not found on PATH:${missing} -- see CONTRIBUTING.md (setup section)"
+fi
+
 echo "=== zig fmt --check ==="
 zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported unformatted files"
 

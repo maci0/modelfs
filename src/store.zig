@@ -982,7 +982,6 @@ pub const Store = struct {
     /// `now_sec` is the caller's monotonic instant (see punchPiece).
     pub fn cullOne(self: *Store, now_sec: i64) bool {
         // Idle time is elapsed time: monotonic clock, immune to NTP steps.
-        const now = now_sec;
         const Cand = struct { f: *Cached, at: i64 };
         var cands: std.ArrayList(Cand) = .empty;
         defer cands.deinit(self.gpa);
@@ -995,7 +994,7 @@ pub const Store = struct {
         while (it.next()) |e| {
             const f = e.value_ptr.*;
             const at = f.last_access.load(.monotonic);
-            if (now - at < recency_secs) continue;
+            if (now_sec - at < recency_secs) continue;
             _ = f.refs.fetchAdd(1, .monotonic);
             cands.append(self.gpa, .{ .f = f, .at = at }) catch {
                 _ = f.refs.fetchSub(1, .monotonic);

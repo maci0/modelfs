@@ -218,10 +218,9 @@ pub const Catalog = struct {
     pub fn haveGet(self: *Catalog, gpa: std.mem.Allocator, rel: []const u8, ip: []const u8, port: u16, now_ms: i64) ?HaveBits {
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
-        const now = now_ms;
         for (self.have_cache.items) |e| {
             if (e.port != port or !std.mem.eql(u8, e.rel, rel) or !std.mem.eql(u8, e.ip, ip)) continue;
-            if (now >= e.expires_ms) return null;
+            if (now_ms >= e.expires_ms) return null;
             const bits = gpa.dupe(u8, e.bits) catch return null;
             return .{ .bits = bits, .piece_size = e.piece_size };
         }
@@ -233,7 +232,6 @@ pub const Catalog = struct {
     /// caller's monotonic-ms instant (see haveGet).
     pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, now_ms: i64) void {
         const gpa = self.gpa;
-        const now = now_ms;
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
         for (self.have_cache.items, 0..) |e, i| {
@@ -245,7 +243,7 @@ pub const Catalog = struct {
             };
             gpa.free(e.bits);
             self.have_cache.items[i].bits = b;
-            self.have_cache.items[i].expires_ms = now + have_ttl_ms;
+            self.have_cache.items[i].expires_ms = now_ms + have_ttl_ms;
             self.have_cache.items[i].piece_size = piece_size;
             return;
         }
@@ -254,7 +252,7 @@ pub const Catalog = struct {
             // expire (items.len >= cap > 0, so a victim always exists).
             var victim: usize = 0;
             for (self.have_cache.items, 0..) |e, i| {
-                if (now >= e.expires_ms) {
+                if (now_ms >= e.expires_ms) {
                     victim = i;
                     break;
                 }
@@ -277,7 +275,7 @@ pub const Catalog = struct {
             .ip = ip_own,
             .port = port,
             .bits = bits_own,
-            .expires_ms = now + have_ttl_ms,
+            .expires_ms = now_ms + have_ttl_ms,
             .piece_size = piece_size,
         }) catch {
             gpa.free(bits_own);
@@ -441,7 +439,6 @@ pub const Catalog = struct {
 
         var new_arena = std.heap.ArenaAllocator.init(self.gpa);
         var new_paths: std.ArrayList(Path) = .empty;
-        const now = now_sec;
 
         while (c.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
@@ -464,7 +461,7 @@ pub const Catalog = struct {
             };
             defer parsed.deinit();
             const lease = parsed.value;
-            if (lease.until < now) continue;
+            if (lease.until < now_sec) continue;
             if (std.mem.eql(u8, lease.id, self.self_id)) continue;
             for (lease.addrs) |a| {
                 self.pushPath(&new_paths, new_arena.allocator(), lease.id, a);
@@ -577,34 +574,36 @@ pub const Catalog = struct {
     pub fn updateGoodput(self: *Catalog, ip: []const u8, port: u16, bps: f64) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        for (self.paths.items) |*p| {
-            if (p.port == port and std.mem.eql(u8, p.ip, ip)) {
-                if (p.ewma_bps <= 1) {
-                    p.ewma_bps = bps;
-                } else {
-                    p.ewma_bps = 0.3 * bps + 0.7 * p.ewma_bps;
-                }
-                return;
-            }
+        const p = self.pathByAddr(ip, port) orelse return;
+        if (p.ewma_bps <= 1) {
+            p.ewma_bps = bps;
+        } else {
+            p.ewma_bps = 0.3 * bps + 0.7 * p.ewma_bps;
         }
     }
 
     pub fn inflight(self: *Catalog, ip: []const u8, port: u16, delta: i32) u32 {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        for (self.paths.items) |*p| {
-            if (p.port == port and std.mem.eql(u8, p.ip, ip)) {
-                if (delta > 0) {
-                    return p.inflight.fetchAdd(@intCast(delta), .monotonic) + @as(u32, @intCast(delta));
-                }
-                const old = p.inflight.load(.monotonic);
-                const sub: u32 = @intCast(-delta);
-                const nv = if (old > sub) old - sub else 0;
-                p.inflight.store(nv, .monotonic);
-                return nv;
-            }
+        const p = self.pathByAddr(ip, port) orelse return 0;
+        if (delta > 0) {
+            return p.inflight.fetchAdd(@intCast(delta), .monotonic) + @as(u32, @intCast(delta));
         }
-        return 0;
+        const old = p.inflight.load(.monotonic);
+        const sub: u32 = @intCast(-delta);
+        const nv = if (old > sub) old - sub else 0;
+        p.inflight.store(nv, .monotonic);
+        return nv;
+    }
+
+    /// Path keyed to (ip, port), or null. Caller must hold mu; every
+    /// address-keyed lookup on the live list goes through here so the
+    /// keying contract cannot drift between callers.
+    fn pathByAddr(self: *Catalog, ip: []const u8, port: u16) ?*Path {
+        for (self.paths.items) |*p| {
+            if (p.port == port and std.mem.eql(u8, p.ip, ip)) return p;
+        }
+        return null;
     }
 };
 

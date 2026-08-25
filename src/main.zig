@@ -1028,7 +1028,9 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     var live_buf: [160]u8 = undefined;
     const live_doc = try std.fmt.bufPrint(&live_buf, "{{\"id\":\"me\",\"pid\":{d},\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"stats\":{{}}}}\n", .{std.os.linux.getpid()});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live_doc));
-    _ = try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d });
+    // The live pid must read as running (exit 0); the stale-document cases
+    // below pin the exit-1 side, so only this branch pins success.
+    try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
 
     // The same path after the daemon died without cleanup (crash, kill -9):
     // the leftover names an exited pid and must read as not running, exit 1,
