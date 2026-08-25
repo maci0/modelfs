@@ -684,7 +684,7 @@ Kill-risk is step 4 with real llama.cpp and a real vLLM directory. If that is wr
 
 Threat model: trusted LAN cluster, untrusted origin possible (public S3, Hub).
 
-The table below is the original sketch. Only two of its mitigations shipped as written: path-traversal pinning and peer authentication via a static shared token (bearer PSK over plaintext HTTP; mTLS did not ship). No content hashing exists anywhere: pieces fetched from peers are cached and re-served unverified, and origin bytes are trusted as-is. The current threat model, including what these gaps cost, is [THREAT_MODEL.md](THREAT_MODEL.md); do not cite rows below as shipped posture.
+The table below is the original sketch. Only three of its mitigations have any shipped counterpart: path-traversal pinning and mode preservation (via the origin create), plus peer authentication as a static shared token only (bearer PSK over plaintext HTTP; mTLS did not ship). No content hashing exists anywhere: pieces fetched from peers are cached and re-served unverified, and origin bytes are trusted as-is. The current threat model, including what these gaps cost, is [THREAT_MODEL.md](THREAT_MODEL.md); do not cite rows below as shipped posture.
 
 | Risk | Mitigation (sketch) | Shipped? |
 |---|---|---|

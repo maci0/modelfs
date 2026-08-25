@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import urllib.request
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import matplotlib.pyplot as plt
 
 BENCH_PSK = "bench_psk_key_123456789"
@@ -387,7 +387,7 @@ def generate_report(
         f"| {label} | {mbps:.0f} MB/s |"
         for label, mbps in zip(chunk_labels, throughputs_mbps, strict=True)
     )
-    report_date = datetime.now(timezone.utc).date().isoformat()
+    report_date = datetime.now(UTC).date().isoformat()
     report_content = f"""# Benchmarks
 
 | Field | Value |

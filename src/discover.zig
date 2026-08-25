@@ -381,7 +381,6 @@ pub const Catalog = struct {
             std.log.warn("lease publish skipped: origin path too long ({s})", .{self.origin});
             return;
         };
-        _ = sys.mkdirAll(std.mem.span(dir), 0o755);
         var fbuf: [sys.c.PATH_MAX]u8 = undefined;
         const path = sys.joinZ(&fbuf, std.mem.span(dir), self.self_id) catch {
             std.log.warn("lease publish skipped: id \"{s}\" does not fit the lease path", .{self.self_id});
@@ -407,7 +406,18 @@ pub const Catalog = struct {
         };
         // O_NOFOLLOW: the .cluster dir is shared NFS storage, and a symlink
         // planted at our staging name would redirect this truncate-and-write.
-        if (sys.writeFileNoFollow(ztmp, json) != 0) {
+        // The parent directory is created only when the first write misses it
+        // (same shape as store.writeFileMakingParent): an unconditional mkdirAll
+        // here cost one failed mkdir per path component on the origin -- NFS
+        // round trips -- from every node on every discovery tick for the life
+        // of the cluster. A parent that cannot be created surfaces as the
+        // retried write's errno below.
+        var w = sys.writeFileNoFollow(ztmp, json);
+        if (w == -c.ENOENT) {
+            _ = sys.mkdirAll(std.mem.span(dir), 0o755);
+            w = sys.writeFileNoFollow(ztmp, json);
+        }
+        if (w != 0) {
             std.log.warn("lease publish failed at {s}", .{zpath});
             return;
         }
@@ -874,6 +884,11 @@ test "pickBest is exclusive: one winner, skips !have" {
     };
     const i = pickBest(&cands).?;
     try std.testing.expectEqual(@as(usize, 2), i);
+    // Nobody holds the piece: null is the caller's signal to fall through to
+    // the next tier, so both an empty candidate list and an all-!have one
+    // must answer it.
+    try std.testing.expect(pickBest(&.{}) == null);
+    try std.testing.expect(pickBest(&.{cands[0]}) == null);
 }
 
 test "pickBest breaks score ties by ip and port, never by list order" {
@@ -969,6 +984,20 @@ test "publish stages a parseable lease, leaves no tmp, and replaces in place" {
     defer parsed2.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed2.value.addrs.len);
     try std.testing.expectEqualStrings("10.9.9.9", parsed2.value.addrs[0].ip);
+
+    // Regression: publish no longer runs an unconditional mkdirAll before
+    // every write (one failed mkdir per component on the origin -- NFS round
+    // trips -- from every node on every tick). The lazy retry it replaced must
+    // still rebuild the control directory when it is genuinely gone.
+    var cbuf2: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf2, "{s}/.cluster", .{origin_d});
+    sys.deleteTree(std.testing.io, cluster_d);
+    cat2.publish(pub_now);
+    const blob3 = try sys.readFileAlloc(gpa, try sys.toZ(&zbuf, lease_fp), 4096);
+    defer gpa.free(blob3);
+    const parsed3 = try proto.parseLease(gpa, blob3);
+    defer parsed3.deinit();
+    try std.testing.expectEqualStrings("me", parsed3.value.id);
 }
 
 test "refresh skips self and expired leases" {

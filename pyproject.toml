@@ -1,7 +1,9 @@
 # Static analysis configuration for the Python tooling under scripts/.
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+# Matches .python-version and the CI interpreter: the only runtimes these
+# scripts are ever installed and run under.
+target-version = "py312"
 
 [tool.ruff.lint]
 # pycodestyle errors/warnings, pyflakes, bugbear, pyupgrade, simplify,

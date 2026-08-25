@@ -1434,6 +1434,47 @@ test "fault tolerance: traversal path is rejected with 400" {
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "correct_secret", "127.0.0.1", port, "/etc/passwd"));
 }
 
+test "origin stat failures answer 502 while true misses stay healthy 404s" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-originfail");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-originfail");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // A symlink loop under the origin makes stat of everything beneath it
+    // fail with ELOOP deterministically (works even as root): an origin-side
+    // failure, not a miss. deleteTree unlinks the link without following it.
+    var lb: [192]u8 = undefined;
+    var tz: [192]u8 = undefined;
+    var lz: [192]u8 = undefined;
+    const loop_fp = try std.fmt.bufPrint(&lb, "{s}/loop", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), c.symlink(try sys.toZ(&tz, "loop"), try sys.toZ(&lz, loop_fp)));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+    const port = srv.port();
+
+    // Expected-path warning from replyOriginStat; keep it off the runner's
+    // stderr like sibling fault-tolerance tests do. Restored on scope exit.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    // /have and /data must report the origin as unavailable (502, surfacing
+    // here as HttpStatus), never as a healthy miss: a fetching peer and an
+    // operator must be able to tell "nobody has this file" from "the origin
+    // is broken" -- fillFromPeers keys probe_err and its fallback tier on
+    // exactly this distinction.
+    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "secret", "127.0.0.1", port, "loop/x.bin"));
+    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "loop/x.bin", 0, 8));
+
+    // A genuinely absent path stays a healthy miss (404 => PeerMiss), the
+    // shape fillFromPeers relies on to keep probe_err clean on skewed fleets.
+    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, "secret", "127.0.0.1", port, "gone.bin"));
+}
+
 /// Read the kernel-assigned port back from a listening socket (for port 0).
 fn boundPort(fd: c_int) u16 {
     var addr = std.mem.zeroes(c.struct_sockaddr_in);
@@ -1712,6 +1753,13 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
             defer res.deinit(gpa);
             try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
         }
+    }
+    // A routed path without its ?path= parameter is a client error answered
+    // before any storage touch, not a 404 and not a crash.
+    {
+        var res = try roundTrip(port, "GET /have HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
     }
     // /data still demands its Range header (a client error, not a full-file
     // send) and types the 206 body like /have does.

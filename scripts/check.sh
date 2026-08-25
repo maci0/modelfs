@@ -20,7 +20,7 @@ fail() {
 }
 
 echo "=== zig fmt --check ==="
-zig fmt --check src/ build.zig || fail "zig fmt --check reported unformatted files"
+zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported unformatted files"
 
 echo "=== shellcheck ==="
 shellcheck scripts/*.sh || fail "shellcheck reported violations"

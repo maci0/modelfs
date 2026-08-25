@@ -161,11 +161,11 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 |---|---|
 | 200 | `/ping` (`text/plain`, body `ok`) or `/have` (`application/octet-stream` bitmap + `X-Piece-Size`) |
 | 206 | `/data` partial content (`Content-Range`, `application/octet-stream`) |
-| 400 | Undecodable or unsafe (`..`, absolute) `path`; missing or malformed `Range` on `/data` |
+| 400 | Undecodable or unsafe (`..`, absolute) `path`; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
 | 401 | Missing or wrong bearer token |
 | 404 | Unknown path, or the origin has no regular file at `path` |
 | 405 | Any method other than GET (`Allow: GET`) |
-| 416 | `/data` range start at/after EOF, or inverted range |
+| 416 | `/data` range start at/after EOF (an over-long end clamps to EOF instead) |
 | 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write) |
 | 502 | The origin is unreachable or failed (stat/pread error), i.e. retry another peer |
 

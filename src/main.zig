@@ -927,7 +927,9 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
     // The pin path joins cache/pin below; ".." would write outside it.
     if (!store_mod.relOk(rel)) {
-        std.log.err("pin: refusing path outside the mount root", .{});
+        // Suppressed under test like every usage print here, so the refusal
+        // stays assertable without tripping the runner's error-log counter.
+        if (!builtin.is_test) std.log.err("pin: refusing path outside the mount root", .{});
         return 1;
     }
     const rc = store.setPin(rel, on);
@@ -1030,6 +1032,35 @@ test "cmdPeers separates unreachable origins from empty clusters" {
     var nb: [160]u8 = undefined;
     const absent = try std.fmt.bufPrint(&nb, "{s}/does-not-exist", .{origin_d});
     try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = absent }));
+}
+
+test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-pin");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var zb: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    var stbuf: sys.c.struct_stat = undefined;
+
+    // The mount-root prefix and any leading slash are stripped; the pin
+    // artifact lands at cache/pin/<rel>, exactly where punchPiece and
+    // reapIdle consult it. This roundtrip is what makes an operator's pin
+    // actually protect a file from culling.
+    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "/models/gguf/big.gguf", true));
+    const pin_fp = try std.fmt.bufPrint(&pbuf, "{s}/pin/gguf/big.gguf", .{cache_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf) == 0);
+
+    // A ".." component would write outside cache/pin: refused with exit 1,
+    // and nothing may be written for the escaped name.
+    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "../escape.bin", true));
+    const escape_fp = try std.fmt.bufPrint(&pbuf, "{s}/pin/escape.bin", .{cache_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zb, escape_fp), &stbuf) != 0);
+
+    // Unpin removes the artifact so the file becomes cullable again.
+    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "gguf/big.gguf", false));
+    try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf) != 0);
 }
 
 fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {
