@@ -1,32 +1,6 @@
-//! Peer wire helpers: size/range/header parsing, URL codec, bearer auth, and
+//! Peer wire helpers: range/header parsing, URL codec, bearer auth, and
 //! the cluster lease JSON document. Shared by the HTTP server and client.
 const std = @import("std");
-
-pub fn parseSize(s: []const u8) !u64 {
-    if (s.len == 0) return error.BadSize;
-    var i: usize = 0;
-    var n: u64 = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-        const digit = s[i] - '0';
-        n = std.math.mul(u64, n, 10) catch return error.BadSize;
-        n = std.math.add(u64, n, digit) catch return error.BadSize;
-    }
-    if (i == 0) return error.BadSize;
-    var rest = std.mem.trim(u8, s[i..], " \t");
-    if (rest.len > 0 and (rest[rest.len - 1] == 'B' or rest[rest.len - 1] == 'b')) rest = rest[0 .. rest.len - 1];
-    // Exactly one unit character may remain: anything else is trailing
-    // garbage ("16Mi", "1KB2") that must fail, not silently parse as the
-    // prefix's value.
-    if (rest.len == 0) return n;
-    if (rest.len != 1) return error.BadSize;
-    const mul: u64 = switch (rest[0]) {
-        'K', 'k' => 1024,
-        'M', 'm' => 1024 * 1024,
-        'G', 'g' => 1024 * 1024 * 1024,
-        else => return error.BadSize,
-    };
-    return std.math.mul(u64, n, mul) catch return error.BadSize;
-}
 
 const unreserved_lut: [256]bool = blk: {
     var tbl = [_]bool{false} ** 256;
@@ -190,29 +164,6 @@ pub fn formatLease(buf: []u8, id: []const u8, until: i64, addrs: []const LeaseAd
     }
     try w.writeAll("]}");
     return w.buffered();
-}
-
-test "parseSize overflow and invalid" {
-    try std.testing.expectError(error.BadSize, parseSize("9999999999999999999999999999999"));
-    try std.testing.expectError(error.BadSize, parseSize("18446744073709551615G"));
-    try std.testing.expectError(error.BadSize, parseSize("abc"));
-    try std.testing.expectError(error.BadSize, parseSize(""));
-    try std.testing.expectError(error.BadSize, parseSize("12x"));
-    // trailing garbage after a valid prefix must not parse as the prefix
-    try std.testing.expectError(error.BadSize, parseSize("16Mfoo"));
-    try std.testing.expectError(error.BadSize, parseSize("1KB2"));
-}
-
-test "parseSize accepts plain and suffixed values" {
-    try std.testing.expectEqual(@as(u64, 0), try parseSize("0"));
-    try std.testing.expectEqual(@as(u64, 512), try parseSize("512"));
-    try std.testing.expectEqual(@as(u64, 16 * 1024 * 1024), try parseSize("16M"));
-    try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024 * 1024), try parseSize("4G"));
-    try std.testing.expectEqual(@as(u64, 2048), try parseSize("2k"));
-    try std.testing.expectEqual(@as(u64, 4096), try parseSize("4KB"));
-    try std.testing.expectEqual(@as(u64, 3145728), try parseSize("3 MB"));
-    // u64 max is exactly representable
-    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), try parseSize("18446744073709551615"));
 }
 
 test "url encode decode" {

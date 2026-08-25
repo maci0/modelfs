@@ -1124,6 +1124,14 @@ pub const Store = struct {
             }
             if ((st.st_mode & c.S_IFMT) != c.S_IFREG) continue;
             if (st.st_blocks == 0) continue;
+            // Once the sample is full, considerVictim would discard any
+            // candidate that does not beat the youngest sampled entry (same
+            // victimOlder predicate): skip the pin stat and the files-map
+            // probe for those outright, so a large cache under sustained
+            // culling pays one lstat per data file per round instead of an
+            // extra stat and a global-lock hash probe for every file.
+            if (count.* == walk_sample_cap and
+                !victimOlder(st.st_mtim.tv_sec, nrel.len, nrel, &victims[walk_sample_cap - 1])) continue;
             if (self.pinExists(nrel)) continue;
             self.mu.lockUncancelable(self.io);
             const in_mem = self.files.get(nrel) != null;
@@ -2517,6 +2525,58 @@ test "walkData samples oldest-first disk-only files across subdirs" {
     for (want, 0..) |w, i| {
         try std.testing.expectEqualStrings(w, victims[i].rel[0..victims[i].len]);
         if (i > 0) try std.testing.expect(victims[i - 1].at <= victims[i].at);
+    }
+}
+
+test "walkData keeps the oldest cap files when candidates exceed the sample" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-walkcap");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-walkcap");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // More disk-only candidates than walk_sample_cap: the sample must hold
+    // exactly the oldest eight in ascending mtime order. The later (younger)
+    // files arrive after the sample is full and are rejected by the same
+    // victimOlder predicate considerVictim applies -- the early gate that
+    // skips their pin stat and map probe must not change what it would have
+    // sampled.
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const n: usize = Store.walk_sample_cap + 4;
+    for (0..n) |i| {
+        var fb: [320]u8 = undefined;
+        var nb: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "f{d:0>2}.bin", .{i});
+        const fp = try std.fmt.bufPrint(&fb, "{s}/data/{s}", .{ cache_d, name });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "cached"));
+        // Descending age with index: f00 is the oldest, fNN the youngest.
+        const age: i64 = @intCast(100 * (n - i));
+        const past = [2]std.os.linux.timespec{
+            .{ .sec = sys.nowSec() - age, .nsec = 0 },
+            .{ .sec = sys.nowSec() - age, .nsec = 0 },
+        };
+        const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zbuf, fp), &past, 0);
+        try std.testing.expectEqual(@as(usize, 0), rc);
+    }
+
+    var rb: [sys.c.PATH_MAX]u8 = undefined;
+    const root = try sys.joinZ(&rb, cache_d, "data");
+    var victims: [Store.walk_sample_cap]Store.DiskVictim = undefined;
+    var count: usize = 0;
+    st.walkData(std.mem.span(root), "", &victims, &count, 0);
+
+    try std.testing.expectEqual(@as(usize, Store.walk_sample_cap), count);
+    for (&victims, 0..) |*v, i| {
+        var nb: [32]u8 = undefined;
+        const want = try std.fmt.bufPrint(&nb, "f{d:0>2}.bin", .{i});
+        try std.testing.expectEqualStrings(want, v.rel[0..v.len]);
+        if (i > 0) try std.testing.expect(victims[i - 1].at <= v.at);
     }
 }
 
