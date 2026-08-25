@@ -131,6 +131,143 @@ test "relFromFuse rejects .." {
     try std.testing.expect(!isCluster("/gguf/a.gguf"));
 }
 
+/// Collects what readdirResume emits, honoring a per-call quota standing in
+/// for the kernel reply buffer (run returns false once it is spent).
+const DirSink = struct {
+    gpa: std.mem.Allocator,
+    out: std.ArrayList(u8) = .empty,
+    quota: usize = std.math.maxInt(usize),
+
+    fn run(self: *DirSink, name: []const u8, ordinal: fuse.off_t) bool {
+        if (self.quota == 0) return false;
+        self.quota -= 1;
+        var buf: [300]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{d}:{s},", .{ ordinal, name }) catch return false;
+        self.out.appendSlice(self.gpa, line) catch return false;
+        return true;
+    }
+
+    fn deinit(self: *DirSink) void {
+        self.out.deinit(self.gpa);
+    }
+};
+
+const dir_fixture = [_][]const u8{ "one", "two", "three", "four", "five" };
+
+const DirIter = struct {
+    items: []const []const u8,
+    i: usize = 0,
+
+    fn next(self: *DirIter) ?[]const u8 {
+        if (self.i >= self.items.len) return null;
+        const n = self.items[self.i];
+        self.i += 1;
+        return n;
+    }
+};
+
+fn dirFixtureIter() DirIter {
+    return .{ .items = &dir_fixture };
+}
+
+test "readdir resume splits a large listing without duplicates or gaps" {
+    const gpa = std.testing.allocator;
+
+    // One unlimited call emits the whole listing with stable ordinals:
+    // "." and ".." lead, then the origin order.
+    {
+        var iter = dirFixtureIter();
+        var sink = DirSink{ .gpa = gpa };
+        defer sink.deinit();
+        readdirResume(&iter, &sink, 0);
+        try std.testing.expectEqualStrings("1:.,2:..,3:one,4:two,5:three,6:four,7:five,", sink.out.items);
+    }
+
+    // The old all-zero-offset shape made every full-buffer break restart
+    // the directory: chunked calls must instead continue after the last
+    // emitted ordinal, and the concatenation must equal the single call.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(gpa);
+    {
+        var iter = dirFixtureIter();
+        var sink = DirSink{ .gpa = gpa, .quota = 3 };
+        defer sink.deinit();
+        readdirResume(&iter, &sink, 0);
+        try std.testing.expectEqualStrings("1:.,2:..,3:one,", sink.out.items);
+        try joined.appendSlice(gpa, sink.out.items);
+    }
+    {
+        // Resume from ordinal 3 (the value filler was handed for "one").
+        var iter = dirFixtureIter();
+        var sink = DirSink{ .gpa = gpa, .quota = 3 };
+        defer sink.deinit();
+        readdirResume(&iter, &sink, 3);
+        try std.testing.expectEqualStrings("4:two,5:three,6:four,", sink.out.items);
+        try joined.appendSlice(gpa, sink.out.items);
+    }
+    {
+        var iter = dirFixtureIter();
+        var sink = DirSink{ .gpa = gpa };
+        defer sink.deinit();
+        readdirResume(&iter, &sink, 6);
+        try std.testing.expectEqualStrings("7:five,", sink.out.items);
+        try joined.appendSlice(gpa, sink.out.items);
+    }
+    try std.testing.expectEqualStrings("1:.,2:..,3:one,4:two,5:three,6:four,7:five,", joined.items);
+
+    // A rewind (fresh handle, offset 0) reproduces the full listing.
+    {
+        var iter = dirFixtureIter();
+        var sink = DirSink{ .gpa = gpa };
+        defer sink.deinit();
+        readdirResume(&iter, &sink, 0);
+        try std.testing.expectEqualStrings(joined.items, sink.out.items);
+    }
+
+    // A resume offset at or past the end yields nothing.
+    {
+        var iter = dirFixtureIter();
+        var sink = DirSink{ .gpa = gpa };
+        defer sink.deinit();
+        readdirResume(&iter, &sink, 7);
+        try std.testing.expectEqualStrings("", sink.out.items);
+    }
+}
+
+test "rename flag passthrough keeps NOREPLACE and EXCHANGE semantics" {
+    // The flags libfuse forwards ride unchanged into the origin's
+    // renameat2: NOREPLACE must refuse an existing destination instead of
+    // silently overwriting it, and EXCHANGE must swap two names in place.
+    // This pins the translated call surface mf_rename hands the flags to,
+    // argument order included.
+    const io = std.testing.io;
+    var db: [128]u8 = undefined;
+    const scratch = try sys.scratchDir(&db, "modelfs-rename-flags");
+    defer sys.deleteTree(io, scratch);
+
+    var az: [192]u8 = undefined;
+    var bz: [192]u8 = undefined;
+    var za: [192]u8 = undefined;
+    var zb: [192]u8 = undefined;
+    const a_fp = try std.fmt.bufPrint(&az, "{s}/a.bin", .{scratch});
+    const b_fp = try std.fmt.bufPrint(&bz, "{s}/b.bin", .{scratch});
+    const a_z = try sys.toZ(&za, a_fp);
+    const b_z = try sys.toZ(&zb, b_fp);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(a_z, "AAA"));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(b_z, "BBB"));
+
+    // NOREPLACE onto an existing destination fails EEXIST; b keeps its bytes.
+    try std.testing.expect(fuse.renameat2(sys.c.AT_FDCWD, a_z, sys.c.AT_FDCWD, b_z, sys.c.RENAME_NOREPLACE) != 0);
+    try std.testing.expectEqual(sys.c.EEXIST, sys.errno());
+    var rb: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("BBB", try sys.readFileBuf(&rb, b_z));
+
+    // EXCHANGE swaps the two names' contents in place.
+    try std.testing.expectEqual(@as(i32, 0), fuse.renameat2(sys.c.AT_FDCWD, a_z, sys.c.AT_FDCWD, b_z, sys.c.RENAME_EXCHANGE));
+    try std.testing.expectEqualStrings("BBB", try sys.readFileBuf(&rb, a_z));
+    try std.testing.expectEqualStrings("AAA", try sys.readFileBuf(&rb, b_z));
+}
+
 export fn mf_getattr(path: [*c]const u8, stbuf: ?*fuse.struct_stat, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
@@ -483,7 +620,6 @@ export fn mf_rmdir(path: [*c]const u8) callconv(.c) c_int {
 }
 
 export fn mf_rename(old: [*c]const u8, new: [*c]const u8, flags: c_uint) callconv(.c) c_int {
-    _ = flags;
     const st = statePtr();
     var orel: []const u8 = "";
     var nrel: []const u8 = "";
@@ -495,7 +631,15 @@ export fn mf_rename(old: [*c]const u8, new: [*c]const u8, flags: c_uint) callcon
     var b: [sys.c.PATH_MAX]u8 = undefined;
     const oa = st.store.originPath(&a, orel) catch return -sys.c.ENAMETOOLONG;
     const ob = st.store.originPath(&b, nrel) catch return -sys.c.ENAMETOOLONG;
-    if (std.c.rename(oa, ob) != 0) return sys.negErrno();
+    // Namespace ops present the origin's own rename semantics, flags
+    // included: the kernel routes RENAME_NOREPLACE/EXCHANGE through FUSE's
+    // rename2 and libfuse forwards them here. Dropping them would silently
+    // overwrite a destination the caller asked to keep (mv -n, cp -n) or
+    // move instead of swap (renameat2 EXCHANGE). The origin filesystem
+    // answers for whatever it cannot do -- loud failure, never a silently
+    // different operation.
+    if (fuse.renameat2(sys.c.AT_FDCWD, oa, sys.c.AT_FDCWD, ob, flags) != 0)
+        return sys.negErrno();
     // Both names lose their cache identity with this rename: the source name
     // no longer exists on the origin, and the destination name now holds the
     // source's bytes in place of whatever its bits describe. Purge both like
@@ -523,7 +667,6 @@ export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_i
 }
 
 export fn mf_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: fuse.fuse_fill_dir_t, off: fuse.off_t, fi: ?*fuse.fuse_file_info, flags: fuse.enum_fuse_readdir_flags) callconv(.c) c_int {
-    _ = off;
     _ = fi;
     _ = flags;
     const st = statePtr();
@@ -536,21 +679,73 @@ export fn mf_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: fuse.fuse_fil
     const dir = sys.c.opendir(op) orelse return sys.negErrno();
     defer _ = sys.c.closedir(dir);
     const fill = filler orelse return -sys.c.EIO;
-    _ = fill(buf, ".", null, 0, 0);
-    _ = fill(buf, "..", null, 0, 0);
-    const hide_cluster = rel.len == 0;
-    while (sys.c.readdir(dir)) |ent| {
-        const name = sys.dirName(ent);
-        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        if (hide_cluster and std.mem.eql(u8, name, discover.cluster_dir)) continue;
-        var namez: [256]u8 = undefined;
-        if (name.len >= namez.len) continue;
-        @memcpy(namez[0..name.len], name);
-        namez[name.len] = 0;
-        if (fill(buf, &namez, null, 0, 0) != 0) break;
-    }
+    var names = OriginDirNames{ .dir = dir, .hide_cluster = rel.len == 0 };
+    const emit = DirFiller{ .buf = buf, .fill = fill };
+    readdirResume(&names, emit, off);
     return 0;
 }
+
+/// libfuse's readdir contract has two valid modes: ignore the offset and
+/// always pass zero to filler (only legal when the whole listing fits one
+/// reply buffer), or track offsets and resume where the kernel asks. This
+/// handler implements the second: a listing of a models directory past one
+/// reply (~32-128 KiB of fuse_dirent records) made filler report full with
+/// every entry stamped offset 0, so the kernel's next READDIR resumed at 0
+/// and re-received the head of the directory forever -- duplicates without
+/// end in ls/readdir(3). Entries carry stable 1-based ordinals (".", "..",
+/// then origin order); entries at or below the incoming offset are skipped
+/// and emitted entries hand filler their ordinal, which is exactly the
+/// value the kernel returns to resume after them. Extracted from
+/// mf_readdir so the resume contract is drivable in tests without mounting.
+fn readdirResume(names: anytype, emit: anytype, off: fuse.off_t) void {
+    var pos: fuse.off_t = 0;
+    inline for ([_][]const u8{ ".", ".." }) |dot| {
+        pos += 1;
+        if (pos > off) {
+            if (!emit.run(dot, pos)) return;
+        }
+    }
+    while (names.next()) |name| {
+        pos += 1;
+        if (pos <= off) continue;
+        if (!emit.run(name, pos)) return;
+    }
+}
+
+/// The origin-side entry stream of an mf_readdir walk: everything invisible
+/// to the mount (dot entries, the control dir at the root) is filtered here,
+/// so the resume ordinals count only emittable names.
+const OriginDirNames = struct {
+    dir: *anyopaque,
+    hide_cluster: bool,
+
+    fn next(self: *OriginDirNames) ?[]const u8 {
+        while (sys.c.readdir(@ptrCast(self.dir))) |ent| {
+            const name = sys.dirName(ent);
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            if (self.hide_cluster and std.mem.eql(u8, name, discover.cluster_dir)) continue;
+            return name;
+        }
+        return null;
+    }
+};
+
+/// Hands each planned entry to libfuse's filler. False ends the walk, both
+/// on a full reply buffer (filler nonzero) and for a name that cannot ride
+/// the fixed staging buffer; either way the kernel resumes from the last
+/// ordinal actually emitted.
+const DirFiller = struct {
+    buf: ?*anyopaque,
+    fill: fuse.fuse_fill_dir_t,
+
+    fn run(self: DirFiller, name: []const u8, ordinal: fuse.off_t) bool {
+        var namez: [256]u8 = undefined;
+        if (name.len >= namez.len) return true;
+        @memcpy(namez[0..name.len], name);
+        namez[name.len] = 0;
+        return self.fill.?(self.buf, &namez, null, ordinal, 0) == 0;
+    }
+};
 
 export fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.c) c_int {
     const st = statePtr();

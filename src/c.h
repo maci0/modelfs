@@ -1,6 +1,7 @@
 #include <fuse.h>
 #include <fuse_common.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>

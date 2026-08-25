@@ -14,10 +14,45 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
+from pathlib import Path
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    sys.exit(
+        "matplotlib not found: install the pinned Python tooling "
+        "(uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt, "
+        "see CONTRIBUTING.md); this script re-execs under .venv automatically once it exists"
+    )
 
 BENCH_PSK = "bench_psk_key_123456789"
+
+# Same convention as scripts/check.sh: when the pinned .venv exists, run under
+# it, so benchmarks use the declared interpreter (.python-version) and the
+# locked matplotlib instead of whatever python3 is first on PATH.
+_SCRIPT = os.fspath(Path(__file__).resolve())
+_VENV_PYTHON = Path(_SCRIPT).parent.parent / ".venv" / "bin" / "python3"
+
+
+def reexec_under_venv() -> None:
+    if not _VENV_PYTHON.is_file() or Path(sys.executable).samefile(_VENV_PYTHON):
+        return
+    os.execv(os.fspath(_VENV_PYTHON), [os.fspath(_VENV_PYTHON), _SCRIPT, *sys.argv[1:]])
+
+
+def require_fuse() -> None:
+    """Fail with named problems instead of nine daemons dying obscurely later."""
+    problems: list[str] = []
+    if not Path("/dev/fuse").exists():
+        problems.append("/dev/fuse is missing")
+    if shutil.which("fusermount3") is None and shutil.which("fusermount") is None:
+        problems.append("no fusermount3/fusermount helper on PATH")
+    if problems:
+        sys.exit(
+            "cannot run benchmarks: "
+            + "; ".join(problems)
+            + " -- every benchmark mounts a live FUSE filesystem (see CONTRIBUTING.md)"
+        )
 
 
 def unmount(mount_dir: str) -> None:
@@ -457,6 +492,8 @@ peer latency.
 
 
 def main() -> None:
+    reexec_under_venv()
+    require_fuse()
     bin_path = build_modelfs()
     node_counts, latencies_ms = run_cluster_latency_benchmark(bin_path)
     chunk_labels, throughputs_mbps = run_throughput_vs_piece_size_benchmark(bin_path)

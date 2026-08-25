@@ -12,6 +12,13 @@ cd "${ROOT_DIR}"
 # .venv is still what checks run with, matching CI exactly.
 if [[ -d "${ROOT_DIR}/.venv/bin" ]]; then
     export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
+else
+    # CI always runs the requirements-dev.lock.txt versions; without .venv,
+    # PATH's ruff/mypy stand in and their rules can drift from the gate, so
+    # name the substitution instead of letting it surface as an after-push
+    # failure.
+    echo "WARN: .venv not found; running whatever ruff/mypy is on PATH, which may differ from the versions pinned in requirements-dev.lock.txt" >&2
+    echo "WARN: setup: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt" >&2
 fi
 
 fail() {

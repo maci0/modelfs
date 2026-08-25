@@ -14,6 +14,11 @@ pub const Path = struct {
     inflight: std.atomic.Value(u32) = .init(0),
 };
 
+/// Parses a dotted quad into `out` (one byte per octet, in order). The accept
+/// set is exactly the dialer's inet_pton: digits and dots, four parts, octets
+/// capped at 255, and no leading zeros ("0255" is refused, "0" alone is
+/// kept). Every admitted string is therefore dialable verbatim by peer.zig's
+/// inet_pton gate; the fuzz harness below pins this against libc itself.
 pub fn parseV4(s: []const u8, out: *[4]u8) bool {
     var part: u8 = 0;
     var acc: u32 = 0;
@@ -31,6 +36,10 @@ pub fn parseV4(s: []const u8, out: *[4]u8) bool {
         // Octets cap at 255: bail before acc*10 can overflow u32 on long
         // digit runs from untrusted input (peer lease ip fields).
         if (acc > 255) return false;
+        // A second digit after a leading zero ("01", "0255") must fail: libc
+        // inet_pton refuses those spellings, so admitting them here would put
+        // undialable addresses into the path list.
+        if (saw and acc == 0) return false;
         acc = acc * 10 + (ch - '0');
         saw = true;
     }
@@ -731,16 +740,30 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0 + Catalog.have_ttl_ms) == null);
 
     // Distinct keys fill to the cap; one more insert evicts exactly one
-    // entry so the bound holds.
+    // entry so the bound holds. Expiries are staggered (earlier inserts
+    // expire sooner), so the documented victim choice -- expired first,
+    // else soonest to expire -- names a specific casualty per spill, and
+    // the freshest line (a.bin) must survive both.
     var i: usize = 0;
     while (i < Catalog.have_cache_cap) : (i += 1) {
         var name_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "f{d}.bin", .{i});
-        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0, t0);
+        const put_at = t0 - @as(i64, @intCast(Catalog.have_cache_cap - i));
+        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0, put_at);
     }
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
+    // f31's insert evicted soonest-to-expire f0, not the newest entry.
+    try std.testing.expect(cat.haveGet(gpa, "f0.bin", "10.1.0.1", 18080, t0) == null);
+    if (cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0)) |fresh| {
+        gpa.free(fresh.bits);
+    } else return error.TestUnexpectedResult;
     cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0}, 0, t0);
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
+    // The next spill drains the next-soonest expiry in sequence.
+    try std.testing.expect(cat.haveGet(gpa, "f1.bin", "10.1.0.1", 18080, t0) == null);
+    if (cat.haveGet(gpa, "f31.bin", "10.1.0.1", 18080, t0)) |fresh| {
+        gpa.free(fresh.bits);
+    } else return error.TestUnexpectedResult;
 }
 
 test "printable gates lease names and ids for log echo" {
@@ -863,8 +886,103 @@ test "parseV4 validation" {
     // long digit runs must fail validation, not overflow the accumulator
     try std.testing.expect(!parseV4("99999999999.1.1.1", &out));
     try std.testing.expect(!parseV4("1.1.1.99999999999", &out));
-    try std.testing.expect(parseV4("0255.0.0.1", &out));
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 255, 0, 0, 1 }, &out);
+    // leading zeros are refused exactly like the dialer's inet_pton, so an
+    // admitted quad is always dialable as written; a lone 0 stays valid
+    try std.testing.expect(!parseV4("0255.0.0.1", &out));
+    try std.testing.expect(!parseV4("010.1.1.1", &out));
+    try std.testing.expect(!parseV4("1.1.1.01", &out));
+    try std.testing.expect(parseV4("0.0.0.0", &out));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, &out);
+    try std.testing.expect(parseV4("10.0.0.100", &out));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 100 }, &out);
+}
+
+// Lease ip fields are untrusted twice over: published by other nodes' JSON
+// off shared NFS storage, then consumed by dialers that gate through libc
+// inet_pton (peer.zig). parseV4 sits between the two, so its accept set must
+// equal inet_pton's exactly -- a spelling one side refuses and the other
+// admits either strands a live-looking path on every fetch or drops an
+// address the peer would have answered. Unit tests pin known spellings; this
+// harness diffs the pair across the whole input space so any future drift in
+// either parser surfaces as a fuzz failure instead of dead cluster routes.
+
+/// One dotted-quad candidate in the corpus framing the harness reads: u32
+/// length prefix, then the raw bytes.
+fn quadEntry(comptime s: []const u8) [4 + s.len]u8 {
+    var out: [4 + s.len]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(s.len), .little);
+    for (s, 0..) |b, i| out[4 + i] = b;
+    return out;
+}
+
+const seed_quad_ok = quadEntry("192.168.100.10");
+const seed_quad_zero = quadEntry("0.0.0.0");
+const seed_quad_max = quadEntry("255.255.255.255");
+const seed_quad_leading_zero = quadEntry("0255.0.0.1");
+const seed_quad_leading_zero_last = quadEntry("1.2.3.040");
+const seed_quad_overflow_octet = quadEntry("256.1.1.1");
+const seed_quad_long_run = quadEntry("99999999999999999999.1.1.1");
+const seed_quad_empty_part = quadEntry("1..2.3");
+const seed_quad_trailing_dot = quadEntry("1.2.3.");
+const seed_quad_five_parts = quadEntry("10.0.0.1.2");
+const seed_quad_hostname = quadEntry("spark9.example");
+const seed_quad_log_forge = quadEntry("10.0.0.1\r2026-08-26 ERROR forged");
+const seed_quad_trailing_space = quadEntry("10.0.0.1 ");
+const seed_quad_empty = quadEntry("");
+
+const fuzz_quad_corpus = [_][]const u8{
+    &seed_quad_ok,
+    &seed_quad_zero,
+    &seed_quad_max,
+    &seed_quad_leading_zero,
+    &seed_quad_leading_zero_last,
+    &seed_quad_overflow_octet,
+    &seed_quad_long_run,
+    &seed_quad_empty_part,
+    &seed_quad_trailing_dot,
+    &seed_quad_five_parts,
+    &seed_quad_hostname,
+    &seed_quad_log_forge,
+    &seed_quad_trailing_space,
+    &seed_quad_empty,
+};
+
+/// Asserts the cross-implementation contract: parseV4 accepts exactly what
+/// the dialer's inet_pton accepts, hands back the same four octets, and
+/// every accepted address survives a canonical inet_ntop reparse -- so the
+/// ingestion gate and the dial gate can never disagree about a lease ip.
+fn fuzzParseV4One(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [48]u8 = undefined;
+    const s = buf[0..smith.slice(&buf)];
+    // inet_pton reads a C string and stops at the first NUL, so inputs
+    // carrying one have no reference answer to differ against.
+    if (std.mem.indexOfScalar(u8, s, 0) != null) return;
+
+    var quad: [4]u8 = undefined;
+    const ours = parseV4(s, &quad);
+
+    var zbuf: [buf.len + 1]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{s}) catch unreachable;
+    var ref: c.struct_in_addr = undefined;
+    const rc = c.inet_pton(c.AF_INET, z.ptr, &ref);
+    try std.testing.expectEqual(ours, rc == 1);
+
+    if (!ours) return;
+    // Same bytes the dialer binds: struct in_addr stores the octets in
+    // network order.
+    try std.testing.expectEqualSlices(u8, &quad, std.mem.asBytes(&ref));
+
+    // The canonical spelling reparses to the identical address on both
+    // sides, so publishers echoing inet_ntop output stay reachable.
+    var nbuf: [c.INET_ADDRSTRLEN]u8 = undefined;
+    const canon = c.inet_ntop(c.AF_INET, &ref, &nbuf, nbuf.len) orelse return error.NtopFailed;
+    var back: [4]u8 = undefined;
+    try std.testing.expect(parseV4(std.mem.span(canon), &back));
+    try std.testing.expectEqualSlices(u8, &quad, &back);
+}
+
+test "fuzz lease ip parsing matches the dialer's inet_pton exactly" {
+    try std.testing.fuzz({}, fuzzParseV4One, .{ .corpus = &fuzz_quad_corpus });
 }
 
 test "path score: 200G L2 beats 10G routed beats busy 200G" {
@@ -1064,16 +1182,17 @@ test "refresh drops lease addresses that are not dialable dotted quads" {
     try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
 
     // A forged lease off shared storage: its first address carries CR plus
-    // a forged journal line, its second a hostname no dialer can resolve.
-    // Both must die at ingestion -- every dialer inet_pton's the field, and
-    // the control bytes would otherwise ride the fetch-failure log line
-    // verbatim. Only the trailing dotted quad survives.
+    // a forged journal line, its second a hostname no dialer can resolve,
+    // its third a leading-zero quad parseV4 must refuse exactly like the
+    // dialer's inet_pton (admitting it would list a path no fetch can
+    // ever use). Only the trailing dotted quad survives.
     var zbuf: [192]u8 = undefined;
     var pbuf: [192]u8 = undefined;
     const fp = try std.fmt.bufPrint(&pbuf, "{s}/forged.json", .{cluster_d});
     const forged = "{\"id\":\"forged\",\"until\":4102444800,\"addrs\":[" ++
         "{\"ip\":\"10.0.0.1\\r2026-08-26 ERROR forged\",\"port\":18080,\"mbps\":0}," ++
         "{\"ip\":\"spark9.example\",\"port\":18080,\"mbps\":0}," ++
+        "{\"ip\":\"010.0.0.7\",\"port\":18080,\"mbps\":0}," ++
         "{\"ip\":\"10.0.0.9\",\"port\":18080,\"mbps\":0}]}";
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), forged));
 

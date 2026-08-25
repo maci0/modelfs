@@ -2562,6 +2562,57 @@ test "beginFill surfaces allocation failure instead of spinning" {
     try std.testing.expectError(error.OutOfMemory, st.beginFill(f, 0));
 }
 
+test "beginFill answers filled and raced without claiming or marking" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-claim");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-claim");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Already filled (including by a concurrent filler that finished while
+    // we waited): the second hydrator must see .filled and take no claim,
+    // so the first filler's finishPiece never finds a dangling entry.
+    const f = try st.get("claim.bin", 48);
+    defer st.releaseFile(f);
+    f.mu.lockUncancelable(std.testing.io);
+    f.bits.set(0);
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect((try st.beginFill(f, 0)) == .filled);
+    f.mu.lockUncancelable(std.testing.io);
+    const no_dangling_claim = !f.filling.contains(0);
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(no_dangling_claim);
+
+    // Raced: the piece starts past EOF, exactly the state a concurrent
+    // truncate leaves between claim and sample. The claim must come back
+    // dropped with nothing marked -- a hydrator treating this as data would
+    // mark hole zeros as a filled piece (the underflow hazard hydratePiece
+    // documents for an empty buf).
+    try std.testing.expect((try st.beginFill(f, 5)) == .raced);
+    f.mu.lockUncancelable(std.testing.io);
+    const dropped_unmarked = !f.bits.get(5) and f.filling.count() == 0;
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(dropped_unmarked);
+
+    // The raced piece stays fillable once it is in range again: the drop
+    // must not poison later claims. Growing size and bitfield together under
+    // file.mu is the same move reconcileSize and truncate make.
+    f.mu.lockUncancelable(std.testing.io);
+    f.bits.deinit(gpa);
+    f.bits = try piece.Bitfield.init(gpa, piece.count(112, st.piece_size));
+    f.size = 112;
+    f.mu.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 5)).len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 5, "0123456789abcdef"));
+    try std.testing.expect(st.hasPiece(f, 5));
+}
+
 test "sidecar save and cache open recreate a deleted parent directory" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
