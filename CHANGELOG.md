@@ -1,5 +1,11 @@
 # Changelog & Autoresearch Notebook
 
+## [API review pass] - 2026-08-25
+- **Unknown peer paths now answer 404 consistently**: routing ran after path-parameter decoding, so `GET /nope` answered 400 Bad Request while `GET /nope?path=x.bin` answered 404 Not Found; one resource state had two answers depending on the query string. Dispatch now happens before any input decoding, and only `/have`/`/data` pay for it. Covered end to end (bare path, valid query, bad escape, traversal attempt behind an unknown path).
+- **405 responses name their method**: a non-GET request was refused with a bare status line; RFC 9110 §15.5.5 requires `Allow`, and without it a probing client has no way to learn the API shape. The refusal now carries `Allow: GET`.
+- **Success replies are typed like their siblings already were**: `/have` sent `Content-Type: application/octet-stream` but the `/data` 206 and the `/ping` body went out untyped. Both now declare theirs (`application/octet-stream`, `text/plain`), so ordinary HTTP clients can tell bytes from text.
+- **The wire contract is written down**: docs/architecture.md gained the per-endpoint status-code table (200/206/400/401/404/405/416/500/502 with the exact trigger each maps to) plus the framing guarantees (`Content-Length` always present, `Connection: close`, empty error bodies), matching what the tests pin.
+
 ## [Observability review pass] - 2026-08-25
 - **Read latency is now measurable**: rates and byte totals existed, but nothing answered "reads got slow". `mf_read` accumulates wall time (`read_nanos`) and piece fills accumulate claim-through-cache-write stall by tier (`fill_peer_nanos` / `fill_origin_nanos`); the tick line publishes per-op averages (`rd_us`, `fill_ms peer/nfs`) and status.json the lifetime totals. Warm reads pay two clock reads.
 - **Origin outages no longer hide from the read error counter**: `mf_read` counted only cache-read failures, so an NFS outage failing every uncached read left `reads_err` flat while clients saw an EIO storm. Service-side failures (origin stat failure, entry OOM, hydration failure) now count; caller misuse (traversal paths, bad offsets, EISDIR) deliberately stays uncounted so the rate tracks service health.

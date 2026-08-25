@@ -248,7 +248,9 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     const method = it.next() orelse return;
     const target = it.next() orelse return;
     if (!std.mem.eql(u8, method, "GET")) {
-        replyStatus(self, fd, "405 Method Not Allowed");
+        // RFC 9110 §15.5.5: a 405 must name the methods the resource
+        // supports, so a probing client can discover the shape of the API.
+        reply(fd, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
     const auth = proto.headerGet(head, "Authorization") orelse "";
@@ -263,7 +265,16 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
     }
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) {
-        reply(fd, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        reply(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        return;
+    }
+    // Route before touching the query string: an unknown path is 404 no
+    // matter what rides behind it. Validating the path parameter first used
+    // to shadow the 404 branch, so e.g. "/nope" answered 400 on one request
+    // shape and 404 on another.
+    const routed = std.mem.eql(u8, path, "/have") or std.mem.eql(u8, path, "/data");
+    if (!routed) {
+        replyStatus(self, fd, "404 Not Found");
         return;
     }
     var rel_buf: [4096]u8 = undefined;
@@ -277,11 +288,11 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
         replyStatus(self, fd, "400 Bad Request");
         return;
     }
-    if (std.mem.eql(u8, path, "/have")) {
+    if (path[1] == 'h') {
         serveHave(self, fd, rel);
         return;
     }
-    if (std.mem.eql(u8, path, "/data")) {
+    {
         const rh = proto.headerGet(head, "Range") orelse {
             replyStatus(self, fd, "400 Bad Request");
             return;
@@ -291,9 +302,7 @@ fn handleConn(self: *Server, fd: std.posix.fd_t) void {
             return;
         };
         serveData(self, fd, rel, rg);
-        return;
     }
-    replyStatus(self, fd, "404 Not Found");
 }
 
 fn decodePath(target: []const u8, out: []u8) ![]u8 {
@@ -510,7 +519,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     if (!hydrateRange(self, fd, file, rg.start, want, size)) return;
 
     var hdr: [220]u8 = undefined;
-    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {d}-{d}/{d}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
+    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {d}-{d}/{d}\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
         rg.start, rg_end, size, want,
     }) catch return;
     _ = sys.writeAll(fd, h);
@@ -1520,34 +1529,58 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
     defer srv.stop();
     const port = srv.port();
 
-    // /ping is the liveness probe: 200 with body "ok".
+    // /ping is the liveness probe: 200 with body "ok", typed like every
+    // other success reply here.
     {
         var res = try roundTrip(port, "GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Type: text/plain\r\n") != null);
         try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\nok"));
     }
-    // A non-GET method is refused even with valid auth.
+    // A non-GET method is refused even with valid auth, and the refusal
+    // names what the resource accepts (RFC 9110 §15.5.5).
     {
         var res = try roundTrip(port, "POST /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, res.items, "Allow: GET\r\n") != null);
     }
-    // Unknown paths are 404, not confused with origin misses.
+    // Unknown paths are 404 regardless of the query string behind them.
+    // Regression: routing used to run after path-parameter decoding, so an
+    // unknown path without a decodable ?path= answered 400 while the same
+    // path with one answered 404 -- two answers for one resource state.
     {
-        var res = try roundTrip(port, "GET /nope?path=x.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
-        defer res.deinit(gpa);
-        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+        for ([_][]const u8{
+            "GET /nope HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n",
+            "GET /nope?path=x.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n",
+            "GET /nope?path=%zz HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n",
+            "GET /nope?path=..%2Fx HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n",
+        }) |req| {
+            var res = try roundTrip(port, req);
+            defer res.deinit(gpa);
+            try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+        }
     }
-    // /data without a Range header is a client error, not a full-file send.
+    // /data still demands its Range header (a client error, not a full-file
+    // send) and types the 206 body like /have does.
     {
         var fbuf: [192]u8 = undefined;
         var fz: [192]u8 = undefined;
         const fp = try std.fmt.bufPrint(&fbuf, "{s}/r.bin", .{origin_d});
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), "data"));
-        var res = try roundTrip(port, "GET /data?path=r.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
-        defer res.deinit(gpa);
-        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+        {
+            var res = try roundTrip(port, "GET /data?path=r.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+            defer res.deinit(gpa);
+            try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+        }
+        {
+            var res = try roundTrip(port, "GET /data?path=r.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-3\r\nConnection: close\r\n\r\n");
+            defer res.deinit(gpa);
+            try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 206 Partial Content\r\n"));
+            try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Type: application/octet-stream\r\n") != null);
+            try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\ndata"));
+        }
     }
 }
 
