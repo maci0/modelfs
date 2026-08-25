@@ -174,23 +174,22 @@ const dial_timeout_ms: u32 = 15_000;
 /// sending a partial head slower than the timeout.
 const head_deadline_ms: i64 = 10_000;
 
-/// Wall-clock budget for reading one response body: a base allowance plus
-/// 1s per expected MiB (Content-Length is known before any body byte is
-/// read). Same per-recv-reset hole as the head budget covers -- a dribbling
-/// peer must not hold a client fill (and the piece's filling claim every
-/// other reader of that piece waits behind) open-endedly -- scaled so healthy
-/// but slow links never trip it: a 16 MiB piece gets 76s (needs ~0.2 MB/s).
+/// Wall-clock budget for one response body, read or served: a base allowance
+/// plus 1s per expected MiB (Content-Length is known before any body byte
+/// moves). Same per-transfer-reset hole as the head budget covers: SO_RCVTIMEO
+/// resets on every dribbled byte, so a slow sender must not hold a client fill
+/// (and the piece's filling claim every other reader of that piece waits
+/// behind) open-endedly; SO_SNDTIMEO resets on every drain, so a receiver
+/// reading one byte per timeout window cannot pin a /data handler slot (plus
+/// thread, socket, and entry reference) forever -- sixteen of those deaden the
+/// peer service permanently. Scaled so healthy but slow links never trip it:
+/// a 16 MiB piece gets 76s (needs ~0.2 MB/s).
 const body_deadline_base_ms: i64 = 60_000;
 const body_deadline_per_mib_ms: i64 = 1_000;
 
-/// Wall-clock budget for serving one /data response body, same shape and
-/// scaling as the client-side body budget above. SO_SNDTIMEO is per-send
-/// and resets whenever the receiver drains any bytes, so without a total cap
-/// a peer reading one byte per timeout window pins an inflight handler slot
-/// (plus thread, socket, and entry reference) forever -- sixteen of them
-/// deaden the peer service permanently. The same scaling argument applies:
-/// a 16 MiB range gets 76s, ~0.2 MB/s, before the connection is dropped.
-fn serveBodyDeadlineFor(want_len: u64) i64 {
+/// Deadline instant for the body budget above, stamped at the call so every
+/// chunk check compares against one sample.
+fn bodyDeadlineFor(want_len: u64) i64 {
     const mibs: i64 = @intCast(want_len / (1024 * 1024));
     return sys.monoMs() + body_deadline_base_ms + mibs * body_deadline_per_mib_ms;
 }
@@ -482,7 +481,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
 /// status line would be parsed as body bytes and corrupt the response. The
 /// user-space fallback streams fixed chunks so a large range cannot drive a
 /// want-sized allocation. `deadline_ms` bounds the whole send (see
-/// serveBodyDeadlineFor): SO_SNDTIMEO resets on every drained byte, so the
+/// bodyDeadlineFor): SO_SNDTIMEO resets on every drained byte, so the
 /// per-chunk clamp to its remainder is what keeps a dribbling receiver from
 /// holding an inflight slot forever.
 fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, deadline_ms: i64) void {
@@ -611,7 +610,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     }) catch return;
     _ = sys.writeAll(fd, h);
 
-    streamRange(self, fd, file, rg.start, want, serveBodyDeadlineFor(want));
+    streamRange(self, fd, file, rg.start, want, bodyDeadlineFor(want));
 }
 
 fn reply(fd: std.posix.fd_t, s: []const u8) void {
@@ -753,13 +752,6 @@ fn dial(ip: []const u8, port: u16) !c_int {
 
 fn readFlexBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8) ![]u8 {
     return readFlexBodyAllocDeadline(gpa, fd, dest, null);
-}
-
-/// Total body budget scaled to the expected length (1s per MiB on top of the
-/// base allowance), unless the caller overrides it (tests inject short ones).
-fn bodyDeadlineFor(want_len: usize) i64 {
-    const mibs: i64 = @intCast(want_len / (1024 * 1024));
-    return sys.monoMs() + body_deadline_base_ms + mibs * body_deadline_per_mib_ms;
 }
 
 fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
