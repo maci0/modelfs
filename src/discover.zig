@@ -210,12 +210,15 @@ pub const Catalog = struct {
     }
 
     /// Owned copy of a fresh /have bitmap for (rel, ip, port), or null when
-    /// no unexpired entry exists. Copies under the lock so the entry cannot
-    /// be replaced or freed between lookup and use by a concurrent filler.
-    pub fn haveGet(self: *Catalog, gpa: std.mem.Allocator, rel: []const u8, ip: []const u8, port: u16) ?HaveBits {
+    /// no unexpired entry exists at `now_ms`, the caller's monotonic-ms
+    /// instant: the TTL decision is a pure function of cache state plus
+    /// instant, so tests drive expiry virtually instead of sleeping.
+    /// Copies under the lock so the entry cannot be replaced or freed
+    /// between lookup and use by a concurrent filler.
+    pub fn haveGet(self: *Catalog, gpa: std.mem.Allocator, rel: []const u8, ip: []const u8, port: u16, now_ms: i64) ?HaveBits {
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
-        const now = sys.monoMs();
+        const now = now_ms;
         for (self.have_cache.items) |e| {
             if (e.port != port or !std.mem.eql(u8, e.rel, rel) or !std.mem.eql(u8, e.ip, ip)) continue;
             if (now >= e.expires_ms) return null;
@@ -226,10 +229,11 @@ pub const Catalog = struct {
     }
 
     /// Caches a successful probe result; failures are never cached so a
-    /// transiently down peer is retried on the next piece.
-    pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32) void {
+    /// transiently down peer is retried on the next piece. `now_ms` is the
+    /// caller's monotonic-ms instant (see haveGet).
+    pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, now_ms: i64) void {
         const gpa = self.gpa;
-        const now = sys.monoMs();
+        const now = now_ms;
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
         for (self.have_cache.items, 0..) |e, i| {
@@ -652,11 +656,15 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &addrs, &.{}, &.{});
     defer cat.deinit();
 
-    try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080) == null);
+    // One edge read of the real clock; every decision below runs on this
+    // instant or offsets of it, so the TTL behavior is replayable exactly.
+    const t0 = sys.monoMs();
 
-    cat.havePut("a.bin", "10.0.0.1", 18080, &.{ 1, 2 }, 4096);
+    try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0) == null);
+
+    cat.havePut("a.bin", "10.0.0.1", 18080, &.{ 1, 2 }, 4096, t0);
     {
-        const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080).?;
+        const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0).?;
         defer gpa.free(got.bits);
         try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, got.bits);
         // The alignment context rides with the bits: a TTL hit must answer
@@ -664,13 +672,13 @@ test "have cache stores, replaces, evicts at cap, and frees" {
         try std.testing.expectEqual(@as(u32, 4096), got.piece_size);
     }
     // A different rel, ip, or port must not hit this entry.
-    try std.testing.expect(cat.haveGet(gpa, "b.bin", "10.0.0.1", 18080) == null);
-    try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.2", 18080) == null);
+    try std.testing.expect(cat.haveGet(gpa, "b.bin", "10.0.0.1", 18080, t0) == null);
+    try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.2", 18080, t0) == null);
 
     // Same key replaces in place instead of growing the table.
-    cat.havePut("a.bin", "10.0.0.1", 18080, &.{3}, 8192);
+    cat.havePut("a.bin", "10.0.0.1", 18080, &.{3}, 8192, t0);
     {
-        const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080).?;
+        const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0).?;
         defer gpa.free(got.bits);
         try std.testing.expectEqualSlices(u8, &.{3}, got.bits);
         try std.testing.expectEqual(@as(u32, 8192), got.piece_size);
@@ -678,10 +686,13 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     try std.testing.expectEqual(@as(usize, 1), cat.have_cache.items.len);
 
     // Past the TTL the same entry answers nothing: stale bits would send
-    // fills to pieces a peer no longer has. (Backdating the stamp instead of
-    // sleeping keeps the suite fast.)
-    cat.have_cache.items[0].expires_ms = sys.monoMs() - 1;
-    try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080) == null);
+    // fills to pieces a peer no longer has. Virtual time pins the exact
+    // boundary without sleeping: still fresh one tick before expiry, gone
+    // the moment the window closes (haveGet is exclusive of expires_ms).
+    if (cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0 + Catalog.have_ttl_ms - 1)) |fresh| {
+        gpa.free(fresh.bits);
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0 + Catalog.have_ttl_ms) == null);
 
     // Distinct keys fill to the cap; one more insert evicts exactly one
     // entry so the bound holds.
@@ -689,10 +700,10 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     while (i < Catalog.have_cache_cap) : (i += 1) {
         var name_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "f{d}.bin", .{i});
-        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0);
+        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0, t0);
     }
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
-    cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0}, 0);
+    cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0}, 0, t0);
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
 }
 

@@ -593,7 +593,7 @@ fn cullLoop(st: *State) void {
     var last_reap = sys.monoSec();
     while (st.running.load(.acquire)) {
         if (sys.monoSec() - last_reap >= reap_every_secs) {
-            st.store.reapIdle(reap_idle_secs);
+            st.store.reapIdle(sys.monoSec(), reap_idle_secs);
             last_reap = sys.monoSec();
         }
         const free_pct = st.store.freePercentChecked() orelse {
@@ -608,7 +608,7 @@ fn cullLoop(st: *State) void {
         if (culling) {
             var n: u32 = 0;
             while (n < 16) : (n += 1) {
-                if (!st.store.cullOne()) break;
+                if (!st.store.cullOne(sys.monoSec())) break;
             }
             napMs(st, if (ph == .stop) 500 else 1000);
             continue;

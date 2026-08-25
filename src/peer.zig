@@ -813,7 +813,7 @@ fn probeWorker(ctx: *ProbeCtx) void {
                 continue;
             };
             ctx.slots[gi] = rep;
-            ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size);
+            ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size, sys.monoMs());
             break;
         }
     }
@@ -836,11 +836,14 @@ fn probeSlots(
 ) !void {
     var todo: std.ArrayList(usize) = .empty;
     defer todo.deinit(gpa);
+    // One edge instant for the whole fill: cache-hit decisions across groups
+    // share the same clock sample instead of drifting mid-walk.
+    const now_ms = sys.monoMs();
     for (groups, 0..) |g, gi| {
         var answered = false;
         for (g) |pi| {
             const p = paths[pi];
-            if (cat.haveGet(gpa, rel, p.ip, p.port)) |cached| {
+            if (cat.haveGet(gpa, rel, p.ip, p.port, now_ms)) |cached| {
                 slots[gi] = cached;
                 answered = true;
                 break;
@@ -1372,6 +1375,23 @@ fn boundPort(fd: c_int) u16 {
     return std.mem.bigToNative(u16, addr.sin_port);
 }
 
+/// Reserves a kernel-picked free loopback TCP port and releases it, for tests
+/// that need a port dialing fails on: a hardcoded one would break on any host
+/// where a real service already holds it.
+fn freeTcpPort() !u16 {
+    const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    try std.testing.expect(lfd >= 0);
+    defer sys.close(lfd);
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    try std.testing.expectEqual(@as(i32, 0), c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)));
+    var got = std.mem.zeroes(c.struct_sockaddr_in);
+    var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+    try std.testing.expectEqual(@as(i32, 0), c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen));
+    return std.mem.bigToNative(u16, got.sin_port);
+}
+
 /// Test harness: one Store plus a Server bound to an ephemeral kernel-picked
 /// port with its accept loop running. Heap-allocated so the Server's store
 /// pointer stays valid across the return. stop() is the single shutdown
@@ -1425,22 +1445,8 @@ const TestServer = struct {
 
 test "fault tolerance: dial unreachable peer fails gracefully" {
     // Reserve a kernel-picked free port, then release it: dialing a closed
-    // port must fail with Connect. A hardcoded port here would break on any
-    // host where a real service already holds it.
-    const free_port = blk: {
-        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        try std.testing.expect(lfd >= 0);
-        defer sys.close(lfd);
-        var addr = std.mem.zeroes(c.struct_sockaddr_in);
-        addr.sin_family = c.AF_INET;
-        addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
-        try std.testing.expectEqual(@as(i32, 0), c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)));
-        var got = std.mem.zeroes(c.struct_sockaddr_in);
-        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        try std.testing.expectEqual(@as(i32, 0), c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen));
-        break :blk std.mem.bigToNative(u16, got.sin_port);
-    };
-    const err = dial("127.0.0.1", free_port);
+    // port must fail with Connect.
+    const err = dial("127.0.0.1", try freeTcpPort());
     try std.testing.expectError(error.Connect, err);
 }
 
@@ -2043,19 +2049,7 @@ test "fillFromPeers counts failed /have probes but not healthy misses" {
 
     // Reserve a free port, then release it: dialing it fails with Connect,
     // the wire shape of a dead or partitioned peer.
-    const dead_port = blk: {
-        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        try std.testing.expect(lfd >= 0);
-        defer sys.close(lfd);
-        var addr = std.mem.zeroes(c.struct_sockaddr_in);
-        addr.sin_family = c.AF_INET;
-        addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001);
-        try std.testing.expectEqual(@as(i32, 0), c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)));
-        var got = std.mem.zeroes(c.struct_sockaddr_in);
-        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        try std.testing.expectEqual(@as(i32, 0), c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen));
-        break :blk std.mem.bigToNative(u16, got.sin_port);
-    };
+    const dead_port = try freeTcpPort();
 
     var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
     defer cat.deinit();
@@ -2134,4 +2128,156 @@ test "fillFromPeers excludes peers whose advertised piece size differs" {
     // NoPeer surfaces and the caller falls through to the origin tier.
     _ = cat.paths.pop();
     try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "grid.bin", 0, 16, &out, null));
+}
+
+fn corpusEntry(comptime payload: []const u8) [4 + payload.len]u8 {
+    var out: [4 + payload.len]u8 = undefined;
+    std.mem.writeInt(u32, out[0..4], @intCast(payload.len), .little);
+    for (payload, 0..) |b, i| out[4 + i] = b;
+    return out;
+}
+
+const seed_reply_ok = corpusEntry("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nabc");
+const seed_reply_206 = corpusEntry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+const seed_reply_miss = corpusEntry("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+const seed_reply_huge_cl = corpusEntry("HTTP/1.1 200 OK\r\nContent-Length: 536870913\r\nConnection: close\r\n\r\n");
+const seed_reply_bad_ps = corpusEntry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: huge\r\nConnection: close\r\n\r\nz");
+const seed_reply_short_body = corpusEntry("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n1234");
+const seed_reply_garbage = corpusEntry("HTTP/1.0 500 oops\r\n\r\n");
+const seed_reply_dup_header = corpusEntry("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nCONTENT-LENGTH: 99999999999\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nok");
+
+const fuzz_reply_corpus = [_][]const u8{
+    &seed_reply_ok,
+    &seed_reply_206,
+    &seed_reply_miss,
+    &seed_reply_huge_cl,
+    &seed_reply_bad_ps,
+    &seed_reply_short_body,
+    &seed_reply_garbage,
+    &seed_reply_dup_header,
+};
+
+fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var wire_buf: [2048]u8 = undefined;
+    const wire = wire_buf[0..smith.slice(&wire_buf)];
+    var fds: [2]c_int = undefined;
+    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.Socket;
+    defer sys.close(fds[1]);
+    const staged = sys.writeAll(fds[0], wire) == @as(isize, @intCast(wire.len));
+    sys.close(fds[0]);
+    if (!staged) return;
+    var head_buf: [8192]u8 = undefined;
+    var head_len: usize = 0;
+    var total_read: usize = 0;
+    readHeadFull(fds[1], &head_buf, &head_len, &total_read) catch return;
+    const rep = haveFromHead(gpa, fds[1], &head_buf, head_len, total_read) catch return;
+    defer gpa.free(rep.bits);
+    const head = head_buf[0..head_len];
+    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
+    const want_len = std.fmt.parseInt(usize, cl_str, 10) catch 0;
+    try std.testing.expectEqual(want_len, rep.bits.len);
+    try std.testing.expect(total_read >= head_len + rep.bits.len);
+    try std.testing.expectEqualSlices(u8, wire[head_len..][0..rep.bits.len], rep.bits);
+    const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
+    try std.testing.expectEqual(try std.fmt.parseInt(u32, ps_str, 10), rep.piece_size);
+}
+
+test "fuzz peer reply parsing accepts well-formed replies and fails closed" {
+    try std.testing.fuzz({}, fuzzHaveReplyOne, .{ .corpus = &fuzz_reply_corpus });
+}
+
+const fuzz_request_psk = "fuzz-psk";
+
+const seed_req_have_ok = corpusEntry("GET /have?path=gguf%2Fmodel.gguf HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-1023\r\n\r\n");
+const seed_req_traversal = corpusEntry("GET /data?path=..%2F..%2Fetc%2Fpasswd HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_wrong_auth = corpusEntry("POST /ping HTTP/1.1\r\nauthorization: BEARER wrong\r\n\r\n");
+const seed_req_max_range = corpusEntry("GET /data?path=a HTTP/1.1\r\nAuthorization: Bearer fuzz-psk \r\nRange: bytes=18446744073709551615-\r\n\r\n");
+const seed_req_control_path = corpusEntry("GET /have?path=%00%1b%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_inverted_range = corpusEntry("GET /data?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=10-5\r\n\r\n");
+const seed_req_no_path = corpusEntry("GET /have HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+
+const fuzz_request_corpus = [_][]const u8{
+    &seed_req_have_ok,
+    &seed_req_traversal,
+    &seed_req_wrong_auth,
+    &seed_req_max_range,
+    &seed_req_control_path,
+    &seed_req_inverted_range,
+    &seed_req_no_path,
+};
+
+fn refBearerOk(got: []const u8, want: []const u8) bool {
+    const prefix: []const u8 = "Bearer ";
+    if (got.len < prefix.len) return false;
+    for (prefix, 0..) |p, i| {
+        if (std.ascii.toLower(got[i]) != std.ascii.toLower(p)) return false;
+    }
+    const token = std.mem.trim(u8, got[prefix.len..], " \t");
+    var ha: [32]u8 = undefined;
+    var hb: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token, &ha, .{});
+    std.crypto.hash.sha2.Sha256.hash(want, &hb, .{});
+    return std.crypto.timing_safe.eql([32]u8, ha, hb);
+}
+
+fn refRelOk(rel: []const u8) bool {
+    if (rel.len == 0 or rel[0] == '/') return false;
+    var seg_start: usize = 0;
+    var i: usize = 0;
+    while (i <= rel.len) : (i += 1) {
+        if (i != rel.len and rel[i] != '/') {
+            if (rel[i] < 0x20 or rel[i] == 0x7f) return false;
+            continue;
+        }
+        const seg = rel[seg_start..i];
+        if (seg.len != 0 and seg[0] == '.' and (seg.len == 1 or (seg.len == 2 and seg[1] == '.'))) return false;
+        seg_start = i + 1;
+    }
+    return true;
+}
+
+fn fuzzRequestHeadOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var wire_buf: [2048]u8 = undefined;
+    const head = wire_buf[0..smith.slice(&wire_buf)];
+    const line_end = std.mem.find(u8, head, "\r\n") orelse return;
+    const line = head[0..line_end];
+    var it = std.mem.splitScalar(u8, line, ' ');
+    const method = it.next() orelse return;
+    const target = it.next() orelse return;
+    if (!std.mem.eql(u8, method, "GET")) return;
+    const auth = proto.headerGet(head, "Authorization") orelse return;
+    const authed = proto.bearerOk(auth, fuzz_request_psk);
+    try std.testing.expectEqual(refBearerOk(auth, fuzz_request_psk), authed);
+    if (!authed) return;
+
+    var tok_buf: [128]u8 = undefined;
+    const tok = tok_buf[0..smith.slice(&tok_buf)];
+    var form_buf: ["Bearer ".len + tok_buf.len]u8 = undefined;
+    const formed = std.fmt.bufPrint(&form_buf, "Bearer {s}", .{tok}) catch return;
+    const trimmed = std.mem.trim(u8, tok, " \t");
+    try std.testing.expectEqual(std.mem.eql(u8, trimmed, tok), proto.bearerOk(formed, tok));
+    try std.testing.expectEqual(refBearerOk(formed, tok), proto.bearerOk(formed, tok));
+
+    const path = proto.pathOnly(target);
+    if (!std.mem.eql(u8, path, "/have") and !std.mem.eql(u8, path, "/data")) return;
+    var rel_buf: [4096]u8 = undefined;
+    const q = proto.queryGet(target, "path") orelse return;
+    const rel = proto.urlDecode(&rel_buf, q) catch return;
+    try std.testing.expect(rel.len <= q.len);
+    const routed_ok = store_mod.relOk(rel);
+    try std.testing.expectEqual(refRelOk(rel), routed_ok);
+    if (!routed_ok or path[1] != 'd') return;
+    const rh = proto.headerGet(head, "Range") orelse return;
+    const rg = proto.parseRange(rh) orelse return;
+    try std.testing.expect(rg.start <= rg.end);
+    var canon: [64]u8 = undefined;
+    const canon_s = std.fmt.bufPrint(&canon, "bytes={d}-{d}", .{ rg.start, rg.end }) catch return;
+    const rt = proto.parseRange(canon_s) orelse return error.RangeRoundTripFailed;
+    try std.testing.expectEqual(rg.start, rt.start);
+    try std.testing.expectEqual(rg.end, rt.end);
+}
+
+test "fuzz request head parsing pipeline gates auth paths and ranges" {
+    try std.testing.fuzz({}, fuzzRequestHeadOne, .{ .corpus = &fuzz_request_corpus });
 }

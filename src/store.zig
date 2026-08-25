@@ -554,7 +554,7 @@ pub const Store = struct {
     /// are evicted outright (their data/meta/pin artifacts carry no cached
     /// bytes). Bounds the files map on nodes that churn through many model
     /// paths without unlinks.
-    pub fn reapIdle(self: *Store, min_idle_secs: i64) void {
+    pub fn reapIdle(self: *Store, now_sec: i64, min_idle_secs: i64) void {
         var victims: std.ArrayList(*Cached) = .empty;
         defer victims.deinit(self.gpa);
 
@@ -570,12 +570,12 @@ pub const Store = struct {
             // Cheap gates outside file.mu: busy entries and steady-state
             // warm ones (fd closed, pieces cached) cost one atomic load.
             if (f.refs.load(.acquire) != 0) continue;
-            if (sys.monoSec() - f.last_access.load(.monotonic) < min_idle_secs) continue;
+            if (now_sec - f.last_access.load(.monotonic) < min_idle_secs) continue;
             var evict = false;
             f.mu.lockUncancelable(self.io);
             candidate: {
                 if (f.filling.count() != 0) break :candidate;
-                if (sys.monoSec() - f.last_access.load(.monotonic) < min_idle_secs) break :candidate;
+                if (now_sec - f.last_access.load(.monotonic) < min_idle_secs) break :candidate;
                 if (f.cache_fd >= 0) {
                     sys.close(f.cache_fd);
                     f.cache_fd = -1;
@@ -875,14 +875,19 @@ pub const Store = struct {
         return cull.freePercent(@as(u64, vs.f_bavail), @as(u64, vs.f_blocks));
     }
 
-    pub fn punchPiece(self: *Store, file: *Cached, idx: u32) bool {
+    /// Punches piece idx when it may be culled at instant `now_sec`. The
+    /// caller's monotonic instant keeps the decision a pure function of
+    /// entry state plus time, drivable virtually in tests; cull drivers
+    /// sample sys.monoSec() once per round.
+    pub fn punchPiece(self: *Store, file: *Cached, idx: u32, now_sec: i64) bool {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
         // Revalidate recency under the file lock: cullOne picked this file on
         // a >=10s idle sample, but a read, fill, or peer transfer may have
-        // started since. Punching a piece mid-transfer would serve hole zeros
-        // and the peer would mark them filled.
-        if (sys.monoSec() - file.last_access.load(.monotonic) < recency_secs) return false;
+        // started since (its stamp lands under this same lock). Punching a
+        // piece mid-transfer would serve hole zeros and the peer would mark
+        // them filled.
+        if (now_sec - file.last_access.load(.monotonic) < recency_secs) return false;
         if (self.pinExists(file.rel)) return false;
         if (file.filling.contains(idx)) return false;
         // Bytes of this entry may be mid-send to a fetching peer (stalled
@@ -953,9 +958,10 @@ pub const Store = struct {
     }
 
     /// Punch one LRU unpinned piece. Returns false if nothing to cull.
-    pub fn cullOne(self: *Store) bool {
+    /// `now_sec` is the caller's monotonic instant (see punchPiece).
+    pub fn cullOne(self: *Store, now_sec: i64) bool {
         // Idle time is elapsed time: monotonic clock, immune to NTP steps.
-        const now = sys.monoSec();
+        const now = now_sec;
         const Cand = struct { f: *Cached, at: i64 };
         var cands: std.ArrayList(Cand) = .empty;
         defer cands.deinit(self.gpa);
@@ -996,9 +1002,9 @@ pub const Store = struct {
                 defer cd.f.mu.unlock(self.io);
                 break :blk cd.f.bits.lastSet();
             } orelse continue;
-            if (self.punchPiece(cd.f, idx)) return true;
+            if (self.punchPiece(cd.f, idx, now_sec)) return true;
         }
-        return self.cullOneOnDisk();
+        return self.cullOneOnDisk(now_sec);
     }
 
     /// One disk-only cull candidate sampled by walkData.
@@ -1014,7 +1020,7 @@ pub const Store = struct {
     /// pays the scan once per batch instead of once per punched piece.
     const walk_sample_cap: usize = 8;
 
-    fn cullOneOnDisk(self: *Store) bool {
+    fn cullOneOnDisk(self: *Store, now_sec: i64) bool {
         var data: [sys.c.PATH_MAX]u8 = undefined;
         const root = sys.joinZ(&data, self.cache, "data") catch return false;
         var victims: [walk_sample_cap]DiskVictim = undefined;
@@ -1035,7 +1041,7 @@ pub const Store = struct {
             live.mu.lockUncancelable(self.io);
             const idx = live.bits.lastSet();
             live.mu.unlock(self.io);
-            if (idx) |i| punched = self.punchPiece(live, i) or punched;
+            if (idx) |i| punched = self.punchPiece(live, i, now_sec) or punched;
         }
         return punched;
     }
@@ -1481,7 +1487,7 @@ test "forget evicts after release and reapIdle frees idle empty entries" {
     f4.last_access.store(sys.monoSec() - 3600, .monotonic);
     st.releaseFile(f4);
 
-    st.reapIdle(60);
+    st.reapIdle(sys.monoSec(), 60);
     try std.testing.expectEqual(@as(usize, 2), st.files.count());
     const f4b = st.lookupRef("held.bin").?;
     try std.testing.expectEqual(f4, f4b);
@@ -1588,7 +1594,7 @@ test "punchPiece refuses while a peer transfer is inflight" {
     f.mu.unlock(std.testing.io);
 
     _ = f.xfer.fetchAdd(1, .monotonic);
-    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(!st.punchPiece(f, 0, sys.monoSec()));
     // Passive bit observation (hasPiece itself now counts as access and
     // would refresh the recency window under test).
     f.mu.lockUncancelable(std.testing.io);
@@ -1598,7 +1604,7 @@ test "punchPiece refuses while a peer transfer is inflight" {
 
     // Transfer done: the idle cached piece culls normally.
     _ = f.xfer.fetchSub(1, .monotonic);
-    try std.testing.expect(st.punchPiece(f, 0));
+    try std.testing.expect(st.punchPiece(f, 0, sys.monoSec()));
     try std.testing.expect(!st.hasPiece(f, 0));
 }
 
@@ -1625,7 +1631,7 @@ test "fill completion and piece probes refresh the cull recency window" {
     f.last_access.store(sys.monoSec() - 3600, .monotonic);
     try std.testing.expect((try st.beginFill(f, 0)) == .len);
     try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef"));
-    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(!st.punchPiece(f, 0, sys.monoSec()));
     try std.testing.expect(st.hasPiece(f, 0));
 
     // Same guard on the probe itself: a warm read answers every bit check
@@ -1633,14 +1639,14 @@ test "fill completion and piece probes refresh the cull recency window" {
     // a concurrent punch out of the check-to-readCache window.
     f.last_access.store(sys.monoSec() - 3600, .monotonic);
     _ = st.hasPiece(f, 1);
-    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(!st.punchPiece(f, 0, sys.monoSec()));
 
     // Once genuinely idle past the window, the same piece culls normally:
     // the stamps close race windows, they do not block culling.
     f.mu.lockUncancelable(std.testing.io);
     f.last_access.store(sys.monoSec() - 3600, .monotonic);
     f.mu.unlock(std.testing.io);
-    try std.testing.expect(st.punchPiece(f, 0));
+    try std.testing.expect(st.punchPiece(f, 0, sys.monoSec()));
     try std.testing.expect(!st.hasPiece(f, 0));
 }
 
@@ -1668,23 +1674,24 @@ test "punchPiece refuses pinned and freshly accessed entries" {
     f.mu.lockUncancelable(std.testing.io);
     f.last_access.store(sys.monoSec() - 3600, .monotonic);
     f.mu.unlock(std.testing.io);
-    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(!st.punchPiece(f, 0, sys.monoSec()));
     try std.testing.expect(st.hasPiece(f, 0));
     try std.testing.expectEqual(@as(i32, 0), st.setPin("gated.bin", false));
 
     // A piece touched inside the recency window must not punch: a read,
-    // fill, or transfer may still be using those pages.
+    // fill, or transfer may still be using those pages. The instant comes
+    // from the caller, so the exact boundary is pinned virtually -- still
+    // guarded one tick before the window closes, culled the moment it does,
+    // with no sleeping and no dependence on how fast this test runs.
     f.mu.lockUncancelable(std.testing.io);
-    f.last_access.store(sys.monoSec(), .monotonic);
+    const touched = sys.monoSec();
+    f.last_access.store(touched, .monotonic);
     f.mu.unlock(std.testing.io);
-    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(!st.punchPiece(f, 0, touched + Store.recency_secs - 1));
     try std.testing.expect(st.hasPiece(f, 0));
 
     // Past the window with nothing held, the same piece culls normally.
-    f.mu.lockUncancelable(std.testing.io);
-    f.last_access.store(sys.monoSec() - 3600, .monotonic);
-    f.mu.unlock(std.testing.io);
-    try std.testing.expect(st.punchPiece(f, 0));
+    try std.testing.expect(st.punchPiece(f, 0, touched + Store.recency_secs));
 }
 
 /// Writes a meta sidecar for rel naming exactly `filled` pieces as cached,
@@ -1988,7 +1995,7 @@ test "punchPiece refuses to cut the hole unless the cleared bits persist" {
     // leaving both bytes and mark intact.
     var broken = try SidecarBroken.apply(&st, "p.bin");
     defer broken.undo();
-    try std.testing.expect(!st.punchPiece(f, 0));
+    try std.testing.expect(!st.punchPiece(f, 0, sys.monoSec()));
 
     f.mu.lockUncancelable(std.testing.io);
     try std.testing.expect(f.bits.get(0));
@@ -1999,7 +2006,7 @@ test "punchPiece refuses to cut the hole unless the cleared bits persist" {
 
     // Once saves work again the same piece culls normally.
     broken.undo();
-    try std.testing.expect(st.punchPiece(f, 0));
+    try std.testing.expect(st.punchPiece(f, 0, sys.monoSec()));
     try std.testing.expect(!st.hasPiece(f, 0));
 }
 
@@ -2038,7 +2045,7 @@ test "disk cull refuses to cut the hole unless the cleared bits persist" {
 
     // With persistence possible again the orphan punches through cullOne.
     broken.undo();
-    try std.testing.expect(st.cullOne());
+    try std.testing.expect(st.cullOne(sys.monoSec()));
     const after = sys.readFileBuf(&rb, dp) catch return error.ReadFailed;
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** pattern.len), after);
 }
