@@ -287,7 +287,7 @@ fn cachedFor(st: *State, rel: []const u8) ?*store_mod.Store.Cached {
     var ost: sys.c.struct_stat = undefined;
     if (st.store.statOrigin(rel, &ost) != 0) return null;
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return null;
-    return st.store.get(rel, @intCast(ost.st_size)) catch null;
+    return st.store.get(rel, @intCast(ost.st_size), sys.monoSec()) catch null;
 }
 
 export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
@@ -303,7 +303,7 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     const src = st.store.statOrigin(rel, &ost);
     if (src != 0) return src;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
-        const file = st.store.get(rel, @intCast(ost.st_size)) catch return -sys.c.ENOMEM;
+        const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec()) catch return -sys.c.ENOMEM;
         defer st.store.releaseFile(file);
         const fd = st.store.openCache(file);
         if (fd < 0) return fd;
@@ -327,7 +327,7 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     // warmup OOM) would tell the caller the create failed over a file that
     // exists and was possibly truncated. Warmup is best-effort; the next
     // open/read rebuilds the entry.
-    if (st.store.get(rel, 0)) |file| {
+    if (st.store.get(rel, 0, sys.monoSec())) |file| {
         st.store.releaseFile(file);
     } else |_| {
         std.log.warn("cache entry warmup failed for {s}; rebuilding on next open", .{rel});
@@ -341,7 +341,10 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     // piece-size scratch always fits. An allocation failure claiming the
     // piece must fail this read with ENOMEM rather than hang: beginFill
     // surfaces claim OOM instead of retrying it forever.
-    const cl = st.store.beginFill(file, idx) catch return -sys.c.ENOMEM;
+    // Claim and completion are separate clock samples on purpose: a slow
+    // fill must land a fresh recency stamp (finishPiece), not the claim's
+    // pre-transfer one, or a piece that filled for minutes is born punchable.
+    const cl = st.store.beginFill(file, idx, sys.monoSec()) catch return -sys.c.ENOMEM;
     const ln = switch (cl) {
         // Filled by someone else, or a truncate shrank the file below the
         // piece between claim and sample (the claim was dropped unmarked):
@@ -361,8 +364,15 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
         from_peer = false;
         const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
         if (n != @as(isize, @intCast(ln))) {
-            st.store.finishPiece(file, idx, false);
+            st.store.finishPiece(file, idx, false, sys.monoSec());
             _ = st.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
+            // The reader sees EIO and nothing else names the cause; keep the
+            // same sender-side trace serveData's hydration branch does,
+            // distinguishing a real errno from a short read.
+            if (n < 0)
+                std.log.warn("origin fill failed for {s} piece {d} (errno {d}); failing read", .{ file.rel, idx, -n })
+            else
+                std.log.warn("origin fill short for {s} piece {d} ({d}/{d} bytes); failing read", .{ file.rel, idx, n, ln });
             if (n < 0) return @intCast(n);
             return -sys.c.EIO;
         }
@@ -371,7 +381,18 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     // of pieces, and the totals land in status.json and the discovery tick's
     // summary line. Failures keep their own warns at the failure sites.
     const s = &st.store.stats;
-    const rc = st.store.completeFill(file, idx, buf);
+    const rc = st.store.completeFill(file, idx, buf, sys.monoSec());
+    if (rc != 0) {
+        // Hydrated bytes the cache fs refused: the piece stays unmarked and
+        // the reader gets EIO, so name the refusal like serveData's twin
+        // branch. Failed fills keep their error counts and no time (and no
+        // fill or byte totals): the tick line's averages stay miss-only.
+        _ = s.fill_err_cache.fetchAdd(1, .monotonic);
+        std.log.warn("cache write refused {s} piece {d} (errno {d}); failing read", .{ file.rel, idx, -rc });
+        return rc;
+    }
+    // Sampled after the cache write lands: the published average is the full
+    // claim-to-cache-write stall the reader ate for this piece.
     const fill_dt: u64 = @intCast(sys.monoNs() - fill_t0);
     if (from_peer) {
         _ = s.fills_peer.fetchAdd(1, .monotonic);
@@ -382,8 +403,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
         _ = s.bytes_from_origin.fetchAdd(ln, .monotonic);
         _ = s.fill_origin_nanos.fetchAdd(fill_dt, .monotonic);
     }
-    if (rc != 0) _ = s.fill_err_cache.fetchAdd(1, .monotonic);
-    return rc;
+    return 0;
 }
 
 /// fsize must be a size sample taken under file.mu by the caller (the same
@@ -399,7 +419,7 @@ fn ensureRange(st: *State, file: *store_mod.Store.Cached, fsize: u64, off: u64, 
     defer if (scratch) |s| st.gpa.free(s);
     var i = cov.start;
     while (i < cov.end) : (i += 1) {
-        if (st.store.hasPiece(file, i)) continue;
+        if (st.store.hasPiece(file, i, sys.monoSec())) continue;
         if (scratch == null)
             scratch = st.gpa.alloc(u8, st.store.piece_size) catch return -sys.c.ENOMEM;
         const rc = hydratePiece(st, file, i, scratch.?);
@@ -431,7 +451,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         return src;
     }
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return -sys.c.EISDIR;
-    const file = st.store.get(rel, @intCast(ost.st_size)) catch {
+    const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec()) catch {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         return -sys.c.ENOMEM;
     };
@@ -460,7 +480,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         return rc;
     }
-    const got = st.store.readServed(file, buf[0..n], uoff);
+    const got = st.store.readServed(file, buf[0..n], uoff, sys.monoSec());
     if (got < 0) {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
     } else {
@@ -503,7 +523,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
         (ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG and
         @as(u64, @intCast(ost.st_size)) == end)
     {
-        st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)]);
+        st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)], sys.monoSec());
         return @intCast(n);
     }
     if (cachedFor(st, rel)) |file| {
@@ -879,7 +899,10 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     const fill_ms_peer = if (d.fills_peer > 0) d.fill_peer_nanos / (d.fills_peer * std.time.ns_per_ms) else 0;
     const fill_ms_origin = if (d.fills_origin > 0) d.fill_origin_nanos / (d.fills_origin * std.time.ns_per_ms) else 0;
     std.log.info(
-        "tick: reads={d} err={d} read_mib={d} rd_us={d} writes={d} err={d} write_mib={d}" ++
+        // Field names mirror Stats.Snap's (what status.json publishes), so
+        // the journal line and the machine artifact share one vocabulary and
+        // no key collides ("err" used to name both read and write failures).
+        "tick: reads_ok={d} reads_err={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d}" ++
             " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache={d}/{d}/{d}" ++
             " probe_err={d} peer_mib={d} origin_mib={d} culled={d} http401={d} http5xx={d} httpbad={d}",
         .{

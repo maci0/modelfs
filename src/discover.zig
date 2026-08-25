@@ -127,16 +127,25 @@ pub fn pickBest(cands: []const PathCand) ?usize {
 /// `modelfs peers`; every module referencing the path must use this constant.
 pub const cluster_dir = ".cluster";
 
-/// True when s carries no C0 control byte or DEL. Lease file names come off
-/// shared NFS storage and lease ids out of other nodes' JSON, so neither is
-/// trustworthy for verbatim echo: a co-tenant planting ".cluster/<newline>
-/// forged line.json" would forge multi-line daemon log entries, and an id
-/// holding escapes would inject into the terminal running `modelfs peers`.
-/// Same policy store.relOk applies to paths; such entries are still swept,
-/// only their names are withheld from output.
+/// True when s carries no control character in its terminal-visible form:
+/// C0 bytes and DEL outright, plus their UTF-8-encoded C1 counterparts
+/// (U+0080..U+009F, the 0xC2 0x80..0xC2 0x9F sequences), which several
+/// terminal families honor as 8-bit controls (OSC/CSI) even in UTF-8 mode.
+/// Lease file names come off shared NFS storage and lease ids out of other
+/// nodes' JSON, so neither is trustworthy for verbatim echo: a co-tenant
+/// planting ".cluster/<newline> forged line.json" would forge multi-line
+/// daemon log entries, an id holding ESC or its C1 spelling "\u{9d}0;pwned
+/// \u{9c}" would inject into the terminal running `modelfs peers`. Same
+/// policy store.relOk applies to paths; such entries are still swept, only
+/// their names are withheld from output. Bytes above the C1 pair (NFC/NFD
+/// spellings, astral emoji, bare high bytes) are display text, not
+/// controls, and stay echoable.
 pub fn printable(s: []const u8) bool {
-    for (s) |ch| {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const ch = s[i];
         if (ch < 0x20 or ch == 0x7f) return false;
+        if (ch == 0xc2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9f) return false;
     }
     return true;
 }
@@ -775,6 +784,19 @@ test "printable gates lease names and ids for log echo" {
     // ESC and other C0 bytes, plus DEL, would inject terminal escapes
     try std.testing.expect(!printable("\x1b]0;pwned\x07"));
     try std.testing.expect(!printable("\x7f"));
+    // C1 controls ride in as UTF-8 (0xC2 0x80..0xC2 0x9F), past a C0-only
+    // byte gate: an id "\u{9d}0;pwned\u{9c}" is an 8-bit OSC sequence some
+    // terminal families honor even in UTF-8 mode, and "\u{9b}31m" is CSI.
+    try std.testing.expect(!printable("a\xc2\x9bd"));
+    try std.testing.expect(!printable("\xc2\x9d0;pwned\xc2\x9c"));
+    try std.testing.expect(!printable("\xc2\x9b"));
+    // Display text above the C1 range stays echoable: NBSP (U+00A0) shares
+    // the 0xC2 lead byte but is not a control, nor are accented names.
+    try std.testing.expect(printable("caf\xc3\xa9"));
+    try std.testing.expect(printable("\xc2\xa0"));
+    // A trailing 0xC2 with no continuation byte is invalid UTF-8 display
+    // noise, not an injectable control.
+    try std.testing.expect(printable("a\xc2"));
 }
 
 test "displayName echoes printable names and withholds the rest" {

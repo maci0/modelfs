@@ -364,7 +364,7 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
         replyStatus(self, fd, "404 Not Found");
         return;
     }
-    const file = self.store.get(rel, @intCast(st.st_size)) catch {
+    const file = self.store.get(rel, @intCast(st.st_size), sys.monoSec()) catch {
         // The fetching peer only sees 500; without this line the serving
         // node's log says nothing about why.
         std.log.warn("cache entry open failed for {s}; replying 500", .{rel});
@@ -409,7 +409,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
     defer if (pbuf) |b| self.gpa.free(b);
     var pi = cov.start;
     while (pi < cov.end) : (pi += 1) {
-        if (!self.store.hasPiece(file, pi)) {
+        if (!self.store.hasPiece(file, pi, sys.monoSec())) {
             // Allocate before claiming: nothing but finishPiece removes a
             // filling entry, so an allocation failure after the claim would
             // leave the piece claimed forever and wedge every later filler
@@ -420,7 +420,10 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                     replyStatus(self, fd, "500 Internal Server Error");
                     return false;
                 };
-            const cl = self.store.beginFill(file, pi) catch {
+            // Claim and completion take separate samples, like the FUSE
+            // hydration path: a fill that streamed for minutes must land a
+            // fresh recency stamp at completion, not the claim's.
+            const cl = self.store.beginFill(file, pi, sys.monoSec()) catch {
                 std.log.warn("fill claim failed for {s} piece {d}; replying 500", .{ file.rel, pi });
                 replyStatus(self, fd, "500 Internal Server Error");
                 return false;
@@ -436,7 +439,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                 .len => |ln| {
                     const got = self.store.originPread(file.rel, pbuf.?[0..ln], piece.offset(pi, piece_size));
                     if (got == @as(isize, @intCast(ln))) {
-                        const w = self.store.completeFill(file, pi, pbuf.?[0..ln]);
+                        const w = self.store.completeFill(file, pi, pbuf.?[0..ln], sys.monoSec());
                         if (w != 0) {
                             // The bytes are in hand but the cache fs refused them
                             // (full or failing disk). Falling through to the
@@ -447,7 +450,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                             return false;
                         }
                     } else {
-                        self.store.finishPiece(file, pi, false);
+                        self.store.finishPiece(file, pi, false, sys.monoSec());
                         // statOrigin passed, so the file exists: a failed or short
                         // read is an upstream (origin) failure. Reporting 404 here
                         // would make peers believe the path is gone. Log it too:
@@ -463,7 +466,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             // already cached above skips this entirely, halving the per-piece
             // lock traffic on fully-warm transfers. Punches cannot land under
             // us either way -- serveData holds xfer across the whole response.
-            if (!self.store.hasPiece(file, pi)) {
+            if (!self.store.hasPiece(file, pi, sys.monoSec())) {
                 replyStatus(self, fd, "404 Not Found");
                 return false;
             }
@@ -539,7 +542,7 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
         if (remain_ms < sock_timeout_ms)
             sys.setSockTimeout(fd, @intCast(remain_ms));
         const take = @min(remaining, buf.len);
-        const n = self.store.readCache(file, buf[0..take], off);
+        const n = self.store.readCache(file, buf[0..take], off, sys.monoSec());
         if (n < 0 or @as(u64, @intCast(n)) != take) {
             // Same contract as the sendfile path: the peer sees a truncated
             // body, so the local log must carry where and why.
@@ -585,7 +588,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     // here would break ordinary HTTP clients asking for the rest of the file;
     // the internal peer protocol always sends exact piece bounds.
     const rg_end = @min(rg.end, size - 1);
-    const file = self.store.get(rel, size) catch {
+    const file = self.store.get(rel, size, sys.monoSec()) catch {
         // Same operator-trace contract as serveHave's 500: the peer sees the
         // status alone, so the local log must carry the cause.
         std.log.warn("cache entry open failed for {s}; replying 500", .{rel});
@@ -1450,6 +1453,40 @@ test "duplicate bind of a live port fails instead of sharing it" {
     first.stop();
 }
 
+test "bindAll collapses duplicate specs and refuses an already-bound port" {
+    const gpa = std.testing.allocator;
+    const spec = struct {
+        fn addr(port: u16) proto.LeaseAddr {
+            return .{ .ip = "", .port = port };
+        }
+    }.addr;
+
+    // Kernel-chosen ports everywhere, like every sibling test: nothing here
+    // races a fixed default (18080) a modelfs instance may already own.
+    // Duplicate port-0 specs name one port as far as the seen-port set is
+    // concerned, so they collapse into a single listener instead of two fds
+    // fighting over one address.
+    var dedup = Server{ .gpa = gpa, .io = std.testing.io, .psk = "secret", .store = undefined };
+    defer dedup.stop();
+    try dedup.bindAll(&.{ spec(0), spec(0) });
+    try std.testing.expectEqual(@as(usize, 1), dedup.listen_fds.items.len);
+    const port = boundPort(dedup.listen_fds.items[0]);
+    try std.testing.expect(port > 0);
+
+    // A later call appends its own listener instead of resetting the fd
+    // registry serve() walks.
+    try dedup.bindAll(&.{spec(0)});
+    try std.testing.expectEqual(@as(usize, 2), dedup.listen_fds.items.len);
+
+    // A spec naming a live listener's port must fail the whole call loudly
+    // like a double daemon start (EADDRINUSE; no SO_REUSEPORT sharing), and
+    // add no listener of its own.
+    var refused = Server{ .gpa = gpa, .io = std.testing.io, .psk = "secret", .store = undefined };
+    defer refused.stop();
+    try std.testing.expectError(error.Bind, refused.bindAll(&.{spec(port)}));
+    try std.testing.expectEqual(@as(usize, 0), refused.listen_fds.items.len);
+}
+
 test "fault tolerance: bad psk fetchHave fails with http status" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
@@ -1594,8 +1631,11 @@ const TestServer = struct {
     accept_thread: ?std.Thread = null,
 
     fn start(gpa: std.mem.Allocator, origin: []const u8, cache: []const u8, piece_size: u32, psk: []const u8) !*TestServer {
+        // stop() is the single destruction path (it ends in gpa.destroy), so
+        // cleanup after it is registered must go through stop() alone: a
+        // parallel destroy errdefer would double-free on the first failure
+        // past that point. Nothing between create and registration can fail.
         const ts = try gpa.create(TestServer);
-        errdefer gpa.destroy(ts);
         ts.* = .{
             .gpa = gpa,
             .store = store_mod.Store.init(gpa, std.testing.io, origin, cache, piece_size),

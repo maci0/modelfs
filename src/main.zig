@@ -764,6 +764,12 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     var ops = fuse_fs.ops();
     const rc = fuseMain(cargv.items, &ops, st);
     teardownMount(st);
+    // Lifecycle closure next to the startup "mount" line: when this node
+    // later shows up with an expired lease in `modelfs peers`, the journal
+    // distinguishes a cleanly stopped daemon from one that crashed or was
+    // killed by the absence of this line. A nonzero rc means the mount never
+    // served; libfuse already narrated the failure on stderr.
+    if (rc == 0) std.log.info("unmounted {s}", .{mount_abs});
     return @intCast(if (rc < 0) 1 else rc);
 }
 
