@@ -48,6 +48,19 @@ fn vendoredFuseMismatch(b: *std.Build) ?[]const u8 {
     return null;
 }
 
+/// One libfuse3 link contract for the executable and the test binary alike:
+/// an explicit -Dfuse-lib dir (cross builds, pkg-config disabled) or the
+/// system default.
+fn linkFuse(m: *std.Build.Module, fuse_lib: ?[]const u8) void {
+    if (fuse_lib) |dir| {
+        m.addLibraryPath(.{ .cwd_relative = dir });
+        m.linkSystemLibrary("fuse3", .{ .use_pkg_config = .no, .preferred_link_mode = .dynamic });
+        m.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
+    } else {
+        m.linkSystemLibrary("fuse3", .{});
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -103,13 +116,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("c", c_mod);
     exe_mod.addImport("build_options", version_mod);
-    if (fuse_lib) |dir| {
-        exe_mod.addLibraryPath(.{ .cwd_relative = dir });
-        exe_mod.linkSystemLibrary("fuse3", .{ .use_pkg_config = .no, .preferred_link_mode = .dynamic });
-        exe_mod.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
-    } else {
-        exe_mod.linkSystemLibrary("fuse3", .{});
-    }
+    linkFuse(exe_mod, fuse_lib);
     exe_mod.addIncludePath(.{ .cwd_relative = fuse_inc });
 
     const exe = b.addExecutable(.{
@@ -126,13 +133,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    if (fuse_lib) |dir| {
-        test_mod.addLibraryPath(.{ .cwd_relative = dir });
-        test_mod.linkSystemLibrary("fuse3", .{ .use_pkg_config = .no, .preferred_link_mode = .dynamic });
-        test_mod.linkSystemLibrary("pthread", .{ .use_pkg_config = .no });
-    } else {
-        test_mod.linkSystemLibrary("fuse3", .{});
-    }
+    linkFuse(test_mod, fuse_lib);
     test_mod.addIncludePath(.{ .cwd_relative = fuse_inc });
     test_mod.addImport("c", c_mod);
     test_mod.addImport("build_options", version_mod);

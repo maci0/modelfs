@@ -33,9 +33,17 @@ zig build -Doptimize=ReleaseFast          # ./zig-out/bin/modelfs
 zig build test --summary all              # unit tests
 ```
 
-Non-default libfuse3 locations, e.g. when cross-compiling:
+Non-default libfuse3 locations, e.g. when cross-compiling. The vendored arm64 tree ships as `.deb` files only (`root/` and `lib/` are gitignored), so extract it first, exactly as [.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md) prescribes and CI does:
 
 ```bash
+cd .deps/fuse3-arm64
+dpkg-deb -x libfuse3-3_3.14.0-5build1_arm64.deb root/
+dpkg-deb -x libfuse3-dev_3.14.0-5build1_arm64.deb root/
+mkdir -p lib
+ln -s libfuse3.so.3 lib/libfuse3.so
+ln -s ../root/lib/aarch64-linux-gnu/libfuse3.so.3.14.0 lib/libfuse3.so.3
+cd ../..
+
 zig build -Dtarget=aarch64-linux-gnu.2.39 -Doptimize=ReleaseFast \
   -Dfuse-include=.deps/fuse3-arm64/root/usr/include/fuse3 \
   -Dfuse-lib=.deps/fuse3-arm64/lib
@@ -107,7 +115,7 @@ Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); instal
 | `c.zig` | the single door to libfuse3/libc |
 | `root.zig` | test aggregator: pulls every module's tests into the test binary |
 
-`@cImport` is gone in Zig 0.16, so C declarations are translated once from `src/c.h` by `build.zig`; `c.zig` re-exports that module and every other module goes through it. `build.zig.zon` declares no package dependencies: the binary links only `libfuse3`, libc, and pthread.
+`@cImport` is deprecated in Zig 0.16, so C declarations are translated once from `src/c.h` by `build.zig`; `c.zig` re-exports that module and every other module goes through it. `build.zig.zon` declares no package dependencies: the binary links only `libfuse3`, libc, and pthread.
 
 ## Documentation
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Verify a running modelfs cluster over its peer HTTP protocol.
 
-Pings every node, then reads one /have bitfield per node (one piece each),
-timing the sweep for the benchmark log. Exits nonzero on the first failure.
+Pings every node, then reads /have bitfields round-robin across the nodes
+(one per piece, cycling pieces over nodes) while timing the sweep for the
+benchmark log. Exits nonzero on the first failure.
 """
 
 import sys

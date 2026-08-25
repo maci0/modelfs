@@ -199,26 +199,23 @@ pub fn pwriteAll(fd: c_int, buf: []const u8, off: u64) isize {
 }
 
 pub fn sendfileAll(out_fd: c_int, in_fd: c_int, off: u64, count: usize) isize {
-    if (@import("builtin").os.tag == .linux) {
-        var offset: c.off_t = @intCast(off);
-        var sent: usize = 0;
-        while (sent < count) {
-            const rc = std.c.sendfile(out_fd, in_fd, &offset, count - sent);
-            if (rc < 0) {
-                const e = errno();
-                // Only EINTR is retried. On a blocking out-socket EAGAIN is
-                // the SO_SNDTIMEO expiry: retrying would just re-arm another
-                // full timeout window and loop forever against a stalled
-                // receiver, so surface it like readOnce does.
-                if (e == c.EINTR) continue;
-                return -e;
-            }
-            if (rc == 0) break;
-            sent += @intCast(rc);
+    var offset: c.off_t = @intCast(off);
+    var sent: usize = 0;
+    while (sent < count) {
+        const rc = std.c.sendfile(out_fd, in_fd, &offset, count - sent);
+        if (rc < 0) {
+            const e = errno();
+            // Only EINTR is retried. On a blocking out-socket EAGAIN is
+            // the SO_SNDTIMEO expiry: retrying would just re-arm another
+            // full timeout window and loop forever against a stalled
+            // receiver, so surface it like readOnce does.
+            if (e == c.EINTR) continue;
+            return -e;
         }
-        return @intCast(sent);
+        if (rc == 0) break;
+        sent += @intCast(rc);
     }
-    return -c.ENOSYS;
+    return @intCast(sent);
 }
 
 pub fn fstat(fd: c_int, st: *c.struct_stat) i32 {
@@ -532,32 +529,30 @@ test "resolveIpv4 passes numeric quads and resolves localhost" {
 }
 
 test "sendfileAll zero copy" {
-    if (@import("builtin").os.tag == .linux) {
-        var path_buf: [128]u8 = undefined;
-        var z_buf: [128]u8 = undefined;
-        // pid suffix: two test processes starting in the same second must not
-        // share the scratch file (second-resolution stamps collide otherwise)
-        const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/sf-{d}-{d}.tmp", .{ nowSec(), std.os.linux.getpid() });
-        const z = try toZ(&z_buf, p);
-        const data = "hello zero-copy sendfile world!";
-        try std.testing.expectEqual(@as(i32, 0), writeFile(z, data));
-        defer _ = c.unlink(z);
+    var path_buf: [128]u8 = undefined;
+    var z_buf: [128]u8 = undefined;
+    // pid suffix: two test processes starting in the same second must not
+    // share the scratch file (second-resolution stamps collide otherwise)
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/sf-{d}-{d}.tmp", .{ nowSec(), std.os.linux.getpid() });
+    const z = try toZ(&z_buf, p);
+    const data = "hello zero-copy sendfile world!";
+    try std.testing.expectEqual(@as(i32, 0), writeFile(z, data));
+    defer _ = c.unlink(z);
 
-        const in_fd = open(z, c.O_RDONLY, 0);
-        try std.testing.expect(in_fd >= 0);
-        defer close(in_fd);
+    const in_fd = open(z, c.O_RDONLY, 0);
+    try std.testing.expect(in_fd >= 0);
+    defer close(in_fd);
 
-        var fds: [2]c_int = undefined;
-        if (c.pipe(&fds) != 0) return error.Pipe;
-        defer close(fds[0]);
-        defer close(fds[1]);
+    var fds: [2]c_int = undefined;
+    if (c.pipe(&fds) != 0) return error.Pipe;
+    defer close(fds[0]);
+    defer close(fds[1]);
 
-        const n = sendfileAll(fds[1], in_fd, 0, data.len);
-        try std.testing.expectEqual(@as(isize, @intCast(data.len)), n);
+    const n = sendfileAll(fds[1], in_fd, 0, data.len);
+    try std.testing.expectEqual(@as(isize, @intCast(data.len)), n);
 
-        var buf: [64]u8 = undefined;
-        const read_n = c.read(fds[0], &buf, buf.len);
-        try std.testing.expectEqual(@as(isize, @intCast(data.len)), read_n);
-        try std.testing.expectEqualStrings(data, buf[0..@intCast(read_n)]);
-    }
+    var buf: [64]u8 = undefined;
+    const read_n = c.read(fds[0], &buf, buf.len);
+    try std.testing.expectEqual(@as(isize, @intCast(data.len)), read_n);
+    try std.testing.expectEqualStrings(data, buf[0..@intCast(read_n)]);
 }

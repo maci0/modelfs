@@ -704,14 +704,12 @@ fn statusJson(st: *State) !void {
     const cache_free_pct: i32 = if (st.store.freePercentChecked()) |pct| @intCast(pct) else -1;
     // Single line like every other machine-read artifact here: consumers
     // tail/grep it and a multi-line document would break line-oriented
-    // parsing (journalctl, jq -line, watch loops).
-    const json = try std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d}," ++
-        "\"stats\":{{\"reads_ok\":{d},\"reads_err\":{d},\"bytes_read\":{d},\"read_nanos\":{d}" ++
-        ",\"writes_ok\":{d},\"writes_err\":{d},\"bytes_written\":{d}" ++
-        ",\"fills_peer\":{d},\"fills_origin\":{d},\"bytes_from_peer\":{d},\"bytes_from_origin\":{d}" ++
-        ",\"fill_peer_nanos\":{d},\"fill_origin_nanos\":{d}" ++
-        ",\"fill_err_peer\":{d},\"fill_err_origin\":{d},\"fill_err_cache\":{d}" ++
-        ",\"probe_err\":{d},\"pieces_culled\":{d},\"http_unauthorized\":{d},\"http_5xx\":{d},\"http_malformed\":{d}}}}}\n", .{
+    // parsing (journalctl, jq -line, watch loops). The stats object is
+    // emitted from Stats.Snap's fields (the same list logStatsTick diffs),
+    // so a new counter publishes here by construction instead of by
+    // remembering to edit this document's format string.
+    var w = std.Io.Writer.fixed(&buf);
+    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"stats\":{{", .{
         st.catalog.self_id,
         std.os.linux.getpid(),
         sys.monoSec() - st.start_secs,
@@ -719,28 +717,13 @@ fn statusJson(st: *State) !void {
         st.store.piece_size,
         st.server.http_inflight.load(.monotonic),
         cache_free_pct,
-        s.reads_ok,
-        s.reads_err,
-        s.bytes_read,
-        s.read_nanos,
-        s.writes_ok,
-        s.writes_err,
-        s.bytes_written,
-        s.fills_peer,
-        s.fills_origin,
-        s.bytes_from_peer,
-        s.bytes_from_origin,
-        s.fill_peer_nanos,
-        s.fill_origin_nanos,
-        s.fill_err_peer,
-        s.fill_err_origin,
-        s.fill_err_cache,
-        s.probe_err,
-        s.pieces_culled,
-        s.http_unauthorized,
-        s.http_5xx,
-        s.http_malformed,
     });
+    inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields, 0..) |f, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("\"{s}\":{d}", .{ f.name, @field(s, f.name) });
+    }
+    try w.writeAll("}}\n");
+    const json = w.buffered();
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const p = try sys.joinZ(&pbuf, st.store.cache, status_file);
     var tbuf: [sys.c.PATH_MAX]u8 = undefined;

@@ -56,7 +56,11 @@ pub const Stats = struct {
     http_malformed: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks
-    /// and for status.json formatting.
+    /// and for status.json formatting. Snap's field list is the single
+    /// source of truth for what gets published: snap() below loads these
+    /// fields generically and statusJson emits them generically, so a new
+    /// counter rides every output by adding its three declarations here --
+    /// never by editing a format string in another module.
     pub const Snap = struct {
         reads_ok: u64 = 0,
         reads_err: u64 = 0,
@@ -81,30 +85,21 @@ pub const Stats = struct {
         http_malformed: u64 = 0,
     };
 
+    // Every Stats counter must have a Snap counterpart, or it compiles fine
+    // while silently dropping out of every published output (status.json,
+    // the tick line); make the omission a compile error instead.
+    comptime {
+        for (@typeInfo(Stats).@"struct".fields) |f| {
+            if (!@hasField(Snap, f.name)) @compileError("Stats." ++ f.name ++ " has no Snap counterpart; the counter would never be published");
+        }
+    }
+
     pub fn snap(self: *const Stats) Snap {
-        return .{
-            .reads_ok = self.reads_ok.load(.monotonic),
-            .reads_err = self.reads_err.load(.monotonic),
-            .bytes_read = self.bytes_read.load(.monotonic),
-            .read_nanos = self.read_nanos.load(.monotonic),
-            .writes_ok = self.writes_ok.load(.monotonic),
-            .writes_err = self.writes_err.load(.monotonic),
-            .bytes_written = self.bytes_written.load(.monotonic),
-            .fills_peer = self.fills_peer.load(.monotonic),
-            .fills_origin = self.fills_origin.load(.monotonic),
-            .bytes_from_peer = self.bytes_from_peer.load(.monotonic),
-            .bytes_from_origin = self.bytes_from_origin.load(.monotonic),
-            .fill_peer_nanos = self.fill_peer_nanos.load(.monotonic),
-            .fill_origin_nanos = self.fill_origin_nanos.load(.monotonic),
-            .fill_err_peer = self.fill_err_peer.load(.monotonic),
-            .fill_err_origin = self.fill_err_origin.load(.monotonic),
-            .fill_err_cache = self.fill_err_cache.load(.monotonic),
-            .probe_err = self.probe_err.load(.monotonic),
-            .pieces_culled = self.pieces_culled.load(.monotonic),
-            .http_unauthorized = self.http_unauthorized.load(.monotonic),
-            .http_5xx = self.http_5xx.load(.monotonic),
-            .http_malformed = self.http_malformed.load(.monotonic),
-        };
+        var out: Snap = .{};
+        inline for (@typeInfo(Snap).@"struct".fields) |f| {
+            @field(out, f.name) = @field(self.*, f.name).load(.monotonic);
+        }
+        return out;
     }
 };
 
@@ -1632,8 +1627,14 @@ test "a finisher racing distrust never republishes the wiped marks" {
         const mp = try st.cacheMetaPath(&mb, "dt.bin");
         var blob_buf: [4096]u8 = undefined;
         if (sys.readFileBuf(&blob_buf, mp)) |blob| {
-            var decoded = try piece.Bitfield.decode(gpa, blob, st.piece_size, 64);
-            defer decoded.deinit(gpa);
+            // The filler's own post-distrust save can be mid-flight when this
+            // read samples the file (open O_TRUNC landed, bytes not yet), so
+            // a torn or empty prefix is an expected observation, not a
+            // violation -- loadBits degrades exactly these to "cache as
+            // empty". Only a decodable snapshot asserts anything: its bits 0
+            // and 1 must stay clear.
+            const decoded = piece.Bitfield.decode(gpa, blob, st.piece_size, 64) catch continue;
+            defer gpa.free(decoded.bytes);
             try std.testing.expect(!decoded.get(0));
             try std.testing.expect(!decoded.get(1));
         } else |_| {}
@@ -1762,6 +1763,123 @@ test "punchPiece refuses pinned and freshly accessed entries" {
 
     // Past the window with nothing held, the same piece culls normally.
     try std.testing.expect(st.punchPiece(f, 0, touched + Store.recency_secs));
+}
+
+test "cullOne punches the least recently used live entry first" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-lru");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-lru");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Two idle cached entries aged past the recency window relative to the
+    // caller-supplied instant: the victim must be picked by last_access
+    // alone, never by map iteration order. Virtual stamps pin the exact
+    // boundary with no sleeping.
+    const t0 = sys.monoSec();
+    {
+        const old = try st.get("old.bin", 16);
+        const new = try st.get("new.bin", 16);
+        old.mu.lockUncancelable(std.testing.io);
+        old.bits.set(0);
+        old.last_access.store(t0, .monotonic);
+        old.mu.unlock(std.testing.io);
+        new.mu.lockUncancelable(std.testing.io);
+        new.bits.set(0);
+        new.last_access.store(t0 + 60, .monotonic);
+        new.mu.unlock(std.testing.io);
+        st.releaseFile(old);
+        st.releaseFile(new);
+    }
+    const now = t0 + 60 + Store.recency_secs;
+    try std.testing.expect(st.cullOne(now));
+
+    {
+        const old = st.lookupRef("old.bin").?;
+        defer st.releaseFile(old);
+        const new = st.lookupRef("new.bin").?;
+        defer st.releaseFile(new);
+        old.mu.lockUncancelable(std.testing.io);
+        const old_punched = !old.bits.get(0);
+        old.mu.unlock(std.testing.io);
+        new.mu.lockUncancelable(std.testing.io);
+        const new_kept = new.bits.get(0);
+        new.mu.unlock(std.testing.io);
+        try std.testing.expect(old_punched);
+        try std.testing.expect(new_kept);
+    }
+
+    // The next round moves to the previously newer entry: LRU order drains
+    // candidates oldest-first instead of replaying the same victim.
+    try std.testing.expect(st.cullOne(now));
+    const new2 = st.lookupRef("new.bin").?;
+    defer st.releaseFile(new2);
+    new2.mu.lockUncancelable(std.testing.io);
+    const new_punched = !new2.bits.get(0);
+    new2.mu.unlock(std.testing.io);
+    try std.testing.expect(new_punched);
+}
+
+test "cullOne breaks equal-recency ties by rel bytes, not map order" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-lru-tie");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-lru-tie");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Identical stamps on every entry: the tie must resolve by rel bytes
+    // ("a.bin" before "b.bin"), so the victim is a function of durable state
+    // alone even though b.bin entered the map first.
+    const t0 = sys.monoSec();
+    for ([_][]const u8{ "b.bin", "a.bin" }) |rel| {
+        const f = try st.get(rel, 16);
+        f.mu.lockUncancelable(std.testing.io);
+        f.bits.set(0);
+        f.last_access.store(t0, .monotonic);
+        f.mu.unlock(std.testing.io);
+        st.releaseFile(f);
+    }
+
+    const now = t0 + Store.recency_secs;
+    try std.testing.expect(st.cullOne(now));
+    {
+        const a = st.lookupRef("a.bin").?;
+        defer st.releaseFile(a);
+        const b = st.lookupRef("b.bin").?;
+        defer st.releaseFile(b);
+        a.mu.lockUncancelable(std.testing.io);
+        const a_punched = !a.bits.get(0);
+        a.mu.unlock(std.testing.io);
+        b.mu.lockUncancelable(std.testing.io);
+        const b_kept = b.bits.get(0);
+        b.mu.unlock(std.testing.io);
+        try std.testing.expect(a_punched);
+        try std.testing.expect(b_kept);
+    }
+
+    try std.testing.expect(st.cullOne(now));
+    {
+        const b = st.lookupRef("b.bin").?;
+        defer st.releaseFile(b);
+        b.mu.lockUncancelable(std.testing.io);
+        const b_punched = !b.bits.get(0);
+        b.mu.unlock(std.testing.io);
+        try std.testing.expect(b_punched);
+    }
+    // Every live candidate drained: nothing left to punch.
+    try std.testing.expect(!st.cullOne(now));
 }
 
 /// Writes a meta sidecar for rel naming exactly `filled` pieces as cached,
@@ -2183,6 +2301,41 @@ test "sidecar save and cache open recreate a deleted parent directory" {
     f.mu.unlock(std.testing.io);
     try std.testing.expect(st.openCache(f) >= 0);
     try std.testing.expect(sys.statPath(dp, &stbuf) == 0);
+}
+
+test "openCache refuses a symlink planted at the data path" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-sym");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-sym");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // O_NOFOLLOW contract on the data artifact: a local writer who can plant
+    // a symlink at a cache data path must not turn the daemon's open with
+    // O_RDWR|O_CREAT (and its ftruncate/pwrite) into writes to an arbitrary
+    // file. The open fails and the planted target keeps its bytes.
+    var tb: [192]u8 = undefined;
+    const target = try std.fmt.bufPrint(&tb, "{s}/outside.txt", .{origin_d});
+    var zb: [192]u8 = undefined;
+    const target_z = try sys.toZ(&zb, target);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(target_z, "keepme"));
+
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.cacheDataPath(&db, "sym.bin");
+    try std.testing.expectEqual(@as(i32, 0), c.symlink(target_z, dp));
+
+    const f = try st.get("sym.bin", 32);
+    defer st.releaseFile(f);
+    try std.testing.expect(st.openCache(f) < 0);
+
+    var rb: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("keepme", try sys.readFileBuf(&rb, try sys.toZ(&zb, target)));
 }
 
 test "late finisher on a forgotten entry does not resurrect the sidecar" {

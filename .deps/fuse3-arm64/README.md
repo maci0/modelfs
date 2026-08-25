@@ -2,7 +2,9 @@
 
 Target-root libfuse3 for cross-building modelfs on aarch64 spark nodes
 (Ubuntu 24.04 "noble"). The host build uses the system libfuse3; point a
-cross build at this tree instead:
+cross build at this tree instead. On a fresh clone only the two `.deb`
+files exist (`root/` and `lib/` are gitignored), so extract them per
+[Refreshing](#refreshing) before building:
 
 ```
 zig build -Dtarget=aarch64-linux-gnu.2.39 -Dfuse-include=<repo>/.deps/fuse3-arm64/root/usr/include/fuse3 \

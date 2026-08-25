@@ -1743,6 +1743,53 @@ test "acceptLoop exits instead of spinning when the listen fd is unusable" {
     t.join();
 }
 
+test "acceptLoop closes connections beyond the inflight handler cap" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-cap-o");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-cap-c");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+
+    // More idle connections than the cap, none sending a head: admitted
+    // handlers park on their head read until their clients close below, and
+    // every connection beyond the cap must be closed outright. The
+    // claim-then-check atomic decides which ones; only the count matters.
+    const n_conns: usize = Server.max_inflight + 8;
+    var fds: [n_conns]c_int = undefined;
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, srv.port());
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    for (&fds) |*fd| {
+        fd.* = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        try std.testing.expect(fd.* >= 0);
+        try std.testing.expectEqual(@as(i32, 0), sys.connectIn(fd.*, &addr, 5000));
+    }
+    defer for (&fds) |fd| sys.close(fd);
+
+    // Rejected connections see EOF as soon as the accept loop claims them;
+    // bounded retries absorb scheduler delay without masking a regression
+    // (a missing or miscounted cap leaves every socket open).
+    const expect_eof = n_conns - Server.max_inflight;
+    var eof: usize = 0;
+    var waited: u32 = 0;
+    while (waited < 500) : (waited += 1) {
+        eof = 0;
+        for (&fds) |fd| {
+            var probe: [1]u8 = undefined;
+            if (c.recv(fd, &probe, probe.len, c.MSG_PEEK | c.MSG_DONTWAIT) == 0) eof += 1;
+        }
+        if (eof >= expect_eof) break;
+        sys.sleepMs(10);
+    }
+    try std.testing.expectEqual(@as(usize, expect_eof), eof);
+}
+
 test "serveData fills every piece of a multi-piece range" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
