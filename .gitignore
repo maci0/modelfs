@@ -20,3 +20,10 @@ __pycache__/
 # Scratch and runtime state
 .scratch/
 .gauntlet.lock
+
+# Core dumps from crashed test binaries and debug runs (glibc: core[.<pid>],
+# valgrind: vgcore.<pid>) land in the repo root; process memory is not a
+# commit artifact.
+/core
+/core.*
+/vgcore.*
