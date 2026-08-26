@@ -34,6 +34,12 @@ Downloaded from the Ubuntu noble archive (main/f/fuse3 pool):
   http://archive.ubuntu.com/ubuntu/pool/main/f/fuse3/libfuse3-dev_3.14.0-5build1_arm64.deb
   sha256: 9a32e4ed3fe950417074d534207d399c5a80ad06843e265ae75a06ba703feafb
 
+License: LGPL-2.1 (upstream fuse3, same for both packages). The authoritative
+text and copyright list ship inside each `.deb` and land under
+`root/usr/share/doc/libfuse3-3/copyright` after extraction; consult that file
+for the grant covering the exact vendored artifact. This repo is
+GPL-3.0-or-later and links the shared library dynamically.
+
 Verify before use: `sha256sum -c` against the digests above, then compare
 with `Release` file hashes from archive.ubuntu.com. `build.zig` enforces
 these digests on every build and fails with a mismatch message if either

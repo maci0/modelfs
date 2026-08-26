@@ -93,12 +93,13 @@ fn resolveRel(p: []const u8, cluster_rc: c_int, rel: *[]const u8) c_int {
     return 0;
 }
 
-/// Client-supplied create/mkdir modes carry permission bits only. The FUSE
-/// authority transition makes the daemon the owner of everything created
+/// Client-supplied create/mkdir/chmod modes carry permission bits only. The
+/// FUSE authority transition makes the daemon the owner of everything created
 /// through the mount, and Linux honors S_ISUID/S_ISGID in open(2)/mkdir(2)
-/// create modes, so passing the caller's mode verbatim would let any writer
-/// to a mount directory plant a setuid/setgid executable owned by the daemon
-/// uid -- root on an allow_other root mount. Nothing this filesystem stores
+/// create modes just as it does in a later chmod(2) on those daemon-owned
+/// files, so passing the caller's mode verbatim would let any writer to a
+/// mount directory plant a setuid/setgid executable owned by the daemon uid
+/// -- root on an allow_other root mount. Nothing this filesystem stores
 /// (model weights, cache artifacts) has a use for special bits.
 fn clientCreateMode(mode: fuse.mode_t) fuse.mode_t {
     return mode & 0o777;
@@ -416,8 +417,8 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     // open/read rebuilds the entry.
     if (st.store.get(rel, 0, sys.monoSec())) |file| {
         st.store.releaseFile(file);
-    } else |_| {
-        std.log.warn("cache entry warmup failed for {s}; rebuilding on next open", .{rel});
+    } else |err| {
+        std.log.warn("cache entry warmup failed for {s} ({t}); rebuilding on next open", .{ rel, err });
     }
     return 0;
 }
@@ -767,9 +768,13 @@ export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_i
     // though create/unlink deny the same paths.
     const rerr = resolveRel(cPath(path), -sys.c.EPERM, &rel);
     if (rerr != 0) return rerr;
+    // Same mask as create/mkdir (see clientCreateMode): chmod(2) honors
+    // S_ISUID/S_ISGID on the daemon-owned origin file exactly like the
+    // create modes do, so an unmasked mode here would let a mount writer
+    // plant the special bit one step after a masked create.
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    if (std.c.chmod(op, mode) != 0) return sys.negErrno();
+    if (std.c.chmod(op, clientCreateMode(mode)) != 0) return sys.negErrno();
     return 0;
 }
 

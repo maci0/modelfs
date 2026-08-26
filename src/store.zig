@@ -450,8 +450,9 @@ pub const Store = struct {
         };
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cacheMetaPath(&buf, file.rel) catch return false;
-        if (writeFileMakingParent(p, blob.items, durable) != 0) {
-            std.log.warn("bitfield save failed for {s}; cache state resets on restart", .{file.rel});
+        const w = writeFileMakingParent(p, blob.items, durable);
+        if (w != 0) {
+            std.log.warn("bitfield save failed for {s} (errno {d}); cache state resets on restart", .{ file.rel, -w });
             return false;
         }
         return true;
@@ -1203,8 +1204,9 @@ pub const Store = struct {
         // persisted durably before any destructive step. A save failure leaves
         // the old sidecar standing and nothing punched; a crash after the save
         // but before the punch costs only a refill over intact bytes.
-        if (sys.writeFileDurable(mp, blob.items) != 0) {
-            std.log.warn("bitfield save failed for {s}; piece {d} stays cached", .{ rel, idx });
+        const w = sys.writeFileDurable(mp, blob.items);
+        if (w != 0) {
+            std.log.warn("bitfield save failed for {s} (errno {d}); piece {d} stays cached", .{ rel, -w, idx });
             return false;
         }
         if (sys.punchHole(fd, off, ln) != 0) return false;
@@ -1240,8 +1242,9 @@ pub const Store = struct {
         defer self.mu.unlock(self.io);
         if (self.files.contains(rel)) return false;
         if (self.purge_epoch != epoch0) return false;
-        if (writeFileMakingParent(mp, blob.items, true) != 0) {
-            std.log.warn("bitfield save failed for {s}; unclaimed bytes stay cached", .{rel});
+        const w = writeFileMakingParent(mp, blob.items, true);
+        if (w != 0) {
+            std.log.warn("bitfield save failed for {s} (errno {d}); unclaimed bytes stay cached", .{ rel, -w });
             return false;
         }
         const punched = sys.punchHole(fd, 0, size);

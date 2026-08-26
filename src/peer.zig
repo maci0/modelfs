@@ -374,10 +374,10 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
         replyStatus(self, fd, "404 Not Found");
         return;
     }
-    const file = self.store.get(rel, @intCast(st.st_size), sys.monoSec()) catch {
+    const file = self.store.get(rel, @intCast(st.st_size), sys.monoSec()) catch |err| {
         // The fetching peer only sees 500; without this line the serving
         // node's log says nothing about why.
-        std.log.warn("cache entry open failed for {s}; replying 500", .{rel});
+        std.log.warn("cache entry open failed for {s} ({t}); replying 500", .{ rel, err });
         replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
@@ -399,10 +399,13 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
         return;
     };
     _ = sys.writeAll(fd, h);
-    if (sys.writeAll(fd, snap) < 0)
+    const put = sys.writeAll(fd, snap);
+    if (put < 0) {
         // The 200 header is already on the wire, so the fetching peer only
-        // sees a truncated body; this line is the sender-side trace of why.
-        std.log.warn("have bits send failed for {s}; dropping peer transfer", .{rel});
+        // sees a truncated body; this line is the sender-side trace of why
+        // (EPIPE/ECONNRESET for a departed peer, ETIMEDOUT for a stalled one).
+        std.log.warn("have bits send failed for {s} (errno {d}); dropping peer transfer", .{ rel, -put });
+    }
 }
 
 /// Hydrates every piece the range touches before streaming; unhydrated
@@ -522,8 +525,13 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
                 // still falls back to user-space streaming below.
                 if (sent > 0 or done > 0) {
                     // The fetching peer only sees a truncated body; this line
-                    // is the sender-side trace of where the transfer died.
-                    std.log.warn("sendfile short send for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, start + done, sent, take });
+                    // is the sender-side trace of where the transfer died. A
+                    // negative result is an errno (EAGAIN is the send-timeout
+                    // expiry), not a count -- name it as one.
+                    if (sent < 0)
+                        std.log.warn("sendfile failed for {s} at offset {d} (errno {d}); dropping peer transfer", .{ file.rel, start + done, -sent })
+                    else
+                        std.log.warn("sendfile short send for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, start + done, sent, take });
                     return;
                 }
                 break;
@@ -555,15 +563,20 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
         const n = self.store.readCache(file, buf[0..take], off, sys.monoSec());
         if (n < 0 or @as(u64, @intCast(n)) != take) {
             // Same contract as the sendfile path: the peer sees a truncated
-            // body, so the local log must carry where and why.
-            std.log.warn("cache short read for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, off, n, take });
+            // body, so the local log must carry where and why. A negative
+            // result is an errno, not a count -- name it as one.
+            if (n < 0)
+                std.log.warn("cache read failed for {s} at offset {d} (errno {d}); dropping peer transfer", .{ file.rel, off, -n })
+            else
+                std.log.warn("cache short read for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, off, n, take });
             return;
         }
-        if (sys.writeAll(fd, buf[0..take]) < 0) {
+        const w = sys.writeAll(fd, buf[0..take]);
+        if (w < 0) {
             // Same contract as the sendfile and short-read paths above: the
             // peer sees a truncated body, so the local log must carry where
             // the transfer died.
-            std.log.warn("peer send failed for {s} at offset {d}; dropping peer transfer", .{ file.rel, off });
+            std.log.warn("peer send failed for {s} at offset {d} (errno {d}); dropping peer transfer", .{ file.rel, off, -w });
             return;
         }
         off += take;
@@ -607,10 +620,10 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     // here would break ordinary HTTP clients asking for the rest of the file;
     // the internal peer protocol always sends exact piece bounds.
     const rg_end = @min(rg.end, size - 1);
-    const file = self.store.get(rel, size, sys.monoSec()) catch {
+    const file = self.store.get(rel, size, sys.monoSec()) catch |err| {
         // Same operator-trace contract as serveHave's 500: the peer sees the
         // status alone, so the local log must carry the cause.
-        std.log.warn("cache entry open failed for {s}; replying 500", .{rel});
+        std.log.warn("cache entry open failed for {s} ({t}); replying 500", .{ rel, err });
         replyStatus(self, fd, "500 Internal Server Error");
         return;
     };

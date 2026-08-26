@@ -434,11 +434,12 @@ pub const Catalog = struct {
             w = sys.writeFileNoFollow(ztmp, json);
         }
         if (w != 0) {
-            std.log.warn("lease publish failed at {s}", .{zpath});
+            std.log.warn("lease publish failed at {s} (errno {d})", .{ zpath, -w });
             return;
         }
-        if (std.c.rename(ztmp, zpath) != 0)
-            std.log.warn("lease publish rename failed at {s}", .{zpath});
+        if (std.c.rename(ztmp, zpath) != 0) {
+            std.log.warn("lease publish rename failed at {s} (errno {d})", .{ zpath, sys.errno() });
+        }
     }
 
     /// Rebuilds the peer list from origin/.cluster, dropping leases expired

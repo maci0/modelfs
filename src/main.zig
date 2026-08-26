@@ -82,9 +82,17 @@ fn writeOut(io: std.Io, bytes: []const u8) void {
     std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
 }
 
-fn printOut(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+fn printOut(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const line = std.fmt.bufPrint(&buf, fmt, args) catch {
+        // A rendered line can outgrow the stack buffer: a lease id comes off
+        // other nodes' JSON bounded by the read cap, not by validId, and a
+        // pin relpath is whatever argv carried. Dropping the line would hide
+        // a real result behind exit 0, so fall back to the heap instead.
+        const heap = std.fmt.allocPrint(gpa, fmt, args) catch return;
+        defer gpa.free(heap);
+        return writeOut(io, heap);
+    };
     writeOut(io, line);
 }
 
@@ -413,7 +421,7 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
         // like the group-readable PSK-file warning below.
         if (!builtin.is_test)
             std.log.warn("--psk-value exposes the secret in /proc/<pid>/cmdline to every local user; prefer --psk FILE (mode 0600)", .{});
-        return gpa.dupe(u8, v);
+        return dupeHeaderSafePsk(gpa, v);
     }
     var z: [sys.c.PATH_MAX]u8 = undefined;
     const p = try sys.toZ(&z, opts.psk_file);
@@ -456,7 +464,27 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
         if (!builtin.is_test) std.log.err("PSK at {s} is empty; refusing to serve unauthenticated", .{opts.psk_file});
         return error.EmptyPsk;
     }
-    return gpa.dupe(u8, trimmed);
+    return dupeHeaderSafePsk(gpa, trimmed);
+}
+
+/// Copies the shared secret, refusing CR or LF anywhere inside it. The
+/// secret is embedded verbatim in the peer protocol's "Authorization" header
+/// (peer.zig sendRequest) and compared byte-exact there (proto.bearerOk), so
+/// a line break would split one node's request head mid-token: every fetch
+/// between two such nodes fails 401 with only probe_err counting the storm.
+/// Spaces and tabs ride fine (both sides trim only the token's ends); any
+/// other byte, non-ASCII included, passes through the slice-based head parser
+/// untouched. Failing at load names the cause instead of leaving the operator
+/// a cluster that reads as PSK-drifted.
+fn dupeHeaderSafePsk(gpa: std.mem.Allocator, secret: []const u8) ![]u8 {
+    for (secret) |ch| {
+        if (ch == '\r' or ch == '\n') {
+            if (!builtin.is_test)
+                std.log.err("shared secret contains a line break; it would corrupt the peer request head -- regenerate it (umask 077; openssl rand -hex 32)", .{});
+            return error.PskNotHeaderSafe;
+        }
+    }
+    return gpa.dupe(u8, secret);
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -497,7 +525,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("{s}", .{usage});
             return 2;
         }
-        printOut(init.io, "modelfs {s}\n", .{build_options.version});
+        printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
         return 0;
     }
     const parsed = parseArgs(gpa, init.environ_map, argv.items) catch |err| switch (err) {
@@ -506,7 +534,7 @@ pub fn main(init: std.process.Init) !u8 {
             return 0;
         },
         error.Version => {
-            printOut(init.io, "modelfs {s}\n", .{build_options.version});
+            printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
             return 0;
         },
         // Usage errors exit 2, like every other bad invocation in this CLI
@@ -977,20 +1005,20 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             // JSON; echo them only when free of control bytes so `modelfs peers`
             // cannot be turned into a terminal-injection vector.
             const id_shown = if (discover.printable(lease.id)) lease.id else "<id withheld: control bytes>";
-            printOut(io, "{s} (until={d}, {s})\n", .{ id_shown, lease.until, status_str });
+            printOut(io, gpa, "{s} (until={d}, {s})\n", .{ id_shown, lease.until, status_str });
             for (lease.addrs) |a| {
                 const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
-                printOut(io, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
+                printOut(io, gpa, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
             }
             any = true;
         }
-        if (!any) printOut(io, "no leases\n", .{});
+        if (!any) printOut(io, gpa, "no leases\n", .{});
     } else {
         // The origin itself was verified reachable above, so a missing or
         // unreadable .cluster dir here is a fresh/empty cluster, not an
         // error: same exit-0 empty output as below, with the reason on
         // stdout next to where the listing would have been.
-        printOut(io, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir });
+        printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir });
     }
     return 0;
 }
@@ -1000,8 +1028,11 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     defer dummy_io.deinit();
     var store = store_mod.Store.init(gpa, dummy_io.io(), opts.origin orelse "", opts.cache, opts.piece);
     defer store.deinit();
-    if (store.ensureLayout() != 0) {
-        std.log.err("cannot create cache dirs under {s}", .{opts.cache});
+    // Same operator trace as cmdMount's mount-time layout check: the errno
+    // distinguishes EACCES from ENOSPC, which the remediation differs for.
+    const layout_rc = store.ensureLayout();
+    if (layout_rc != 0) {
+        std.log.err("cannot create cache dirs under {s} (errno {d})", .{ opts.cache, -layout_rc });
         return 1;
     }
     var rel = path;
@@ -1019,7 +1050,7 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
         std.log.err("{s} failed errno {d}", .{ if (on) "pin" else "unpin", -rc });
         return 1;
     }
-    printOut(io, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel });
+    printOut(io, gpa, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel });
     return 0;
 }
 
@@ -1640,6 +1671,40 @@ test "loadPsk refuses empty secrets and trims file contents" {
         const fp = try std.fmt.bufPrint(&pb, "{s}/blank.psk", .{scratch});
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "\n\t  \n"));
         try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, .{ .psk_file = fp }));
+    }
+}
+
+test "loadPsk refuses line breaks but rides every other byte header-safe" {
+    const gpa = std.testing.allocator;
+    var db: [128]u8 = undefined;
+    const scratch = try sys.scratchDir(&db, "modelfs-psk-frame");
+    defer sys.deleteTree(std.testing.io, scratch);
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    // sendRequest embeds the secret verbatim in one HTTP header line; an
+    // interior CR/LF splits the head there, so both nodes' fetches 401
+    // forever while reads silently fall back to NFS. Refused at load, for
+    // the inline value...
+    try std.testing.expectError(error.PskNotHeaderSafe, loadPsk(gpa, .{ .psk_value = "ab\rcd" }));
+    try std.testing.expectError(error.PskNotHeaderSafe, loadPsk(gpa, .{ .psk_value = "ab\ncd" }));
+    try std.testing.expectError(error.PskNotHeaderSafe, loadPsk(gpa, .{ .psk_value = "a\r\nb" }));
+    // ...and for the file form (surrounding breaks are trim, not content).
+    var zb: [192]u8 = undefined;
+    {
+        var pb: [160]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&pb, "{s}/wrapped.psk", .{scratch});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "first\r\nsecond\n"));
+        try std.testing.expectError(error.PskNotHeaderSafe, loadPsk(gpa, .{ .psk_file = fp }));
+    }
+    // Everything else survives verbatim: spaces and tabs (both sides trim
+    // only the token's ends), high bytes, and multi-byte UTF-8 spellings of
+    // the same secret ride the slice-based head parser byte-exact.
+    {
+        const psk = try loadPsk(gpa, .{ .psk_value = "ke\u{e9}y \ttw\xfeice" });
+        defer gpa.free(psk);
+        try std.testing.expectEqualStrings("ke\xc3\xa9y \ttw\xfeice", psk);
     }
 }
 
