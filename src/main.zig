@@ -38,7 +38,6 @@ const usage =
     \\  --advertise ADDRS     Extra addresses IP[:PORT], comma separated
     \\                        (default: every local IPv4 except loopback and 169.254)
     \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
-    \\  --psk-value STR       Shared secret inline (dev; leaks via /proc cmdline)
     \\  --seed HOST[:PORT]    Peer seed if origin/.cluster is empty; repeatable
     \\  --piece SIZE          Piece size (default 16M)
     \\  --direct-io           FUSE direct_io (default; skips kernel cache)
@@ -51,7 +50,7 @@ const usage =
     \\  -f, --foreground      Stay in the foreground (default)
     \\
     \\status/peers/pin take only the flags shown on their Usage line plus
-    \\the shared --origin/--cache/--psk/--psk-value values; mount-only
+    \\the shared --origin/--cache/--psk values; mount-only
     \\options are refused elsewhere. Every command also accepts -h/--help,
     \\and -V/--version prints the release. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-').
@@ -282,8 +281,7 @@ fn takeValue(args: []const []const u8, flag: []const u8, i: *usize) ![]const u8 
 /// it falls through to the default like an unset variable instead of
 /// replacing a usable path with "" or bricking every mount with BadId on a
 /// value that never appears anywhere. Explicit empty flags keep their
-/// meaning -- `--id ""` is still refused, `--psk-value ""` still trips
-/// loadPsk's EmptyPsk gate.
+/// meaning -- `--id ""` is still refused.
 fn envValue(environ: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
     const v = environ.get(name) orelse return null;
     return if (v.len == 0) null else v;
@@ -404,9 +402,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     if (envValue(environ, "MODELFS_ORIGIN")) |v| opts.origin = v;
     if (envValue(environ, "MODELFS_CACHE")) |v| opts.cache = v;
     if (envValue(environ, "MODELFS_PSK")) |v| opts.psk_file = v;
-    // The inline secret's env spelling, like every other flag's: keeps it
-    // out of /proc/<pid>/cmdline for scripted mounts that cannot use a PSK
-    // file. An explicit --psk-value still wins.
+    // The only inline-secret spelling: no flag carries the secret, because
+    // argv is world-readable through /proc/<pid>/cmdline while the
+    // environment block is readable only by the process owner and root.
+    // For scripted mounts that cannot place a PSK file.
     if (envValue(environ, "MODELFS_PSK_VALUE")) |v| opts.psk_value = v;
     // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin
     // never read the id, so an ambient shell-wide variable must neither leak
@@ -445,8 +444,6 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             opts.id = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--psk")) {
             opts.psk_file = try takeValue(args, a, &i);
-        } else if (std.mem.eql(u8, a, "--psk-value")) {
-            opts.psk_value = try takeValue(args, a, &i);
         } else if (std.mem.eql(u8, a, "--piece")) {
             try rejectOutsideMount(cmd, a);
             const raw = try takeValue(args, a, &i);
@@ -571,15 +568,9 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     // refuse it before any socket is bound.
     if (opts.psk_value) |v| {
         if (v.len == 0) {
-            if (!builtin.is_test) std.log.err("--psk-value is empty; refusing to serve unauthenticated", .{});
+            if (!builtin.is_test) std.log.err("MODELFS_PSK_VALUE is empty; refusing to serve unauthenticated", .{});
             return error.EmptyPsk;
         }
-        // argv is world-readable via /proc/<pid>/cmdline for the daemon's
-        // whole lifetime, so an inline secret hands the cluster credential to
-        // every local user. Never refuse (dev convenience), always surface it,
-        // like the group-readable PSK-file warning below.
-        if (!builtin.is_test)
-            std.log.warn("--psk-value exposes the secret in /proc/<pid>/cmdline to every local user; prefer --psk FILE (mode 0600)", .{});
         return dupeHeaderSafePsk(gpa, v);
     }
     var z: [sys.c.PATH_MAX]u8 = undefined;
@@ -1490,9 +1481,9 @@ fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {
 test "parseArgs mount flags" {
     const gpa = std.testing.allocator;
     const args = [_][]const u8{
-        "mount",       "/mnt/models", "--origin", "/srv/origin",     "--piece", "4M",
-        "--psk-value", "topsecret",   "--listen", "127.0.0.1:19090", "--seed",  "10.0.0.9:19099",
-        "--brun",      "12",          "--bcull",  "6",               "--bstop", "2",
+        "mount",    "/mnt/models",      "--origin", "/srv/origin",     "--piece", "4M",
+        "--psk",    "/etc/modelfs.psk", "--listen", "127.0.0.1:19090", "--seed",  "10.0.0.9:19099",
+        "--brun",   "12",               "--bcull",  "6",               "--bstop", "2",
         "--detach",
     };
     var environ = std.process.Environ.Map.init(gpa);
@@ -1607,8 +1598,8 @@ test "empty environment variables read as unset" {
     try std.testing.expect(parsed.opts.id == null);
 
     // Non-empty values still apply, and an explicitly empty flag keeps its
-    // stricter meaning where one exists (--psk-value "" is refused by
-    // loadPsk, --id "" by the BadId gate above).
+    // stricter meaning where one exists (--id "" is refused by the BadId
+    // gate above).
     try environ.put("MODELFS_ORIGIN", "/env/origin");
     try environ.put("MODELFS_CACHE", "/env/cache");
     try environ.put("MODELFS_PSK", "/env/psk");
@@ -1649,7 +1640,7 @@ test "parseArgs rejects mount-only flags on other commands" {
     // Shared value flags stay legal on every command (the e2e suites pass
     // --psk/--origin to pin and peers).
     {
-        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--cache", "/c", "--origin", "/o", "--psk-value", "s" });
+        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--cache", "/c", "--origin", "/o", "--psk", "/p" });
         defer freeParsed(parsed, gpa);
         try std.testing.expectEqualStrings("/c", parsed.opts.cache);
     }
@@ -1684,7 +1675,7 @@ test "parseArgs treats everything after -- as positional" {
     }
 }
 
-test "psk secret prefers the flag over MODELFS_PSK_VALUE" {
+test "the inline secret comes from MODELFS_PSK_VALUE and has no flag" {
     const gpa = std.testing.allocator;
     var environ = std.process.Environ.Map.init(gpa);
     defer environ.deinit();
@@ -1694,12 +1685,12 @@ test "psk secret prefers the flag over MODELFS_PSK_VALUE" {
         defer freeParsed(parsed, gpa);
         try std.testing.expectEqualStrings("env-secret", parsed.opts.psk_value.?);
     }
-    // An explicit --psk-value wins, like every other flag over its env var.
-    {
-        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--psk-value", "flag-secret" });
-        defer freeParsed(parsed, gpa);
-        try std.testing.expectEqualStrings("flag-secret", parsed.opts.psk_value.?);
-    }
+    // No argv spelling exists: a secret on the command line is world-readable
+    // through /proc/<pid>/cmdline, so the flag is an unknown one.
+    try std.testing.expectError(
+        error.UnknownFlag,
+        parseArgs(gpa, &environ, &.{ "mount", "--psk-value", "flag-secret" }),
+    );
 }
 
 test "parseArgs defaults come from the environ map" {
