@@ -1,12 +1,31 @@
 # ModelFS
 
+[![check](https://github.com/maci0/modelfs/actions/workflows/ci.yml/badge.svg)](https://github.com/maci0/modelfs/actions/workflows/ci.yml)
+![zig 0.16](https://img.shields.io/badge/zig-0.16.0-f7a41d)
+![platform linux + fuse3](https://img.shields.io/badge/platform-linux%20%2B%20fuse3-4c566a)
+![no dependencies](https://img.shields.io/badge/dependencies-libfuse3%20only-4c566a)
+[![license GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-3b7dd8)](LICENSE)
+
 A POSIX `/models` mount for LLM weights. One Zig binary per node: FUSE via `libfuse3`, a local NVMe piece cache, and peer-to-peer piece transfers that stream zero-copy through Linux `sendfile`. Engines (`llama.cpp`, `vLLM`, `SGLang`) just open files.
 
-```
-/net/<nas>/models     NFS origin (read/write authority, required)
-/models               FUSE mount point on the GPU nodes
-/var/cache/modelfs    local NVMe piece cache (16 MiB pieces)
-:18080                peer HTTP protocol (PSK bearer auth)
+| Path | Role |
+| :--- | :--- |
+| `/net/<nas>/models` | NFS origin, the read/write authority. Required |
+| `/models` | FUSE mount point on the GPU nodes |
+| `/var/cache/modelfs` | local NVMe piece cache, 16 MiB pieces |
+| `:18080` | peer HTTP protocol, PSK bearer auth |
+
+```mermaid
+flowchart LR
+  E["engine reads<br/>/models/foo.gguf"] --> Q{"piece in the<br/>local cache?"}
+  Q -- yes --> L[("local NVMe<br/>16 MiB piece")]
+  Q -- no --> P{"any peer<br/>advertises it?"}
+  P -- yes --> S["peer :18080<br/>sendfile, PSK auth"]
+  P -- no --> O[("NFS origin")]
+  S --> F["fill the hole"]
+  O --> F
+  F --> L
+  L --> B["bytes back to the engine"]
 ```
 
 Reads: **local piece → cluster peer (`sendfile`) → origin**.
@@ -79,6 +98,8 @@ Measured with nine `modelfs` instances on **one host over TCP loopback**, not ac
 | Peak `sendfile` throughput (64 MiB pieces) | 3.5 GB/s |
 | `/ping` sweep across 9 instances | 1.1 ms total |
 
+<img src="docs/figures/fig2_throughput_vs_piece_size.png" alt="Throughput against piece size, 256 KiB to 64 MiB" width="640">
+
 The piece-size sweep is why the default piece is 16 MiB: past it the gain is small, and every miss costs the reader a whole piece before the read returns.
 
 ## Tests
@@ -122,12 +143,12 @@ Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); instal
 
 [docs/](docs/) has the index. Shortest path in:
 
-* [docs/architecture.md](docs/architecture.md) — how it actually behaves: cache layers, discovery, path scoring, auth, culling, write races.
-* [docs/operations.md](docs/operations.md) — the ZFS/NFS/FS-Cache setup underneath, and Hugging Face downloads.
-* [docs/recovery.md](docs/recovery.md) — what survives which disaster: backups, per-case restore steps, RPO/RTO, restore drills.
-* [docs/benchmarks.md](docs/benchmarks.md) — numbers, with the caveats that qualify them.
-* [docs/audits.md](docs/audits.md) — review findings and their fixes; [docs/review-guides/](docs/review-guides/) holds the checklists they came from.
-* [docs/design.md](docs/design.md) — the original sketch, kept for history. It marks what never shipped.
+* [docs/architecture.md](docs/architecture.md): how it actually behaves: cache layers, discovery, path scoring, auth, culling, write races.
+* [docs/operations.md](docs/operations.md): the ZFS/NFS/FS-Cache setup underneath, and Hugging Face downloads.
+* [docs/recovery.md](docs/recovery.md): what survives which disaster: backups, per-case restore steps, RPO/RTO, restore drills.
+* [docs/benchmarks.md](docs/benchmarks.md): numbers, with the caveats that qualify them.
+* [docs/audits.md](docs/audits.md): review findings and their fixes; [docs/review-guides/](docs/review-guides/) holds the checklists they came from.
+* [docs/design.md](docs/design.md): the original sketch, kept for history. It marks what never shipped.
 
 ## License
 
