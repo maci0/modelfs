@@ -3090,3 +3090,345 @@ test "fuzz server conn contract holds for mutated corpus heads" {
         try serveConnCheck(buf[0..take]);
     }
 }
+
+// The harnesses above drive handleConn against a deliberately absent origin,
+// so every routed request stops at statOrigin's ENOENT and the /data body
+// path -- where attacker-chosen Range values meet real file bytes, hydration
+// and the streaming loop -- never runs under fuzz. This section pins that
+// branch: a tiny fixture origin (one 48-byte model on a 16-byte piece grid,
+// one empty file, one directory) sits behind the same socketpair harness,
+// and every head is classified by an independent walk of handleConn plus
+// serveData's published decisions before the reply bytes are asserted.
+
+/// The fixture model's bytes: distinct per position so any off-by-one in the
+/// range clamp or the streaming offsets shows up as a body mismatch.
+const data_file_size: u64 = 48;
+const data_pattern: [data_file_size]u8 = blk: {
+    var p: [data_file_size]u8 = undefined;
+    for (&p, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
+    break :blk p;
+};
+
+const DataKind = enum { file48, file0, dir, absent };
+
+fn dataKindOf(rel: []const u8) DataKind {
+    if (std.mem.eql(u8, rel, "m.bin")) return .file48;
+    if (std.mem.eql(u8, rel, "empty.bin")) return .file0;
+    if (std.mem.eql(u8, rel, "d.gguf")) return .dir;
+    return .absent;
+}
+
+const DataClass = union(enum) {
+    dropped,
+    method_not_allowed,
+    unauthorized,
+    ping_ok,
+    no_route,
+    bad_path,
+    bad_range,
+    /// Absent paths and non-regular files answer one identical 404, on
+    /// /have and /data alike.
+    not_found,
+    have_bits: struct { bits_bytes: usize, nbits: u32 },
+    not_satisfiable: u64,
+    partial: struct { start: u64, end: u64 },
+};
+
+/// Independent restatement of handleConn's gate order plus serveData's and
+/// serveHave's decisions over the fixture. Must stay a pure function of the
+/// head: no store state, no clocks.
+fn classifyDataHead(head: []const u8) DataClass {
+    const done = std.mem.find(u8, head, "\r\n\r\n") orelse return .dropped;
+    const served = head[0 .. done + 4];
+    const line_end = std.mem.find(u8, served, "\r\n") orelse return .dropped;
+    var it = std.mem.splitScalar(u8, served[0..line_end], ' ');
+    const method = it.next().?;
+    const target = it.next() orelse return .dropped;
+    if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
+    const auth = proto.headerGet(served, "Authorization") orelse "";
+    if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
+    const path = proto.pathOnly(target);
+    if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
+    const is_have = std.mem.eql(u8, path, "/have");
+    if (!is_have and !std.mem.eql(u8, path, "/data")) return .no_route;
+    var rel_buf: [4096]u8 = undefined;
+    const q = proto.queryGet(target, "path") orelse return .bad_path;
+    const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
+    if (!store_mod.relOk(rel)) return .bad_path;
+    switch (dataKindOf(rel)) {
+        .dir, .absent => return .not_found,
+        .file48 => {},
+        .file0 => {},
+    }
+    if (is_have) {
+        return switch (dataKindOf(rel)) {
+            .file48 => .{ .have_bits = .{ .bits_bytes = 1, .nbits = 3 } },
+            .file0 => .{ .have_bits = .{ .bits_bytes = 0, .nbits = 0 } },
+            .dir, .absent => .not_found,
+        };
+    }
+    const rh = proto.headerGet(served, "Range") orelse return .bad_range;
+    const rg = proto.parseRange(rh) orelse return .bad_range;
+    switch (dataKindOf(rel)) {
+        .dir, .absent => return .not_found,
+        .file48 => {
+            if (rg.start >= data_file_size) return .{ .not_satisfiable = data_file_size };
+            return .{ .partial = .{ .start = rg.start, .end = @min(rg.end, data_file_size - 1) } };
+        },
+        // size 0: every start satisfies start >= size, so every range is 416
+        .file0 => return .{ .not_satisfiable = 0 },
+    }
+}
+
+/// Bits the server hands out must never carry uninitialized pad bits: the
+/// bitmap rides the wire to peers verbatim, so a stray high bit would be a
+/// heap-info leak across the trust boundary, not just a wrong answer.
+fn havePadMask(nbits: usize) u8 {
+    const rem = nbits % 8;
+    return if (rem == 0) 0xFF else ~((@as(u8, 1) << @intCast(rem)) - 1);
+}
+
+const DataFixture = struct {
+    gpa: std.mem.Allocator,
+    origin_buf: [128]u8 = undefined,
+    origin_len: usize = 0,
+    cache_buf: [128]u8 = undefined,
+    cache_len: usize = 0,
+    st: store_mod.Store = undefined,
+    srv: Server = undefined,
+
+    fn create(gpa: std.mem.Allocator) !*DataFixture {
+        const f = try gpa.create(DataFixture);
+        errdefer gpa.destroy(f);
+        f.* = .{ .gpa = gpa };
+        const od = try sys.scratchDir(&f.origin_buf, "modelfs-fzdata-o");
+        f.origin_len = od.len;
+        errdefer sys.deleteTree(std.testing.io, od);
+        const cd = try sys.scratchDir(&f.cache_buf, "modelfs-fzdata-c");
+        f.cache_len = cd.len;
+        errdefer sys.deleteTree(std.testing.io, cd);
+        var zbuf: [192]u8 = undefined;
+        var pbuf: [192]u8 = undefined;
+        const mp = try std.fmt.bufPrint(&zbuf, "{s}/m.bin", .{od});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&pbuf, mp), &data_pattern));
+        const ep = try std.fmt.bufPrint(&zbuf, "{s}/empty.bin", .{od});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&pbuf, ep), ""));
+        const dp = try std.fmt.bufPrint(&zbuf, "{s}/d.gguf", .{od});
+        try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(dp, 0o755));
+        // Slices handed to Store must point at the heap copy: the local f
+        // dies at return, its buffers do not survive the move.
+        f.st = store_mod.Store.init(gpa, std.testing.io, od, cd, 16);
+        errdefer f.st.deinit();
+        try std.testing.expectEqual(@as(i32, 0), f.st.ensureLayout());
+        f.srv = .{ .gpa = gpa, .io = std.testing.io, .psk = fuzz_request_psk, .store = &f.st };
+        return f;
+    }
+
+    fn destroy(self: *DataFixture) void {
+        self.st.deinit();
+        sys.deleteTree(std.testing.io, self.origin());
+        sys.deleteTree(std.testing.io, self.cache());
+        self.gpa.destroy(self);
+    }
+
+    fn origin(self: *DataFixture) []const u8 {
+        return self.origin_buf[0..self.origin_len];
+    }
+
+    fn cache(self: *DataFixture) []const u8 {
+        return self.cache_buf[0..self.cache_len];
+    }
+};
+
+/// One connection against the fixture, asserted per classifyDataHead. The
+/// cache behind the fixture may already hold pieces from earlier heads in
+/// the same run; every assertion below is a function of the origin bytes and
+/// geometry only, so state evolution changes nothing the oracle expects --
+/// which is what makes the mutated-head drill below safe to sequence.
+fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
+    const want = classifyDataHead(head);
+
+    var fds: [2]c_int = undefined;
+    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return;
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+    if (sys.writeAll(fds[0], head) < 0) return;
+    _ = c.shutdown(fds[0], c.SHUT_WR);
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    const malformed_before = f.st.stats.http_malformed.load(.monotonic);
+    const unauthorized_before = f.st.stats.http_unauthorized.load(.monotonic);
+    _ = f.srv.http_inflight.fetchAdd(1, .monotonic);
+
+    handleConn(&f.srv, fds[1], std.mem.zeroes(c.struct_sockaddr_in));
+
+    var rbuf: [2048]u8 = undefined;
+    var got_len: usize = 0;
+    while (got_len < rbuf.len) {
+        const r = c.recv(fds[0], &rbuf[got_len], rbuf.len - got_len, c.MSG_DONTWAIT);
+        if (r <= 0) break;
+        got_len += @intCast(r);
+    }
+    const got = rbuf[0..got_len];
+
+    try std.testing.expectEqual(
+        @as(u64, @intFromBool(want == .dropped)),
+        f.st.stats.http_malformed.load(.monotonic) - malformed_before,
+    );
+    try std.testing.expectEqual(
+        @as(u64, @intFromBool(want == .unauthorized)),
+        f.st.stats.http_unauthorized.load(.monotonic) - unauthorized_before,
+    );
+
+    if (want == .dropped) {
+        try std.testing.expectEqual(@as(usize, 0), got.len);
+        return;
+    }
+    try std.testing.expect(got.len > 0);
+    const body_at = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.NoHeaderEnd;
+    const rep_head = got[0..body_at];
+    const body = got[body_at + 4 ..];
+
+    switch (want) {
+        .dropped => unreachable,
+        .method_not_allowed => try std.testing.expectEqualStrings(
+            "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            got,
+        ),
+        .unauthorized => try std.testing.expectEqualStrings(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            got,
+        ),
+        .ping_ok => try std.testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            got,
+        ),
+        .no_route, .not_found => try std.testing.expectEqualStrings(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            got,
+        ),
+        .bad_path, .bad_range => try std.testing.expectEqualStrings(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            got,
+        ),
+        .not_satisfiable => |size| {
+            var xbuf: [160]u8 = undefined;
+            const x = try std.fmt.bufPrint(&xbuf, "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{d}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{size});
+            try std.testing.expectEqualStrings(x, got);
+        },
+        .partial => |pr| {
+            const want_len: u64 = pr.end - pr.start + 1;
+            try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 206 Partial Content\r\n"));
+            var crbuf: [96]u8 = undefined;
+            const cr = try std.fmt.bufPrint(&crbuf, "bytes {d}-{d}/{d}", .{ pr.start, pr.end, data_file_size });
+            try std.testing.expectEqualStrings(cr, proto.headerGet(rep_head, "Content-Range") orelse return error.NoContentRange);
+            const cl_str = proto.headerGet(rep_head, "Content-Length") orelse return error.NoContentLength;
+            try std.testing.expectEqual(want_len, try std.fmt.parseInt(u64, cl_str, 10));
+            try std.testing.expectEqual(want_len, @as(u64, body.len));
+            try std.testing.expectEqualSlices(u8, data_pattern[pr.start..][0..want_len], body);
+        },
+        .have_bits => |hb| {
+            try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+            try std.testing.expectEqualStrings("16", proto.headerGet(rep_head, "X-Piece-Size") orelse return error.NoPieceSize);
+            const cl_str = proto.headerGet(rep_head, "Content-Length") orelse return error.NoContentLength;
+            try std.testing.expectEqual(hb.bits_bytes, try std.fmt.parseInt(usize, cl_str, 10));
+            try std.testing.expectEqual(hb.bits_bytes, body.len);
+            const mask = havePadMask(hb.nbits);
+            for (body) |b| try std.testing.expect(b & mask == 0);
+        },
+    }
+}
+
+const seed_data_full = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-47\r\n\r\n");
+const seed_data_piece = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=16-31\r\n\r\n");
+const seed_data_last_byte = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=47-47\r\n\r\n");
+const seed_data_clamp = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=32-9999\r\n\r\n");
+const seed_data_open = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=24-\r\n\r\n");
+const seed_data_maxend = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-18446744073709551615\r\n\r\n");
+const seed_data_416_eof = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=48-\r\n\r\n");
+const seed_data_empty_416 = fuzzcorpus.entry("GET /data?path=empty.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-0\r\n\r\n");
+const seed_data_dir = fuzzcorpus.entry("GET /data?path=d.gguf HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-7\r\n\r\n");
+const seed_data_absent = fuzzcorpus.entry("GET /data?path=nope.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-7\r\n\r\n");
+const seed_data_no_range = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_data_bad_range = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=x-\r\n\r\n");
+const seed_data_inverted = fuzzcorpus.entry("GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=10-5\r\n\r\n");
+const seed_data_escape = fuzzcorpus.entry("GET /data?path=%zz HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-1\r\n\r\n");
+const seed_data_traversal = fuzzcorpus.entry("GET /data?path=..%2Fsecret HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-1\r\n\r\n");
+const seed_have_cached = fuzzcorpus.entry("GET /have?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_have_empty = fuzzcorpus.entry("GET /have?path=empty.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+
+const fuzz_data_corpus = [_][]const u8{
+    &seed_data_full,
+    &seed_data_piece,
+    &seed_data_last_byte,
+    &seed_data_clamp,
+    &seed_data_open,
+    &seed_data_maxend,
+    &seed_data_416_eof,
+    &seed_data_empty_416,
+    &seed_data_dir,
+    &seed_data_absent,
+    &seed_data_no_range,
+    &seed_data_bad_range,
+    &seed_data_inverted,
+    &seed_data_escape,
+    &seed_data_traversal,
+    &seed_have_cached,
+    &seed_have_empty,
+    // Shapes shared with the routing harness above: same input, now with a
+    // live origin behind the server.
+    &seed_req_have_ok,
+    &seed_req_traversal,
+    &seed_req_control_path,
+    &seed_serve_ping_ok,
+    &seed_serve_post_ping,
+    &seed_serve_unterminated,
+    &seed_serve_ping_unauthed,
+    &seed_serve_unknown_route,
+};
+
+fn fuzzServeDataOne(fixture: *DataFixture, smith: *std.testing.Smith) anyerror!void {
+    var wire_buf: [2048]u8 = undefined;
+    try serveDataCheck(fixture, wire_buf[0..smith.slice(&wire_buf)]);
+}
+
+test "fuzz data path serves attacker ranges within the published contract" {
+    const gpa = std.testing.allocator;
+    const fixture = try DataFixture.create(gpa);
+    defer fixture.destroy();
+    try std.testing.fuzz(fixture, fuzzServeDataOne, .{ .corpus = &fuzz_data_corpus });
+}
+
+test "fuzz data path contract holds for mutated corpus heads" {
+    // Same stand-in for the continuous --fuzz runner as the routing drill
+    // above, with one addition the absent-origin harness cannot offer:
+    // sequenced heads evolve the cache (fills land, bits persist), and the
+    // oracle must hold identically on every iteration anyway.
+    const gpa = std.testing.allocator;
+    const fixture = try DataFixture.create(gpa);
+    defer fixture.destroy();
+    var prng = std.Random.DefaultPrng.init(20260827);
+    const rand = prng.random();
+    const specials = "\r\n ?=&%.-09";
+    var buf: [2048]u8 = undefined;
+    for (0..2_500) |_| {
+        const base = fuzz_data_corpus[rand.uintLessThan(usize, fuzz_data_corpus.len)];
+        const take = 1 + rand.uintLessThan(usize, @min(base.len + 24, buf.len));
+        const n = @min(take, base.len);
+        @memcpy(buf[0..n], base[0..n]);
+        @memset(buf[n..take], 'A');
+        const flips = rand.uintLessThan(usize, 6);
+        for (0..flips) |_| {
+            const p = rand.uintLessThan(usize, take);
+            switch (rand.intRangeAtMost(u8, 0, 2)) {
+                0 => buf[p] = rand.int(u8),
+                1 => buf[p] = specials[rand.uintLessThan(usize, specials.len)],
+                else => {},
+            }
+        }
+        try serveDataCheck(fixture, buf[0..take]);
+    }
+}
