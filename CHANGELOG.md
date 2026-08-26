@@ -9,6 +9,10 @@ version, so the whole history since the initial commit is one pre-release delta 
 When the first tag lands it belongs on top of this section with the entries it
 covers regrouped under its version number.
 
+## [Recovery review pass 2] - 2026-08-26
+- **The restore drill is now an artifact, not a paste-block**: docs/recovery.md section 6 carried the monthly procedure as inline commands a reader had to retype (with a name-sorted snapshot pick that hourly/daily/monthly suffixes could fool, and no cleanup if any step died mid-way). New `scripts/dr_restore_drill.sh` runs the drill as one command: newest snapshot by creation time, timed clone, diff against the live tree with in-RPO-window drift counted instead of failed, sha256 of a size-stable file on both sides, clone destroyed through an EXIT trap, and the log line that proves the drill ran. An empty snapshot, a hash mismatch, and "no snapshots at all" (the sanoid.timer-down alarm) each fail with their own named message; exit status is the verdict. Verified against a stub `zfs` with fixture trees: drift tolerated, changed files skipped by the sampler, mismatch/empty/no-snapshot failures, and post-run cleanup all pinned.
+- **The recovery doc's example snapshot name now matches what sanoid actually creates** (`autosnap_2026-08-25_00:00:02_hourly`, not the fictional `autosnap-..._00.00.02`), so a copy-pasted restore command does not dead-end on a name that never exists.
+
 ## [DX review pass 2] - 2026-08-26
 - **Running the documented benchmark command no longer dirties the tree**: README listed `python3 scripts/run_benchmarks_and_plots.py` under Tests, but every run re-measures the local machine and overwrote four tracked files (`docs/benchmarks.md` plus three figures), so a contributor following the documented loop got review noise or, worse, committed laptop numbers as cluster results. The script now writes to gitignored `.scratch/benchmarks/` by default and only touches `docs/` with `--update-docs`; README says which command regenerates the tracked report.
 

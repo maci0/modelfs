@@ -6,6 +6,7 @@ const proto = @import("proto.zig");
 const sys = @import("sys.zig");
 const store_mod = @import("store.zig");
 const discover = @import("discover.zig");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 const c = sys.c;
 
 pub const Server = struct {
@@ -2586,21 +2587,14 @@ test "fillFromPeers excludes peers whose advertised piece size differs" {
     try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "grid.bin", 0, 16, &out, null));
 }
 
-fn corpusEntry(comptime payload: []const u8) [4 + payload.len]u8 {
-    var out: [4 + payload.len]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], @intCast(payload.len), .little);
-    for (payload, 0..) |b, i| out[4 + i] = b;
-    return out;
-}
-
-const seed_reply_ok = corpusEntry("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nabc");
-const seed_reply_206 = corpusEntry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
-const seed_reply_miss = corpusEntry("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-const seed_reply_huge_cl = corpusEntry("HTTP/1.1 200 OK\r\nContent-Length: 536870913\r\nConnection: close\r\n\r\n");
-const seed_reply_bad_ps = corpusEntry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: huge\r\nConnection: close\r\n\r\nz");
-const seed_reply_short_body = corpusEntry("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n1234");
-const seed_reply_garbage = corpusEntry("HTTP/1.0 500 oops\r\n\r\n");
-const seed_reply_dup_header = corpusEntry("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nCONTENT-LENGTH: 99999999999\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nok");
+const seed_reply_ok = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nabc");
+const seed_reply_206 = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi");
+const seed_reply_miss = fuzzcorpus.entry("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+const seed_reply_huge_cl = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 536870913\r\nConnection: close\r\n\r\n");
+const seed_reply_bad_ps = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: huge\r\nConnection: close\r\n\r\nz");
+const seed_reply_short_body = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n1234");
+const seed_reply_garbage = fuzzcorpus.entry("HTTP/1.0 500 oops\r\n\r\n");
+const seed_reply_dup_header = fuzzcorpus.entry("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nCONTENT-LENGTH: 99999999999\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nok");
 
 const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_ok,
@@ -2714,13 +2708,13 @@ test "fuzz peer reply parsing accepts well-formed replies and fails closed" {
 
 const fuzz_request_psk = "fuzz-psk";
 
-const seed_req_have_ok = corpusEntry("GET /have?path=gguf%2Fmodel.gguf HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-1023\r\n\r\n");
-const seed_req_traversal = corpusEntry("GET /data?path=..%2F..%2Fetc%2Fpasswd HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_req_wrong_auth = corpusEntry("POST /ping HTTP/1.1\r\nauthorization: BEARER wrong\r\n\r\n");
-const seed_req_max_range = corpusEntry("GET /data?path=a HTTP/1.1\r\nAuthorization: Bearer fuzz-psk \r\nRange: bytes=18446744073709551615-\r\n\r\n");
-const seed_req_control_path = corpusEntry("GET /have?path=%00%1b%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_req_inverted_range = corpusEntry("GET /data?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=10-5\r\n\r\n");
-const seed_req_no_path = corpusEntry("GET /have HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_have_ok = fuzzcorpus.entry("GET /have?path=gguf%2Fmodel.gguf HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-1023\r\n\r\n");
+const seed_req_traversal = fuzzcorpus.entry("GET /data?path=..%2F..%2Fetc%2Fpasswd HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_wrong_auth = fuzzcorpus.entry("POST /ping HTTP/1.1\r\nauthorization: BEARER wrong\r\n\r\n");
+const seed_req_max_range = fuzzcorpus.entry("GET /data?path=a HTTP/1.1\r\nAuthorization: Bearer fuzz-psk \r\nRange: bytes=18446744073709551615-\r\n\r\n");
+const seed_req_control_path = fuzzcorpus.entry("GET /have?path=%00%1b%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_inverted_range = fuzzcorpus.entry("GET /data?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=10-5\r\n\r\n");
+const seed_req_no_path = fuzzcorpus.entry("GET /have HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 
 const fuzz_request_corpus = [_][]const u8{
     &seed_req_have_ok,

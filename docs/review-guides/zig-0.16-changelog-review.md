@@ -5,10 +5,6 @@ removed APIs (absent by construction, spot-check), deprecated-but-present
 APIs, and 0.15-era idioms that still compile but fight the `std.Io`
 interface. Fix per the changelog upgrade guides, not by taste.
 
-Copy everything below the line into a fresh agent session (or `@` this file).
-
----
-
 ## Execution contract
 
 - Follow the user's session instructions and the applicable `AGENTS.md` files.

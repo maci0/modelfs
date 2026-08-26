@@ -8,6 +8,7 @@ const store_mod = @import("store.zig");
 const discover = @import("discover.zig");
 const peer = @import("peer.zig");
 const cull = @import("cull.zig");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 
 /// Daemon liveness artifact in the cache dir; `modelfs status` reads it.
 pub const status_file = "status.json";
@@ -131,28 +132,19 @@ test "relFromFuse rejects .." {
     try std.testing.expect(!isCluster("/gguf/a.gguf"));
 }
 
-/// One mount-side path candidate in the corpus framing the harness reads:
-/// u32 length prefix, then the raw path bytes.
-fn pathEntry(comptime p: []const u8) [4 + p.len]u8 {
-    var out: [4 + p.len]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], @intCast(p.len), .little);
-    for (p, 0..) |b, i| out[4 + i] = b;
-    return out;
-}
-
-const seed_path_root = pathEntry("/");
-const seed_path_model = pathEntry("/gguf/a.gguf");
-const seed_path_cluster_dir = pathEntry("/.cluster");
-const seed_path_cluster_file = pathEntry("/.cluster/spark1.json");
-const seed_path_dotdot = pathEntry("/../etc/passwd");
-const seed_path_inner_dotdot = pathEntry("/a/../b");
-const seed_path_dot_seg = pathEntry("/a/./b");
-const seed_path_dot_name = pathEntry("/...");
-const seed_path_double_slash = pathEntry("/gguf//a.gguf");
-const seed_path_trailing_slash = pathEntry("/gguf/");
-const seed_path_control = pathEntry("/a\x1b[31mb\x7f");
-const seed_path_empty = pathEntry("");
-const seed_path_unicode = pathEntry("/权重/mödel.gguf");
+const seed_path_root = fuzzcorpus.entry("/");
+const seed_path_model = fuzzcorpus.entry("/gguf/a.gguf");
+const seed_path_cluster_dir = fuzzcorpus.entry("/.cluster");
+const seed_path_cluster_file = fuzzcorpus.entry("/.cluster/spark1.json");
+const seed_path_dotdot = fuzzcorpus.entry("/../etc/passwd");
+const seed_path_inner_dotdot = fuzzcorpus.entry("/a/../b");
+const seed_path_dot_seg = fuzzcorpus.entry("/a/./b");
+const seed_path_dot_name = fuzzcorpus.entry("/...");
+const seed_path_double_slash = fuzzcorpus.entry("/gguf//a.gguf");
+const seed_path_trailing_slash = fuzzcorpus.entry("/gguf/");
+const seed_path_control = fuzzcorpus.entry("/a\x1b[31mb\x7f");
+const seed_path_empty = fuzzcorpus.entry("");
+const seed_path_unicode = fuzzcorpus.entry("/权重/mödel.gguf");
 
 const fuzz_path_corpus = [_][]const u8{
     &seed_path_root,

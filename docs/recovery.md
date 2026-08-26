@@ -99,7 +99,7 @@ Nothing to restore. Rebuild per [architecture.md](architecture.md) (Run), remoun
 Clone the last good snapshot, copy back, drop the clone:
 
 ```bash
-zfs clone tank/models@autosnap-2026-08-25_00.00.02 tank/recover
+zfs clone tank/models@autosnap_2026-08-25_00:00:02_hourly tank/recover
 cp -a /tank/recover/gguf/broken-model.gguf /export/models/gguf/
 zfs unmount tank/recover && zfs destroy tank/recover
 ```
@@ -152,13 +152,10 @@ Without section 3, every row below the first is: RPO unbounded, RTO equals re-do
 A backup never restored is a hypothesis. Monthly, on the NAS:
 
 ```bash
-latest=$(zfs list -H -t snapshot -o name tank/models | sort | tail -1)
-time zfs clone "$latest" tank/drill
-diff -rq /tank/drill /export/models && echo drill: content identical
-sha256sum "$(find /tank/drill -name '*.gguf' | sort | head -1)"
-zfs unmount tank/drill && zfs destroy tank/drill
-echo "$(date -Is) $latest ok" >> /var/log/modelfs-drill.log
+./scripts/dr_restore_drill.sh tank/models
 ```
+
+The script ([scripts/dr_restore_drill.sh](../scripts/dr_restore_drill.sh)) picks the newest snapshot by creation time (not name order, where hourly/daily/monthly suffixes would decide), clones it timed, diffs the restored tree against the live dataset, and checksums one size-stable file on both sides before appending the log line that proves the drill ran. Drift inside the RPO window is counted, never failed; a size-stable file that hashes differently fails the drill, and so does an empty snapshot or a missing snapshot schedule: the "no snapshots" exit is the sanoid.timer alarm. Exit status is the verdict; `MODELFS_DRILL_KEEP=1` leaves the clone mounted for inspection and `MODELFS_DRILL_LOG` relocates the artifact log from `/var/log/modelfs-drill.log`.
 
 The timed clone is the measured restore rate that keeps the RTO row honest; the log line is the artifact proving the drill ran. Alert when the newest entry ages past 35 days.
 

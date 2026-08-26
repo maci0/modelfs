@@ -1,6 +1,7 @@
 //! Peer wire helpers: range/header parsing, URL codec, bearer auth, and
 //! the cluster lease JSON document. Shared by the HTTP server and client.
 const std = @import("std");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 
 const unreserved_lut: [256]bool = blk: {
     var tbl = [_]bool{false} ** 256;
@@ -302,25 +303,16 @@ test "lease json roundtrip" {
     try std.testing.expectError(error.MissingField, parseLease(std.testing.allocator, "{\"id\":\"n1\",\"until\":5}"));
 }
 
-/// One lease document in the corpus framing the fuzz harness reads: u32
-/// length prefix, then the raw JSON bytes.
-fn leaseEntry(comptime doc: []const u8) [4 + doc.len]u8 {
-    var out: [4 + doc.len]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], @intCast(doc.len), .little);
-    for (doc, 0..) |b, i| out[4 + i] = b;
-    return out;
-}
-
-const seed_lease_ok = leaseEntry("{\"id\":\"spark1\",\"until\":1710000060,\"addrs\":[{\"ip\":\"192.168.100.1\",\"port\":18080,\"mbps\":200000},{\"ip\":\"192.168.0.11\",\"port\":18080,\"mbps\":10000}]}");
-const seed_lease_unknown_field = leaseEntry("{\"id\":\"n1\",\"until\":5,\"addrs\":[],\"proto_version\":9}");
-const seed_lease_truncated = leaseEntry("{\"id\":");
-const seed_lease_not_json = leaseEntry("not json at all");
-const seed_lease_quote_id = leaseEntry("{\"id\":\"a\\\"b\\\\c\",\"until\":1,\"addrs\":[]}");
-const seed_lease_escape_id = leaseEntry("{\"id\":\"a\\nb\",\"until\":1,\"addrs\":[]}");
-const seed_lease_until_overflow = leaseEntry("{\"id\":\"x\",\"until\":18446744073709551615,\"addrs\":[]}");
-const seed_lease_dup_keys = leaseEntry("{\"id\":\"a\",\"id\":\"b\",\"until\":7,\"addrs\":[]}");
-const seed_lease_deep_unknown = leaseEntry("{\"id\":\"d\",\"until\":1,\"addrs\":[],\"z\":[[[[[[[[]]]]]]]]}");
-const seed_lease_extreme_addrs = leaseEntry("{\"id\":\"m\",\"until\":-5,\"addrs\":[{\"ip\":\"\",\"port\":0,\"mbps\":4294967295}]}");
+const seed_lease_ok = fuzzcorpus.entry("{\"id\":\"spark1\",\"until\":1710000060,\"addrs\":[{\"ip\":\"192.168.100.1\",\"port\":18080,\"mbps\":200000},{\"ip\":\"192.168.0.11\",\"port\":18080,\"mbps\":10000}]}");
+const seed_lease_unknown_field = fuzzcorpus.entry("{\"id\":\"n1\",\"until\":5,\"addrs\":[],\"proto_version\":9}");
+const seed_lease_truncated = fuzzcorpus.entry("{\"id\":");
+const seed_lease_not_json = fuzzcorpus.entry("not json at all");
+const seed_lease_quote_id = fuzzcorpus.entry("{\"id\":\"a\\\"b\\\\c\",\"until\":1,\"addrs\":[]}");
+const seed_lease_escape_id = fuzzcorpus.entry("{\"id\":\"a\\nb\",\"until\":1,\"addrs\":[]}");
+const seed_lease_until_overflow = fuzzcorpus.entry("{\"id\":\"x\",\"until\":18446744073709551615,\"addrs\":[]}");
+const seed_lease_dup_keys = fuzzcorpus.entry("{\"id\":\"a\",\"id\":\"b\",\"until\":7,\"addrs\":[]}");
+const seed_lease_deep_unknown = fuzzcorpus.entry("{\"id\":\"d\",\"until\":1,\"addrs\":[],\"z\":[[[[[[[[]]]]]]]]}");
+const seed_lease_extreme_addrs = fuzzcorpus.entry("{\"id\":\"m\",\"until\":-5,\"addrs\":[{\"ip\":\"\",\"port\":0,\"mbps\":4294967295}]}");
 
 const fuzz_lease_corpus = [_][]const u8{
     &seed_lease_ok,

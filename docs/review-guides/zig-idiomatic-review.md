@@ -2,10 +2,6 @@
 
 Your goal is to find code that fights Zig 0.16 idiom: allocator handling, error sets, comptime, slices and hot-path shape.
 
-Copy everything below the line into a fresh agent session (or `@` this file).
-
----
-
 ## Execution contract
 
 - Follow the user's session instructions and the applicable `AGENTS.md` files.

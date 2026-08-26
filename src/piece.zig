@@ -1,6 +1,7 @@
 //! Piece arithmetic (count/offset/cover) and the persisted cache bitfield
 //! codec, including pad-bit defenses against corrupt sidecars.
 const std = @import("std");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 
 pub const default_size: u32 = 16 * 1024 * 1024;
 pub const magic = "MFS1";
@@ -539,20 +540,13 @@ test "fuzz bitfield sidecar decode matches stored bits or resets empty" {
     try std.testing.fuzz({}, fuzzBitfieldDecodeOne, .{ .corpus = &fuzz_decode_corpus });
 }
 
-/// One op sequence as a corpus entry: u32 length prefix, then one byte per
-/// op (low 2 bits pick set/clear/grow/shrink, the rest carry the index).
-fn opsEntry(comptime ops: []const u8) [4 + ops.len]u8 {
-    var out: [4 + ops.len]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], @intCast(ops.len), .little);
-    @memcpy(out[4..], ops);
-    return out;
-}
-
-const seed_ops_sets = opsEntry(&.{ 0x08, 0x10, 0x18, 0xff });
-const seed_ops_grow_set = opsEntry(&.{ 0x22, 0x2a, 0x06 });
-const seed_ops_shrink = opsEntry(&.{ 0x23, 0x2f, 0x37, 0x03 });
-const seed_ops_mixed = opsEntry(&.{ 0x08, 0x22, 0x1a, 0x23, 0x11, 0x2b });
-const seed_ops_pad_shape = opsEntry(&.{ 0x22, 0x08, 0x12, 0x1c }); // stops at nbits=5, a pad-bit boundary
+/// One op sequence as a corpus entry; each byte's low 2 bits pick
+/// set/clear/grow/shrink, the rest carry the index.
+const seed_ops_sets = fuzzcorpus.entry(&.{ 0x08, 0x10, 0x18, 0xff });
+const seed_ops_grow_set = fuzzcorpus.entry(&.{ 0x22, 0x2a, 0x06 });
+const seed_ops_shrink = fuzzcorpus.entry(&.{ 0x23, 0x2f, 0x37, 0x03 });
+const seed_ops_mixed = fuzzcorpus.entry(&.{ 0x08, 0x22, 0x1a, 0x23, 0x11, 0x2b });
+const seed_ops_pad_shape = fuzzcorpus.entry(&.{ 0x22, 0x08, 0x12, 0x1c }); // stops at nbits=5, a pad-bit boundary
 
 const fuzz_persist_corpus = [_][]const u8{
     &seed_ops_sets,

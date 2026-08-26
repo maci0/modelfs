@@ -2,10 +2,6 @@
 
 Your goal is to find dense loops where SIMD is a real win, and to reject the ones where it is not.
 
-Copy everything below the line into a fresh agent session (or `@` this file).
-
----
-
 ## Execution contract
 
 - Follow the user's session instructions and the applicable `AGENTS.md` files.

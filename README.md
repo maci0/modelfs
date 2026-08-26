@@ -89,6 +89,7 @@ zig build test -Dtest-filter=store        # one module's unit tests only (substr
 ./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end
 ./scripts/run_cluster_e2e_9nodes.sh       # 9-instance block exchange
 ./scripts/test_fault_tolerance.sh         # peer loss and lease expiry
+./scripts/dr_restore_drill.sh             # monthly restore drill, on the NAS (docs/recovery.md)
 python3 scripts/run_benchmarks_and_plots.py  # live benchmarks -> .scratch/benchmarks/
 ```
 

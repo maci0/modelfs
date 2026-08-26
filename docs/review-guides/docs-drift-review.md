@@ -4,7 +4,7 @@ You are a senior engineer whose task is to review whether this repository's own 
 
 Your goal is to find documented claims that have drifted from shipped behavior: architecture, threat-model, operations, recovery, and contributing build-gate statements a reader would act on and be wrong. This differs from a copy edit: the subject is factual agreement between the repository's own documents (`docs/`, `README.md`, `CONTRIBUTING.md`) and `src/`/`scripts/`/CI config, checked claim by claim. It does not grade prose quality and does not review the agent prompts in `docs/review-guides/`.
 
-First decide if this review applies. Confirm this is the modelfs cache tree: `README.md`, `CONTRIBUTING.md`, `.github/workflows/ci.yml`, `docs/architecture.md`, `src/main.zig`, and the five further docs the items below depend on (`docs/THREAT_MODEL.md`, `docs/operations.md`, `docs/recovery.md`, `docs/design.md`, `docs/audits.md`) must exist. On any miss, print the skip result and stop.
+First decide if this review applies. Confirm this is the modelfs cache tree: `README.md`, `CONTRIBUTING.md`, `.github/workflows/ci.yml`, `docs/architecture.md`, and `src/main.zig` must exist. On any miss, print the skip result and stop. The items below also depend on `docs/THREAT_MODEL.md`, `docs/operations.md`, `docs/recovery.md`, `docs/design.md`, and `docs/audits.md`; if one of those is absent, print that item as skipped and continue with the rest rather than skipping the whole review.
 
 ## Review the following
 

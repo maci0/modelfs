@@ -3,6 +3,7 @@
 const std = @import("std");
 const proto = @import("proto.zig");
 const sys = @import("sys.zig");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 const c = sys.c;
 
 pub const Path = struct {
@@ -865,28 +866,19 @@ test "validId gates the lease file name and JSON document" {
     try std.testing.expect(!validId("h\xc3\xa9llo"));
 }
 
-/// One cluster-id candidate in the corpus framing the harness reads: u32
-/// length prefix, then the raw id bytes.
-fn idEntry(comptime s: []const u8) [4 + s.len]u8 {
-    var out: [4 + s.len]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], @intCast(s.len), .little);
-    for (s, 0..) |b, i| out[4 + i] = b;
-    return out;
-}
-
-const seed_id_plain = idEntry("spark1");
-const seed_id_dotted = idEntry("node-9.a");
-const seed_id_punct = idEntry("x~!@#$%^&*()+=[]{};',<>?|`");
-const seed_id_empty = idEntry("");
-const seed_id_leading_dot = idEntry(".hidden");
-const seed_id_dotdot = idEntry("..");
-const seed_id_separator = idEntry("a/b");
-const seed_id_quote = idEntry("a\"b");
-const seed_id_backslash = idEntry("a\\b");
-const seed_id_newline = idEntry("a\nb");
-const seed_id_nul = idEntry("a\x00b");
-const seed_id_non_ascii = idEntry("h\xc3\xa9llo");
-const seed_id_space = idEntry("spark 1");
+const seed_id_plain = fuzzcorpus.entry("spark1");
+const seed_id_dotted = fuzzcorpus.entry("node-9.a");
+const seed_id_punct = fuzzcorpus.entry("x~!@#$%^&*()+=[]{};',<>?|`");
+const seed_id_empty = fuzzcorpus.entry("");
+const seed_id_leading_dot = fuzzcorpus.entry(".hidden");
+const seed_id_dotdot = fuzzcorpus.entry("..");
+const seed_id_separator = fuzzcorpus.entry("a/b");
+const seed_id_quote = fuzzcorpus.entry("a\"b");
+const seed_id_backslash = fuzzcorpus.entry("a\\b");
+const seed_id_newline = fuzzcorpus.entry("a\nb");
+const seed_id_nul = fuzzcorpus.entry("a\x00b");
+const seed_id_non_ascii = fuzzcorpus.entry("h\xc3\xa9llo");
+const seed_id_space = fuzzcorpus.entry("spark 1");
 
 const fuzz_id_corpus = [_][]const u8{
     &seed_id_plain,
@@ -1050,29 +1042,20 @@ test "parseV4 validation" {
 // harness diffs the pair across the whole input space so any future drift in
 // either parser surfaces as a fuzz failure instead of dead cluster routes.
 
-/// One dotted-quad candidate in the corpus framing the harness reads: u32
-/// length prefix, then the raw bytes.
-fn quadEntry(comptime s: []const u8) [4 + s.len]u8 {
-    var out: [4 + s.len]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], @intCast(s.len), .little);
-    for (s, 0..) |b, i| out[4 + i] = b;
-    return out;
-}
-
-const seed_quad_ok = quadEntry("192.168.100.10");
-const seed_quad_zero = quadEntry("0.0.0.0");
-const seed_quad_max = quadEntry("255.255.255.255");
-const seed_quad_leading_zero = quadEntry("0255.0.0.1");
-const seed_quad_leading_zero_last = quadEntry("1.2.3.040");
-const seed_quad_overflow_octet = quadEntry("256.1.1.1");
-const seed_quad_long_run = quadEntry("99999999999999999999.1.1.1");
-const seed_quad_empty_part = quadEntry("1..2.3");
-const seed_quad_trailing_dot = quadEntry("1.2.3.");
-const seed_quad_five_parts = quadEntry("10.0.0.1.2");
-const seed_quad_hostname = quadEntry("spark9.example");
-const seed_quad_log_forge = quadEntry("10.0.0.1\r2026-08-26 ERROR forged");
-const seed_quad_trailing_space = quadEntry("10.0.0.1 ");
-const seed_quad_empty = quadEntry("");
+const seed_quad_ok = fuzzcorpus.entry("192.168.100.10");
+const seed_quad_zero = fuzzcorpus.entry("0.0.0.0");
+const seed_quad_max = fuzzcorpus.entry("255.255.255.255");
+const seed_quad_leading_zero = fuzzcorpus.entry("0255.0.0.1");
+const seed_quad_leading_zero_last = fuzzcorpus.entry("1.2.3.040");
+const seed_quad_overflow_octet = fuzzcorpus.entry("256.1.1.1");
+const seed_quad_long_run = fuzzcorpus.entry("99999999999999999999.1.1.1");
+const seed_quad_empty_part = fuzzcorpus.entry("1..2.3");
+const seed_quad_trailing_dot = fuzzcorpus.entry("1.2.3.");
+const seed_quad_five_parts = fuzzcorpus.entry("10.0.0.1.2");
+const seed_quad_hostname = fuzzcorpus.entry("spark9.example");
+const seed_quad_log_forge = fuzzcorpus.entry("10.0.0.1\r2026-08-26 ERROR forged");
+const seed_quad_trailing_space = fuzzcorpus.entry("10.0.0.1 ");
+const seed_quad_empty = fuzzcorpus.entry("");
 
 const fuzz_quad_corpus = [_][]const u8{
     &seed_quad_ok,

@@ -4,10 +4,6 @@ Your goal is to find code that fights Zig language best practice: folder
 structure and layering, filenames, naming and capitalization, comptime
 discipline, `@builtin` selection, and zero-cost abstraction habits.
 
-Copy everything below the line into a fresh agent session (or `@` this file).
-
----
-
 ## Execution contract
 
 - Follow the user's session instructions and the applicable `AGENTS.md` files.

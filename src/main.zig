@@ -16,6 +16,7 @@ const store_mod = @import("store.zig");
 const discover = @import("discover.zig");
 const fuse_fs = @import("fuse_fs.zig");
 const cull = @import("cull.zig");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 
 const usage =
     \\modelfs: POSIX mount for model files. Local NVMe, then peers, then NFS.
@@ -187,6 +188,43 @@ fn envValue(environ: *const std.process.Environ.Map, name: []const u8) ?[]const 
     return if (v.len == 0) null else v;
 }
 
+/// The MODELFS_ prefix is this CLI's environment namespace; anything under
+/// it that no flag answers to is a misspelling, not a foreign variable.
+/// Variables outside the namespace are never this binary's business and
+/// pass untouched.
+fn checkKnownEnv(environ: *const std.process.Environ.Map) !void {
+    const known = [_][]const u8{ "MODELFS_ORIGIN", "MODELFS_CACHE", "MODELFS_PSK", "MODELFS_PSK_VALUE", "MODELFS_ID" };
+    var it = environ.iterator();
+    while (it.next()) |e| {
+        const name = e.key_ptr.*;
+        if (!std.mem.startsWith(u8, name, "MODELFS_")) continue;
+        for (known) |k| {
+            if (std.mem.eql(u8, name, k)) break;
+        } else {
+            if (!builtin.is_test)
+                std.debug.print("unknown environment variable {s} (see 'modelfs help')\n", .{name});
+            return error.UnknownEnv;
+        }
+    }
+}
+
+/// True when sub lies beneath dir (component-wise). Both sides are
+/// realpaths, so a leading run of components is containment: "/a/bc" does
+/// not start with "/a/b/" and stays outside, while everything sits within
+/// "/" (the one realpath that ends in a slash).
+fn pathWithin(sub: []const u8, dir: []const u8) bool {
+    if (!std.mem.startsWith(u8, sub, dir)) return false;
+    if (dir.len > 0 and dir[dir.len - 1] == '/') return true;
+    return sub.len > dir.len and sub[dir.len] == '/';
+}
+
+/// Equal or one contains the other. Any such pair between the mountpoint
+/// and its origin or cache makes the daemon serve or fill through its own
+/// mount, so cmdMount refuses it before any socket is bound.
+fn pathsOverlap(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b) or pathWithin(a, b) or pathWithin(b, a);
+}
+
 /// Refuses mount-only knobs on the other commands, as the help text promises
 /// ("status/peers/pin take only the flags shown on their Usage line"):
 /// accepted-and-ignored they would silently do nothing (a `status --detach`,
@@ -242,6 +280,12 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         return error.UnknownCommand;
     }
     var opts = Opts{};
+    // A MODELFS_* variable outside the documented set is a typo'd knob
+    // (MODELFS_CACHEE, MODELFS_ORIGN): applied-and-ignored it would silently
+    // drop the operator's setting (mount onto /var/cache/modelfs instead of
+    // the intended cache, wrong origin) and surface only as a later
+    // incident. Refused here like every unknown flag.
+    try checkKnownEnv(environ);
     // 0.16: environment variables are only reachable via the main function's
     // process.Init; the map is threaded in instead of reading global environ.
     if (envValue(environ, "MODELFS_ORIGIN")) |v| opts.origin = v;
@@ -690,6 +734,20 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     const cache = ensureDirReal(gpa, opts.cache, "cache") catch return 1;
     defer gpa.free(cache);
 
+    // Dependent-path gate: the kernel routes by mount, so origin preads or
+    // cache piece writes under the mountpoint would come back through this
+    // daemon's own FUSE handlers, each nesting another request until the
+    // handler threads exhaust and the mount wedges. Both sides are already
+    // realpaths, so symlinks cannot smuggle the overlap past this check.
+    if (pathsOverlap(origin, mount_abs)) {
+        std.log.err("mountpoint {s} equals or contains origin {s}; mount outside the origin", .{ mount_abs, origin });
+        return 1;
+    }
+    if (pathsOverlap(cache, mount_abs)) {
+        std.log.err("mountpoint {s} equals or contains cache {s}; keep the cache outside the mountpoint", .{ mount_abs, cache });
+        return 1;
+    }
+
     // MissingPsk/EmptyPsk/PskUnreadable are already reported with remediation
     // steps inside loadPsk; anything else still needs a one-line cause before
     // the clean exit.
@@ -1110,41 +1168,32 @@ test "parseSize accepts plain and suffixed values" {
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), try parseSize("18446744073709551615"));
 }
 
-/// One flag value in the corpus framing the harness reads: u32 length
-/// prefix, then the raw bytes.
-fn argvEntry(comptime s: []const u8) [4 + s.len]u8 {
-    var out: [4 + s.len]u8 = undefined;
-    std.mem.writeInt(u32, out[0..4], @intCast(s.len), .little);
-    for (s, 0..) |b, i| out[4 + i] = b;
-    return out;
-}
-
-const seed_argv_plain = argvEntry("512");
-const seed_argv_suffixed = argvEntry("16M");
-const seed_argv_spaced_unit = argvEntry("3 MB");
-const seed_argv_lower_suffix = argvEntry("4kb");
-const seed_argv_trailing_b = argvEntry("12 B");
-const seed_argv_trailing_garbage = argvEntry("16Mi");
-const seed_argv_two_tokens = argvEntry("1KB2");
-const seed_argv_leading_space = argvEntry(" 16");
-const seed_argv_word = argvEntry("abc");
-const seed_argv_empty = argvEntry("");
-const seed_argv_digit_run_overflow = argvEntry("99999999999999999999999");
-const seed_argv_max_u64 = argvEntry("18446744073709551615");
-const seed_argv_suffix_mul_overflow = argvEntry("18446744073709551615G");
-const seed_argv_host_port = argvEntry("192.168.0.100:18080");
-const seed_argv_host_only = argvEntry("spark9.example");
-const seed_argv_colon_only = argvEntry(":18081");
-const seed_argv_trailing_colon = argvEntry("spark1:");
-const seed_argv_port_zero = argvEntry("10.0.0.9:0");
-const seed_argv_port_max = argvEntry("10.0.0.9:65535");
-const seed_argv_port_overflow = argvEntry("10.0.0.9:65536");
-const seed_argv_double_colon = argvEntry("a:b:19090");
-const seed_argv_pct_low = argvEntry("50");
-const seed_argv_pct_edge = argvEntry("100");
-const seed_argv_pct_over = argvEntry("101");
-const seed_argv_pct_negative = argvEntry("-1");
-const seed_argv_pct_overflow = argvEntry("99999999999999999999");
+const seed_argv_plain = fuzzcorpus.entry("512");
+const seed_argv_suffixed = fuzzcorpus.entry("16M");
+const seed_argv_spaced_unit = fuzzcorpus.entry("3 MB");
+const seed_argv_lower_suffix = fuzzcorpus.entry("4kb");
+const seed_argv_trailing_b = fuzzcorpus.entry("12 B");
+const seed_argv_trailing_garbage = fuzzcorpus.entry("16Mi");
+const seed_argv_two_tokens = fuzzcorpus.entry("1KB2");
+const seed_argv_leading_space = fuzzcorpus.entry(" 16");
+const seed_argv_word = fuzzcorpus.entry("abc");
+const seed_argv_empty = fuzzcorpus.entry("");
+const seed_argv_digit_run_overflow = fuzzcorpus.entry("99999999999999999999999");
+const seed_argv_max_u64 = fuzzcorpus.entry("18446744073709551615");
+const seed_argv_suffix_mul_overflow = fuzzcorpus.entry("18446744073709551615G");
+const seed_argv_host_port = fuzzcorpus.entry("192.168.0.100:18080");
+const seed_argv_host_only = fuzzcorpus.entry("spark9.example");
+const seed_argv_colon_only = fuzzcorpus.entry(":18081");
+const seed_argv_trailing_colon = fuzzcorpus.entry("spark1:");
+const seed_argv_port_zero = fuzzcorpus.entry("10.0.0.9:0");
+const seed_argv_port_max = fuzzcorpus.entry("10.0.0.9:65535");
+const seed_argv_port_overflow = fuzzcorpus.entry("10.0.0.9:65536");
+const seed_argv_double_colon = fuzzcorpus.entry("a:b:19090");
+const seed_argv_pct_low = fuzzcorpus.entry("50");
+const seed_argv_pct_edge = fuzzcorpus.entry("100");
+const seed_argv_pct_over = fuzzcorpus.entry("101");
+const seed_argv_pct_negative = fuzzcorpus.entry("-1");
+const seed_argv_pct_overflow = fuzzcorpus.entry("99999999999999999999");
 
 const fuzz_argv_corpus = [_][]const u8{
     &seed_argv_plain,
@@ -1268,6 +1317,42 @@ test "pidAlive answers for live and exited processes" {
     const term = try child.wait(std.testing.io);
     try std.testing.expect(term == .exited);
     try std.testing.expect(!pidAlive(dead_pid));
+}
+
+test "pathsOverlap matches equality and whole-component containment" {
+    try std.testing.expect(pathsOverlap("/m", "/m"));
+    try std.testing.expect(pathsOverlap("/m/sub/x", "/m"));
+    try std.testing.expect(pathsOverlap("/m", "/m/sub/x"));
+    // The root contains everything: mounting with origin "/" would shadow
+    // the whole filesystem.
+    try std.testing.expect(pathsOverlap("/x", "/"));
+    // A bare string prefix is not containment: /models2 is a sibling of
+    // /models, and refusing it would break legitimate layouts.
+    try std.testing.expect(!pathsOverlap("/models2/c", "/models"));
+    try std.testing.expect(!pathsOverlap("/models", "/models2/c"));
+    try std.testing.expect(!pathsOverlap("/a/b", "/a/bc"));
+    try std.testing.expect(!pathsOverlap("/other", "/m"));
+}
+
+test "parseArgs refuses unknown MODELFS_ variables as typos" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    // A misspelled knob must fail loudly instead of silently dropping the
+    // operator's setting, on every command that reads configuration.
+    try environ.put("MODELFS_CACHEE", "/intended/cache");
+    try std.testing.expectError(error.UnknownEnv, parseArgs(gpa, &environ, &.{ "mount", "--origin", "/o" }));
+    try std.testing.expectError(error.UnknownEnv, parseArgs(gpa, &environ, &.{"status"}));
+    // Variables outside the MODELFS_ namespace are never this CLI's
+    // business and stay untouched; documented variables keep applying.
+    _ = environ.orderedRemove("MODELFS_CACHEE");
+    try environ.put("PATH", "/usr/bin");
+    try environ.put("MODELFS_CACHE", "/env/cache");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--origin", "/o" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/env/cache", parsed.opts.cache);
+    }
 }
 
 test "cmdStatus retires a crashed daemon's status.json as not running" {

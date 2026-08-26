@@ -4,10 +4,6 @@ Your goal is to find code that fights the reliable-send rules: WindowFull retry
 semantics, join-critical delivery, the shared retry shape, LiteNet capture
 mode, compression fallthrough and send-phase gating.
 
-Copy everything below the line into a fresh agent session (or `@` this file).
-
----
-
 ## Execution contract
 
 - Follow the user's session instructions and the applicable `AGENTS.md` files.

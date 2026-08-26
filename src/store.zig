@@ -2079,6 +2079,45 @@ test "a punched piece punched again stays culled with nothing rewritten" {
     try std.testing.expectEqual(@as(u32, 1), st.stats.pieces_culled.load(.monotonic));
 }
 
+// The pin marker is the guard punchPiece defers to, so a repeated pin or
+// unpin (operator double-runs the CLI, a script re-executes after a timeout)
+// must converge on the single-marker state instead of erroring or piling up
+// artifacts: pin twice leaves exactly one marker, unpin twice absorbs the
+// already-gone second unlink as success.
+test "pin and unpin run twice converge on the one-marker state" {
+    const gpa: std.mem.Allocator = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pin-twice");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pin-twice");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const pp = try st.cachePinPath(&pbuf, "m.bin");
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const pp_z = try sys.toZ(&zbuf, std.mem.span(pp));
+    var stat: c.struct_stat = undefined;
+
+    // Pin twice: both runs succeed and the same single marker answers.
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("m.bin", true));
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("m.bin", true));
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(pp_z, &stat));
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @intCast(stat.st_size)));
+    try std.testing.expect(st.pinExists("m.bin"));
+
+    // Unpin twice: the first removes it, the second is the normal
+    // already-gone case reported as success.
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("m.bin", false));
+    try std.testing.expect(sys.statPath(pp_z, &stat) != 0);
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("m.bin", false));
+    try std.testing.expect(!st.pinExists("m.bin"));
+}
+
 test "punchPiece refuses pinned and freshly accessed entries" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
