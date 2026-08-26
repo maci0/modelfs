@@ -883,9 +883,13 @@ export fn mf_init(conn: ?*fuse.fuse_conn_info, cfg: ?*fuse.fuse_config) callconv
     _ = conn;
     const st = statePtr();
     if (cfg) |cf| {
-        cf.*.kernel_cache = 0;
+        // The kernel page cache is UMA RAM shared with the GPU, so it stays
+        // off under direct_io (the default). `--kernel-cache` flips direct_io
+        // off to permit mmap; the cache only engages when kernel_cache is also
+        // enabled, so mirror the flag here instead of hardcoding it off, which
+        // would leave --kernel-cache a no-op.
+        cf.*.kernel_cache = @intFromBool(!st.direct_io);
         cf.*.auto_cache = 0;
-        // UMA: kernel page cache is the same RAM as the GPU. Keep it off.
         cf.*.direct_io = @intFromBool(st.direct_io);
         cf.*.use_ino = 0;
         cf.*.entry_timeout = 1.0;
