@@ -246,6 +246,15 @@ fn readHeadFull(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_r
     return readHeadFullDeadline(fd, buf, out_head_len, out_total_read, sys.monoMs() + head_deadline_ms);
 }
 
+/// readHeadFull with an injectable budget: a non-null deadline drives the
+/// head stage directly (virtual time in tests and any caller that already
+/// holds an instant), null stamps the real clock here like every production
+/// entry point. One branch so the expiry rule stays in readHeadFullDeadline.
+fn readHeadFullAt(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: ?i64) !void {
+    if (deadline_ms) |d| return readHeadFullDeadline(fd, buf, out_head_len, out_total_read, d);
+    return readHeadFull(fd, buf, out_head_len, out_total_read);
+}
+
 fn readHeadFullDeadline(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: i64) !void {
     var n: usize = 0;
     while (n < buf.len) {
@@ -709,19 +718,30 @@ fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) 
 /// malformed header fails the probe like any other bad reply so failures
 /// stay uncached and retried.
 fn fetchHave(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !discover.HaveBits {
+    return fetchHaveDeadline(gpa, psk, ip, port, rel, null);
+}
+
+/// fetchHave with an injectable budget (see readHeadFullAt): a non-null
+/// deadline bounds both the head stage and the bitmap body as one span, so
+/// tests expire the probe virtually instead of waiting out SO_RCVTIMEO.
+fn fetchHaveDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, deadline_ms: ?i64) !discover.HaveBits {
     const fd = try sendRequest(psk, ip, port, rel, null);
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    readHeadFull(fd, &head_buf, &head_len, &total_read) catch return error.Head;
-    return haveFromHead(gpa, fd, &head_buf, head_len, total_read);
+    readHeadFullAt(fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
+    return haveFromHeadDeadline(gpa, fd, &head_buf, head_len, total_read, deadline_ms);
 }
 
 /// Parses one /have response head (already read, body bytes possibly
 /// pipelined behind it in head_buf) and completes the bitmap body. The
 /// seam between dialing and parsing so tests can drive replies directly.
 fn haveFromHead(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize) !discover.HaveBits {
+    return haveFromHeadDeadline(gpa, fd, head_buf, head_len, total_read, null);
+}
+
+fn haveFromHeadDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, deadline_ms: ?i64) !discover.HaveBits {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 200")) {
@@ -742,7 +762,7 @@ fn haveFromHead(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8
     const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
     const declared = std.fmt.parseInt(usize, cl_str, 10) catch 0;
     if (declared > max_have_body_bytes) return error.BodyTooLarge;
-    const bits = try finishBodyAlloc(gpa, fd, head_buf, head_len, total_read, null, null);
+    const bits = try finishBodyAlloc(gpa, fd, head_buf, head_len, total_read, null, deadline_ms);
     return .{ .bits = bits, .piece_size = piece_size };
 }
 
@@ -769,18 +789,29 @@ fn sendRequest(psk: []const u8, ip: []const u8, port: u16, rel: []const u8, rang
 }
 
 fn fetchRange(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64) ![]u8 {
+    return fetchRangeDeadline(gpa, psk, ip, port, rel, start, end, null);
+}
+
+/// Fetch variants with an injectable budget (see readHeadFullAt): a non-null
+/// deadline bounds head and body stages as one span, so a test expires the
+/// transfer virtually instead of holding real socket timeouts open.
+fn fetchRangeDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, deadline_ms: ?i64) ![]u8 {
     const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end });
     defer sys.close(fd);
-    return readFlexBodyAlloc(gpa, fd, null);
+    return readFlexBodyAllocDeadline(gpa, fd, null, deadline_ms);
 }
 
 /// Like fetchRange, but streams the body directly into `out` (whose length
 /// must match the peer's Content-Length): one fewer piece-sized allocation
 /// and copy per fetched piece.
 fn fetchRangeInto(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8) !void {
+    return fetchRangeIntoDeadline(gpa, psk, ip, port, rel, start, end, out, null);
+}
+
+fn fetchRangeIntoDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8, deadline_ms: ?i64) !void {
     const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end });
     defer sys.close(fd);
-    _ = try readFlexBodyAlloc(gpa, fd, out);
+    _ = try readFlexBodyAllocDeadline(gpa, fd, out, deadline_ms);
 }
 
 fn rangeBps(bytes: u64, dt_ns: i128) f64 {
@@ -825,7 +856,7 @@ fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    readHeadFull(fd, &head_buf, &head_len, &total_read) catch return error.Head;
+    readHeadFullAt(fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
     return finishBodyAlloc(gpa, fd, &head_buf, head_len, total_read, dest, deadline_ms);
 }
 
@@ -1392,6 +1423,68 @@ test "readFlexBodyAllocDeadline aborts a dribbled body at the deadline" {
     const err = readFlexBodyAllocDeadline(std.testing.allocator, pair[1], null, t0 + 150);
     try std.testing.expectError(error.BodyTimeout, err);
     try std.testing.expect(sys.monoMs() - t0 <= 2000);
+}
+
+test "readHeadFullAt expires an injected budget without waiting real time" {
+    // Nothing staged and an already-past budget: the first armChunkTimeout
+    // check must refuse before any blocking syscall, so a simulator (or this
+    // test) can drive head expiry virtually instead of holding a socket
+    // timeout open for sock_timeout_ms.
+    const pair = try responsePair("");
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    var head_len: usize = 0;
+    var total: usize = 0;
+    var buf: [64]u8 = undefined;
+    const t0 = sys.monoMs();
+    const err = readHeadFullAt(pair[1], &buf, &head_len, &total, t0 - 1);
+    try std.testing.expectError(error.HeadTimeout, err);
+    try std.testing.expect(sys.monoMs() - t0 <= 2000);
+}
+
+test "haveFromHeadDeadline pairs refusal at an expired budget with success at a live one" {
+    const gpa = std.testing.allocator;
+    const wire = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nok";
+    const head_len = std.mem.indexOf(u8, wire, "\r\n\r\n").? + 4;
+    // Drains exactly the head bytes off the socket, leaving only the bitmap
+    // body staged -- the state fetchHaveDeadline hands to this function.
+    const drainHead = struct {
+        fn go(fd: std.posix.fd_t, head_bytes: usize) !void {
+            var sink: [96]u8 = undefined;
+            var got: usize = 0;
+            while (got < head_bytes) {
+                // Capped so a coalesced read cannot swallow staged body
+                // bytes past the head.
+                got += try sys.readOnce(fd, sink[0 .. head_bytes - got]);
+            }
+        }
+    }.go;
+    // Head pre-read exactly like fetchHaveDeadline leaves it; the bitmap
+    // bytes stay staged in the socket behind it.
+    {
+        // Fully staged reply, expired budget: no further byte may move under
+        // a dead budget, even bytes already in the receive buffer -- same
+        // rule streamRange applies to the send side.
+        const pair = try responsePair(wire);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try drainHead(pair[1], head_len);
+        const t0 = sys.monoMs();
+        try std.testing.expectError(error.BodyTimeout, haveFromHeadDeadline(gpa, pair[1], wire[0..head_len], head_len, head_len, t0 - 1));
+    }
+    {
+        // The identical reply under a live injected budget parses exactly as
+        // the real-clock path would: injection changes only when the budget
+        // expires, never what a valid answer yields.
+        const pair = try responsePair(wire);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try drainHead(pair[1], head_len);
+        const rep = try haveFromHeadDeadline(gpa, pair[1], wire[0..head_len], head_len, head_len, sys.monoMs() + 60_000);
+        defer gpa.free(rep.bits);
+        try std.testing.expectEqualSlices(u8, "ok", rep.bits);
+        try std.testing.expectEqual(@as(u32, 4096), rep.piece_size);
+    }
 }
 
 test "streamRange honors the response body budget in both directions" {
