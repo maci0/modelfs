@@ -32,6 +32,10 @@ Changes made for the tag itself:
   with the throughput being measured. They use gitignored `.scratch/` now.
 - **The threat model points at symbols rather than line numbers.** All 139
   `src/file.zig:NNN` references had drifted, several by more than 150 lines.
+- **A punch test no longer depends on the host's uptime.** It stamped the
+  cache entry with a virtual 40_000 but asked for the punch at
+  `sys.monoSec()`, so the piece read as too recently accessed on any host up
+  for less than 11 hours: green on a long-running desktop, red in CI.
 - **`AGENTS.md`** records the layout, the gates, and the constraints that are
   specific to this tree.
 
