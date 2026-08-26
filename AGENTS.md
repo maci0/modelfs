@@ -41,3 +41,5 @@ locally rather than in CI: `run_e2e_tests.sh`, `run_cluster_e2e_9nodes.sh`,
   the single source of truth for the toolchain, including in CI.
 - **Docs point at symbols, not line numbers.** Line references rot within a
   commit or two; name the function and the file.
+- **One rule file.** `CLAUDE.md` stays a symlink pointer to this file rather
+  than a copy; edit rules here, never by replacing the pointer.
