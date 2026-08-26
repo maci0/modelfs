@@ -1042,22 +1042,17 @@ fn probeSlots(
     if (spawned < todo.items.len) probeWorker(&ctx);
 }
 
-/// Lease prior for best-first address ordering inside a peer-id group:
-/// pathScore with inflight fixed at 0, matching the pre-probe state.
-fn scoreOf(p: discover.Path) f64 {
-    return discover.pathScore(p.ewma_bps, p.hops, 0);
-}
-
 /// Total order for the probe walk inside one peer-id group: higher lease
-/// prior first, then pathTieLess (ip bytes, then port). The tie-break is
+/// prior first (pathScore with inflight fixed at 0, the pre-probe state),
+/// then pathTieLess (ip bytes, then port). The tie-break is
 /// what keeps the walk a function of the address set alone: on a cold
 /// cluster every path carries the same prior, so without it the first-tried
 /// address would be decided by the publisher's getifaddrs order riding in
 /// the lease document -- environment enumeration order choosing which NIC
 /// gets the wire round trip and the first goodput sample.
 fn probeOrderLess(a: discover.Path, b: discover.Path) bool {
-    const sa = scoreOf(a);
-    const sb = scoreOf(b);
+    const sa = discover.pathScore(a.ewma_bps, a.hops, 0);
+    const sb = discover.pathScore(b.ewma_bps, b.hops, 0);
     if (sa != sb) return sa > sb;
     return discover.pathTieLess(a, b);
 }
