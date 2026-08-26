@@ -722,10 +722,11 @@ fn fetchHave(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16,
 }
 
 /// fetchHave with an injectable budget (see readHeadFullAt): a non-null
-/// deadline bounds both the head stage and the bitmap body as one span, so
-/// tests expire the probe virtually instead of waiting out SO_RCVTIMEO.
+/// deadline bounds the dial, the head stage, and the bitmap body as one
+/// span, so tests expire the probe virtually instead of waiting out
+/// connect(2) or SO_RCVTIMEO.
 fn fetchHaveDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, deadline_ms: ?i64) !discover.HaveBits {
-    const fd = try sendRequest(psk, ip, port, rel, null);
+    const fd = try sendRequest(psk, ip, port, rel, null, deadline_ms);
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
@@ -769,8 +770,11 @@ fn haveFromHeadDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []
 /// Dials and sends one GET (/have, or /data when range is set); returns the
 /// connected socket with the request already on the wire. One builder for
 /// both shapes so URL encoding, bearer auth, and Connection framing cannot
-/// drift between them.
-fn sendRequest(psk: []const u8, ip: []const u8, port: u16, rel: []const u8, range: ?proto.Range) !c_int {
+/// drift between them. `deadline_ms` (see readHeadFullAt) also bounds the
+/// dial: the connect wait clamps to the budget's remainder, so an injected
+/// deadline spans the whole wire round trip instead of starting only after
+/// connect(2) returned on its own.
+fn sendRequest(psk: []const u8, ip: []const u8, port: u16, rel: []const u8, range: ?proto.Range, deadline_ms: ?i64) !c_int {
     var qbuf: [4096 * 3]u8 = undefined;
     const enc = try proto.urlEncode(&qbuf, rel);
     var req: [max_head_bytes]u8 = undefined;
@@ -782,7 +786,7 @@ fn sendRequest(psk: []const u8, ip: []const u8, port: u16, rel: []const u8, rang
         try std.fmt.bufPrint(&req, "GET /have?path={s} HTTP/1.1\r\nHost: {s}:{d}\r\nAuthorization: Bearer {s}\r\nConnection: close\r\n\r\n", .{
             enc, ip, port, psk,
         });
-    const fd = try dial(ip, port);
+    const fd = try dial(ip, port, deadline_ms);
     errdefer sys.close(fd);
     if (sys.writeAll(fd, s) < 0) return error.Write;
     return fd;
@@ -793,10 +797,11 @@ fn fetchRange(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16
 }
 
 /// Fetch variants with an injectable budget (see readHeadFullAt): a non-null
-/// deadline bounds head and body stages as one span, so a test expires the
-/// transfer virtually instead of holding real socket timeouts open.
+/// deadline bounds the dial plus head and body stages as one span, so a test
+/// expires the transfer virtually instead of holding real connect waits or
+/// socket timeouts open.
 fn fetchRangeDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, deadline_ms: ?i64) ![]u8 {
-    const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end });
+    const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
     defer sys.close(fd);
     return readFlexBodyAllocDeadline(gpa, fd, null, deadline_ms);
 }
@@ -809,7 +814,7 @@ fn fetchRangeInto(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port:
 }
 
 fn fetchRangeIntoDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8, deadline_ms: ?i64) !void {
-    const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end });
+    const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
     defer sys.close(fd);
     _ = try readFlexBodyAllocDeadline(gpa, fd, out, deadline_ms);
 }
@@ -831,17 +836,31 @@ fn sockaddrV4(ip: []const u8, port: u16, out: *c.struct_sockaddr_in) !void {
     if (c.inet_pton(c.AF_INET, z, &out.sin_addr) != 1) return error.BadIp;
 }
 
-fn dial(ip: []const u8, port: u16) !c_int {
+/// Connect budget for one dial under an injected deadline (see
+/// readHeadFullAt): null stamps the full dial_timeout_ms like every
+/// production entry point; a live deadline clamps the wait to its remainder;
+/// a spent one refuses before any blocking syscall, so a simulator expires
+/// the wire round trip at the dial instead of after it.
+fn dialBudgetMs(deadline_ms: ?i64) u32 {
+    const d = deadline_ms orelse return dial_timeout_ms;
+    const remain_ms = d - sys.monoMs();
+    if (remain_ms <= 0) return 0;
+    return @intCast(@min(remain_ms, @as(i64, dial_timeout_ms)));
+}
+
+fn dial(ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     var addr: c.struct_sockaddr_in = undefined;
     try sockaddrV4(ip, port, &addr);
+    const budget_ms = dialBudgetMs(deadline_ms);
+    if (budget_ms == 0) return error.Connect;
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (fd < 0) return error.Socket;
-    sys.setSockTimeout(fd, dial_timeout_ms);
+    sys.setSockTimeout(fd, budget_ms);
     sys.setTcpNoDelay(fd);
     sys.setSockBuffers(fd, sock_buf_bytes);
     // Bounded connect: SO_RCVTIMEO does not cover the dial itself, and a
     // blocking connect to a dead address stalls the fill path for minutes.
-    if (sys.connectIn(fd, &addr, dial_timeout_ms) != 0) {
+    if (sys.connectIn(fd, &addr, budget_ms) != 0) {
         sys.close(fd);
         return error.Connect;
     }
@@ -1886,8 +1905,32 @@ const TestServer = struct {
 test "fault tolerance: dial unreachable peer fails gracefully" {
     // Reserve a kernel-picked free port, then release it: dialing a closed
     // port must fail with Connect.
-    const err = dial("127.0.0.1", try freeTcpPort());
+    const err = dial("127.0.0.1", try freeTcpPort(), null);
     try std.testing.expectError(error.Connect, err);
+}
+
+test "dial expires an injected budget that is already spent" {
+    // A spent budget must refuse at the dial stage itself, before the socket
+    // even exists: fetchHaveDeadline and the fetchRange* variants span dial,
+    // head, and body as one budget, so a test (or any simulator driving
+    // virtual deadlines) can expire a wire round trip without connect(2)
+    // ever running against a real address.
+    const t0 = sys.monoMs();
+    const err = dial("10.255.255.255", 18080, t0 - 1);
+    try std.testing.expectError(error.Connect, err);
+    try std.testing.expect(sys.monoMs() - t0 <= 2000);
+}
+
+test "dial clamps the connect wait to an injected budget's remainder" {
+    // Unroutable RFC1918 sink (same shape as sys.zig's connectIn bound test;
+    // a sandboxed fast refusal also satisfies rc != 0). Without the clamp
+    // this dial would hold the fill path for the full dial_timeout_ms no
+    // matter what budget the caller injected; with it, expiry lands with the
+    // deadline instead of after the steady-state window.
+    const t0 = sys.monoMs();
+    const err = dial("10.255.255.255", 18080, t0 + 250);
+    try std.testing.expectError(error.Connect, err);
+    try std.testing.expect(sys.monoMs() - t0 <= 2000);
 }
 
 /// One raw request over its own connection; returns everything the server
@@ -2211,7 +2254,7 @@ test "serveData replies 500 when the cache refuses hydrated bytes" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
-    const fd = try sendRequest("secret", "127.0.0.1", port, "ro.bin", .{ .start = 0, .end = 15 });
+    const fd = try sendRequest("secret", "127.0.0.1", port, "ro.bin", .{ .start = 0, .end = 15 }, null);
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
