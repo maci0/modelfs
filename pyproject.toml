@@ -29,12 +29,16 @@ required-version = ">=0.16,<0.17"
 # join-to-f-string simplification (FLY), conventional import aliases (ICN),
 # TODO-comment hygiene (TD), annotation completeness including Any spelled
 # out by hand (ANN), stale FIXME/TBD/HACK comments (FIX), logging call
-# hygiene (G), and logging setup anti-patterns (LOG).
+# hygiene (G), logging setup anti-patterns (LOG), pytest conventions so any
+# Python tests added later start life under the same bar (PT), quote hygiene
+# beyond what the formatter normalizes, like avoidable escapes (Q), and
+# missing __slots__ on value classes (SLOT).
 select = [
     "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
     "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
     "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE", "TRY", "EM",
     "EXE", "FBT", "I", "FLY", "ICN", "TD", "ANN", "FIX", "G", "LOG",
+    "PT", "Q", "SLOT",
 ]
 
 [tool.ruff.format]
