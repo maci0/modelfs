@@ -153,7 +153,7 @@ Range: bytes=start-end
 Authorization: Bearer <psk>
 ```
 
-`/have` replies carry `X-Piece-Size: <n>`, the piece grid the bitmap's bits are indexed against; a fetcher running a different `--piece` treats that peer's answer as no-answer instead of routing fills by bits that cover different byte ranges (a fleet should still run one piece size; mixed grids degrade to origin traffic, never to wrong data). Peers older than this header read as unknown and are assumed aligned. The bitmap body itself stays raw bits.
+`/have` replies carry `X-Piece-Size: <n>`, the piece grid the bitmap's bits are indexed against; a fetcher running a different `--piece` treats that peer's answer as no-answer instead of routing fills by bits that cover different byte ranges (a fleet should still run one piece size; mixed grids degrade to origin traffic, never to wrong data). Peers older than this header read as unknown and are assumed aligned. The bitmap body itself stays raw bits: one byte per eight pieces, bit i naming piece i least-significant-bit first, `ceil(pieces / 8)` bytes long.
 
 Status codes, identical framing on every endpoint (`Content-Length` always present, `Connection: close`, empty body on errors):
 
@@ -161,7 +161,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 |---|---|
 | 200 | `/ping` (`text/plain`, body `ok`) or `/have` (`application/octet-stream` bitmap + `X-Piece-Size`) |
 | 206 | `/data` partial content (`Content-Range`, `application/octet-stream`) |
-| 400 | Undecodable or unsafe (`..`, absolute) `path`; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
+| 400 | Undecodable or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
 | 401 | Missing or wrong bearer token (`WWW-Authenticate: Bearer`) |
 | 404 | Unknown path, or the origin has no regular file at `path` |
 | 405 | Any method other than GET (`Allow: GET`) |

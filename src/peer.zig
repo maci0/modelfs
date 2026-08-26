@@ -675,12 +675,18 @@ fn replyStatus(self: *Server, fd: std.posix.fd_t, status: []const u8) void {
     reply(fd, res);
 }
 
-/// 404 when the origin reports the path truly absent, 502 when the origin
-/// itself failed (NFS I/O error, stale mount): a fetching peer and an
-/// operator must be able to tell a missing file from an unavailable one.
+/// 404 when the origin reports the path truly absent, 400 when the path is
+/// too long to name any file under the origin root (client input, like the
+/// other unsafe-path rejections: a 502 here would feed the http_5xx health
+/// gauge and send peers retrying every node for a request that can never
+/// succeed), 502 when the origin itself failed (NFS I/O error, stale mount):
+/// a fetching peer and an operator must be able to tell a missing file from
+/// an unavailable one.
 fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) void {
     if (rc == -sys.c.ENOENT or rc == -sys.c.ENOTDIR) {
         replyStatus(self, fd, "404 Not Found");
+    } else if (rc == -sys.c.ENAMETOOLONG) {
+        replyStatus(self, fd, "400 Bad Request");
     } else {
         std.log.warn("origin stat failed for {s} (errno {d})", .{ rel, -rc });
         replyStatus(self, fd, "502 Bad Gateway");
@@ -1651,6 +1657,48 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
     // The healthy miss must not have fed the failure gauge: 404s are fleet
     // skew, not broken nodes.
     try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_5xx.load(.monotonic));
+}
+
+test "a path too long for the origin answers 400 on /have and /data alike" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-longpath");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-longpath");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+    const port = srv.port();
+
+    // The longest rel the request boundary can carry (decodePath's buffer
+    // cap): relOk-clean bytes that can never name a file because the joined
+    // origin path exceeds PATH_MAX. That is client input -- the same family
+    // as ".." and absolute paths -- so both data endpoints must answer 400,
+    // not 502: a server-failure code here would bump the http_5xx health
+    // counter and send the fetching peer retrying every node for a request
+    // that can never succeed.
+    const long_rel = "a" ** 4096;
+
+    {
+        var req_buf: [8192]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET /have?path={s} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n", .{long_rel});
+        var res = try roundTrip(port, req);
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+    {
+        var req_buf: [8192]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET /data?path={s} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-7\r\nConnection: close\r\n\r\n", .{long_rel});
+        var res = try roundTrip(port, req);
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+
+    // And neither reply may pollute the 5xx health gauge status.json
+    // publishes: nothing server-side failed here.
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
 }
 
 /// Read the kernel-assigned port back from a listening socket (for port 0).
