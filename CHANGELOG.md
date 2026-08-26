@@ -1,5 +1,8 @@
 # Changelog
 
+## [CLI review pass 3] - 2026-08-26
+- **A regular file at `--origin` is refused instead of silently misbehaving**: both `mount` and `peers` gated only on reachability, which a file satisfies, so the mount proceeded past the origin check (mountpoint and cache layout created, peer port bound) while every lookup died ENOTDIR behind the NFS fallback, and `peers` reported a healthy empty cluster for a path that can never hold `.cluster` leases. Both commands now require the origin to be an existing directory right after the realpath gate (named message, exit 1, nothing created), matching the documented contract ("any POSIX dir"); `modelfs help` says "Existing".
+
 ## [0.1.0] - 2026-08-26
 
 First tagged release. It mounts `/models` over FUSE on every node, serves reads

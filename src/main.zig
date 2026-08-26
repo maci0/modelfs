@@ -31,7 +31,7 @@ const usage =
     \\  modelfs help
     \\
     \\mount options:
-    \\  --origin PATH         NFS/dir origin (required). Writes go here.
+    \\  --origin PATH         Existing NFS/dir origin (required). Writes go here.
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
     \\  --id NAME             Override node id (default: hostname)
     \\  --listen [IP:]PORT    Peer HTTP port (default 18080); binds all interfaces
@@ -322,6 +322,17 @@ fn pathWithin(sub: []const u8, dir: []const u8) bool {
 /// mount, so cmdMount refuses it before any socket is bound.
 fn pathsOverlap(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b) or pathWithin(a, b) or pathWithin(b, a);
+}
+
+/// True when the (already realpathed) path names an existing directory.
+/// Both --origin consumers gate on this right after their reachability
+/// check: a regular file realpaths fine, but leases can never live under
+/// it (.cluster creation fails every tick) and joined relpath reads all
+/// die ENOTDIR behind the NFS fallback, so accepting it would trade one
+/// named refusal now for a silently dead origin.
+fn pathIsDir(zp: [*:0]const u8) bool {
+    var st: sys.c.struct_stat = undefined;
+    return sys.statPath(zp, &st) == 0 and (st.st_mode & sys.c.S_IFMT) == sys.c.S_IFDIR;
 }
 
 /// Refuses mount-only knobs on the other commands, as the help text promises
@@ -732,6 +743,15 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         return 1;
     };
     defer gpa.free(origin);
+    // Reachable is not enough: a regular file realpaths fine but cannot
+    // hold .cluster leases or serve joined relpath reads. Refused before
+    // the mountpoint or cache is touched, like the dependent-path gates
+    // below.
+    var ozbuf: [sys.c.PATH_MAX]u8 = undefined;
+    if (!if (sys.toZ(&ozbuf, origin)) |z| pathIsDir(z) else |_| false) {
+        std.log.err("origin {s} is not a directory", .{origin});
+        return 1;
+    }
 
     const mount_abs = ensureDirReal(gpa, mount, "mountpoint") catch return 1;
     defer gpa.free(mount_abs);
@@ -1009,7 +1029,15 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         if (!builtin.is_test) std.log.err("origin {s} is not reachable", .{origin});
         return 1;
     };
-    gpa.free(real);
+    defer gpa.free(real);
+    // And the same non-directory gate: a file at --origin can never hold
+    // .cluster leases, so listing it as an empty cluster would read a dead
+    // origin as healthy.
+    var rzbuf: [sys.c.PATH_MAX]u8 = undefined;
+    if (!if (sys.toZ(&rzbuf, real)) |z| pathIsDir(z) else |_| false) {
+        if (!builtin.is_test) std.log.err("origin {s} is not a directory", .{origin});
+        return 1;
+    }
     var dbuf: [sys.c.PATH_MAX]u8 = undefined;
     const dirz = sys.joinZ(&dbuf, origin, discover.cluster_dir) catch {
         std.log.err("origin path too long to name {s}/{s}", .{ origin, discover.cluster_dir });
@@ -1467,6 +1495,24 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
 }
 
+test "pathIsDir separates directories from files and absent paths" {
+    var cb: [128]u8 = undefined;
+    const d = try sys.scratchDir(&cb, "modelfs-isdir");
+    defer sys.deleteTree(std.testing.io, d);
+
+    var zb: [256]u8 = undefined;
+    try std.testing.expect(pathIsDir(try sys.toZ(&zb, d)));
+    // The --origin gate exists for exactly this case: a regular file passes
+    // realpath ("reachable") but must never read as an origin.
+    var fb: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fb, "{s}/regular", .{d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "x"));
+    try std.testing.expect(!pathIsDir(try sys.toZ(&zb, fp)));
+    var ab: [160]u8 = undefined;
+    const ap = try std.fmt.bufPrint(&ab, "{s}/absent", .{d});
+    try std.testing.expect(!pathIsDir(try sys.toZ(&zb, ap)));
+}
+
 test "cmdPeers separates unreachable origins from empty clusters" {
     const gpa = std.testing.allocator;
     var cb: [128]u8 = undefined;
@@ -1482,6 +1528,15 @@ test "cmdPeers separates unreachable origins from empty clusters" {
     var nb: [160]u8 = undefined;
     const absent = try std.fmt.bufPrint(&nb, "{s}/does-not-exist", .{origin_d});
     try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = absent }));
+
+    // A regular file at --origin is the same verdict: reachable but unable
+    // to hold .cluster leases, so it must fail loudly instead of listing as
+    // a healthy empty cluster.
+    var wb: [256]u8 = undefined;
+    var fb: [160]u8 = undefined;
+    const file_origin = try std.fmt.bufPrint(&fb, "{s}/regular", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&wb, file_origin), "x"));
+    try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = file_origin }));
 }
 
 test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
