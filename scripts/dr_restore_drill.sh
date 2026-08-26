@@ -12,10 +12,14 @@
 #   MODELFS_DRILL_LOG   artifact log path     (default /var/log/modelfs-drill.log)
 #   MODELFS_DRILL_LIVE  live tree to diff     (default: the dataset's mountpoint)
 #   MODELFS_DRILL_KEEP  set non-empty to keep the drill clone mounted for inspection
+#   MODELFS_DRILL_MAX_SNAP_AGE  seconds the newest snapshot may be old before
+#                               the drill fails   (default 90000 = 25 h)
 #
 # Exit status is the drill verdict: 0 means the newest snapshot restored,
 # mounted, and read back verified; anything else is an alarm, including
-# "no snapshots exist", which means the backup schedule itself is dead.
+# "no snapshots exist" and "newest snapshot older than the age limit", which
+# mean the backup schedule itself is dead or has silently stopped keeping
+# restore points inside the RPO the recovery doc claims.
 set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
@@ -37,12 +41,30 @@ zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
     || die "dataset ${DATASET} does not exist on this host"
 
 # Newest by creation time, not by name sort: hourly/daily/monthly suffixes
-# would otherwise decide which snapshot a lexicographic tail picks.
-SNAP="$(zfs list -H -t snapshot -o name -s creation "${DATASET}" | tail -n 1)"
+# would otherwise decide which snapshot a lexicographic tail picks. The
+# creation stamp rides along (-p keeps it a parseable epoch) so the drill can
+# refuse to bless a restore point too old for the RPO: snapshots existing but
+# stale is how a dead sanoid.timer hides behind last month's green drill.
+SNAP_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${DATASET}" | tail -n 1)"
+SNAP="${SNAP_LINE%%$'\t'*}"
 if [[ -z "${SNAP}" ]]; then
     die "no snapshots of ${DATASET}: sanoid.timer is down or was never enabled (docs/recovery.md section 3)"
 fi
-echo "drill: newest snapshot ${SNAP}"
+SNAP_CTIME="${SNAP_LINE##*$'\t'}"
+NOW="$(date +%s)"
+SNAP_AGE=$((NOW - SNAP_CTIME))
+MAX_SNAP_AGE="${MODELFS_DRILL_MAX_SNAP_AGE:-90000}"
+case "${MAX_SNAP_AGE}" in
+    '' | *[!0-9]*)
+        die "MODELFS_DRILL_MAX_SNAP_AGE must be a whole number of seconds, got '${MAX_SNAP_AGE}'"
+        ;;
+    *)
+        ;;
+esac
+if [[ "${SNAP_AGE}" -gt "${MAX_SNAP_AGE}" ]]; then
+    die "newest snapshot ${SNAP} is ${SNAP_AGE}s old, past the ${MAX_SNAP_AGE}s limit: the autosnap schedule stopped keeping restore points inside the claimed RPO (docs/recovery.md sections 3 and 5)"
+fi
+echo "drill: newest snapshot ${SNAP} (age ${SNAP_AGE}s)"
 
 PARENT="${DATASET%/*}"
 if [[ "${PARENT}" == "${DATASET}" ]]; then
@@ -161,6 +183,6 @@ fi
 
 touch "${LOG_FILE}" || die "cannot write the drill log ${LOG_FILE}"
 STAMP="$(date -Is)"
-echo "${STAMP} ${SNAP} ok clone_s=${ELAPSED} drift=${DRIFT} sample=${SAMPLE_REL}" >>"${LOG_FILE}"
+echo "${STAMP} ${SNAP} ok snap_age_s=${SNAP_AGE} clone_s=${ELAPSED} drift=${DRIFT} sample=${SAMPLE_REL}" >>"${LOG_FILE}"
 echo "drill OK: ${SNAP} restored and verified (${FILE_COUNT} files, drift ${DRIFT} lines, sample sha256 match on ${SAMPLE_REL})"
 echo "drill log line appended to ${LOG_FILE}; alert when its newest entry ages past 35 days (docs/recovery.md section 6)"

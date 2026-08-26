@@ -1,5 +1,16 @@
 # Changelog
 
+## [Restore drill staleness alarm] - 2026-08-26
+- **A dead autosnap schedule no longer passes the restore drill.** The drill
+  only failed when a dataset had no snapshots at all, so sanoid dying after a
+  green drill left the newest restore point aging silently past the RPO table's
+  claims while the next monthly run still logged "ok". It now reads the newest
+  snapshot's creation stamp, fails when it is older than
+  `MODELFS_DRILL_MAX_SNAP_AGE` (default 25 h: catches an hourly schedule that
+  stopped without false-alarming daily-only datasets), and records the true age
+  in the log line as `snap_age_s`, making the recovery doc's RPO column a
+  measured number instead of an assumption.
+
 ## [CLI review pass 3] - 2026-08-26
 - **A regular file at `--origin` is refused instead of silently misbehaving**: both `mount` and `peers` gated only on reachability, which a file satisfies, so the mount proceeded past the origin check (mountpoint and cache layout created, peer port bound) while every lookup died ENOTDIR behind the NFS fallback, and `peers` reported a healthy empty cluster for a path that can never hold `.cluster` leases. Both commands now require the origin to be an existing directory right after the realpath gate (named message, exit 1, nothing created), matching the documented contract ("any POSIX dir"); `modelfs help` says "Existing".
 
