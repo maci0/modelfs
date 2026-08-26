@@ -4,9 +4,29 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
+/// The effective log ceiling, moved by MODELFS_LOG (parseArgs) before any
+/// command runs. Default info keeps the steady-state daemon quiet while the
+/// mount/tick/pin lines stay answerable from the journal.
+var active_log_level: std.log.Level = .info;
+
 pub const std_options: std.Options = .{
-    .log_level = .info,
+    // The compile-time gate stays fully open so every level reaches
+    // logFilter; the runtime ceiling above decides what actually prints.
+    // Without the indirection, raising or lowering verbosity would need a
+    // rebuild instead of an environment variable.
+    .log_level = .debug,
+    .logFn = logFilter,
 };
+
+fn logFilter(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (@intFromEnum(level) > @intFromEnum(active_log_level)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
 
 const fuse = @import("c.zig").c;
 const piece = @import("piece.zig");
@@ -57,6 +77,7 @@ const usage =
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID set the same values as their flags; an explicit flag wins.
+    \\MODELFS_LOG sets the log ceiling: err, warn, info (default), or debug.
     \\An empty environment value counts as unset (defaults apply).
     \\
     \\Examples:
@@ -287,12 +308,23 @@ fn envValue(environ: *const std.process.Environ.Map, name: []const u8) ?[]const 
     return if (v.len == 0) null else v;
 }
 
+/// MODELFS_LOG values name a std.log.Level exactly; anything else ("Info",
+/// "warning", "verbose") is refused by the caller instead of silently
+/// leaving the default ceiling in force.
+fn parseLogLevel(s: []const u8) ?std.log.Level {
+    if (std.mem.eql(u8, s, "err")) return .err;
+    if (std.mem.eql(u8, s, "warn")) return .warn;
+    if (std.mem.eql(u8, s, "info")) return .info;
+    if (std.mem.eql(u8, s, "debug")) return .debug;
+    return null;
+}
+
 /// The MODELFS_ prefix is this CLI's environment namespace; anything under
 /// it that no flag answers to is a misspelling, not a foreign variable.
 /// Variables outside the namespace are never this binary's business and
 /// pass untouched.
 fn checkKnownEnv(environ: *const std.process.Environ.Map) !void {
-    const known = [_][]const u8{ "MODELFS_ORIGIN", "MODELFS_CACHE", "MODELFS_PSK", "MODELFS_PSK_VALUE", "MODELFS_ID" };
+    const known = [_][]const u8{ "MODELFS_ORIGIN", "MODELFS_CACHE", "MODELFS_PSK", "MODELFS_PSK_VALUE", "MODELFS_ID", "MODELFS_LOG" };
     var it = environ.iterator();
     while (it.next()) |e| {
         const name = e.key_ptr.*;
@@ -418,6 +450,21 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // environment block is readable only by the process owner and root.
     // For scripted mounts that cannot place a PSK file.
     if (envValue(environ, "MODELFS_PSK_VALUE")) |v| opts.psk_value = v;
+    // The journal is the only configuration observability this daemon has,
+    // so the ceiling is movable per environment: MODELFS_LOG=err quiets a
+    // cron'd status loop, debug aids a misbehaving mount. Applied for every
+    // command -- status/peers/pin log warnings too. A value outside the
+    // documented set is refused like any other malformed knob: silently
+    // keeping the default would leave the operator believing verbosity
+    // changed.
+    if (envValue(environ, "MODELFS_LOG")) |v| {
+        const level = parseLogLevel(v) orelse {
+            if (!builtin.is_test)
+                std.debug.print("MODELFS_LOG {s}: want err, warn, info, or debug\n", .{v});
+            return error.BadLogLevel;
+        };
+        if (!builtin.is_test) active_log_level = level;
+    }
     // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin
     // never read the id, so an ambient shell-wide variable must neither leak
     // into them nor fail them with BadId the way the explicit flag is
@@ -1689,6 +1736,7 @@ test "empty environment variables read as unset" {
     try environ.put("MODELFS_PSK", "");
     try environ.put("MODELFS_PSK_VALUE", "");
     try environ.put("MODELFS_ID", "");
+    try environ.put("MODELFS_LOG", "");
     const parsed = try parseArgs(gpa, &environ, &.{"mount"});
     defer freeParsed(parsed, gpa);
     try std.testing.expect(parsed.opts.origin == null);
@@ -1712,6 +1760,36 @@ test "empty environment variables read as unset" {
     try std.testing.expectEqualStrings("/env/psk", parsed2.opts.psk_file);
     try std.testing.expectEqualStrings("env-secret", parsed2.opts.psk_value.?);
     try std.testing.expectEqualStrings("spark-env", parsed2.opts.id.?);
+}
+
+test "parseLogLevel accepts the documented names only" {
+    try std.testing.expectEqual(std.log.Level.err, parseLogLevel("err").?);
+    try std.testing.expectEqual(std.log.Level.warn, parseLogLevel("warn").?);
+    try std.testing.expectEqual(std.log.Level.info, parseLogLevel("info").?);
+    try std.testing.expectEqual(std.log.Level.debug, parseLogLevel("debug").?);
+    // Near-misses must refuse rather than silently keep the default
+    // ceiling: the operator asked for a verbosity change and would never
+    // learn it did not happen.
+    try std.testing.expect(parseLogLevel("Info") == null);
+    try std.testing.expect(parseLogLevel("warning") == null);
+    try std.testing.expect(parseLogLevel("verbose") == null);
+    try std.testing.expect(parseLogLevel("") == null);
+}
+
+test "parseArgs refuses an unknown MODELFS_LOG value on every command" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("MODELFS_LOG", "verbose");
+    try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{ "mount", "--origin", "/o" }));
+    try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{"status"}));
+    try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{"peers"}));
+    // A documented value is accepted on the non-mount commands too: the log
+    // ceiling is shared configuration, not a mount-only knob.
+    _ = environ.orderedRemove("MODELFS_LOG");
+    try environ.put("MODELFS_LOG", "err");
+    const parsed = try parseArgs(gpa, &environ, &.{"status"});
+    defer freeParsed(parsed, gpa);
 }
 
 test "parseArgs refuses unknown commands before flag scanning" {

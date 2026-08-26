@@ -1,5 +1,9 @@
 # Changelog
 
+## [Config pass] - 2026-08-26
+- **Harness and drill environment knobs no longer squat on the daemon's `MODELFS_` namespace**: `test_fault_tolerance.sh` read `MODELFS_TEST_HOST`/`MODELFS_TEST_PORT` and `dr_restore_drill.sh` read `MODELFS_DRILL_LOG/LIVE/KEEP`, but every `modelfs` invocation refuses any unknown `MODELFS_*` variable as a typo'd knob — so exporting one of these settings (the natural way to keep it for a session) made every command in that shell exit 2 with "unknown environment variable". They are renamed to `MF_TEST_*` and `MF_DRILL_*`; recovery.md's drill section matches.
+- **The log level is runtime configuration, not a compile-time constant**: verbosity was fixed at info inside `main.zig`, so quieting a cron'd `status` loop or debugging a misbehaving mount meant a rebuild. `MODELFS_LOG` (`err`, `warn`, `info` default, `debug`) moves the ceiling for every command; values outside that set are refused at startup like any other malformed knob, and an empty value counts as unset. Documented in `modelfs help`, README, docs/architecture.md, and docs/THREAT_MODEL.md.
+
 ## [CLI review pass 3] - 2026-08-26
 - **A regular file at `--origin` is refused instead of silently misbehaving**: both `mount` and `peers` gated only on reachability, which a file satisfies, so the mount proceeded past the origin check (mountpoint and cache layout created, peer port bound) while every lookup died ENOTDIR behind the NFS fallback, and `peers` reported a healthy empty cluster for a path that can never hold `.cluster` leases. Both commands now require the origin to be an existing directory right after the realpath gate (named message, exit 1, nothing created), matching the documented contract ("any POSIX dir"); `modelfs help` says "Existing".
 

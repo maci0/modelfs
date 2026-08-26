@@ -8,10 +8,12 @@
 # Runs on the NAS (Rocky/RHEL, GNU coreutils), not on sparks or the desktop:
 #   ./scripts/dr_restore_drill.sh [DATASET]      # default: tank/models
 #
-# Environment:
-#   MODELFS_DRILL_LOG   artifact log path     (default /var/log/modelfs-drill.log)
-#   MODELFS_DRILL_LIVE  live tree to diff     (default: the dataset's mountpoint)
-#   MODELFS_DRILL_KEEP  set non-empty to keep the drill clone mounted for inspection
+# Environment (deliberately not MODELFS_*: the daemon refuses any unknown
+# MODELFS_* variable as a typo'd knob, so an exported drill setting would
+# fail every modelfs command in the same shell):
+#   MF_DRILL_LOG   artifact log path     (default /var/log/modelfs-drill.log)
+#   MF_DRILL_LIVE  live tree to diff     (default: the dataset's mountpoint)
+#   MF_DRILL_KEEP  set non-empty to keep the drill clone mounted for inspection
 #
 # Exit status is the drill verdict: 0 means the newest snapshot restored,
 # mounted, and read back verified; anything else is an alarm, including
@@ -31,7 +33,7 @@ command -v zfs >/dev/null 2>&1 || die "zfs not found; this drill runs on the NAS
 [[ $# -le 1 ]] || die "usage: dr_restore_drill.sh [DATASET]"
 
 DATASET="${1:-tank/models}"
-LOG_FILE="${MODELFS_DRILL_LOG:-/var/log/modelfs-drill.log}"
+LOG_FILE="${MF_DRILL_LOG:-/var/log/modelfs-drill.log}"
 
 zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
     || die "dataset ${DATASET} does not exist on this host"
@@ -62,8 +64,8 @@ if zfs list -H -o name "${CLONE}" >/dev/null 2>&1; then
 fi
 
 cleanup() {
-    if [[ -n "${MODELFS_DRILL_KEEP:-}" ]]; then
-        echo "drill: MODELFS_DRILL_KEEP set, leaving ${CLONE} mounted for inspection"
+    if [[ -n "${MF_DRILL_KEEP:-}" ]]; then
+        echo "drill: MF_DRILL_KEEP set, leaving ${CLONE} mounted for inspection"
         return 0
     fi
     if zfs list -H -o name "${CLONE}" >/dev/null 2>&1; then
@@ -73,10 +75,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-LIVE="${MODELFS_DRILL_LIVE:-$(zfs get -H -o value mountpoint "${DATASET}")}"
+LIVE="${MF_DRILL_LIVE:-$(zfs get -H -o value mountpoint "${DATASET}")}"
 case "${LIVE}" in
     none | legacy | '-')
-        die "dataset ${DATASET} has mountpoint '${LIVE}'; mount it or point MODELFS_DRILL_LIVE at the live tree"
+        die "dataset ${DATASET} has mountpoint '${LIVE}'; mount it or point MF_DRILL_LIVE at the live tree"
         ;;
     *)
         ;;

@@ -24,8 +24,11 @@ chmod 600 "${PSK_FILE}"
 echo "=== Test 1: Invalid PSK Auth Rejection ==="
 # Needs a live peer endpoint (e.g. started by run_cluster_e2e_9nodes.sh).
 # Without one this is skipped loudly, never counted as a pass.
-PEER_HOST="${MODELFS_TEST_HOST:-127.0.0.1}"
-PEER_PORT="${MODELFS_TEST_PORT:-19081}"
+# Harness knobs stay outside the MODELFS_ namespace: the daemon refuses any
+# unknown MODELFS_* variable as a typo'd knob, so exporting one of these
+# would fail every modelfs invocation in the same shell.
+PEER_HOST="${MF_TEST_HOST:-127.0.0.1}"
+PEER_PORT="${MF_TEST_PORT:-19081}"
 python3 "${SCRIPTS_DIR}/peer_auth_probe.py" "${PEER_HOST}" "${PEER_PORT}"
 
 echo "=== Test 2: Expired Cluster Lease Marking ==="
