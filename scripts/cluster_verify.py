@@ -9,48 +9,17 @@ benchmark log. Exits nonzero on the first failure.
 import os
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Sibling module (this directory is sys.path[0] when the script runs): the
+# daemon-readiness policy shared with run_benchmarks_and_plots.py.
+import peer_ping
+
 ARGC = 7  # prog + ORIGIN_FILE REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES
 MAX_PORT = 65535
 READY_TIMEOUT_S = 30.0
-
-
-def wait_until_peers_ready(base_port: int, num_nodes: int, headers: dict[str, str]) -> None:
-    """Poll every node's /ping until all answer, or fail after a fixed budget.
-
-    The caller's startup sleep is only a guess: nine concurrent FUSE mounts
-    on a loaded host can bind later than any constant, and one refused
-    connection would kill the whole verification run with ConnectionRefused.
-    A node that answers but rejects (wrong PSK, server error) fails
-    immediately; retrying cannot fix that.
-    """
-    pending = [base_port + i for i in range(1, num_nodes + 1)]
-    deadline = time.monotonic() + READY_TIMEOUT_S
-    while pending:
-        port = pending[0]
-        url = f"http://127.0.0.1:{port}/ping"
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                assert resp.read() == b"ok", (
-                    f"Node on port {port} answered /ping with an unexpected body"
-                )
-        except urllib.error.HTTPError as e:
-            sys.exit(f"node on port {port}: /ping rejected with HTTP {e.code}")
-        except OSError:
-            if time.monotonic() >= deadline:
-                sys.exit(
-                    f"node on port {port}: no working listener within "
-                    f"{READY_TIMEOUT_S:.0f}s (daemon failed to start or died)"
-                )
-            time.sleep(0.2)
-        else:
-            pending.pop(0)
-    print(f"✓ All {num_nodes} peer nodes responding to HTTP /ping")
 
 
 def main(argv: list[str]) -> int:
@@ -101,7 +70,10 @@ def main(argv: list[str]) -> int:
 
     # Wait for every node's listener instead of assuming the spawner's
     # startup sleep was long enough, then start the timed sweep.
-    wait_until_peers_ready(base_port, num_nodes, headers)
+    peer_ping.wait_for_peers_ready(
+        [base_port + i for i in range(1, num_nodes + 1)], headers, READY_TIMEOUT_S
+    )
+    print(f"✓ All {num_nodes} peer nodes responding to HTTP /ping")
 
     # Query /have across the cluster
     t0 = time.monotonic()
