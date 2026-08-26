@@ -461,9 +461,14 @@ pub const Store = struct {
     }
 
     /// Brings a live entry in line with a freshly observed origin size:
-    /// swaps in an empty bitfield sized for the new length and truncates the
-    /// cache fd so stale pieces cannot serve the new inode. Must be called
-    /// WITHOUT store.mu held (it takes file.mu internally).
+    /// swaps in an empty bitfield sized for the new length, truncates the
+    /// cache fd so stale pieces cannot serve the new inode, and persists the
+    /// emptied field best-effort. The save closes the crash window decode
+    /// cannot: a sidecar whose recorded size equals the loader's decodes
+    /// cleanly, so an unsaved wipe let a crash here reload the pre-reset
+    /// marks as soon as the file was back at the last-saved length, serving
+    /// old bytes or hole zeros as current. Must be called WITHOUT store.mu
+    /// held (it takes file.mu internally).
     fn reconcileSize(self: *Store, f: *Cached, file_size: u64) !*Cached {
         if (f.size == file_size) return f;
         const nb = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
@@ -476,6 +481,9 @@ pub const Store = struct {
         f.bits = nb;
         f.size = file_size;
         if (f.cache_fd >= 0) _ = sys.ftruncate(f.cache_fd, file_size);
+        // Same best-effort save mf_truncate pairs with its own swap: the
+        // reset must outlive the process to count as an invalidation.
+        _ = self.saveBits(f, false);
         f.mu.unlock(self.io);
         ob.deinit(self.gpa);
         return f;
@@ -828,12 +836,16 @@ pub const Store = struct {
         } else if (end < file.size) {
             // Entry is longer than the observed origin: someone truncated
             // externally. Reset like reconcileSize instead of keeping marks
-            // for bytes past the new end.
+            // for bytes past the new end, and persist the reset like it does:
+            // the old sidecar's recorded size decodes cleanly again once the
+            // file is back at that length, which would resurrect pre-shrink
+            // marks over new content after a crash.
             if (piece.Bitfield.init(self.gpa, piece.count(end, self.piece_size))) |nb| {
                 var ob = file.bits;
                 file.bits = nb;
                 file.size = end;
                 ob.deinit(self.gpa);
+                _ = self.saveBits(file, false);
             } else |_| {
                 std.log.warn("bitfield shrink failed for {s}; stale tail pieces refill", .{rel});
             }
@@ -1506,6 +1518,86 @@ test "get reconciles an externally shrunken origin by wiping marks and truncatin
     try std.testing.expectEqual(@as(i32, 0), sys.fstat(f.cache_fd, &post));
     try std.testing.expectEqual(@as(u64, 32), @as(u64, @intCast(post.st_size)));
     st.releaseFile(f);
+}
+
+test "size reconciliation persists the wipe so a restart cannot reload stale marks" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-rcpersist");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-rcpersist");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Warm entry at 64 bytes: pieces 0 and 3 marked and saved, so the
+    // sidecar on disk vouches for two filled pieces of a 64-byte grid.
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, "rc.bin");
+    {
+        const f = try st.get("rc.bin", 64, sys.monoSec());
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        f.bits.set(0);
+        f.bits.set(3);
+        f.mu.unlock(std.testing.io);
+        _ = st.saveBits(f, false);
+        const blob = try sys.readFileAlloc(gpa, mp, 4096);
+        defer gpa.free(blob);
+        var side = try piece.Bitfield.decode(gpa, blob, st.piece_size, 64);
+        defer side.deinit(gpa);
+        try std.testing.expectEqual(@as(u32, 2), side.filled());
+    }
+
+    // The create-truncate shape (mf_create stats a zero-length file through
+    // get): reconcileSize wipes the marks in memory, and the wipe must reach
+    // the sidecar before returning. Regression: the reset lived only in RAM,
+    // so a crash here let the next daemon load decode the old sidecar
+    // cleanly against a file back at 64 bytes -- pre-truncate marks served
+    // over post-truncate content.
+    {
+        const g = try st.get("rc.bin", 0, sys.monoSec());
+        defer st.releaseFile(g);
+        try std.testing.expectEqual(@as(u64, 0), g.size);
+    }
+    {
+        const blob = try sys.readFileAlloc(gpa, mp, 4096);
+        defer gpa.free(blob);
+        // Exactly what a restarted daemon loading against a regrown 64-byte
+        // file would decode: empty, not the old two marks.
+        var side = try piece.Bitfield.decode(gpa, blob, st.piece_size, 64);
+        defer side.deinit(gpa);
+        try std.testing.expectEqual(@as(u32, 0), side.filled());
+    }
+
+    // The cacheFill shrink branch (an externally truncated file observed on
+    // the write path) carries the same contract.
+    {
+        var zb: [160]u8 = undefined;
+        var zz: [160]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&zb, "{s}/rc.bin", .{origin_d});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zz, fp), ""));
+        const f = try st.get("rc.bin", 64, sys.monoSec());
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        f.bits.set(0);
+        f.bits.set(3);
+        f.mu.unlock(std.testing.io);
+        _ = st.saveBits(f, false);
+
+        var chunk: [32]u8 = undefined;
+        @memset(&chunk, 0x5A);
+        st.cacheFill("rc.bin", 32, 0, &chunk, sys.monoSec());
+
+        const blob = try sys.readFileAlloc(gpa, mp, 4096);
+        defer gpa.free(blob);
+        var side = try piece.Bitfield.decode(gpa, blob, st.piece_size, 64);
+        defer side.deinit(gpa);
+        try std.testing.expectEqual(@as(u32, 0), side.filled());
+    }
 }
 
 test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
