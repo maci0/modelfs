@@ -400,7 +400,10 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     if (rerr != 0) return rerr;
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC, clientCreateMode(mode));
+    // O_NOFOLLOW like every daemon write into a tree someone else can plant
+    // names in: a symlink staged at this name on the shared origin must not
+    // turn the create's O_TRUNC into a truncate of the link's target.
+    const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC | sys.c.O_NOFOLLOW, clientCreateMode(mode));
     if (fd < 0) return sys.negErrno();
     sys.close(fd);
     // The origin create above already landed: failing the syscall here (entry
@@ -660,7 +663,9 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
     const new_size: u64 = @intCast(size);
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    const fd = sys.open(op, sys.c.O_WRONLY, 0);
+    // O_NOFOLLOW: the ftruncate below must land on the named origin file,
+    // never on a planted symlink's target (arbitrary daemon-writable file).
+    const fd = sys.open(op, sys.c.O_WRONLY | sys.c.O_NOFOLLOW, 0);
     if (fd < 0) return sys.negErrno();
     defer sys.close(fd);
     if (sys.ftruncate(fd, new_size) != 0) return sys.negErrno();
@@ -778,6 +783,13 @@ export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_i
     // plant the special bit one step after a masked create.
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
+    // Linux has no atomic lchmod, so gate the link case with lstat first: a
+    // planted origin symlink must not route the daemon's (root's) chmod onto
+    // the target file -- setuid bits included. ELOOP matches O_NOFOLLOW.
+    var lst: sys.c.struct_stat = undefined;
+    const lrc = sys.lstatPath(op, &lst);
+    if (lrc != 0) return lrc;
+    if ((lst.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
     if (std.c.chmod(op, clientCreateMode(mode)) != 0) return sys.negErrno();
     return 0;
 }
@@ -792,6 +804,12 @@ export fn mf_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: fuse.fuse_fil
     if (rerr != 0) return rerr;
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&pbuf, rel) catch return -sys.c.ENAMETOOLONG;
+    // A planted directory symlink must not have the daemon list its target's
+    // (client-local) contents into this mount; lstat first, ELOOP on links.
+    var lst: sys.c.struct_stat = undefined;
+    const lrc = sys.lstatPath(op, &lst);
+    if (lrc != 0) return lrc;
+    if ((lst.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
     const dir = sys.c.opendir(op) orelse return sys.negErrno();
     defer _ = sys.c.closedir(dir);
     const fill = filler orelse return -sys.c.EIO;

@@ -1653,6 +1653,53 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
     try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_5xx.load(.monotonic));
 }
 
+test "a symlink planted at an origin model path is a miss, never served" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-origsym");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-origsym");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Co-tenant plants steal.bin -> secret.txt inside the shared origin:
+    // serving it would hand out the link's client-local target bytes (and
+    // cache them) on every node that answers a peer fetch for that name.
+    var sz: [192]u8 = undefined;
+    const secret_fp = try std.fmt.bufPrint(&sz, "{s}/secret.txt", .{origin_d});
+    var zbuf: [192]u8 = undefined;
+    const secret_z = try sys.toZ(&zbuf, secret_fp);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(secret_z, "topsecret"));
+    var lz: [192]u8 = undefined;
+    const link_fp = try std.fmt.bufPrint(&sz, "{s}/steal.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), c.symlink(secret_z, try sys.toZ(&lz, link_fp)));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+    const port = srv.port();
+
+    // statOrigin's S_IFLNK sample fails both routes' regular-file gate: both
+    // answer like any absent path (/have => 404 => PeerMiss here; /data's
+    // client folds every non-success status into HttpStatus), and no byte of
+    // the target may come back or land in the local cache. The zeroed 5xx
+    // counter below pins "healthy miss", not an origin failure.
+    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, "secret", "127.0.0.1", port, "steal.bin"));
+    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "steal.bin", 0, 8));
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
+
+    // The target file still holds exactly what the planter wrote.
+    var rbuf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("topsecret", try sys.readFileBuf(&rbuf, secret_z));
+
+    // A regular origin file keeps serving through the same server.
+    var fz: [192]u8 = undefined;
+    const real_z = try sys.toZ(&fz, try std.fmt.bufPrint(&lz, "{s}/real.bin", .{origin_d}));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(real_z, "modelbytes"));
+    const got = try fetchRange(gpa, "secret", "127.0.0.1", port, "real.bin", 0, 9);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("modelbytes", got);
+}
+
 /// Read the kernel-assigned port back from a listening socket (for port 0).
 fn boundPort(fd: c_int) u16 {
     var addr = std.mem.zeroes(c.struct_sockaddr_in);

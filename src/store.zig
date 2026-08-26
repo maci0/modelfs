@@ -247,10 +247,16 @@ pub const Store = struct {
         return 0;
     }
 
+    /// lstat semantics: the origin is shared storage other parties can write
+    /// (the .cluster threat model applies to model names too), so a planted
+    /// final symlink must surface as S_IFLNK -- every caller's S_IFREG gate
+    /// then rejects it fail-closed instead of stat'ing the link's target.
+    /// Paired with the O_NOFOLLOW opens in originPread/originPwrite, which
+    /// close the window between this sample and any later open.
     pub fn statOrigin(self: Store, rel: []const u8, st: *c.struct_stat) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
-        return sys.statPath(p, st);
+        return sys.lstatPath(p, st);
     }
 
     fn pinExists(self: Store, rel: []const u8) bool {
@@ -782,7 +788,10 @@ pub const Store = struct {
     pub fn originPread(self: Store, rel: []const u8, buf: []u8, off: u64) isize {
         var path: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&path, rel) catch return -c.ENAMETOOLONG;
-        const fd = sys.open(p, c.O_RDONLY, 0);
+        // O_NOFOLLOW: a symlink planted at this name on the shared origin
+        // would otherwise have the daemon read the link's target (resolved
+        // client-side) and serve those bytes to peers. ELOOP fails closed.
+        const fd = sys.open(p, c.O_RDONLY | c.O_NOFOLLOW, 0);
         if (fd < 0) return sys.negErrno();
         defer sys.close(fd);
         return sys.preadAll(fd, buf, off);
@@ -791,7 +800,11 @@ pub const Store = struct {
     pub fn originPwrite(self: Store, rel: []const u8, buf: []const u8, off: u64) isize {
         var path: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&path, rel) catch return -c.ENAMETOOLONG;
-        const fd = sys.open(p, c.O_WRONLY, 0);
+        // Same O_NOFOLLOW contract as every other daemon write into a tree
+        // someone else can plant names in (writeFileNoFollow, openCache): a
+        // planted symlink must not redirect this truncate-and-write onto an
+        // arbitrary daemon-writable file.
+        const fd = sys.open(p, c.O_WRONLY | c.O_NOFOLLOW, 0);
         if (fd < 0) return sys.negErrno();
         defer sys.close(fd);
         return sys.pwriteAll(fd, buf, off);
@@ -3157,6 +3170,52 @@ test "openCache refuses a symlink planted at the data path" {
 
     var rb: [8]u8 = undefined;
     try std.testing.expectEqualStrings("keepme", try sys.readFileBuf(&rb, try sys.toZ(&zb, target)));
+}
+
+test "origin access refuses a symlink planted at the model path" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-origsym");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-origsym");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // O_NOFOLLOW contract on the origin tier: the origin is shared storage a
+    // co-tenant can plant names in, so a symlink at a model path must never
+    // turn the daemon's stat/pread/pwrite into reads or writes of the link's
+    // client-local target. statOrigin reports S_IFLNK (every caller's S_IFREG
+    // gate then rejects fail-closed), and both data syscalls answer ELOOP.
+    var tb: [192]u8 = undefined;
+    const target = try std.fmt.bufPrint(&tb, "{s}/secret.txt", .{origin_d});
+    var zb: [192]u8 = undefined;
+    const target_z = try sys.toZ(&zb, target);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(target_z, "s3cret"));
+
+    var lb: [sys.c.PATH_MAX]u8 = undefined;
+    const lp = try st.originPath(&lb, "planted.gguf");
+    try std.testing.expectEqual(@as(i32, 0), c.symlink(target_z, lp));
+
+    var stbuf: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), st.statOrigin("planted.gguf", &stbuf));
+    try std.testing.expect((stbuf.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK);
+
+    var rbuf: [8]u8 = undefined;
+    try std.testing.expectEqual(-c.ELOOP, st.originPread("planted.gguf", &rbuf, 0));
+    try std.testing.expectEqual(-c.ELOOP, st.originPwrite("planted.gguf", &rbuf, 0));
+    // The planted target keeps its bytes: nothing read or wrote through.
+    try std.testing.expectEqualStrings("s3cret", try sys.readFileBuf(&rbuf, target_z));
+
+    // A regular origin file keeps working through the same calls.
+    var fz: [192]u8 = undefined;
+    const real_z = try sys.toZ(&fz, try std.fmt.bufPrint(&tb, "{s}/real.bin", .{origin_d}));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(real_z, "model"));
+    try std.testing.expectEqual(@as(isize, 5), st.originPread("real.bin", rbuf[0..5], 0));
+    try std.testing.expectEqualStrings("model", rbuf[0..5]);
 }
 
 test "late finisher on a forgotten entry does not resurrect the sidecar" {
