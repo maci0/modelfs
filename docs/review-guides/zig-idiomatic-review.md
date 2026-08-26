@@ -153,7 +153,7 @@ memory, generics/`anytype` quality, and the hot path.
 | Closed enum maps | Package name → handler table, bit field layouts | Gigantic comptime that rebuilds half the game |
 | Small parsers / formatters | Fixed wire header sizes, `comptime` string hash of stock **names** | Comptime file I/O of full `blocks.xml` every compile without need |
 | Generic helpers | `fn append(comptime T: type, …)`, `anytype` with clear constraints | `anytype` soup with no docs and 6 overload meanings |
-| Unrolling tiny loops | `@memcpy`/`inline for` over 4–16 fixed fields | `inline for` over 10k items or whole chunk |
+| Unrolling tiny loops | `@memcpy`/`inline for` over 4 to 16 fixed fields | `inline for` over 10k items or whole chunk |
 | Type-level invariants | `comptime assert` on struct sizes matching RE | Silent `@sizeOf` assumptions without test |
 
 **Rules of thumb:**
@@ -162,7 +162,7 @@ memory, generics/`anytype` quality, and the hot path.
 - If it only runs at init once, **runtime is fine** (XML load, map load).
 - Prefer `comptime` **tables generated from data** (embed/parse fixtures) over
   hand-copied content (that is also a data-audit concern).
-- `inline` = tiny hot helpers only (2–10 lines). Never `inline` large package
+- `inline` = tiny hot helpers only (2 to 10 lines). Never `inline` large package
   builders or AI systems.
 - Avoid `comptime` that makes **error messages unreadable** or compile times
   explode for little gain.
@@ -625,7 +625,7 @@ _ = parse(...) catch {}; // applied nothing, caller thinks success
 
 ## Success criteria
 
-- [ ] Findings are actionable with `path:line` and severity
+- [ ] Findings name a `path:line` and a severity
 - [ ] Comptime/inline/`anytype` called out explicitly
 - [ ] **Hot-path alloc findings listed** (or explicit "none found" after search)
 - [ ] I/O debt classified: std abstraction vs OS-specific legacy vs fix-now

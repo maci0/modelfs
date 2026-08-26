@@ -1,10 +1,6 @@
 # ModelFS
 
 [![check](https://github.com/maci0/modelfs/actions/workflows/ci.yml/badge.svg)](https://github.com/maci0/modelfs/actions/workflows/ci.yml)
-![zig 0.16](https://img.shields.io/badge/zig-0.16.0-f7a41d)
-![platform linux + fuse3](https://img.shields.io/badge/platform-linux%20%2B%20fuse3-4c566a)
-![no dependencies](https://img.shields.io/badge/dependencies-libfuse3%20only-4c566a)
-[![license GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-3b7dd8)](LICENSE)
 
 A POSIX `/models` mount for LLM weights. One Zig binary per node: FUSE via `libfuse3`, a local NVMe piece cache, and peer-to-peer piece transfers that stream zero-copy through Linux `sendfile`. Engines (`llama.cpp`, `vLLM`, `SGLang`) just open files.
 
@@ -16,7 +12,7 @@ A POSIX `/models` mount for LLM weights. One Zig binary per node: FUSE via `libf
 | `:18080` | peer HTTP protocol, PSK bearer auth |
 
 ```mermaid
-flowchart LR
+flowchart TD
   E["engine reads<br/>/models/foo.gguf"] --> Q{"piece in the<br/>local cache?"}
   Q -- yes --> L[("local NVMe<br/>16 MiB piece")]
   Q -- no --> P{"any peer<br/>advertises it?"}
@@ -26,6 +22,15 @@ flowchart LR
   O --> F
   F --> L
   L --> B["bytes back to the engine"]
+
+  classDef entry fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+  classDef inflight fill:#fef9c3,stroke:#eab308,color:#713f12
+  classDef cached fill:#bbf7d0,stroke:#16a34a,color:#14532d
+  classDef shared fill:#f3e8ff,stroke:#9333ea,color:#581c87
+  class E entry
+  class S,F inflight
+  class L,B cached
+  class O shared
 ```
 
 Reads: **local piece → cluster peer (`sendfile`) → origin**.
@@ -35,7 +40,7 @@ A read that misses blocks until that one piece is filled from a single source. T
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
 
-Releases: none yet. `build.zig.zon` declares `0.1.0`, there are no tags, and [CHANGELOG.md](CHANGELOG.md) records everything as unreleased pass notes; pin a commit hash if you need a reproducible binary. Security issues go through private vulnerability reporting: [SECURITY.md](SECURITY.md).
+Releases: `v0.1.0` is the first tag ([CHANGELOG.md](CHANGELOG.md)). Security issues go through private vulnerability reporting: [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -83,7 +88,7 @@ modelfs pin gguf/foo.gguf                         # keep a file out of the cull
 modelfs unpin gguf/foo.gguf
 ```
 
-Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps the very first node. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise`, `--piece`, `--kernel-cache`, and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_PSK_VALUE`, and `MODELFS_ID` set the same values from the environment; an explicit flag wins and an empty environment value counts as unset.
+Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps the very first node. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise`, `--piece`, `--kernel-cache`, and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, and `MODELFS_ID` set the same values from the environment, and `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`); an explicit flag wins and an empty environment value counts as unset.
 
 Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS ([docs/operations.md](docs/operations.md)).
 

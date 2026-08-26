@@ -126,7 +126,7 @@ Run this on every candidate (new PR or existing helper).
 
 4. Does it cross a trust or layer boundary?
    (C2S validate, XML load, package encode, chunk persist)
-   YES → named function/type at that boundary is good even with 1–2 sites.
+   YES → named function/type at that boundary is good even with 1 or 2 sites.
    NO → need stronger duplication evidence.
 
 5. Would the abstraction force heap alloc, vtable, or dynamic dispatch
@@ -146,7 +146,7 @@ Run this on every candidate (new PR or existing helper).
 
 ### Quick scorecard (optional)
 
-Score each candidate 0–2:
+Score each candidate 0 to 2:
 
 | Criterion | 0 | 1 | 2 |
 |---|---|---|---|
@@ -156,7 +156,7 @@ Score each candidate 0–2:
 | Hot-path cost | worse | neutral | better or equal + clearer |
 | One obvious way | creates dual path | neutral | removes dual path |
 
-**Sum ≥ 6:** build or keep. **3–5:** maybe private helper only. **≤ 2:** do not
+**Sum ≥ 6:** build or keep. **3 to 5:** maybe private helper only. **≤ 2:** do not
 build; delete or inline if existing abstraction fails this score.
 
 ---
