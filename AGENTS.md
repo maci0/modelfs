@@ -10,7 +10,7 @@ this file holds what is specific to this tree.
 | Path | Contents |
 |---|---|
 | `src/*.zig` | The daemon. Tests live beside the code they cover; `root.zig` aggregates them into the test binary |
-| `src/c.h`, `src/c.zig` | The only door to libfuse3 and libc. `build.zig` translates the header once; every module imports `c.zig` |
+| `src/c.h`, `src/c.zig` | The only door to libfuse3 and libc. `build.zig` translates the header once into a module that `src/c.zig` re-exports; every module reaches libc only through it |
 | `scripts/` | Gates and harnesses. `lib.sh` is sourced by every shell script for `ROOT_DIR`, `SCRIPTS_DIR`, `SCRATCH_DIR` |
 | `docs/` | `README.md` indexes them. `architecture.md` is authoritative for shipped behavior |
 | `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files plus provenance. `build.zig` verifies both sha256 digests before compiling |
