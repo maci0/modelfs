@@ -2,11 +2,12 @@
 
 ## Supported versions
 
-Nothing has been released yet: `build.zig.zon` declares `0.1.0`, no tag exists,
-and there are no published artifacts to patch. Fixes land on `main`. If you run
-a build, pin the commit hash it came from (see the README) so you know exactly
-what you are running and can rebuild from a fixed revision. This section will
-name the release lines that receive security fixes once a first tag exists.
+The `0.1.x` line is supported: security fixes land on `main` and ship in the
+next `v0.1.x` tag matching `build.zig.zon`'s `.version`, which
+`modelfs version` prints. `v0.1.0` is the first tag. If you build from an
+intermediate revision rather than a tag, pin the commit hash it came from
+(see the README) so you know exactly what you are running and can rebuild
+from a fixed revision.
 
 ## Reporting a vulnerability
 
@@ -27,6 +28,5 @@ Please include what you can of:
 
 Maintainers triage in the advisory thread, land the fix on `main`, and note it
 in [CHANGELOG.md](CHANGELOG.md) with credit to the reporter unless asked not
-to. Until the first tagged release, that changelog entry plus `main` is the
-whole fix delivery; once releases exist, the fixed versions will be named
-there.
+to. The fix ships as the next `v0.1.x` tag; its changelog entry names the
+fixed version.
