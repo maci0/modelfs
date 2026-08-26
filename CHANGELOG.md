@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+Nothing has accumulated since `v0.1.0`. Post-tag change sets land here as
+their own dated sections until the next cut regroups them under its version.
+
 ## [0.1.0] - 2026-08-26
 
 First tagged release. It mounts `/models` over FUSE on every node, serves reads
