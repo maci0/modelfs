@@ -2959,10 +2959,13 @@ test "punchPiece refuses to cut the hole unless the cleared bits persist" {
     try std.testing.expectEqual(@as(isize, 32), sys.preadAll(f.cache_fd, &back, 0));
     try std.testing.expectEqualSlices(u8, &pattern, &back);
 
-    // Once saves work again the same piece culls normally.
+    // Once saves work again the same piece culls normally. Same virtual
+    // clock as the entry's 40_000 creation stamp: sys.monoSec() here would
+    // compare seconds-since-boot against that stamp, so the punch would be
+    // refused as too recent on any host up for less than 11 hours.
     broken.undo();
-    try std.testing.expect(st.punchPiece(f, 0, sys.monoSec()));
-    try std.testing.expect(!st.hasPiece(f, 0, sys.monoSec()));
+    try std.testing.expect(st.punchPiece(f, 0, 40_000 + 7200));
+    try std.testing.expect(!st.hasPiece(f, 0, 40_000 + 7200));
 }
 
 test "disk cull refuses to cut the hole unless the cleared bits persist" {
