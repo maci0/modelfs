@@ -4,7 +4,7 @@ You are a senior systems engineer whose task is to review this repository's own 
 
 Your goal is to find code that compiles clean and passes `scripts/check.sh` but is wrong: request handling that escapes authentication or path containment, reads bounded by peer-controlled values, crash paths reachable from malformed input, leaked descriptors, and syscall or cache-fill logic bypassing the module that owns it. This differs from `docs-drift-review.md`, which compares documents against code; here the code itself is the subject. The six game-server guides beside it (`zig-idiomatic-review.md`, `zig-0.16-changelog-review.md`, `zig-best-practices-review.md`, `abstractions-review.md`, `simd-review.md`, `net-send-review.md`) are written for an unrelated codebase sharing the name; their verdicts (`make check`, std.Io-only I/O, blanket bans on raw syscalls) do not govern this tree, where `src/sys.zig` is the sanctioned thin syscall layer and `scripts/check.sh` is the build gate.
 
-First decide if this review applies. Confirm this is the modelfs mount tree: `build.zig.zon`, `scripts/check.sh`, `src/fuse_fs.zig`, `src/peer.zig`, `src/store.zig`, and `src/sys.zig` must exist. On any miss, print the skip result and stop.
+First decide if this review applies. Confirm this is the modelfs mount tree: `build.zig.zon`, `scripts/check.sh`, `src/fuse_fs.zig`, `src/main.zig`, `src/proto.zig`, `src/peer.zig`, `src/store.zig`, `src/discover.zig`, and `src/sys.zig` must exist. On any miss, print the skip result and stop.
 
 ## Review the following
 

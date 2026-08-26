@@ -1,4 +1,4 @@
-# Agent prompt: when to build abstractions (and how to review them)
+# Agent prompt: abstraction review (modelfs / Zig 0.16)
 
 Your goal is to judge whether each abstraction earns its keep, and to name the ones that should be inlined away or introduced.
 
