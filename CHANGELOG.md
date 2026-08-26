@@ -1,13 +1,39 @@
 # Changelog
 
-## [Unreleased]
-No version has been tagged or released yet: `build.zig.zon` declares `0.1.0`, that
-declaration has not moved since the initial commit, and the repository holds no git
-tags or published artifacts. Every entry below is unreleased work toward that first
-version, so the whole history since the initial commit is one pre-release delta onto
-`0.1.0`; nothing documented here has ever shipped to a consumer between entries.
-When the first tag lands it belongs on top of this section with the entries it
-covers regrouped under its version number.
+## [0.1.0] - 2026-08-26
+
+First tagged release. It mounts `/models` over FUSE on every node, serves reads
+from a local NVMe piece cache, falls back to a cluster peer over plaintext HTTP
+with `sendfile` and then to the NFS origin, and writes through the origin first.
+Membership is lease files on the origin, authentication is one shared PSK, and
+eviction follows cachefilesd-shaped watermarks. Tested on two DGX Spark nodes
+against a ZFS/NFS NAS; the sections below are the passes that got it here.
+
+Changes made for the tag itself:
+
+- **The PSK cannot be passed on the command line.** `--psk-value` is gone:
+  argv is world-readable through `/proc/<pid>/cmdline` for the daemon's whole
+  lifetime, so the warning it printed was papering over a leak. The file
+  (`--psk FILE`, default `/etc/modelfs.psk`) and `MODELFS_PSK_VALUE` remain,
+  the second readable only by the process owner and root.
+- **The test binary compiles again.** `src/peer.zig` called `corpusEntry`,
+  which had been renamed to `fuzzcorpus.entry`, so `zig build test` failed to
+  compile and every suite behind it was unrunnable. 173 tests pass.
+- **The static analysis gate passes again.** `scripts/dr_restore_drill.sh`
+  masked three command exit statuses (a `date` inside `awk` arguments, `find`
+  in a process substitution, a `date` inside the log line), which shellcheck
+  rejects under the option set `scripts/check.sh` enables.
+- **Scripts find the project root by walking up for `build.zig.zon`** instead
+  of counting directories back from their own path, through the new
+  `scripts/lib.sh` they all source.
+- **Run artifacts stay on disk.** The e2e, cluster, fault-tolerance, and
+  benchmark harnesses created their mounts, caches, and origins under `/tmp`,
+  which is tmpfs: a piece cache written there is charged to RAM and competes
+  with the throughput being measured. They use gitignored `.scratch/` now.
+- **The threat model points at symbols rather than line numbers.** All 139
+  `src/file.zig:NNN` references had drifted, several by more than 150 lines.
+- **`AGENTS.md`** records the layout, the gates, and the constraints that are
+  specific to this tree.
 
 ## [Recovery review pass 2] - 2026-08-26
 - **The restore drill is now an artifact, not a paste-block**: docs/recovery.md section 6 carried the monthly procedure as inline commands a reader had to retype (with a name-sorted snapshot pick that hourly/daily/monthly suffixes could fool, and no cleanup if any step died mid-way). New `scripts/dr_restore_drill.sh` runs the drill as one command: newest snapshot by creation time, timed clone, diff against the live tree with in-RPO-window drift counted instead of failed, sha256 of a size-stable file on both sides, clone destroyed through an EXIT trap, and the log line that proves the drill ran. An empty snapshot, a hash mismatch, and "no snapshots at all" (the sanoid.timer-down alarm) each fail with their own named message; exit status is the verdict. Verified against a stub `zfs` with fixture trees: drift tolerated, changed files skipped by the sampler, mismatch/empty/no-snapshot failures, and post-run cleanup all pinned.
@@ -110,7 +136,7 @@ covers regrouped under its version number.
 ## [Fresh Autoresearch Session] - 2026-08-22
 - **New Benchmark Focus**: 64 MB piece transfer latency & peak zero-copy throughput.
 - **Key Findings**:
-  1. Unchunked single-pass `sendfile` kernel streaming achieves **3.43–3.94 GB/s** zero-copy throughput.
+  1. Unchunked single-pass `sendfile` kernel streaming achieves **3.43 to 3.94 GB/s** zero-copy throughput.
   2. Preserving read-ahead body bytes in `readHeadFull` prevents socket re-read stalls on multi-megabyte transfers.
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
