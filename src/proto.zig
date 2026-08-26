@@ -508,3 +508,226 @@ fn fuzzUrlCodecOne(_: void, smith: *std.testing.Smith) anyerror!void {
 test "fuzz url codec round-trips across the peer trust boundary" {
     try std.testing.fuzz({}, fuzzUrlCodecOne, .{ .corpus = &fuzz_codec_corpus });
 }
+
+// headerGet, queryGet, and parseRange are the extraction layer every
+// untrusted-byte decision rides: Authorization on both server and client,
+// Content-Length and X-Piece-Size sizing the bitmap allocation, the path=
+// query parameter feeding the relOk gate, and the Range clamp before origin
+// reads. The harnesses above execute them on every input but read their
+// expectations back through these same functions -- a drift there (returning
+// the last duplicate instead of the first, matching a prefix of the name,
+// trimming more than OWS, wrapping a 21-digit value) would reconfirm itself
+// in every assertion and ship silently. These oracles restate each contract
+// independently so the fuzzer sees the difference.
+
+fn refHeaderGet(head: []const u8, name: []const u8) ?[]const u8 {
+    // Manual offset walk instead of splitSequence: skip the status/request
+    // line, then scan lines until the blank terminator, honoring exact-name
+    // case-insensitive matches and space/tab-only OWS trimming.
+    const first_end = std.mem.indexOf(u8, head, "\r\n") orelse return null;
+    var pos: usize = first_end + 2;
+    while (pos <= head.len) {
+        const rel_end = std.mem.indexOf(u8, head[pos..], "\r\n") orelse head.len - pos;
+        const line = head[pos .. pos + rel_end];
+        if (line.len == 0) return null;
+        if (std.mem.findScalar(u8, line, ':')) |colon| {
+            if (colon == name.len and std.ascii.eqlIgnoreCase(line[0..colon], name)) {
+                var v = line[colon + 1 ..];
+                while (v.len > 0 and (v[0] == ' ' or v[0] == '\t')) v = v[1..];
+                while (v.len > 0 and (v[v.len - 1] == ' ' or v[v.len - 1] == '\t')) v = v[0 .. v.len - 1];
+                return v;
+            }
+        }
+        pos += rel_end + 2;
+    }
+    return null;
+}
+
+fn refQueryGet(target: []const u8, key: []const u8) ?[]const u8 {
+    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    var rest = target[q + 1 ..];
+    while (rest.len > 0) {
+        const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
+        const pair = rest[0..amp];
+        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+            if (eq == key.len and std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+        }
+        if (amp == rest.len) break;
+        rest = rest[amp + 1 ..];
+    }
+    return null;
+}
+
+/// Overflow via parseInt's machinery instead of parseU64Fast's hand-rolled
+/// mul/add ladder, so a corrupted ladder cannot self-confirm (same shape as
+/// main.zig's refParseSize). The digit pre-scan keeps parseInt's sign and
+/// underscore tolerance out of the accepted set.
+fn refDigitsU64(s: []const u8) ?u64 {
+    if (s.len == 0 or s.len > 20) return null;
+    for (s) |ch| {
+        if (ch < '0' or ch > '9') return null;
+    }
+    return std.fmt.parseInt(u64, s, 10) catch null;
+}
+
+fn refParseRange(h: []const u8) ?Range {
+    const s = std.mem.trim(u8, h, " \t");
+    const prefix = "bytes=";
+    if (!std.mem.startsWith(u8, s, prefix)) return null;
+    const body = s[prefix.len..];
+    const dash = std.mem.indexOfScalar(u8, body, '-') orelse return null;
+    const start = refDigitsU64(body[0..dash]) orelse return null;
+    const tail = body[dash + 1 ..];
+    const end: u64 = if (tail.len == 0) std.math.maxInt(u64) else refDigitsU64(tail) orelse return null;
+    if (end < start) return null;
+    return .{ .start = start, .end = end };
+}
+
+/// Four framed slices per corpus entry: the raw head, the header name to
+/// look up in it, the request target queryGet scans, and the Range value
+/// parsed alongside them.
+fn extractEntry(
+    comptime head: []const u8,
+    comptime name: []const u8,
+    comptime target: []const u8,
+    comptime range: []const u8,
+) [16 + head.len + name.len + target.len + range.len]u8 {
+    var out: [16 + head.len + name.len + target.len + range.len]u8 = undefined;
+    comptime var off: usize = 0;
+    inline for (.{ head, name, target, range }) |part| {
+        std.mem.writeInt(u32, out[off..][0..4], @intCast(part.len), .little);
+        @memcpy(out[off + 4 ..][0..part.len], part);
+        off += 4 + part.len;
+    }
+    return out;
+}
+
+const seed_extract_ok = extractEntry(
+    "GET /have?path=gguf%2Fmodel.gguf HTTP/1.1\r\nAuthorization: Bearer tok\r\nRange: bytes=0-1023\r\n\r\n",
+    "Authorization",
+    "/have?path=gguf%2Fmodel.gguf&x=1",
+    "bytes=0-1023",
+);
+const seed_extract_dup_cl = extractEntry(
+    "HTTP/1.1 200 OK\r\nContent-Length: 3\r\ncontent-length: 999\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nabc",
+    "Content-Length",
+    "/data?path=a.bin",
+    "bytes=536870912-536870913",
+);
+const seed_extract_prefix_name = extractEntry(
+    "HTTP/1.1 200 OK\r\nX-Piece-Size-Extra: 9\r\nX-Piece-Size: 16\r\n\r\n",
+    "X-Piece-SIZE",
+    "?path=%2F..%2Fetc",
+    "bytes=10-",
+);
+const seed_extract_lf_only = extractEntry(
+    "GET / HTTP/1.1\nAuthorization: Bearer x\n",
+    "authorization",
+    "/have?path",
+    "bytes=-",
+);
+const seed_extract_odd_lines = extractEntry(
+    "H: v\r\nno-colon\r\nA:\r\n \t spaced \t\r\n",
+    "A",
+    "?a=b=c&path=z=9",
+    "BYTES=0-1",
+);
+const seed_extract_space_before_colon = extractEntry(
+    "S\r\na: 1\r\nA : 2\r\nAuthorization: B\r\n\r\n",
+    "A",
+    "//?=&path",
+    "bytes=18446744073709551615-18446744073709551615",
+);
+const seed_extract_empty = extractEntry("", "", "", "");
+const seed_extract_bad_range = extractEntry(
+    "%zz\r\nRange: bytes=x-\r\n",
+    "Range",
+    "no-question-mark",
+    "bytes=99999999999999999999-1",
+);
+
+const fuzz_extract_corpus = [_][]const u8{
+    &seed_extract_ok,
+    &seed_extract_dup_cl,
+    &seed_extract_prefix_name,
+    &seed_extract_lf_only,
+    &seed_extract_odd_lines,
+    &seed_extract_space_before_colon,
+    &seed_extract_empty,
+    &seed_extract_bad_range,
+};
+
+/// Asserts each extractor against its independent oracle on arbitrary bytes:
+/// identical accept/reject and identical values for headerGet, queryGet, and
+/// parseRange; a canonically reformatted accepted range reparses to the same
+/// bounds; and the first-match-wins property the wire depends on holds for
+/// duplicated headers and repeated query keys (synthesized only when the
+/// fuzzed name/key cannot corrupt the frame itself).
+fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var head_buf: [512]u8 = undefined;
+    const head = head_buf[0..smith.slice(&head_buf)];
+    var name_buf: [64]u8 = undefined;
+    const name = name_buf[0..smith.slice(&name_buf)];
+
+    {
+        const got = headerGet(head, name);
+        const want = refHeaderGet(head, name);
+        if (want) |w| {
+            try std.testing.expectEqualStrings(w, got orelse return error.HeaderOracleMismatch);
+        } else try std.testing.expect(got == null);
+    }
+
+    var target_buf: [256]u8 = undefined;
+    const target = target_buf[0..smith.slice(&target_buf)];
+    {
+        const got = queryGet(target, name);
+        const want = refQueryGet(target, name);
+        if (want) |w| {
+            try std.testing.expectEqualStrings(w, got orelse return error.QueryOracleMismatch);
+        } else try std.testing.expect(got == null);
+    }
+
+    var range_buf: [64]u8 = undefined;
+    const range_val = range_buf[0..smith.slice(&range_buf)];
+    {
+        const got = parseRange(range_val);
+        const want = refParseRange(range_val);
+        if (want) |w| {
+            const g = got orelse return error.RangeOracleMismatch;
+            try std.testing.expectEqual(w.start, g.start);
+            try std.testing.expectEqual(w.end, g.end);
+            var canon: [64]u8 = undefined;
+            const rt = try std.fmt.bufPrint(&canon, "bytes={d}-{d}", .{ g.start, g.end });
+            const reparsed = parseRange(rt) orelse return error.RangeRoundTripFailed;
+            try std.testing.expectEqual(g.start, reparsed.start);
+            try std.testing.expectEqual(g.end, reparsed.end);
+        } else try std.testing.expect(got == null);
+    }
+
+    // First match wins on both extraction layers, spelled out because the
+    // reply-side allocation sizes ride exactly the first Content-Length a
+    // peer sends. Synthesis needs a name/key free of frame bytes; hostile
+    // spellings stay covered by the oracle legs above.
+    const clean = struct {
+        fn frame(s: []const u8) bool {
+            for (s) |ch| {
+                if (ch == '\r' or ch == '\n' or ch == ':' or ch == '&' or ch == '=') return false;
+            }
+            return s.len > 0;
+        }
+    }.frame;
+    if (clean(name)) {
+        var dup_head: [256]u8 = undefined;
+        const dup = try std.fmt.bufPrint(&dup_head, "S\r\n{s}: first\r\n{s}: last\r\n\r\n", .{ name, name });
+        try std.testing.expectEqualStrings("first", headerGet(dup, name).?);
+    }
+    if (clean(name)) {
+        var dup_target: [256]u8 = undefined;
+        const dup = try std.fmt.bufPrint(&dup_target, "/x?{s}=2&{s}=1", .{ name, name });
+        try std.testing.expectEqualStrings("2", queryGet(dup, name).?);
+    }
+}
+
+test "fuzz header query and range extraction match an independent scan" {
+    try std.testing.fuzz({}, fuzzExtractorsOne, .{ .corpus = &fuzz_extract_corpus });
+}
