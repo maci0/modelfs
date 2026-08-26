@@ -8,8 +8,8 @@
 # symlinks are replaced in place instead of dying on an existing link.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 DEB_DIR="${ROOT_DIR}/.deps/fuse3-arm64"
 
 DEBS=(

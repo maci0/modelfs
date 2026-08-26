@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 echo "=== Running Fault Tolerance & Resilience Test Suite ==="
 
@@ -11,7 +11,8 @@ zig build
 
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"
 
-TEMP_DIR="$(mktemp -d /tmp/modelfs-fault-XXXXXX)"
+mkdir -p "${SCRATCH_DIR}"
+TEMP_DIR="$(mktemp -d "${SCRATCH_DIR}/fault-XXXXXX")"
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "${TEMP_DIR}"' EXIT
 
 ORIGIN_DIR="${TEMP_DIR}/origin"
@@ -25,7 +26,7 @@ echo "=== Test 1: Invalid PSK Auth Rejection ==="
 # Without one this is skipped loudly, never counted as a pass.
 PEER_HOST="${MODELFS_TEST_HOST:-127.0.0.1}"
 PEER_PORT="${MODELFS_TEST_PORT:-19081}"
-python3 "${SCRIPT_DIR}/peer_auth_probe.py" "${PEER_HOST}" "${PEER_PORT}"
+python3 "${SCRIPTS_DIR}/peer_auth_probe.py" "${PEER_HOST}" "${PEER_PORT}"
 
 echo "=== Test 2: Expired Cluster Lease Marking ==="
 # Write an expired lease file directly to .cluster, then require the peers

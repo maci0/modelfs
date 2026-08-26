@@ -2,7 +2,7 @@
 """
 Benchmark & Figure Generator for modelfs
 Runs real latency, throughput, and cluster scaling benchmarks across modelfs peer nodes
-and plots publication-grade figures using matplotlib.
+and plots the figures with matplotlib.
 
 Numbers come from the machine running the script, so by default the report and
 figures land in .scratch/benchmarks/ (gitignored); pass --update-docs to
@@ -33,11 +33,28 @@ except ModuleNotFoundError:
 
 BENCH_PSK = "bench_psk_key_123456789"
 
+_SCRIPT = os.fspath(Path(__file__).resolve())
+
+
+def project_root() -> Path:
+    """Directory holding build.zig.zon, found by walking up from this file."""
+    for d in Path(_SCRIPT).parents:
+        if (d / "build.zig.zon").is_file():
+            return d
+    sys.exit(f"cannot find build.zig.zon above {_SCRIPT}")
+
+
+_ROOT = project_root()
+
 # Same convention as scripts/check.sh: when the pinned .venv exists, run under
 # it, so benchmarks use the declared interpreter (.python-version) and the
 # locked matplotlib instead of whatever python3 is first on PATH.
-_SCRIPT = os.fspath(Path(__file__).resolve())
-_VENV_PYTHON = Path(_SCRIPT).parent.parent / ".venv" / "bin" / "python3"
+_VENV_PYTHON = _ROOT / ".venv" / "bin" / "python3"
+
+# Run artifacts stay on disk in the gitignored scratch dir. The default
+# tempfile location is /tmp, which is tmpfs here: a benchmark that writes
+# piece caches there is charged to RAM and competes with the thing measured.
+_SCRATCH = _ROOT / ".scratch"
 
 
 def reexec_under_venv() -> None:
@@ -161,7 +178,8 @@ def make_origin_and_psk(temp_dir: str) -> tuple[str, str]:
 
 def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]]:
     print("=== Benchmark 1: Cluster Endpoint Query Latency Scaling ===")
-    temp_dir = tempfile.mkdtemp(prefix="modelfs-bench-cluster-")
+    _SCRATCH.mkdir(parents=True, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix="bench-cluster-", dir=_SCRATCH)
     try:
         origin_dir, psk_file = make_origin_and_psk(temp_dir)
 
@@ -235,7 +253,8 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
 
 def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], list[float]]:
     print("=== Benchmark 2: Expanded Chunk Size Sweep (256KB to 64MB) ===")
-    temp_dir = tempfile.mkdtemp(prefix="modelfs-bench-size-")
+    _SCRATCH.mkdir(parents=True, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix="bench-size-", dir=_SCRATCH)
     try:
         origin_dir, psk_file = make_origin_and_psk(temp_dir)
 

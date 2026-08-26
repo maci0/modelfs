@@ -3,8 +3,8 @@
 # shell lint, Python lint, Python type check.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "${ROOT_DIR}"
 
 # CI installs the pinned Python tooling into .venv and puts it on PATH before

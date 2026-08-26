@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 echo "================================================================="
 echo "=== 9-Node Cluster Performance & Block Exchange E2E Benchmark ==="
@@ -13,7 +13,8 @@ zig build
 
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"
 
-TEMP_DIR="$(mktemp -d /tmp/modelfs-cluster9-XXXXXX)"
+mkdir -p "${SCRATCH_DIR}"
+TEMP_DIR="$(mktemp -d "${SCRATCH_DIR}/cluster9-XXXXXX")"
 
 cleanup() {
     echo "Tearing down cluster processes and unmounting..."
@@ -101,7 +102,7 @@ echo "=== Step 4: Inspecting active cluster peers ==="
 "${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}" --psk "${PSK_FILE}"
 
 echo "=== Step 5: Executing multi-peer piece exchange benchmark ==="
-python3 "${SCRIPT_DIR}/cluster_verify.py" \
+python3 "${SCRIPTS_DIR}/cluster_verify.py" \
     "${ORIGIN_DIR}/${TEST_FILE}" \
     "${TEST_FILE}" \
     "${PSK_FILE}" \

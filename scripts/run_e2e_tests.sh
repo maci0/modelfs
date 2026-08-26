@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=scripts/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 echo "=== Building modelfs binary ==="
 cd "${ROOT_DIR}"
@@ -15,7 +15,8 @@ if [[ ! -x "${MODELFS_BIN}" ]]; then
     exit 1
 fi
 
-TEMP_DIR="$(mktemp -d /tmp/modelfs-e2e-XXXXXX)"
+mkdir -p "${SCRATCH_DIR}"
+TEMP_DIR="$(mktemp -d "${SCRATCH_DIR}/e2e-XXXXXX")"
 trap 'rm -rf "${TEMP_DIR}"' EXIT
 
 ORIGIN_DIR="${TEMP_DIR}/origin"
