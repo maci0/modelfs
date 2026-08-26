@@ -301,6 +301,17 @@ test "lease json roundtrip" {
     // a peer publishing such a document must fail closed here, never read
     // downstream as an empty-address (unreachable) or empty-cluster node.
     try std.testing.expectError(error.MissingField, parseLease(std.testing.allocator, "{\"id\":\"n1\",\"until\":5}"));
+
+    // The writer refuses an undersized buffer instead of truncating: publish
+    // ships this document verbatim to every peer, so a torn tail would look
+    // like a corrupt lease and drop the node from the cluster silently. The
+    // exact fit succeeds byte-for-byte; one byte short is refused whole.
+    var tight: [128]u8 = undefined;
+    const single = [_]LeaseAddr{.{ .ip = "192.168.0.11", .port = default_port, .mbps = 7 }};
+    const full = try formatLease(&tight, "spark1", 1710000060, &single);
+    const need = full.len;
+    try std.testing.expectEqualStrings(full, try formatLease(tight[0..need], "spark1", 1710000060, &single));
+    try std.testing.expectError(error.WriteFailed, formatLease(tight[0 .. need - 1], "spark1", 1710000060, &single));
 }
 
 const seed_lease_ok = fuzzcorpus.entry("{\"id\":\"spark1\",\"until\":1710000060,\"addrs\":[{\"ip\":\"192.168.100.1\",\"port\":18080,\"mbps\":200000},{\"ip\":\"192.168.0.11\",\"port\":18080,\"mbps\":10000}]}");
