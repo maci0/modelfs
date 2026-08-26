@@ -23,9 +23,12 @@ chmod 600 "${PSK_FILE}"
 
 echo "=== Test 1: Invalid PSK Auth Rejection ==="
 # Needs a live peer endpoint (e.g. started by run_cluster_e2e_9nodes.sh).
-# Without one this is skipped loudly, never counted as a pass.
-PEER_HOST="${MODELFS_TEST_HOST:-127.0.0.1}"
-PEER_PORT="${MODELFS_TEST_PORT:-19081}"
+# Without one this is skipped loudly, never counted as a pass. The overrides
+# sit under MODFS_, not MODELFS_: the daemon refuses unknown MODELFS_*
+# variables as typos, so an exported knob here would fail every modelfs
+# invocation this script makes (see lib.sh).
+PEER_HOST="${MODFS_TEST_HOST:-127.0.0.1}"
+PEER_PORT="${MODFS_TEST_PORT:-19081}"
 python3 "${SCRIPTS_DIR}/peer_auth_probe.py" "${PEER_HOST}" "${PEER_PORT}"
 
 echo "=== Test 2: Expired Cluster Lease Marking ==="

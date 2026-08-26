@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+- **Harness environment knobs moved off the daemon's reserved prefix.** The CLI
+  refuses any `MODELFS_*` variable outside its documented five as a typo'd
+  knob, but the fault-tolerance suite (`MODELFS_TEST_HOST`/`PORT`) and the
+  restore drill (`MODELFS_DRILL_LOG`/`LIVE`/`KEEP`) spelled their own knobs
+  under that same prefix: exporting one -- as their own docs suggested --
+  made every `modelfs` invocation exit 2 with "unknown environment variable",
+  including each binary call inside the test suite itself. They are
+  `MODFS_TEST_HOST`, `MODFS_TEST_PORT`, `MODFS_DRILL_LOG`, `MODFS_DRILL_LIVE`,
+  and `MODFS_DRILL_KEEP` now; `scripts/lib.sh` records the namespace split.
+
 ## [0.1.0] - 2026-08-26
 
 First tagged release. It mounts `/models` over FUSE on every node, serves reads

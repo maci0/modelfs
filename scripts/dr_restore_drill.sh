@@ -9,9 +9,13 @@
 #   ./scripts/dr_restore_drill.sh [DATASET]      # default: tank/models
 #
 # Environment:
-#   MODELFS_DRILL_LOG   artifact log path     (default /var/log/modelfs-drill.log)
-#   MODELFS_DRILL_LIVE  live tree to diff     (default: the dataset's mountpoint)
-#   MODELFS_DRILL_KEEP  set non-empty to keep the drill clone mounted for inspection
+#   MODFS_DRILL_LOG   artifact log path     (default /var/log/modelfs-drill.log)
+#   MODFS_DRILL_LIVE  live tree to diff     (default: the dataset's mountpoint)
+#   MODFS_DRILL_KEEP  set non-empty to keep the drill clone mounted for inspection
+#
+# These sit under MODFS_, not MODELFS_: the modelfs binary refuses unknown
+# MODELFS_* variables as typo'd knobs, so an exported drill knob spelled with
+# the daemon's prefix would fail every modelfs command on this host (lib.sh).
 #
 # Exit status is the drill verdict: 0 means the newest snapshot restored,
 # mounted, and read back verified; anything else is an alarm, including
@@ -31,7 +35,7 @@ command -v zfs >/dev/null 2>&1 || die "zfs not found; this drill runs on the NAS
 [[ $# -le 1 ]] || die "usage: dr_restore_drill.sh [DATASET]"
 
 DATASET="${1:-tank/models}"
-LOG_FILE="${MODELFS_DRILL_LOG:-/var/log/modelfs-drill.log}"
+LOG_FILE="${MODFS_DRILL_LOG:-/var/log/modelfs-drill.log}"
 
 zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
     || die "dataset ${DATASET} does not exist on this host"
@@ -62,8 +66,8 @@ if zfs list -H -o name "${CLONE}" >/dev/null 2>&1; then
 fi
 
 cleanup() {
-    if [[ -n "${MODELFS_DRILL_KEEP:-}" ]]; then
-        echo "drill: MODELFS_DRILL_KEEP set, leaving ${CLONE} mounted for inspection"
+    if [[ -n "${MODFS_DRILL_KEEP:-}" ]]; then
+        echo "drill: MODFS_DRILL_KEEP set, leaving ${CLONE} mounted for inspection"
         return 0
     fi
     if zfs list -H -o name "${CLONE}" >/dev/null 2>&1; then
@@ -73,10 +77,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-LIVE="${MODELFS_DRILL_LIVE:-$(zfs get -H -o value mountpoint "${DATASET}")}"
+LIVE="${MODFS_DRILL_LIVE:-$(zfs get -H -o value mountpoint "${DATASET}")}"
 case "${LIVE}" in
     none | legacy | '-')
-        die "dataset ${DATASET} has mountpoint '${LIVE}'; mount it or point MODELFS_DRILL_LIVE at the live tree"
+        die "dataset ${DATASET} has mountpoint '${LIVE}'; mount it or point MODFS_DRILL_LIVE at the live tree"
         ;;
     *)
         ;;
