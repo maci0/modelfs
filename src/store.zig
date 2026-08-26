@@ -55,6 +55,11 @@ pub const Stats = struct {
     /// heads, request lines without a target. Counted rather than logged;
     /// the accept cap bounds the rate anyway.
     http_malformed: std.atomic.Value(u64) = .init(0),
+    /// Connections closed unaccepted because every inflight slot was taken:
+    /// work this node actively refused while it looked up from the outside.
+    /// Without the count a saturated server is indistinguishable from a
+    /// quiet one -- fetchers time out and nothing on this node says why.
+    http_dropped: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks
     /// and for status.json formatting. Snap's field list is the single
@@ -84,6 +89,7 @@ pub const Stats = struct {
         http_unauthorized: u64 = 0,
         http_5xx: u64 = 0,
         http_malformed: u64 = 0,
+        http_dropped: u64 = 0,
     };
 
     // Every Stats counter must have a Snap counterpart, or it compiles fine

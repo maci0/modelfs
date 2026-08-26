@@ -937,9 +937,18 @@ fn pidAlive(pid: i64) bool {
     return true;
 }
 
-/// Only the pid field matters for liveness; every other status.json field is
-/// ignored here (and validated by whoever consumes the full document).
-const StatusLiveness = struct { pid: i64 };
+/// Only liveness fields matter here; every other status.json field is
+/// ignored (and validated by whoever consumes the full document). now_s is
+/// optional so artifacts from older builds keep parsing: without it the
+/// staleness gate below simply cannot fire.
+const StatusLiveness = struct { pid: i64, now_s: ?i64 = null };
+
+/// How long a status.json may go unrefreshed before `status` stops serving
+/// it as evidence of a working mount. The discovery tick rewrites the
+/// artifact every 10s, so this tolerates eleven missed ticks; a daemon
+/// wedged inside a hung origin call or a stuck worker leaves the file aging
+/// past it while its pid lives on, which the pid check alone cannot catch.
+const max_status_age_secs: i64 = 120;
 
 fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
@@ -968,6 +977,20 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     if (!pidAlive(doc.value.pid)) {
         if (!builtin.is_test) std.debug.print("modelfs: not running (stale status.json names exited pid {d})\n", .{doc.value.pid});
         return 1;
+    }
+    // A live pid with a frozen artifact is the wedged case: the daemon hangs
+    // (origin call that never returns, deadlocked worker) and keeps status.json
+    // exactly as it was when the discovery tick last got to run. Serving it
+    // would report a mount that cannot serve reads as healthy to every
+    // monitor keying on this command's exit code. A wall-clock step backward
+    // makes the age negative, which reads as fresh; only real aging retires.
+    if (doc.value.now_s) |stamp| {
+        const age = sys.nowSec() - stamp;
+        if (age > max_status_age_secs) {
+            if (!builtin.is_test)
+                std.debug.print("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ opts.cache, fuse_fs.status_file, age });
+            return 1;
+        }
     }
     writeOut(io, blob);
     return 0;
@@ -1113,6 +1136,12 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
         std.log.err("{s} failed errno {d}", .{ if (on) "pin" else "unpin", -rc });
         return 1;
     }
+    // Audit line beside the stdout confirmation: pins are persistent state
+    // that shields a file from culling across restarts, so "why is this file
+    // never culled" must be answerable from the journal alone, including
+    // when stdout went down a pipe. rel passed relOk, so echoing it cannot
+    // forge log lines.
+    std.log.info("{s} {s}", .{ if (on) "pinned" else "unpinned", rel });
     printOut(io, gpa, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel });
     return 0;
 }
@@ -1416,6 +1445,22 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     const dead_doc = try std.fmt.bufPrint(&dead_buf, "{{\"id\":\"me\",\"pid\":-3,\"uptime_s\":99}}\n", .{});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), dead_doc));
     try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+
+    // A live writer whose artifact has stopped ticking is the wedged daemon:
+    // pid alive, discovery tick hung. Past the freshness window the document
+    // must read as not serving (exit 1) instead of reporting frozen stats as
+    // a healthy node; inside the window it still serves.
+    {
+        var old_buf: [128]u8 = undefined;
+        const old_doc = try std.fmt.bufPrint(&old_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec() - 121 });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), old_doc));
+        try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+
+        var fresh_buf: [128]u8 = undefined;
+        const fresh_doc = try std.fmt.bufPrint(&fresh_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec() });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), fresh_doc));
+        try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+    }
 
     // An unparseable leftover gets the same verdict as an absent one.
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "not json"));

@@ -942,6 +942,10 @@ fn cullLoop(st: *State) void {
             napMs(st, 2000);
             continue;
         };
+        // Closure for the suspension line above: without it a suspended
+        // stretch reads as permanent -- nothing in the journal ever says
+        // culling came back after the cache fs healed or was remounted.
+        if (statfs_failing) std.log.info("cache statvfs recovered on {s}; culling resumed", .{st.store.cache});
         statfs_failing = false;
         const ph = cull.phase(free_pct, st.store.water, culling);
         culling = ph != .run;
@@ -1002,7 +1006,7 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
         // no key collides ("err" used to name both read and write failures).
         "tick: reads_ok={d} reads_err={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d}" ++
             " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache={d}/{d}/{d}" ++
-            " probe_err={d} peer_mib={d} origin_mib={d} culled={d} http401={d} http5xx={d} httpbad={d}",
+            " probe_err={d} peer_mib={d} origin_mib={d} culled={d} http401={d} http5xx={d} httpbad={d} httpdrop={d}",
         .{
             d.reads_ok,
             d.reads_err,
@@ -1025,6 +1029,7 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.http_unauthorized,
             d.http_5xx,
             d.http_malformed,
+            d.http_dropped,
         },
     );
 }
@@ -1056,7 +1061,7 @@ fn statusJson(st: *State) !void {
     // so a new counter publishes here by construction instead of by
     // remembering to edit this document's format string.
     var w = std.Io.Writer.fixed(&buf);
-    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"stats\":{{", .{
+    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"now_s\":{d},\"stats\":{{", .{
         st.catalog.self_id,
         std.os.linux.getpid(),
         sys.monoSec() - st.start_secs,
@@ -1064,6 +1069,7 @@ fn statusJson(st: *State) !void {
         st.store.piece_size,
         st.server.http_inflight.load(.monotonic),
         cache_free_pct,
+        sys.nowSec(),
     });
     inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields, 0..) |f, i| {
         if (i != 0) try w.writeByte(',');
@@ -1173,6 +1179,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
         piece: u32,
         inflight: u32,
         cache_free_pct: i32,
+        now_s: i64,
         stats: StatsDoc,
     };
     const doc = try std.json.parseFromSlice(StatusDoc, gpa, blob, .{});
@@ -1186,6 +1193,10 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // The saturation gauge rides along: statvfs works here, so a real
     // percentage, not the -1 unknown marker.
     try std.testing.expect(doc.value.cache_free_pct >= 0);
+    // The wall-clock stamp is what lets `status` (and any monitor) tell a
+    // wedged daemon from a ticking one from a single read: it must be a
+    // current epoch second, not zero or a monotonic value.
+    try std.testing.expect(doc.value.now_s >= sys.nowSec() - 5);
     // Counters ride along with the liveness fields: an operator answers
     // "is it serving, from where, is it failing" from one artifact.
     try std.testing.expectEqual(@as(u64, 0), doc.value.stats.reads_ok);

@@ -140,6 +140,13 @@ fn acceptLoop(self: *Server, fd: c_int) void {
         // value, so exactly the claims beyond the cap undo themselves.
         if (self.http_inflight.fetchAdd(1, .monotonic) >= Server.max_inflight) {
             _ = self.http_inflight.fetchSub(1, .monotonic);
+            // Counted rather than logged: each drop is one close(2), and
+            // logging them would hand a connection storm the same
+            // log-flooding lever the malformed-head path refuses. The
+            // counter rides status.json and the tick line instead, so
+            // saturation is visible without giving up the cap's flood
+            // protection.
+            _ = self.store.stats.http_dropped.fetchAdd(1, .monotonic);
             sys.close(cfd);
             continue;
         }
