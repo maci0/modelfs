@@ -52,8 +52,8 @@ zig build test -Dtest-filter=store     # only tests whose name matches (substrin
 The blocking requirement is green CI: `./scripts/check.sh` plus the
 `cross-aarch64` compile job. There are no sign-off or changelog-entry gates,
 but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) as their own
-dated section (everything there is unreleased until the first tag; see
-Cutting a release below), and changes to
+dated section at the top (unreleased until the next release; see Cutting a
+release below), and changes to
 [requirements-dev.txt](requirements-dev.txt) must be reflected in the
 hash-pinned lock (regeneration command in the lock's header).
 
@@ -66,10 +66,10 @@ Nothing else carries a version, so a release is four steps that must stay in
 sync:
 
 1. Bump `.version` in [build.zig.zon](build.zig.zon).
-2. Regroup [CHANGELOG.md](CHANGELOG.md): every entry there is unreleased work;
-   move the entries this release covers under a heading named after the new
-   version and today's date, per the `[Unreleased]` note at the top of the
-   file.
+2. Regroup [CHANGELOG.md](CHANGELOG.md): every section below the previous
+   release's heading is unreleased work; move the entries this release covers
+   under a heading named after the new version and today's date, placed above
+   that previous release's heading.
 3. Tag `v<version>`, exactly matching the manifest (`v0.1.0` for
    `.version = "0.1.0"`), so a checkout can be matched to a version.
 4. Confirm the built binary answers with the declared version before
