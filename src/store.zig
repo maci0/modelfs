@@ -106,11 +106,13 @@ pub const Stats = struct {
 
 /// ENOENT is the expected already-gone case; any other unlink failure would
 /// leave stale cache artifacts that a same-size recreate can resurrect.
+/// Callers span forget, distrust, and the reaper's purges, so the line names
+/// the artifact rather than attributing itself to one of them.
 fn unlinkOrWarn(path_z: [*:0]const u8, what: []const u8, rel: []const u8) void {
     if (c.unlink(path_z) != 0) {
         const e = sys.errno();
         if (e != c.ENOENT)
-            std.log.warn("forget {s}: cannot remove cached {s} (errno {d})", .{ rel, what, e });
+            std.log.warn("cannot remove cached {s} for {s} (errno {d})", .{ what, rel, e });
     }
 }
 

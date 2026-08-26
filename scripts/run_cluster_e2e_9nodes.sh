@@ -23,7 +23,9 @@ cleanup() {
         fi
     done
     local pids=()
-    readarray -t pids < <(jobs -p)
+    # || true: a jobs(1) failure must not abort teardown; the PIDs are
+    # best-effort, so the substituted command's status is deliberately ignored.
+    readarray -t pids < <(jobs -p || true)
     if ((${#pids[@]} > 0)); then
         kill "${pids[@]}" 2>/dev/null || true
     fi
@@ -74,7 +76,26 @@ for i in $(seq 1 "${NUM_NODES}"); do
 done
 
 echo "=== Step 3: Waiting for cluster peer lease publication ==="
-sleep 2
+# Each node publishes a lease at .cluster/<id>.json once it is up; poll for
+# all NUM_NODES of them instead of sleeping a fixed two seconds, which races
+# a loaded host and leaves the peers listing below half-empty. Bounded, so a
+# daemon that died on startup fails loudly here rather than as a refused
+# connection in the verifier.
+LEASE_DEADLINE=$((SECONDS + 30))
+while :; do
+    leases=0
+    for lease in "${ORIGIN_DIR}"/.cluster/*.json; do
+        [[ -f "${lease}" ]] && leases=$((leases + 1))
+    done
+    if [[ "${leases}" -ge "${NUM_NODES}" ]]; then
+        break
+    fi
+    if ((SECONDS >= LEASE_DEADLINE)); then
+        echo "Error: only ${leases}/${NUM_NODES} peer leases published after 30s"
+        exit 1
+    fi
+    sleep 0.5
+done
 
 echo "=== Step 4: Inspecting active cluster peers ==="
 "${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}" --psk "${PSK_FILE}"
@@ -100,9 +121,9 @@ for i in $(seq 1 "${NUM_NODES}"); do
         echo "Error: Node spark_${i} cache exceeds file size!"
         exit 1
     fi
-    if [ "${USAGE_MB}" -lt "${FILE_SIZE_MB}" ]; then
-        echo "✓ Node spark_${i} cache size (${USAGE_MB} MB) is smaller than full file (${FILE_SIZE_MB} MB)"
-    fi
+    # du rounds to whole KB, so an exact fit is a legitimate pass; above the
+    # bound already failed, so reaching this line always means within bounds.
+    echo "✓ Node spark_${i} cache size (${USAGE_MB} MB) is within the ${FILE_SIZE_MB} MB bound"
 done
 
 echo "================================================================="

@@ -205,10 +205,35 @@ fn bodyDeadlineFor(want_len: u64) i64 {
     return sys.monoMs() + body_deadline_base_ms + mibs * body_deadline_per_mib_ms;
 }
 
+/// Arms one blocking chunk against a total wall-clock budget. False when
+/// `deadline_ms` has already passed (the caller reports its own timeout
+/// error); otherwise the socket timeout is clamped to the remaining budget,
+/// so the last blocking syscall wakes at the deadline instead of a full
+/// steady-state window. One copy of this rule for every head/body/send
+/// loop: the clamp condition and the expiry comparison must not drift
+/// between them. Connections close when a transfer stage ends, so the
+/// clamp never needs restoring mid-stage (readHeadFull restores it for the
+/// body stages that follow a completed head).
+fn armChunkTimeout(fd: std.posix.fd_t, deadline_ms: i64) bool {
+    const remain_ms = deadline_ms - sys.monoMs();
+    if (remain_ms <= 0) return false;
+    if (remain_ms < sock_timeout_ms)
+        sys.setSockTimeout(fd, @intCast(remain_ms));
+    return true;
+}
+
 /// Cap on a peer-chosen Content-Length driving an allocation in
 /// readFlexBodyAlloc. Caller-supplied destinations bypass it: their length is
 /// verified against Content-Length instead.
 const max_alloc_body_bytes: usize = 512 * 1024 * 1024;
+
+/// Tighter cap on a peer-chosen /have body, which is a piece bitmap:
+/// bytesLen(pieces) for the serving grid. 16 MiB names 2^27 pieces -- a 2 PiB
+/// file at the default 16 MiB grid -- so any larger answer is broken or
+/// hostile. Honoring it up to max_alloc_body_bytes would drive a half-gigabyte
+/// allocation per probe, and havePut caches the answer (have_cache_cap
+/// entries), pinning copies of it past the probe.
+const max_have_body_bytes: usize = 16 * 1024 * 1024;
 
 fn readHeadFull(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize) !void {
     return readHeadFullDeadline(fd, buf, out_head_len, out_total_read, sys.monoMs() + head_deadline_ms);
@@ -217,12 +242,7 @@ fn readHeadFull(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_r
 fn readHeadFullDeadline(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: i64) !void {
     var n: usize = 0;
     while (n < buf.len) {
-        const remain_ms = deadline_ms - sys.monoMs();
-        if (remain_ms <= 0) return error.HeadTimeout;
-        // The last blocking read must wake at the deadline, not at the full
-        // socket timeout: clamp it to the remaining budget.
-        if (remain_ms < sock_timeout_ms)
-            sys.setSockTimeout(fd, @intCast(remain_ms));
+        if (!armChunkTimeout(fd, deadline_ms)) return error.HeadTimeout;
         const r = sys.readOnce(fd, buf[n..]) catch {
             if (deadline_ms - sys.monoMs() <= 0) return error.HeadTimeout;
             return error.Head;
@@ -506,16 +526,10 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     if (cfd >= 0) {
         var done: u64 = 0;
         while (done < want) {
-            const remain_ms = deadline_ms - sys.monoMs();
-            if (remain_ms <= 0) {
+            if (!armChunkTimeout(fd, deadline_ms)) {
                 std.log.warn("range send budget expired for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, start + done, done, want });
                 return;
             }
-            // The last blocking send must wake at the deadline, not at the
-            // full socket timeout; the connection closes once this returns,
-            // so the clamp never needs restoring.
-            if (remain_ms < sock_timeout_ms)
-                sys.setSockTimeout(fd, @intCast(remain_ms));
             file.last_access.store(sys.monoSec(), .monotonic);
             const take: usize = @intCast(@min(want - done, @as(u64, self.store.piece_size)));
             const sent = sys.sendfileAll(fd, cfd, start + done, take);
@@ -553,13 +567,10 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     var off = start;
     var remaining = want;
     while (remaining > 0) {
-        const remain_ms = deadline_ms - sys.monoMs();
-        if (remain_ms <= 0) {
+        if (!armChunkTimeout(fd, deadline_ms)) {
             std.log.warn("range send budget expired for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, off, want - remaining, want });
             return;
         }
-        if (remain_ms < sock_timeout_ms)
-            sys.setSockTimeout(fd, @intCast(remain_ms));
         const take = @min(remaining, buf.len);
         const n = self.store.readCache(file, buf[0..take], off, sys.monoSec());
         if (n < 0 or @as(u64, @intCast(n)) != take) {
@@ -711,6 +722,13 @@ fn haveFromHead(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8
     }
     const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
     const piece_size = std.fmt.parseInt(u32, ps_str, 10) catch return error.BadPieceSize;
+    // Refuse absurd bitmaps before the allocation instead of letting
+    // finishBodyAlloc honor them up to max_alloc_body_bytes (see
+    // max_have_body_bytes). A missing header reads as length 0, matching the
+    // zero-length success below.
+    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
+    const declared = std.fmt.parseInt(usize, cl_str, 10) catch 0;
+    if (declared > max_have_body_bytes) return error.BodyTooLarge;
     const bits = try finishBodyAlloc(gpa, fd, head_buf, head_len, total_read, null, null);
     return .{ .bits = bits, .piece_size = piece_size };
 }
@@ -854,13 +872,7 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const
     }
 
     while (got < want_len) {
-        const remain_ms = deadline - sys.monoMs();
-        if (remain_ms <= 0) return error.BodyTimeout;
-        // The last blocking read must wake at the deadline; every caller of
-        // this helper closes the socket once the body settles, so the clamp
-        // never needs restoring for a later transfer stage.
-        if (remain_ms < sock_timeout_ms)
-            sys.setSockTimeout(fd, @intCast(remain_ms));
+        if (!armChunkTimeout(fd, deadline)) return error.BodyTimeout;
         const n = sys.readOnce(fd, buf[got..]) catch {
             if (deadline - sys.monoMs() <= 0) return error.BodyTimeout;
             return error.Read;
@@ -1227,10 +1239,7 @@ test "peerAddrText formats the accepted peer address for security logs" {
     // attributable after the fact (THREAT_MODEL R8). Loopback and a routable
     // address both format exactly, port included.
     var buf: [64]u8 = undefined;
-    var lo = std.mem.zeroes(c.struct_sockaddr_in);
-    lo.sin_family = c.AF_INET;
-    lo.sin_port = std.mem.nativeToBig(u16, 18080);
-    lo.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    const lo = loopbackAddr(18080);
     try std.testing.expectEqualStrings("127.0.0.1:18080", peerAddrText(lo, &buf));
 
     var far = std.mem.zeroes(c.struct_sockaddr_in);
@@ -1652,6 +1661,16 @@ fn boundPort(fd: c_int) u16 {
     return std.mem.bigToNative(u16, addr.sin_port);
 }
 
+/// Loopback client address for a test dial: one construction so the
+/// 127.0.0.1 spelling and byte orders cannot drift between call sites.
+fn loopbackAddr(port: u16) c.struct_sockaddr_in {
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, port);
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    return addr;
+}
+
 /// Reserves a kernel-picked free loopback TCP port and releases it, for tests
 /// that need a port dialing fails on: a hardcoded one would break on any host
 /// where a real service already holds it.
@@ -1659,9 +1678,7 @@ fn freeTcpPort() !u16 {
     const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(lfd >= 0);
     defer sys.close(lfd);
-    var addr = std.mem.zeroes(c.struct_sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    var addr = loopbackAddr(0);
     try std.testing.expectEqual(@as(i32, 0), c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)));
     var got = std.mem.zeroes(c.struct_sockaddr_in);
     var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
@@ -1736,10 +1753,7 @@ test "fault tolerance: dial unreachable peer fails gracefully" {
 /// test on the client socket timeout instead of hanging the runner.
 fn roundTrip(port: u16, req: []const u8) !std.ArrayList(u8) {
     const gpa = std.testing.allocator;
-    var addr = std.mem.zeroes(c.struct_sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_port = std.mem.nativeToBig(u16, port);
-    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    var addr = loopbackAddr(port);
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(fd >= 0);
     defer sys.close(fd);
@@ -1773,10 +1787,7 @@ test "handleConn counts a targetless request line as malformed" {
     // A completed head whose request line names no target ("HELP") is the
     // scanner noise the timeout and oversize paths count; it must land in
     // http_malformed too instead of dropping invisibly.
-    var addr = std.mem.zeroes(c.struct_sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_port = std.mem.nativeToBig(u16, srv.port());
-    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    var addr = loopbackAddr(srv.port());
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(fd >= 0);
     defer sys.close(fd);
@@ -1898,6 +1909,25 @@ test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, pair[1], head, head.len, head.len));
+    }
+}
+
+test "haveFromHead refuses a bitmap above the /have body bound before allocating" {
+    const gpa = std.testing.allocator;
+    // A truthful /have body is bytesLen(pieces) -- KiB-scale for any real
+    // model. A peer-chosen Content-Length one byte past max_have_body_bytes
+    // must fail the probe at parse time: finishBodyAlloc would otherwise
+    // honor it up to max_alloc_body_bytes, and havePut caches the answer,
+    // pinning the allocation in the probe cache past the probe itself.
+    // Under the bound the body readers behave as every sibling test above
+    // pins (small bodies parse, missing bytes fail ReadIncomplete), so only
+    // the refusal needs its own case here.
+    {
+        const head = "HTTP/1.1 200 OK\r\nContent-Length: 16777217\r\nX-Piece-Size: 16777216\r\nConnection: close\r\n\r\n";
+        const pair = try responsePair(head);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BodyTooLarge, haveFromHead(gpa, pair[1], head, head.len, head.len));
     }
 }
 
@@ -2116,10 +2146,7 @@ test "acceptLoop closes connections beyond the inflight handler cap" {
     // claim-then-check atomic decides which ones; only the count matters.
     const n_conns: usize = Server.max_inflight + 8;
     var fds: [n_conns]c_int = undefined;
-    var addr = std.mem.zeroes(c.struct_sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_port = std.mem.nativeToBig(u16, srv.port());
-    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    var addr = loopbackAddr(srv.port());
     for (&fds) |*fd| {
         fd.* = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
         try std.testing.expect(fd.* >= 0);
@@ -2265,10 +2292,7 @@ test "serveData answers an open-ended range with the file tail" {
     const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
     defer srv.stop();
 
-    var addr = std.mem.zeroes(c.struct_sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_port = std.mem.nativeToBig(u16, srv.port());
-    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    var addr = loopbackAddr(srv.port());
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(fd >= 0);
     defer sys.close(fd);

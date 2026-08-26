@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
@@ -65,6 +66,38 @@ def unmount(mount_dir: str) -> None:
     helper = shutil.which("fusermount3") or shutil.which("fusermount")
     cmd = [helper, "-u", mount_dir] if helper else ["umount", mount_dir]
     subprocess.run(cmd, capture_output=True, check=False)
+
+
+def wait_for_ping(port: int, psk: str, timeout_s: float = 30.0) -> None:
+    """Poll one daemon's /ping until it answers, or fail after a fixed budget.
+
+    A fixed sleep is a guess at the bind time, and nine concurrent FUSE
+    mounts on a loaded host can bind later than any constant; one refused
+    connection would then kill the whole benchmark run mid-sweep. A node
+    that answers but rejects (wrong PSK, server error) fails immediately:
+    retrying cannot fix that.
+    """
+    headers = {"Authorization": f"Bearer {psk}"}
+    url = f"http://127.0.0.1:{port}/ping"
+    deadline = time.monotonic() + timeout_s
+    while True:
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                assert resp.read() == b"ok", (
+                    f"Node on port {port} answered /ping with an unexpected body"
+                )
+        except urllib.error.HTTPError as e:
+            sys.exit(f"node on port {port}: /ping rejected with HTTP {e.code}")
+        except OSError:
+            if time.monotonic() >= deadline:
+                sys.exit(
+                    f"node on port {port}: no working listener within "
+                    f"{timeout_s:.0f}s (daemon failed to start or died)"
+                )
+            time.sleep(0.2)
+        else:
+            return
 
 
 def stop_mount(p: subprocess.Popen[bytes], mount_dir: str) -> None:
@@ -168,7 +201,11 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
                 )
                 procs.append((p, port, mount_dir))
 
-            time.sleep(2)  # Allow processes to bind and publish leases
+            # Every listener must be up before the timed sweep: poll instead
+            # of a fixed sleep, whose guess would otherwise surface inside
+            # the measured window as ConnectionRefused.
+            for _, port, _ in procs:
+                wait_for_ping(port, BENCH_PSK)
 
             headers = {"Authorization": f"Bearer {BENCH_PSK}"}
 
@@ -251,7 +288,9 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
                 ]
             )
             try:
-                time.sleep(1.2)
+                # The daemon must be serving before hydration and the timed
+                # fetch; poll its /ping instead of sleeping a constant.
+                wait_for_ping(port, BENCH_PSK)
 
                 headers = {"Authorization": f"Bearer {BENCH_PSK}"}
 

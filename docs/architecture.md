@@ -171,7 +171,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 
 A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. Errors carry no body: both peers of a conversation parse only the status line.
 
-Every endpoint requires the bearer token, including `/ping`. Listen `0.0.0.0:18080`; `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers.
+Every endpoint requires the bearer token, including `/ping`. Listen `0.0.0.0:18080`; `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status.
 
 ---
 
