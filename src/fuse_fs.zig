@@ -599,14 +599,26 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     // cacheFill (marks preserved); any divergence keeps the conservative
     // reset below.
     var ost: sys.c.struct_stat = undefined;
-    if (st.store.statOrigin(rel, &ost) == 0 and
-        (ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG and
-        @as(u64, @intCast(ost.st_size)) == end)
-    {
+    const src = st.store.statOrigin(rel, &ost);
+    const regular = src == 0 and (ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG;
+    if (regular and @as(u64, @intCast(ost.st_size)) == end) {
         st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)], sys.monoSec());
         return @intCast(n);
     }
-    if (cachedFor(st, rel)) |file| {
+    // One referenced entry for every remaining shape, resolved from the stat
+    // sample this handler already paid for. The old shape stat'ed the origin
+    // a second time through cachedFor on this path; each write's open-pwrite-
+    // close cycle invalidates the NFS client's attribute cache, so both stats
+    // were real GETATTR round trips -- two per written chunk whenever the
+    // observed size lagged the write (the common ingest shape).
+    const live = blk: {
+        if (regular)
+            break :blk st.store.get(rel, @intCast(ost.st_size), sys.monoSec()) catch null;
+        // Failed observation: one retry through cachedFor's own stat before
+        // trust is dropped below, so a single flaky GETATTR cannot wipe marks.
+        break :blk cachedFor(st, rel);
+    };
+    if (live) |file| {
         defer st.store.releaseFile(file);
         file.mu.lockUncancelable(st.io);
         const old_size = file.size;

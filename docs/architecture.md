@@ -85,7 +85,7 @@ modelfs unpin gguf/foo.gguf
 
 Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_PSK_VALUE` `MODELFS_ID`; an explicit flag wins and an empty environment value counts as unset.
 
-`--id`, `--advertise IP:PORT`, `--cache`, `--listen` override defaults. `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
+`--id`, `--advertise IP[:PORT][,...]`, `--cache`, `--listen [IP:]PORT` override defaults. `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
 
 Build:
 

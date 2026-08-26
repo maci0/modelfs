@@ -2800,3 +2800,214 @@ fn fuzzRequestHeadOne(_: void, smith: *std.testing.Smith) anyerror!void {
 test "fuzz request head parsing pipeline gates auth paths and ranges" {
     try std.testing.fuzz({}, fuzzRequestHeadOne, .{ .corpus = &fuzz_request_corpus });
 }
+
+// The request-head harness above mirrors handleConn's pipeline, so parser
+// drift shows up as oracle mismatches -- but wiring drift (a reordered
+// branch, an uncounted rejection, a reply missing its challenge header)
+// would leave both the handler and its mirror agreeing on the wrong thing.
+// This harness drives the real handleConn over a socketpair instead and
+// pins the published routing contract end to end: method gate before auth,
+// auth before routing, unknown routes 404 ahead of query validation,
+// traversal/control paths refused, ranges required on /data, and every
+// outcome landed in the counter status.json publishes.
+
+const seed_serve_ping_ok = corpusEntry("GET /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_post_ping = corpusEntry("POST /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_no_target = corpusEntry("HELP\r\n\r\n");
+const seed_serve_unterminated = corpusEntry("GET /have?path=a HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n");
+const seed_serve_ping_unauthed = corpusEntry("GET /ping HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n");
+const seed_serve_unknown_route = corpusEntry("GET /nope?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_bad_escape = corpusEntry("GET /have?path=%zz HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_data_no_range = corpusEntry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_data_bad_range = corpusEntry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=x-\r\n\r\n");
+
+const fuzz_serve_corpus = [_][]const u8{
+    &seed_req_have_ok,
+    &seed_req_traversal,
+    &seed_req_wrong_auth,
+    &seed_req_control_path,
+    &seed_req_max_range,
+    &seed_req_inverted_range,
+    &seed_req_no_path,
+    &seed_serve_ping_ok,
+    &seed_serve_post_ping,
+    &seed_serve_no_target,
+    &seed_serve_unterminated,
+    &seed_serve_ping_unauthed,
+    &seed_serve_unknown_route,
+    &seed_serve_bad_escape,
+    &seed_serve_data_no_range,
+    &seed_serve_data_bad_range,
+};
+
+/// Every outcome handleConn's published order can produce for a head whose
+/// origin lookups all miss. `dropped` covers both unroutable shapes: a head
+/// that never terminates (EOF before \r\n\r\n) and one whose request line
+/// names no target; neither earns a reply, only the malformed counter.
+const ServeClass = enum { dropped, unauthorized, method_not_allowed, ping_ok, no_route, bad_path, bad_range, miss };
+
+/// Independent walk of handleConn's decision order over the head the
+/// handler will actually see (everything up to and including the blank
+/// line; pipelined bytes past it belong to no request).
+fn classifyServedHead(head: []const u8) ServeClass {
+    const done = std.mem.find(u8, head, "\r\n\r\n") orelse return .dropped;
+    const served = head[0 .. done + 4];
+    const line_end = std.mem.find(u8, served, "\r\n") orelse return .dropped;
+    var it = std.mem.splitScalar(u8, served[0..line_end], ' ');
+    const method = it.next() orelse return .dropped;
+    const target = it.next() orelse return .dropped;
+    if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
+    const auth = proto.headerGet(served, "Authorization") orelse "";
+    if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
+    const path = proto.pathOnly(target);
+    if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
+    const is_have = std.mem.eql(u8, path, "/have");
+    if (!is_have and !std.mem.eql(u8, path, "/data")) return .no_route;
+    var rel_buf: [4096]u8 = undefined;
+    const q = proto.queryGet(target, "path") orelse return .bad_path;
+    const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
+    if (!store_mod.relOk(rel)) return .bad_path;
+    if (!is_have) {
+        const rh = proto.headerGet(served, "Range") orelse return .bad_range;
+        _ = proto.parseRange(rh) orelse return .bad_range;
+    }
+    // Both routed requests stop at statOrigin's ENOENT in the fixture
+    // below and answer the healthy-miss 404.
+    return .miss;
+}
+
+/// One connection served end to end against the classifier: the shared
+/// body of the fuzz entry below and the mutation drill behind it, kept a
+/// plain function of the head so both callers assert identical facts.
+fn serveConnCheck(head: []const u8) anyerror!void {
+    const want = classifyServedHead(head);
+
+    const gpa = std.testing.allocator;
+    // No origin or cache tree sits behind this server: every routed request
+    // stops at statOrigin's ENOENT and touches no disk, so a check is a
+    // pure function of the input and the only mutable state is the
+    // monotonic counters asserted as deltas below.
+    var st = store_mod.Store.init(gpa, std.testing.io, "/modelfs-fuzz-absent-origin", "/modelfs-fuzz-absent-cache", 16);
+    defer st.deinit();
+    var srv = Server{ .gpa = gpa, .io = std.testing.io, .psk = fuzz_request_psk, .store = &st };
+
+    var fds: [2]c_int = undefined;
+    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return;
+    defer sys.close(fds[0]);
+    defer sys.close(fds[1]);
+    if (sys.writeAll(fds[0], head) < 0) return;
+    // End the write half so a non-terminating head meets EOF instead of
+    // holding the handler for the full head budget; replies still flow
+    // back through this half of the pair.
+    _ = c.shutdown(fds[0], c.SHUT_WR);
+
+    // Expected-path warnings (401 source lines, 502 traces) stay off the
+    // runner's stderr, like the sibling fault-tolerance tests.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    const malformed_before = st.stats.http_malformed.load(.monotonic);
+    const unauthorized_before = st.stats.http_unauthorized.load(.monotonic);
+    // acceptLoop claims one inflight slot per admitted connection; claim
+    // the matching slot here so handleConn's unconditional release leaves
+    // the gauge level.
+    _ = srv.http_inflight.fetchAdd(1, .monotonic);
+
+    handleConn(&srv, fds[1], std.mem.zeroes(c.struct_sockaddr_in));
+
+    var rbuf: [512]u8 = undefined;
+    var got_len: usize = 0;
+    while (got_len < rbuf.len) {
+        const r = c.recv(fds[0], &rbuf[got_len], rbuf.len - got_len, c.MSG_DONTWAIT);
+        if (r <= 0) break;
+        got_len += @intCast(r);
+    }
+    const got = rbuf[0..got_len];
+
+    try std.testing.expectEqual(
+        @as(u64, @intFromBool(want == .dropped)),
+        st.stats.http_malformed.load(.monotonic) - malformed_before,
+    );
+    try std.testing.expectEqual(
+        @as(u64, @intFromBool(want == .unauthorized)),
+        st.stats.http_unauthorized.load(.monotonic) - unauthorized_before,
+    );
+
+    if (want == .dropped) {
+        // An unroutable head earns silence: nothing a scanner can learn from.
+        try std.testing.expectEqual(@as(usize, 0), got.len);
+        return;
+    }
+    try std.testing.expect(got.len > 0);
+    // Header block must terminate before any body bytes (/ping's "ok").
+    try std.testing.expect(std.mem.indexOf(u8, got, "\r\n\r\n") != null);
+    switch (want) {
+        .dropped => unreachable,
+        .method_not_allowed => try std.testing.expectEqualStrings(
+            "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            got,
+        ),
+        .unauthorized => try std.testing.expectEqualStrings(
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            got,
+        ),
+        .ping_ok => try std.testing.expectEqualStrings(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            got,
+        ),
+        .no_route, .miss => {
+            try std.testing.expectEqualStrings(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                got,
+            );
+        },
+        .bad_path, .bad_range => {
+            try std.testing.expectEqualStrings(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                got,
+            );
+        },
+    }
+}
+
+fn fuzzServeConnOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var wire_buf: [2048]u8 = undefined;
+    try serveConnCheck(wire_buf[0..smith.slice(&wire_buf)]);
+}
+
+test "fuzz server conn answers every head per the routing contract" {
+    try std.testing.fuzz({}, fuzzServeConnOne, .{ .corpus = &fuzz_serve_corpus });
+}
+
+test "fuzz server conn contract holds for mutated corpus heads" {
+    // std.testing.fuzz runs each corpus entry once outside the --fuzz
+    // runner, so the continuous loop this module's other harnesses rely on
+    // never spins here (and the 0.16.0 --fuzz runner does not build at all).
+    // This drill stands in: mutated corpus shapes get the exact assertions
+    // the fuzzer would apply, deterministically, on every ordinary
+    // `zig build test` run.
+    var prng = std.Random.DefaultPrng.init(20260826);
+    const rand = prng.random();
+    const specials = "\r\n ?=&%.00";
+    var buf: [2048]u8 = undefined;
+    for (0..5_000) |_| {
+        const base = fuzz_serve_corpus[rand.uintLessThan(usize, fuzz_serve_corpus.len)];
+        const take = 1 + rand.uintLessThan(usize, @min(base.len + 24, buf.len));
+        const n = @min(take, base.len);
+        @memcpy(buf[0..n], base[0..n]);
+        // Extending past the seed stages pipelined noise behind the blank
+        // line; truncating cuts anywhere, including mid-escape or mid-CRLF.
+        @memset(buf[n..take], 'A');
+        const flips = rand.uintLessThan(usize, 6);
+        for (0..flips) |_| {
+            const p = rand.uintLessThan(usize, take);
+            switch (rand.intRangeAtMost(u8, 0, 2)) {
+                0 => buf[p] = rand.int(u8),
+                1 => buf[p] = specials[rand.uintLessThan(usize, specials.len)],
+                else => {},
+            }
+        }
+        try serveConnCheck(buf[0..take]);
+    }
+}

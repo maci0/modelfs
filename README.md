@@ -33,7 +33,7 @@ zig build -Doptimize=ReleaseFast          # ./zig-out/bin/modelfs
 zig build test --summary all              # unit tests
 ```
 
-Non-default libfuse3 locations, e.g. when cross-compiling. The vendored arm64 tree ships as `.deb` files only (`root/` and `lib/` are gitignored), so extract it first with the one extractor script CI's cross-aarch64 job runs too ([.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md) holds the provenance; the script falls back to `ar`/`tar` on hosts without dpkg):
+Non-default libfuse3 locations, e.g. when cross-compiling: the vendored arm64 tree ships as `.deb` files only (`root/` and `lib/` are gitignored), so extract it first with the one extractor script CI's cross-aarch64 job runs too ([.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md) holds the provenance; the script falls back to `ar`/`tar` on hosts without dpkg):
 
 ```bash
 ./scripts/extract_fuse3_arm64.sh

@@ -16,10 +16,11 @@ concurrency:
   group: check-${{ github.ref }}
   cancel-in-progress: true
 
-# Single knob for the toolchain version both jobs must agree on
-# (build.zig.zon declares minimum_zig_version 0.16.0); bump in one place.
-env:
-  ZIG_VERSION: "0.16.0"
+# Zig toolchain version: no knob here on purpose. setup-zig resolves the
+# exact version from minimum_zig_version in build.zig.zon when the `version`
+# input is empty, so that field is the single source of truth: bumping it
+# updates both jobs at once, and a parallel env pin that could drift from the
+# manifest cannot exist.
 
 jobs:
   check:
@@ -32,19 +33,14 @@ jobs:
       # cannot silently change what CI executes.
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      # Warm compile cache for zig build test. Zig hashes every input itself,
-      # so a stale hit cannot produce a wrong result; restore-keys keeps the
-      # cache warm across source-only edits. Keyed per job so host and
-      # aarch64 objects never mix.
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: .zig-cache
-          key: zig-${{ runner.os }}-check-${{ hashFiles('build.zig', 'build.zig.zon') }}
-          restore-keys: zig-${{ runner.os }}-check-
-
+      # Resolves Zig from minimum_zig_version in build.zig.zon (see the env
+      # note above) and verifies the tarball's minisign signature. It also
+      # owns compile-cache persistence: ZIG_LOCAL_CACHE_DIR and
+      # ZIG_GLOBAL_CACHE_DIR are pointed at <workspace>/.zig-cache and that
+      # directory is restored/saved via its own per-job, per-version-keyed
+      # actions/cache entry, so no workflow-level cache step is needed here
+      # (one would only double-upload the same directory).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
 
       # README requirement: compiling against libfuse3 needs its headers,
       # which ubuntu-latest does not preinstall.
@@ -85,17 +81,11 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
-      # Same warm compile cache, job-scoped so the aarch64 objects stay
-      # separate from the host build's (see the check job).
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: .zig-cache
-          key: zig-${{ runner.os }}-cross-aarch64-${{ hashFiles('build.zig', 'build.zig.zon') }}
-          restore-keys: zig-${{ runner.os }}-cross-aarch64-
-
+      # Same setup-zig behavior as the check job: version resolved from
+      # build.zig.zon, tarball minisign-verified, and the compile cache kept
+      # in a per-job-keyed entry, so the aarch64 objects stay separate from
+      # the host build's.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
 
       # The extracted root/ and lib/ trees are gitignored build inputs;
       # recreate them from the committed .deb files with the same extractor
