@@ -20,3 +20,8 @@ __pycache__/
 # Scratch and runtime state
 .scratch/
 .gauntlet.lock
+
+# Core dumps: process memory on disk (the daemon holds the PSK in memory)
+core
+vgcore.*
+*.core
