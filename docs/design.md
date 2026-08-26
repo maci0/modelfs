@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Sketch. Shipped behavior is [architecture.md](architecture.md) |
-| Date | 2026-08-21 |
+| Date | 2026-08-26 (goals/decisions/security rows re-verified against `src/`) |
 | Audience | Implementation |
 
 Original architecture notes. Several items here did not ship: origin-less two-node, CAS/blake3 chunks, S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rule 6 in section 4.8 (rationale: UMA OOM, see architecture.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
@@ -693,7 +693,7 @@ The table below is the original sketch. Only three of its mitigations have any s
 | Origin tampering | Same hashes; origin is untrusted for integrity | No. Origin bytes are served and cached without verification |
 | Path traversal in FUSE | Pin the tree to the namespace; no `..` out of mount | Yes: `relOk` gate at every external path boundary (src/store.zig `relOk`) |
 | Hub token leakage | Pull credentials stay in the agent, not in the mount | N/A: no pull agent or hub credential handling ships |
-| Accidental world-writable models | Preserve mode from ingest; default 0644 / 0755 | Yes, via passthrough: creation applies the caller's permission bits on the origin (src/fuse_fs.zig `clientCreateMode`; setuid/setgid/sticky stripped); cache data is 0644 |
+| Accidental world-writable models | Preserve mode from ingest; default 0644 / 0755 | Yes, via passthrough: creation and later `chmod` apply the caller's permission bits on the origin (src/fuse_fs.zig `clientCreateMode`; setuid/setgid/sticky stripped); cache data is 0644 |
 | Disk fill | `--cache-size`, `--free-space-ratio`, staging on the CAS disk, never `/tmp` | Different mechanism: cachefilesd-style percent-free watermarks `--brun/--bcull/--bstop` (src/cull.zig) |
 
 v1 auth: static shared secret or mTLS. No anonymous P2P on a public interface. Shipped as the static shared secret half only.

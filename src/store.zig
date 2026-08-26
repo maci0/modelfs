@@ -1377,6 +1377,135 @@ test "cacheFill grows entry preserving earlier piece marks" {
     try std.testing.expectEqualSlices(u8, &w3, rd[40..48]);
 }
 
+test "cacheFill resets every mark when an external truncate shrinks the file" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-extshrink");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-extshrink");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Three aligned appends fill all three pieces of a 48-byte file.
+    var chunk: [16]u8 = undefined;
+    for (&chunk, 0..) |*b, i| b.* = @truncate(i *% 31 + 1);
+    // mf_create would have made the origin file before any write lands.
+    var fb: [160]u8 = undefined;
+    var zz0: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fb, "{s}/ext.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zz0, fp), ""));
+    for ([_]u64{ 0, 16, 32 }) |off| {
+        try std.testing.expectEqual(@as(isize, 16), st.originPwrite("ext.bin", &chunk, off));
+        st.cacheFill("ext.bin", off + 16, off, &chunk, sys.monoSec());
+    }
+    {
+        const f = st.lookupRef("ext.bin").?;
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        try std.testing.expectEqual(@as(u32, 3), f.bits.filled());
+        f.mu.unlock(std.testing.io);
+    }
+
+    // Someone else truncates the shared origin to 32 bytes and rewrites the
+    // final full piece -- the shape mf_write observes when a co-writer shrank
+    // the file between our writes (observed origin size == this write's end).
+    // Regression class: keeping any mark across an external shrink would let
+    // a bit name bytes whose content the truncator replaced or removed, and
+    // reads would serve them as cached model data without a refill.
+    {
+        var zb: [160]u8 = undefined;
+        const fd = sys.open(try sys.toZ(&zb, fp), c.O_WRONLY, 0);
+        try std.testing.expect(fd >= 0);
+        defer sys.close(fd);
+        try std.testing.expectEqual(@as(i32, 0), sys.ftruncate(fd, 32));
+        try std.testing.expectEqual(@as(isize, 16), sys.pwriteAll(fd, &chunk, 16));
+    }
+    st.cacheFill("ext.bin", 32, 16, &chunk, sys.monoSec());
+
+    {
+        const f = st.lookupRef("ext.bin").?;
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        // The entry reconciled down: piece 2 is gone with the grid...
+        try std.testing.expectEqual(@as(u64, 32), f.size);
+        try std.testing.expectEqual(@as(u32, 2), f.bits.nbits);
+        try std.testing.expect(!f.bits.get(2));
+        // ...and the reset is conservative like reconcileSize's: even piece
+        // 0, whose bytes the truncate did not touch, refills rather than
+        // trusting pre-shrink marks. Only the post-shrink write's own fully
+        // covered piece is marked.
+        try std.testing.expect(!f.bits.get(0));
+        try std.testing.expect(f.bits.get(1));
+        try std.testing.expectEqual(@as(u32, 1), f.bits.filled());
+        f.mu.unlock(std.testing.io);
+    }
+
+    // The persisted sidecar names exactly this state, so a restart cannot
+    // load the pre-shrink marks back over the rewritten file.
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, "ext.bin");
+    const blob = try sys.readFileAlloc(gpa, mp, 4096);
+    defer gpa.free(blob);
+    var sidecar = try piece.Bitfield.decode(gpa, blob, st.piece_size, 32);
+    defer sidecar.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 2), sidecar.nbits);
+    try std.testing.expect(!sidecar.get(0));
+    try std.testing.expect(sidecar.get(1));
+}
+
+test "get reconciles an externally shrunken origin by wiping marks and truncating the cache fd" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-getshrink");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-getshrink");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Warm entry at 64 bytes: pieces 0 and 3 cached, sidecar saved, cache fd
+    // opened (openCache sizes it to the entry with ftruncate).
+    const f = try st.get("shrunk.bin", 64, sys.monoSec());
+    f.mu.lockUncancelable(std.testing.io);
+    f.bits.set(0);
+    f.bits.set(3);
+    f.mu.unlock(std.testing.io);
+    _ = st.saveBits(f, false);
+    try std.testing.expect(st.openCache(f) >= 0);
+    var pre: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.fstat(f.cache_fd, &pre));
+    try std.testing.expectEqual(@as(u64, 64), @as(u64, @intCast(pre.st_size)));
+
+    // The sibling grow case (32 -> 64) is covered above; this is the other
+    // direction, as mf_read observes after a co-writer truncated the shared
+    // origin: the hit path must reconcile DOWN too. reconcileSize's contract
+    // is an empty field sized for the new length plus an fd truncate, so no
+    // stale piece can serve bytes past (or underneath) the new end.
+    const f2 = try st.get("shrunk.bin", 32, sys.monoSec());
+    try std.testing.expectEqual(f, f2);
+    st.releaseFile(f2);
+
+    f.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 32), f.size);
+    try std.testing.expectEqual(@as(u32, 2), f.bits.nbits);
+    try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+    f.mu.unlock(std.testing.io);
+
+    // The open descriptor was cut with the entry: reads through it can no
+    // longer reach the truncated-away tail.
+    var post: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.fstat(f.cache_fd, &post));
+    try std.testing.expectEqual(@as(u64, 32), @as(u64, @intCast(post.st_size)));
+    st.releaseFile(f);
+}
+
 test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;

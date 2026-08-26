@@ -268,7 +268,7 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         sys.close(fd);
     }
     sys.setSockTimeout(fd, sock_timeout_ms);
-    sys.setTcpNoDelay(fd, true);
+    sys.setTcpNoDelay(fd);
     sys.setSockBuffers(fd, sock_buf_bytes);
     // Sized to max_head_bytes: the wire form of a legal deeply-nested
     // non-ASCII path plus a full-size bearer token must complete here, or
@@ -775,7 +775,7 @@ fn dial(ip: []const u8, port: u16) !c_int {
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (fd < 0) return error.Socket;
     sys.setSockTimeout(fd, dial_timeout_ms);
-    sys.setTcpNoDelay(fd, true);
+    sys.setTcpNoDelay(fd);
     sys.setSockBuffers(fd, sock_buf_bytes);
     // Bounded connect: SO_RCVTIMEO does not cover the dial itself, and a
     // blocking connect to a dead address stalls the fill path for minutes.

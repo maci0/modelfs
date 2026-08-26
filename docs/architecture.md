@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Shipped-behavior reference; kept current against `src/` |
-| Date | 2026-08-23 |
+| Date | 2026-08-26 (re-verified against `src/`) |
 | Design history | [design.md](design.md): original architecture, goals G1-G10 with ship status, key decisions and what did not ship |
 
 Shipped in `modelfs` (Zig, libfuse3). A process on a spark only opens `/models/...`.

@@ -70,6 +70,107 @@ const usage =
     \\
 ;
 
+pub fn main(init: std.process.Init) !u8 {
+    const gpa = init.gpa;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    _ = it.next(); // argv0
+    while (it.next()) |a| try argv.append(gpa, a);
+
+    if (argv.items.len == 0) {
+        std.debug.print("{s}", .{usage});
+        return 2;
+    }
+    // Bare global forms live at position 0, where parseArgs sees a command
+    // name, so they are answered here alongside their subcommand spellings.
+    // Like every other subcommand they refuse extra positional arguments
+    // instead of silently ignoring them.
+    const first = argv.items[0];
+    if (std.mem.eql(u8, first, "help") or
+        std.mem.eql(u8, first, "-h") or
+        std.mem.eql(u8, first, "--help"))
+    {
+        if (argv.items.len != 1) {
+            std.log.err("help takes no arguments", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        writeOut(init.io, usage);
+        return 0;
+    }
+    if (std.mem.eql(u8, first, "version") or
+        std.mem.eql(u8, first, "-V") or
+        std.mem.eql(u8, first, "--version"))
+    {
+        if (argv.items.len != 1) {
+            std.log.err("version takes no arguments", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
+        return 0;
+    }
+    const parsed = parseArgs(gpa, init.environ_map, argv.items) catch |err| switch (err) {
+        error.Help => {
+            writeOut(init.io, usage);
+            return 0;
+        },
+        error.Version => {
+            printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
+            return 0;
+        },
+        // Usage errors exit 2, like every other bad invocation in this CLI
+        // (missing subcommand argument, unknown command). Each one is named
+        // at its own flag site inside parseArgs; only a failure before any
+        // site could report (allocation) still needs a line here.
+        else => {
+            if (err == error.OutOfMemory) std.log.err("out of memory parsing arguments", .{});
+            return 2;
+        },
+    };
+    defer freeParsed(parsed, gpa);
+    // Positional shapes follow the Usage lines exactly; extra arguments were
+    // silently dropped before, so e.g. `status junk` and `mount a b` both
+    // looked like they succeeded with the extras meaning something.
+    if (std.mem.eql(u8, parsed.cmd, "mount")) {
+        if (parsed.rest.len != 1) {
+            std.log.err("mount takes exactly one directory argument", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        return cmdMount(init, parsed.opts, parsed.rest[0]);
+    }
+    if (std.mem.eql(u8, parsed.cmd, "status")) {
+        if (parsed.rest.len != 0) {
+            std.log.err("status takes no arguments", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        return cmdStatus(init.io, gpa, parsed.opts);
+    }
+    if (std.mem.eql(u8, parsed.cmd, "peers")) {
+        if (parsed.rest.len != 0) {
+            std.log.err("peers takes no arguments", .{});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        return cmdPeers(init.io, gpa, parsed.opts);
+    }
+    if (std.mem.eql(u8, parsed.cmd, "pin") or std.mem.eql(u8, parsed.cmd, "unpin")) {
+        if (parsed.rest.len != 1) {
+            std.log.err("{s} takes exactly one path relative to the mount", .{parsed.cmd});
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        return cmdPin(init.io, gpa, parsed.opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
+    }
+    // parseArgs refuses anything outside the commands dispatched above, so
+    // this point is unreachable unless the knownCommand list and this
+    // dispatch drift apart; failing loudly here surfaces that immediately.
+    unreachable;
+}
+
 /// Data output (help text, status JSON, lease listings, pin confirmations)
 /// goes to stdout so pipes and redirections see only results; diagnostics
 /// stay on stderr via std.log/std.debug.print. Best effort: the runtime
@@ -113,7 +214,7 @@ const Opts = struct {
     seed: std.ArrayList([]const u8) = .empty,
 };
 
-fn parseHostPort(s: []const u8, default_port: u16) !proto.LeaseAddr {
+fn parseHostPort(s: []const u8) !proto.LeaseAddr {
     // Every consumer inet_pton's the ip field (bind, dial, hops scoring), so
     // an empty host ("", ":1234") can only fail later -- or, for --seed,
     // silently on every discovery tick. Reject it where the flag is parsed.
@@ -123,7 +224,7 @@ fn parseHostPort(s: []const u8, default_port: u16) !proto.LeaseAddr {
         return .{ .ip = s[0..i], .port = port, .mbps = 0 };
     }
     if (s.len == 0) return error.BadHostPort;
-    return .{ .ip = s, .port = default_port, .mbps = 0 };
+    return .{ .ip = s, .port = proto.default_port, .mbps = 0 };
 }
 
 /// "--listen [IP:]PORT": only the port is consumed (binding is always
@@ -235,6 +336,18 @@ fn rejectOutsideMount(cmd: []const u8, flag: []const u8) !void {
         if (!builtin.is_test) std.debug.print("{s} only applies to modelfs mount\n", .{flag});
         return error.FlagOutsideMount;
     }
+}
+
+/// Refusal line for an --id/MODELFS_ID value failing discover.validId. The
+/// offending text goes through discover.displayName, never verbatim: the id
+/// can arrive from the environment (a systemd Environment= line, CI wrapper,
+/// remote shell), and this is the same echo policy discover.hostname answers
+/// to -- an id holding ESC, CR/LF, or their UTF-8 C1 spellings must refuse
+/// without injecting terminal escapes or forging log lines. Ids longer than
+/// the staging buffer render as the generic line; the refusal itself is the
+/// point and stays unconditional either way.
+fn badIdLine(buf: []u8, id: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "--id \"{s}\": must be printable ASCII without / \\ \" or a leading dot\n", .{discover.displayName(id)}) catch "--id unusable as cluster id (see 'modelfs help')\n";
 }
 
 /// Watermark percentages: parse failures name the flag instead of surfacing
@@ -388,7 +501,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             const v = try takeValue(args, a, &i);
             var it = std.mem.splitScalar(u8, v, ',');
             while (it.next()) |one| {
-                const hp = parseHostPort(one, proto.default_port) catch {
+                const hp = parseHostPort(one) catch {
                     if (!builtin.is_test) std.debug.print("--advertise {s}: bad address (want IP[:PORT])\n", .{v});
                     return error.BadHostPort;
                 };
@@ -410,7 +523,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             const s = try takeValue(args, a, &i);
             // Validate now with a named message instead of failing later in
             // mount setup with a bare parseInt error.
-            _ = parseHostPort(s, proto.default_port) catch {
+            _ = parseHostPort(s) catch {
                 if (!builtin.is_test) std.debug.print("--seed {s}: bad address (want HOST[:PORT])\n", .{s});
                 return error.BadHostPort;
             };
@@ -433,8 +546,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // discover.hostname answers to.
     if (opts.id) |id| {
         if (!discover.validId(id)) {
-            if (!builtin.is_test)
-                std.debug.print("--id \"{s}\": must be printable ASCII without / \\ \" or a leading dot\n", .{id});
+            if (!builtin.is_test) {
+                var lbuf: [512]u8 = undefined;
+                std.debug.print("{s}", .{badIdLine(&lbuf, id)});
+            }
             return error.BadId;
         }
     }
@@ -531,107 +646,6 @@ fn dupeHeaderSafePsk(gpa: std.mem.Allocator, secret: []const u8) ![]u8 {
     return gpa.dupe(u8, secret);
 }
 
-pub fn main(init: std.process.Init) !u8 {
-    const gpa = init.gpa;
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    var it = std.process.Args.Iterator.init(init.minimal.args);
-    _ = it.next(); // argv0
-    while (it.next()) |a| try argv.append(gpa, a);
-
-    if (argv.items.len == 0) {
-        std.debug.print("{s}", .{usage});
-        return 2;
-    }
-    // Bare global forms live at position 0, where parseArgs sees a command
-    // name, so they are answered here alongside their subcommand spellings.
-    // Like every other subcommand they refuse extra positional arguments
-    // instead of silently ignoring them.
-    const first = argv.items[0];
-    if (std.mem.eql(u8, first, "help") or
-        std.mem.eql(u8, first, "-h") or
-        std.mem.eql(u8, first, "--help"))
-    {
-        if (argv.items.len != 1) {
-            std.log.err("help takes no arguments", .{});
-            std.debug.print("{s}", .{usage});
-            return 2;
-        }
-        writeOut(init.io, usage);
-        return 0;
-    }
-    if (std.mem.eql(u8, first, "version") or
-        std.mem.eql(u8, first, "-V") or
-        std.mem.eql(u8, first, "--version"))
-    {
-        if (argv.items.len != 1) {
-            std.log.err("version takes no arguments", .{});
-            std.debug.print("{s}", .{usage});
-            return 2;
-        }
-        printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
-        return 0;
-    }
-    const parsed = parseArgs(gpa, init.environ_map, argv.items) catch |err| switch (err) {
-        error.Help => {
-            writeOut(init.io, usage);
-            return 0;
-        },
-        error.Version => {
-            printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
-            return 0;
-        },
-        // Usage errors exit 2, like every other bad invocation in this CLI
-        // (missing subcommand argument, unknown command). Each one is named
-        // at its own flag site inside parseArgs; only a failure before any
-        // site could report (allocation) still needs a line here.
-        else => {
-            if (err == error.OutOfMemory) std.log.err("out of memory parsing arguments", .{});
-            return 2;
-        },
-    };
-    defer freeParsed(parsed, gpa);
-    // Positional shapes follow the Usage lines exactly; extra arguments were
-    // silently dropped before, so e.g. `status junk` and `mount a b` both
-    // looked like they succeeded with the extras meaning something.
-    if (std.mem.eql(u8, parsed.cmd, "mount")) {
-        if (parsed.rest.len != 1) {
-            std.log.err("mount takes exactly one directory argument", .{});
-            std.debug.print("{s}", .{usage});
-            return 2;
-        }
-        return cmdMount(init, parsed.opts, parsed.rest[0]);
-    }
-    if (std.mem.eql(u8, parsed.cmd, "status")) {
-        if (parsed.rest.len != 0) {
-            std.log.err("status takes no arguments", .{});
-            std.debug.print("{s}", .{usage});
-            return 2;
-        }
-        return cmdStatus(init.io, gpa, parsed.opts);
-    }
-    if (std.mem.eql(u8, parsed.cmd, "peers")) {
-        if (parsed.rest.len != 0) {
-            std.log.err("peers takes no arguments", .{});
-            std.debug.print("{s}", .{usage});
-            return 2;
-        }
-        return cmdPeers(init.io, gpa, parsed.opts);
-    }
-    if (std.mem.eql(u8, parsed.cmd, "pin") or std.mem.eql(u8, parsed.cmd, "unpin")) {
-        if (parsed.rest.len != 1) {
-            std.log.err("{s} takes exactly one path relative to the mount", .{parsed.cmd});
-            std.debug.print("{s}", .{usage});
-            return 2;
-        }
-        return cmdPin(init.io, gpa, parsed.opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
-    }
-    // parseArgs refuses anything outside the commands dispatched above, so
-    // this point is unreachable unless the knownCommand list and this
-    // dispatch drift apart; failing loudly here surfaces that immediately.
-    unreachable;
-}
-
 /// realpath of path, creating the directory first when missing. label names
 /// the directory ("mountpoint", "cache") in failure messages.
 fn ensureDirReal(gpa: std.mem.Allocator, path: []const u8, label: []const u8) ![]u8 {
@@ -697,7 +711,7 @@ fn buildSeeds(gpa: std.mem.Allocator, specs: []const []const u8) !SeedList {
     var out: SeedList = .{};
     errdefer out.deinit(gpa);
     for (specs) |s| {
-        const hp = try parseHostPort(s, proto.default_port);
+        const hp = try parseHostPort(s);
         var quad: [4]u8 = undefined;
         if (discover.parseV4(hp.ip, &quad)) {
             try out.addrs.append(gpa, hp);
@@ -1112,19 +1126,50 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     return 0;
 }
 
+test "badIdLine renders refused ids through the displayName echo gate" {
+    // MODELFS_ID and --id can arrive from environments this process does not
+    // control, so the refusal line must never echo the raw value: ESC (OSC
+    // title escape) or CR/LF (forged follow-up lines) would inject into the
+    // operator's terminal exactly like discover.hostname's own gate warns.
+    var buf: [512]u8 = undefined;
+    {
+        const line = badIdLine(&buf, "\x1b]0;pwned\x07");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "\n2026-08-26 forged") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+    }
+    // The UTF-8 C1 spellings ride in as 0xC2 0x80..0xC2 0x9F and get the same
+    // withholding as their raw C0 counterparts.
+    {
+        const line = badIdLine(&buf, "\xc2\x9d0;pwned\xc2\x9c");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\xc2\x9d") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+    }
+    // A printable but invalid id (quote) still names itself verbatim, so the
+    // operator sees which value was refused.
+    {
+        const line = badIdLine(&buf, "a\"b");
+        try std.testing.expect(std.mem.indexOf(u8, line, "--id \"a\"b\":") != null);
+    }
+    // An id that cannot fit the staging buffer degrades to the generic line:
+    // the refusal stays unconditional either way.
+    const long = badIdLine(buf[0..64], "x" ** 100);
+    try std.testing.expectEqualStrings("--id unusable as cluster id (see 'modelfs help')\n", long);
+}
+
 test "parseHostPort splits and defaults" {
-    const a = try parseHostPort("192.168.1.5:9999", 18080);
+    const a = try parseHostPort("192.168.1.5:9999");
     try std.testing.expectEqualStrings("192.168.1.5", a.ip);
     try std.testing.expectEqual(@as(u16, 9999), a.port);
-    const b = try parseHostPort("spark1", 18080);
+    const b = try parseHostPort("spark1");
     try std.testing.expectEqualStrings("spark1", b.ip);
     try std.testing.expectEqual(@as(u16, 18080), b.port);
-    try std.testing.expectError(error.Overflow, parseHostPort("h:70000", 18080));
+    try std.testing.expectError(error.Overflow, parseHostPort("h:70000"));
     // An empty host names no interface: bind/dial inet_pton would reject it
     // later (a bad --seed silently, on every discovery tick), so refuse it
     // at the flag boundary instead.
-    try std.testing.expectError(error.BadHostPort, parseHostPort("", 18080));
-    try std.testing.expectError(error.BadHostPort, parseHostPort(":19081", 18080));
+    try std.testing.expectError(error.BadHostPort, parseHostPort(""));
+    try std.testing.expectError(error.BadHostPort, parseHostPort(":19081"));
 }
 
 test "listenPort accepts bare port per --listen [IP:]PORT" {
@@ -1279,7 +1324,7 @@ fn fuzzFlagValuesOne(_: void, smith: *std.testing.Smith) anyerror!void {
     // both accept as a HOST:PORT form, they must name the same explicit
     // port; on a bare host --seed defaults while --listen only takes a bare
     // numeric port.
-    const hp: ?proto.LeaseAddr = parseHostPort(s, proto.default_port) catch null;
+    const hp: ?proto.LeaseAddr = parseHostPort(s) catch null;
     const lp: ?u16 = listenPort(s) catch null;
     if (hp) |a| {
         try std.testing.expectEqual(@as(u32, 0), a.mbps);

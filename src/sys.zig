@@ -439,8 +439,8 @@ pub fn resolveIpv4(host: []const u8, out_ip: []u8) ?[]const u8 {
     return null;
 }
 
-pub fn setTcpNoDelay(fd: c_int, enable: bool) void {
-    var flag: c_int = @intFromBool(enable);
+pub fn setTcpNoDelay(fd: c_int) void {
+    var flag: c_int = 1;
     _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_NODELAY, &flag, @sizeOf(c_int));
 }
 

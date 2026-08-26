@@ -16,11 +16,9 @@ pub fn count(file_size: u64, piece_size: u32) u32 {
     return @intCast(@min((file_size +| (ps - 1)) / ps, @as(u64, std.math.maxInt(u32))));
 }
 
+/// The pwrite address of piece idx. A u64 product of two u32 values cannot
+/// overflow, so no pow2 fast path is needed here (unlike indexAt's divide).
 pub fn offset(index: u32, piece_size: u32) u64 {
-    if (@popCount(piece_size) == 1) {
-        const shift: u6 = @intCast(@ctz(piece_size));
-        return @as(u64, index) << shift;
-    }
     return @as(u64, index) * piece_size;
 }
 
