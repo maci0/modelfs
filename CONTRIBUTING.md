@@ -49,8 +49,9 @@ zig build test -Dtest-filter=store     # only tests whose name matches (substrin
 
 ## PR expectations
 
-The blocking requirement is green CI: `./scripts/check.sh` plus the
-`cross-aarch64` compile job. There are no sign-off or changelog-entry gates,
+The blocking requirement is green CI: `./scripts/check.sh`, the
+`cross-aarch64` compile job, and the `reproducibility` job. There are no
+sign-off or changelog-entry gates,
 but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) as their own
 dated section at the top (unreleased until the next release; see Cutting a
 release below), and changes to
@@ -81,8 +82,15 @@ sync:
 
 Release artifacts are reproducible: non-Debug builds are stripped of the debug
 info that records absolute build paths, so building the same tree from a
-different directory, host, locale, or timezone produces identical bytes. Verify
-a release candidate by building it twice from two different paths and comparing
+different directory, host, locale, or timezone produces identical bytes. CI
+enforces this on every PR with the `reproducibility` job; verify a release
+candidate locally the same way CI does:
+
+```bash
+./scripts/repro_check.sh    # builds twice (path/TZ/locale varied), diffs the bytes
+```
+
+or by hand by building twice from two different paths and comparing
 `sha256sum zig-out/bin/modelfs` output.
 
 There is no publish step beyond the tag: consumers fetch this repository as a

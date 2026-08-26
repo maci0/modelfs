@@ -17,6 +17,12 @@ __pycache__/
 .deps/fuse3-arm64/root/
 .deps/fuse3-arm64/lib/
 
+# Crash dumps from a failed test or debug run land in the repo root (the
+# crashing process's cwd), e.g. vgcore.<pid> from the unit test binary.
+vgcore.*
+core
+core.*
+
 # Scratch and runtime state
 .scratch/
 .gauntlet.lock
