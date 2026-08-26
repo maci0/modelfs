@@ -126,7 +126,7 @@ fn acceptLoop(self: *Server, fd: c_int) void {
                 return;
             }
             // One line per consecutive-failure run, not one per retry: fd
-            // exhaustion (EMFILE/ENFILE) is actionable, a 50 Hz stream is
+            // exhaustion (EMFILE/ENFILE) is worth acting on, a 50 Hz stream is
             // noise that hides everything else.
             if (!failing) std.log.warn("peer http: accept failed (errno {d}); retrying", .{e});
             failing = true;
@@ -2835,15 +2835,15 @@ test "fuzz request head parsing pipeline gates auth paths and ranges" {
 // traversal/control paths refused, ranges required on /data, and every
 // outcome landed in the counter status.json publishes.
 
-const seed_serve_ping_ok = corpusEntry("GET /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_post_ping = corpusEntry("POST /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_no_target = corpusEntry("HELP\r\n\r\n");
-const seed_serve_unterminated = corpusEntry("GET /have?path=a HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n");
-const seed_serve_ping_unauthed = corpusEntry("GET /ping HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n");
-const seed_serve_unknown_route = corpusEntry("GET /nope?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_bad_escape = corpusEntry("GET /have?path=%zz HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_data_no_range = corpusEntry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_data_bad_range = corpusEntry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=x-\r\n\r\n");
+const seed_serve_ping_ok = fuzzcorpus.entry("GET /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_post_ping = fuzzcorpus.entry("POST /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_no_target = fuzzcorpus.entry("HELP\r\n\r\n");
+const seed_serve_unterminated = fuzzcorpus.entry("GET /have?path=a HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n");
+const seed_serve_ping_unauthed = fuzzcorpus.entry("GET /ping HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n");
+const seed_serve_unknown_route = fuzzcorpus.entry("GET /nope?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_bad_escape = fuzzcorpus.entry("GET /have?path=%zz HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_data_no_range = fuzzcorpus.entry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_data_bad_range = fuzzcorpus.entry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=x-\r\n\r\n");
 
 const fuzz_serve_corpus = [_][]const u8{
     &seed_req_have_ok,
