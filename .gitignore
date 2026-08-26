@@ -20,3 +20,6 @@ __pycache__/
 # Scratch and runtime state
 .scratch/
 .gauntlet.lock
+
+# Debugger/valgrind run artifacts (core dumps land in the working tree)
+/vgcore.*
