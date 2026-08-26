@@ -347,8 +347,18 @@ pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: 
 }
 
 pub fn readFileBuf(buf: []u8, path: [*:0]const u8) ![]u8 {
+    return readFileBufOpenErrno(buf, path, null);
+}
+
+/// readFileBuf plus the failing open's errno written through open_errno_out
+/// (when non-null), so callers can stay silent for the expected ENOENT race
+/// while naming every other open failure, like readFileAllocOpenErrno does.
+pub fn readFileBufOpenErrno(buf: []u8, path: [*:0]const u8, open_errno_out: ?*i32) ![]u8 {
     const fd = open(path, c.O_RDONLY, 0);
-    if (fd < 0) return error.OpenFailed;
+    if (fd < 0) {
+        if (open_errno_out) |out| out.* = errno();
+        return error.OpenFailed;
+    }
     defer close(fd);
     const n = preadAll(fd, buf, 0);
     if (n < 0) return error.ReadFailed;

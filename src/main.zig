@@ -1025,8 +1025,19 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         std.debug.print("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, fuse_fs.status_file });
         return 1;
     };
-    const blob = sys.readFileAlloc(gpa, p, 4096) catch {
-        if (!builtin.is_test) std.debug.print("modelfs: not running (no {s}/{s})\n", .{ opts.cache, fuse_fs.status_file });
+    var open_errno: i32 = 0;
+    const blob = sys.readFileAllocOpenErrno(gpa, p, 4096, &open_errno) catch |err| {
+        // An artifact that exists but cannot be opened (EACCES for a status
+        // query from another user, ELOOP on a planted link) must not read as
+        // "not running (no ...)": a daemon may be live and refreshing exactly
+        // this file, and the remediation differs -- the same distinction
+        // loadPsk draws for its PSK file.
+        if (!builtin.is_test) {
+            if (err == error.OpenFailed and open_errno != sys.c.ENOENT)
+                std.debug.print("modelfs: cannot read {s}/{s} (errno {d}); cannot tell whether the daemon is running\n", .{ opts.cache, fuse_fs.status_file, open_errno })
+            else
+                std.debug.print("modelfs: not running (no {s}/{s})\n", .{ opts.cache, fuse_fs.status_file });
+        }
         return 1;
     };
     defer gpa.free(blob);
@@ -1118,11 +1129,15 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             if (!std.mem.endsWith(u8, name, ".json")) continue;
             var fbuf: [sys.c.PATH_MAX]u8 = undefined;
             const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
-            const blob = sys.readFileAlloc(gpa, fp, 64 * 1024) catch |err| {
-                // Open failure covers the normal race against expiry cleanup;
-                // anything persisting across invocations is named, matching the
-                // corrupt-lease warn below and Catalog.refresh's policy.
-                if (err != error.OpenFailed) {
+            var open_errno: i32 = 0;
+            const blob = sys.readFileAllocOpenErrno(gpa, fp, 64 * 1024, &open_errno) catch |err| {
+                // ENOENT is the normal race against expiry cleanup; any other
+                // failure persists across invocations and is named, matching
+                // the corrupt-lease warn below and Catalog.refresh's policy.
+                if (err == error.OpenFailed) {
+                    if (open_errno != sys.c.ENOENT)
+                        std.log.warn("peers: cannot open lease {s} (errno {d})", .{ discover.displayName(name), open_errno });
+                } else {
                     std.log.warn("peers: cannot read lease {s}: {t}", .{ discover.displayName(name), err });
                 }
                 continue;
@@ -1540,6 +1555,18 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     // An unparseable leftover gets the same verdict as an absent one.
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "not json"));
     try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+
+    // A status.json that exists but cannot be opened at all (self-referential
+    // symlink: ELOOP even under root) is neither running nor plainly absent:
+    // same exit-1 verdict, through the cannot-read branch rather than the
+    // absent one, so a live daemon whose artifact this user cannot read is
+    // not misdiagnosed as "no status.json".
+    {
+        var sbuf: [192]u8 = undefined;
+        try std.testing.expectEqual(@as(i32, 0), sys.c.unlink(try sys.toZ(&zbuf, fp)));
+        try std.testing.expectEqual(@as(i32, 0), sys.c.symlink(try sys.toZ(&zbuf, fp), try sys.toZ(&sbuf, fp)));
+        try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+    }
 }
 
 test "pathIsDir separates directories from files and absent paths" {
@@ -1584,6 +1611,36 @@ test "cmdPeers separates unreachable origins from empty clusters" {
     const file_origin = try std.fmt.bufPrint(&fb, "{s}/regular", .{origin_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&wb, file_origin), "x"));
     try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = file_origin }));
+}
+
+test "cmdPeers skips an unleasable lease entry instead of failing the listing" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&cb, "modelfs-peers-poison");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    // One poisoned name (self-referential symlink: open fails ELOOP even
+    // under root) beside one healthy lease. The listing must degrade to a
+    // skipped row -- named by the cannot-open warning -- never abort or hide
+    // spark9 behind the one broken entry.
+    var zbuf: [192]u8 = undefined;
+    var sbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const poison_fp = try std.fmt.bufPrint(&pbuf, "{s}/poison.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.c.symlink(try sys.toZ(&zbuf, poison_fp), try sys.toZ(&sbuf, poison_fp)));
+    const live_fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, live_fp), "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[]}"));
+
+    // Expected-path warning from the cannot-open branch; keep it off the
+    // runner's stderr like sibling fault-tolerance tests.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
 }
 
 test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {

@@ -467,13 +467,21 @@ pub const Catalog = struct {
             var fbuf: [sys.c.PATH_MAX]u8 = undefined;
             const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
             var lease_buf: [4096]u8 = undefined;
-            // ENOENT is the normal race against expiry cleanup; anything else
-            // persisting across ticks is worth naming.
-            const blob = sys.readFileBuf(&lease_buf, fp) catch |err| {
-                if (err != error.OpenFailed) {
+            // ENOENT is the normal race against expiry cleanup and stays
+            // unnamed; any other open failure (EACCES, ELOOP) persists across
+            // ticks and, left silent, reads exactly like a dead cluster -- so
+            // it is named like the read failures below.
+            var open_errno: i32 = 0;
+            const blob = sys.readFileBufOpenErrno(&lease_buf, fp, &open_errno) catch |err| switch (err) {
+                error.OpenFailed => {
+                    if (open_errno != c.ENOENT)
+                        std.log.warn("lease open failed for {s} (errno {d})", .{ displayName(name), open_errno });
+                    continue;
+                },
+                else => {
                     std.log.warn("lease read failed for {s}: {t}", .{ displayName(name), err });
-                }
-                continue;
+                    continue;
+                },
             };
             const parsed = proto.parseLease(self.gpa, blob) catch {
                 std.log.warn("skipping corrupt lease {s}", .{displayName(name)});
@@ -1392,6 +1400,12 @@ test "refresh skips unreadable and corrupt leases without dropping healthy peers
     // EISDIR (works even as root): the non-ENOENT warn branch, still a skip.
     const dir_fp = try std.fmt.bufPrint(&pbuf, "{s}/dir.json", .{cluster_d});
     try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(dir_fp, 0o755));
+    // A name that cannot even be opened (self-referential symlink: ELOOP
+    // even under root) skips through the cannot-open branch -- named like
+    // the read failures, silent only for the ENOENT expiry race.
+    var sbuf: [192]u8 = undefined;
+    const poison_fp = try std.fmt.bufPrint(&pbuf, "{s}/poison.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), c.symlink(try sys.toZ(&zbuf, poison_fp), try sys.toZ(&sbuf, poison_fp)));
     // One healthy lease among them: it must survive the walk.
     const fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
     const live = "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.1\",\"port\":18080,\"mbps\":0}]}";
