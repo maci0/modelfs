@@ -59,7 +59,7 @@ flowchart TB
 
 ### 2.1 Goals
 
-Status is against the shipped code and [architecture.md](architecture.md) (2026-08-23).
+Status is against the shipped code and [architecture.md](architecture.md) (2026-08-26).
 
 | ID | Requirement | Status |
 |---|---|---|
@@ -743,7 +743,7 @@ Resolved items were settled by the shipped code, not re-decided here; the rest r
 
 ## 13. Key decisions
 
-| Decision | Choice | Why | Status (2026-08-23) |
+| Decision | Choice | Why | Status (2026-08-26) |
 |---|---|---|---|
 | Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partly: POSIX piece cache shipped; no content-addressed store (path-keyed) |
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Holds |
