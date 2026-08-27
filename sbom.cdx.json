@@ -8,6 +8,13 @@
           "content": "d84990ee2b8e6a079ed6f77d7e5fa1fe70e2462bcf9aecd43f4a65a9ae1486c9"
         }
       ],
+      "licenses": [
+        {
+          "license": {
+            "id": "LGPL-2.1-or-later"
+          }
+        }
+      ],
       "name": "libfuse3-3",
       "purl": "pkg:deb/ubuntu/libfuse3-3@3.14.0-5build1?arch=arm64",
       "scope": "required",
@@ -21,11 +28,37 @@
           "content": "9a32e4ed3fe950417074d534207d399c5a80ad06843e265ae75a06ba703feafb"
         }
       ],
+      "licenses": [
+        {
+          "expression": "GPL-2.0-only AND LGPL-2.1-or-later"
+        }
+      ],
       "name": "libfuse3-dev",
       "purl": "pkg:deb/ubuntu/libfuse3-dev@3.14.0-5build1?arch=arm64",
       "scope": "required",
       "type": "library",
       "version": "3.14.0-5build1"
+    },
+    {
+      "name": "actions/checkout",
+      "purl": "pkg:github/actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+      "scope": "excluded",
+      "type": "library",
+      "version": "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
+    },
+    {
+      "name": "astral-sh/setup-uv",
+      "purl": "pkg:github/astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
+      "scope": "excluded",
+      "type": "library",
+      "version": "37802adc94f370d6bfd71619e3f0bf239e1f3b78"
+    },
+    {
+      "name": "mlugg/setup-zig",
+      "purl": "pkg:github/mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
+      "scope": "excluded",
+      "type": "library",
+      "version": "d1434d08867e3ee9daa34448df10607b98908d29"
     },
     {
       "hashes": [
@@ -256,6 +289,13 @@
         {
           "alg": "SHA-256",
           "content": "ffa5e7cb08f96fed9121f77b224151e41caf88feab9d652bb46c78202b6fbeda"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "name": "ast-serialize",
@@ -815,6 +855,13 @@
           "content": "febb1ce6cac545a54e6b769982824e955a700fdd9fbf3a08a3d82c990968b57d"
         }
       ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
       "name": "librt",
       "purl": "pkg:pypi/librt@0.15.0",
       "scope": "excluded",
@@ -830,6 +877,13 @@
         {
           "alg": "SHA-256",
           "content": "52e68efc3284861e772bbcd66823fde5ae21fd2fdb51c62a211403730b916558"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
         }
       ],
       "name": "mypy-extensions",
@@ -1049,6 +1103,13 @@
           "content": "ff715e45b2231a8e85de1d163d1b42791e4d7aab8f5145f85fee1b710b735aff"
         }
       ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
       "name": "mypy",
       "purl": "pkg:pypi/mypy@2.3.1",
       "scope": "excluded",
@@ -1064,6 +1125,13 @@
         {
           "alg": "SHA-256",
           "content": "a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MPL-2.0"
+          }
         }
       ],
       "name": "pathspec",
@@ -1147,6 +1215,13 @@
           "content": "fbd85d2875fdd67e833213a651f613bbf25303abf6aa822a5121f4531195678d"
         }
       ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
       "name": "ruff",
       "purl": "pkg:pypi/ruff@0.16.4",
       "scope": "excluded",
@@ -1162,6 +1237,13 @@
         {
           "alg": "SHA-256",
           "content": "dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "PSF-2.0"
+          }
         }
       ],
       "name": "typing-extensions",

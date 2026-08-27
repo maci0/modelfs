@@ -23,8 +23,8 @@ headings (`[Unreleased]` and semver matching `build.zig.zon`; dated notes are
 contributor-script `--help` handlers (`test_scripts_help.sh`),
 `ruff check scripts/`, `ruff format --check scripts/`, `mypy scripts/`, and
 
-`scripts/sbom.py --check`. CI runs that plus the aarch64 cross-compile
-and the reproducibility rebuild.
+`scripts/sbom.py --self-test` and `scripts/sbom.py --check`. CI runs that
+plus the aarch64 cross-compile and the reproducibility rebuild.
 Never loosen a gate to pass it.
 
 `run_cluster_e2e_9nodes.sh` needs `/dev/fuse` and `fusermount3`, so it runs

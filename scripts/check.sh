@@ -153,6 +153,7 @@ echo "=== mypy ==="
 mypy scripts/ || fail "mypy reported errors"
 
 echo "=== sbom ==="
+python3 "${SCRIPTS_DIR}/sbom.py" --self-test || fail "sbom self-test failed"
 python3 "${SCRIPTS_DIR}/sbom.py" --check || fail "sbom.cdx.json is out of date; regenerate with: python3 scripts/sbom.py --write"
 
 # Slowest step last: the linters above are instant, so a lint failure never

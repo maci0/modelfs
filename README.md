@@ -130,7 +130,7 @@ The benchmark script measures the machine it runs on: it writes to gitignored
 [docs/benchmarks.md](docs/benchmarks.md) and its figures are regenerated from
 representative hardware.
 
-Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); install the hash-verified lock with `uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt`. The CycloneDX inventory of that lock plus the vendored libfuse3 debs is [sbom.cdx.json](sbom.cdx.json) (`python3 scripts/sbom.py --check` in the gate).
+Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); install the hash-verified lock with `uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt`. The CycloneDX inventory of that lock, the vendored libfuse3 debs (with SPDX licenses), and the SHA-pinned GitHub Actions is [sbom.cdx.json](sbom.cdx.json) (`python3 scripts/sbom.py --check` in the gate; `--self-test` covers the parsers).
 
 ## Source layout
 
