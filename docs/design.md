@@ -3,18 +3,20 @@
 | Field | Value |
 |---|---|
 | Status | Sketch. Shipped behavior is [architecture.md](architecture.md) |
-| Date | 2026-08-26 (goals/decisions/security rows re-verified against `src/`) |
+| Date | 2026-08-27 (goals/decisions/security rows and overview/targets/path notes re-verified against `src/`) |
 | Audience | Implementation |
 
 Original architecture notes. Several items here did not ship: origin-less two-node, CAS/blake3 chunks, S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rule 6 in section 4.8 (rationale: UMA OOM, see architecture.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
 
 ModelFS is a POSIX mount for LLM weights. Nodes see a normal directory. llama.cpp, vLLM, and SGLang open files. Bytes come from a local NVMe cache, from peers over a piece protocol, or from a network origin.
 
-This is not a general-purpose distributed filesystem. Model files are huge, written rarely, and almost immutable. The system is a content-addressed blob store with a POSIX facade, a local cache, and datacenter P2P.
+This is not a general-purpose distributed filesystem. Model files are huge, written rarely, and almost immutable. The sketch was a content-addressed blob store with a POSIX facade, a local cache, and datacenter P2P (G9 did not ship: the cache is path-keyed pieces, not CAS).
 
 ---
 
 ## 1. Overview
+
+Original object model (namespace, manifests, content-addressed chunks). G9 did not ship; the diagram's optional S3 origin did not ship. Shipped topology is [architecture.md](architecture.md).
 
 Three kinds of data, three consistencies:
 
@@ -31,7 +33,7 @@ Transfer units are not the same as dedup units:
 - **Chunks** (64 KiB to 1 MiB, content-defined): dedup and integrity.
 - **Pieces** (4 MiB to 16 MiB, concatenated chunks): what the swarm moves.
 
-Mount is immediately usable because the namespace is tiny. `ls /models` and `stat` are local after catalog sync. This sketch assumed the 140 GiB payload would hydrate in the background and on demand and, once on NVMe, leave the agent out of the I/O path so mmap went native; what shipped is on-demand per piece only (a miss blocks until that one piece fills, no background stripe) and `direct_io` by default, so FUSE mmap fails unless `--kernel-cache` is set — see architecture.md.
+Mount is immediately usable because the namespace is tiny. This sketch assumed `ls /models` and `stat` are local after catalog sync, and that the 140 GiB payload would hydrate in the background and on demand and, once on NVMe, leave the agent out of the I/O path so mmap went native. What shipped: `stat` / `readdir` hit the origin (no local catalog; `mf_getattr` / `mf_readdir` in src/fuse_fs.zig); on-demand per piece only (a miss blocks until that one piece fills, no background stripe); `direct_io` by default, so FUSE mmap fails unless `--kernel-cache` is set — see architecture.md.
 
 ```mermaid
 flowchart TB
@@ -59,15 +61,15 @@ flowchart TB
 
 ### 2.1 Goals
 
-Status is against the shipped code and [architecture.md](architecture.md) (2026-08-26).
+Status is against the shipped code and [architecture.md](architecture.md) (2026-08-27).
 
 | ID | Requirement | Status |
 |---|---|---|
-| G1 | Store model files on optional network storage (origin). | Changed: origin is required, a POSIX dir, not S3. |
+| G1 | Store model files on optional network storage (origin). | Superseded: origin is required, a POSIX dir, not S3. |
 | G2 | Mount the same tree on every cluster node as a POSIX directory. | Shipped. |
 | G3 | Each node that uses a file caches its bytes locally ("cache everything" of the working set). | Partial: pieces cache locally on read; no full-file prefetch. |
 | G4 | Nodes exchange missing pieces with each other, torrent-style, in the background. | Partial: peers serve miss pieces on demand; no background swarm. |
-| G5 | Mount is immediately usable: names and sizes exist before bytes arrive. | Shipped. |
+| G5 | Mount is immediately usable: names and sizes exist before bytes arrive. | Shipped (origin `stat`/`readdir`; no local catalog). |
 | G6 | Optional pin: pinned chunks are never LRU-evicted. | Shipped (path-level pin marker). |
 | G7 | Ingest on any node (download, `cp`, `modelfs pull`). Replicate back to origin. | Partial: writes are write-through to origin; no `modelfs pull`. |
 | G8 | Two-node mode with no extra store. Replication factor 2. No Redis, no etcd required. | Not shipped (origin required); "no Redis, no etcd" still holds. |
@@ -103,6 +105,8 @@ JuiceFS, Nydus, Dragonfly, and CVMFS are closer. Section 6 maps them onto these 
 ---
 
 ## 4. Proposed design
+
+Original proposal. It did not ship as written; goal status is section 2.1, decisions are section 13, and current behavior is [architecture.md](architecture.md).
 
 ### 4.1 Cache policy: replicate-on-read
 
@@ -348,6 +352,8 @@ Tokenizer json hydrates in a millisecond. Weight reads trip the piece scheduler 
 
 ## 5. Targets
 
+Original sketch targets, not shipped SLOs. Catalog/manifest/"agent not in path"/RF=2 rows cannot apply to what ran (G8, G9, section 13 Frontend). Piece-fill latency and throughput were later measured on loopback, not 25 GbE: [benchmarks.md](benchmarks.md).
+
 Assumptions: 25 GbE or better LAN, local NVMe, models from ~4 GiB GGUF to ~200 GiB safetensors.
 
 | Metric | Target |
@@ -364,7 +370,9 @@ Assumptions: 25 GbE or better LAN, local NVMe, models from ~4 GiB GGUF to ~200 G
 
 ## 6. Implementation options
 
-Three strategies. Pick one. Mixing "build a DFS" with "wrap JuiceFS" is how this becomes a five-year project.
+Original options analysis. Strategy C (build ModelFS) is what this repo is; the v1 stack recommended in section 7 was not followed (section 13).
+
+Three strategies. Mixing "build a DFS" with "wrap JuiceFS" is how this becomes a five-year project.
 
 ```mermaid
 flowchart TB
@@ -628,7 +636,7 @@ internal/pull/        # hf and URL ingest
 - A custom kernel module.
 - A new object store.
 - Redis as a required dependency.
-- FUSE `direct_io` hot path.
+- FUSE `direct_io` hot path. Reversed: the mount defaults to `direct_io` (UMA OOM; see architecture.md and section 13 Frontend).
 - BitTorrent spec compatibility.
 - Tensor-aware CDC before a working mmap hydrate.
 - Multi-writer random updates inside a GGUF.
@@ -636,6 +644,8 @@ internal/pull/        # hf and URL ingest
 ---
 
 ## 7. Recommended path
+
+Original recommendation. It was not followed. What was decided, including supersessions, is section 13; what runs is [architecture.md](architecture.md).
 
 **Build ModelFS (strategy C)** with a filesystem or S3 origin adapter. Do not start from JuiceFS or Nydus: G8 (two-node, no extra store) and G7 (ingest here, replicate back) fight those products' control planes.
 
@@ -658,6 +668,8 @@ v1.1: FastCDC + tensor split, EROFS read path, Kubernetes CSI, Hub Xet adapter.
 ---
 
 ## 8. Incremental implementation
+
+Original sequence. The repo did not implement these steps in order (no CAS, no Have/Want/Piece, no `modelfs pull`).
 
 Each step is independently testable. Do not start with Kubernetes or CDC.
 
@@ -702,6 +714,8 @@ v1 auth: static shared secret or mTLS. No anonymous P2P on a public interface. S
 
 ## 10. Observability
 
+Original sketch minimum. Shipped signals (tick line, `status.json`) are in [architecture.md](architecture.md); there is no per-file digest, hydrate %, or replicate-lag view, and no verify-fail counter (no hashes).
+
 Minimum:
 
 - Per file: size, digest, pieces local / remote / origin, pin state, hydrate %
@@ -714,6 +728,8 @@ Logs at piece granularity are too noisy. Log file-level start/finish, verify fai
 ---
 
 ## 11. Risks
+
+Original sketch risks. Passthrough, sqlite, CDC, and `commit=origin`/`rf=2` mitigations did not ship; mmap stalls are addressed by `direct_io` (section 13 Frontend). Current failure modes are [architecture.md](architecture.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
 
 | Risk | Severity | Mitigation |
 |---|---|---|
@@ -743,7 +759,7 @@ Resolved items were settled by the shipped code, not re-decided here; the rest r
 
 ## 13. Key decisions
 
-| Decision | Choice | Why | Status (2026-08-26) |
+| Decision | Choice | Why | Status (2026-08-27) |
 |---|---|---|---|
 | Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partly: POSIX piece cache shipped; no content-addressed store (path-keyed) |
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Holds |

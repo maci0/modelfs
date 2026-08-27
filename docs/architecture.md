@@ -203,6 +203,8 @@ UMA: kernel page cache is off (`direct_io`). mmap of FUSE files will fail; engin
 
 ## What did not ship
 
+Canonical status is [design.md](design.md) sections 2.1 (G1–G10) and 13 (key decisions):
+
 - Origin-less two-node (no shared dir)
 - Content-addressed dedup / blake3 chunks
 - Full-file background stripe
