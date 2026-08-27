@@ -2,9 +2,12 @@
 
 ## Supported versions
 
-The `0.1.x` line is supported: security fixes land on `main` and ship in the
-next `v0.1.x` tag matching `build.zig.zon`'s `.version`, which
-`modelfs version` prints. `v0.1.0` is the first tag. If you build from an
+`v0.1.0` is the current release (tag `v0.1.0`, matching `.version = "0.1.0"`
+in [build.zig.zon](build.zig.zon), which `modelfs version` prints), and the
+`0.1.x` line receives security fixes. Fixes land on `main`; a fix concerning
+a released line is noted in [CHANGELOG.md](CHANGELOG.md) with the affected
+and fixed versions named, and shipped as the next `v<version>` tag per the
+release procedure in [CONTRIBUTING.md](CONTRIBUTING.md). If you build from an
 intermediate revision rather than a tag, pin the commit hash it came from
 (see the README) so you know exactly what you are running and can rebuild
 from a fixed revision.
@@ -18,7 +21,8 @@ is exploitable.
 Please include what you can of:
 
 * The commit hash you built from (`modelfs version` prints the declared
-  version, but until a tag exists the hash is what identifies your binary).
+  version, which names the `v<version>` tag for a tagged build; a `main`
+  build is identified by its hash alone).
 * A minimal reproduction: mount flags, the peer request or lease file involved,
   and observed versus expected behavior.
 * Your assessment of impact: origin exposure, peer spoofing, cache poisoning,
@@ -27,6 +31,7 @@ Please include what you can of:
 ## What happens next
 
 Maintainers triage in the advisory thread, land the fix on `main`, and note it
-in [CHANGELOG.md](CHANGELOG.md) with credit to the reporter unless asked not
-to. The fix ships as the next `v0.1.x` tag; its changelog entry names the
-fixed version.
+in [CHANGELOG.md](CHANGELOG.md) under `[Unreleased]` with credit to the
+reporter unless asked not to. When a released line is affected, the entry
+names the affected and fixed versions so users can tell whether they must
+upgrade.
