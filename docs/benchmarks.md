@@ -28,7 +28,7 @@ per-peer cost falls as the cluster grows instead of scaling linearly. The first
 call carries process warmup. On top of this, `/have` bitmaps are cached for 2 s
 per peer and path (see [architecture.md](architecture.md)).
 
-![Query latency vs cluster size](figures/fig1_cluster_latency_scaling.png)
+![Query latency vs cluster size](figures/fig1_cluster_latency_scaling.svg)
 
 ## 2. Throughput vs piece size
 
@@ -51,7 +51,7 @@ cost being amortised against page-cache and socket-buffer effects rather than a
 clean curve. 16 MiB is the default piece: past it the gain is small, and a miss
 costs the reader the whole piece before the read returns.
 
-![Throughput vs piece size](figures/fig2_throughput_vs_piece_size.png)
+![Throughput vs piece size](figures/fig2_throughput_vs_piece_size.svg)
 
 ## 3. Tier comparison
 
@@ -69,4 +69,4 @@ The ordering is the point: a peer answers roughly an order of magnitude faster
 than the origin, so the first node to pull a model pays NFS once and the rest pay
 peer latency.
 
-![Tier latency comparison](figures/fig3_tier_latency_comparison.png)
+![Tier latency comparison](figures/fig3_tier_latency_comparison.svg)

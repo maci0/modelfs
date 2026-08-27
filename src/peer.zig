@@ -3262,6 +3262,7 @@ const fuzz_serve_corpus = [_][]const u8{
     &seed_req_wrong_auth,
     &seed_req_control_path,
     &seed_req_c1_path,
+    &seed_req_c1_csi_path,
     &seed_req_line_sep_path,
     &seed_req_max_range,
     &seed_req_inverted_range,

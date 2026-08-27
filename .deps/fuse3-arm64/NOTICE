@@ -1,0 +1,14 @@
+Vendored Ubuntu noble libfuse3 3.14.0-5build1 (arm64) for
+cross-compiling modelfs. The `.deb` files are unmodified Ubuntu
+archive artifacts; SHA256SUMS is the digest list extract and
+build.zig both verify.
+
+Upstream: https://github.com/libfuse/libfuse
+Ubuntu pool URLs and refresh steps: README.md in this directory.
+
+The shared library this project links (libfuse3, `lib/*` in upstream)
+is LGPL-2.1-or-later. Other files in the source package are GPL-2.
+The Debian copyright file covering these exact packages is `copyright`
+in this directory (extracted from libfuse3-3).
+
+modelfs is GPL-3.0-or-later and links libfuse3 dynamically.

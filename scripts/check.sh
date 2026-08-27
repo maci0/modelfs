@@ -13,7 +13,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 Usage: ./scripts/check.sh
 
 The blocking static gate: zig fmt, unit tests, vendored libfuse3
-digests and extract, shellcheck, ruff, mypy. Same command the CI
+digests and extract, shellcheck, ruff, mypy, sbom. Same command the CI
 `check` job runs. Requires the pinned .venv from setup.
 
 Contributor commands (also listed by `zig build --help`):
@@ -42,8 +42,8 @@ fail() {
 
 # CI installs the pinned Python tooling into .venv and puts it on PATH
 # before running this script. Refuse to stand in with PATH's ruff/mypy:
-# those versions (and missing matplotlib stubs) disagree with the lock
-# and fail either here or only after push.
+# those versions disagree with the lock and fail either here or only after
+# push.
 if [[ -d "${ROOT_DIR}/.venv/bin" ]]; then
     export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
 else
@@ -81,6 +81,12 @@ fi
 
 echo "=== zig fmt --check ==="
 zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported unformatted files; fix with: zig build fmt"
+
+echo "=== vendored fuse3 hashes ==="
+(
+    cd "${ROOT_DIR}/.deps/fuse3-arm64"
+    sha256sum -c SHA256SUMS
+) || fail "vendored libfuse3 sha256 mismatch; refresh per .deps/fuse3-arm64/README.md"
 
 echo "=== shellcheck ==="
 # Defect-oriented optional checks the tree already passes: every case
@@ -120,6 +126,9 @@ ruff format --check scripts/ || fail "ruff format --check reported unformatted f
 
 echo "=== mypy ==="
 mypy scripts/ || fail "mypy reported errors"
+
+echo "=== sbom ==="
+python3 "${SCRIPTS_DIR}/sbom.py" --check || fail "sbom.cdx.json is out of date; regenerate with: python3 scripts/sbom.py --write"
 
 # Slowest step last: the linters above are instant, so a lint failure never
 # pays for the full compile first.

@@ -99,7 +99,7 @@ Measured with nine `modelfs` instances on **one host over TCP loopback**, not ac
 | Peak `sendfile` throughput (64 MiB pieces) | 3.5 GB/s |
 | `/ping` sweep across 9 instances | 1.1 ms total |
 
-<img src="docs/figures/fig2_throughput_vs_piece_size.png" alt="Throughput against piece size, 256 KiB to 64 MiB" width="640">
+<img src="docs/figures/fig2_throughput_vs_piece_size.svg" alt="Throughput against piece size, 256 KiB to 64 MiB" width="640">
 
 The piece-size sweep is why the default piece is 16 MiB: past it the gain is small, and every miss costs the reader a whole piece before the read returns.
 
@@ -125,7 +125,7 @@ The benchmark script measures the machine it runs on: it writes to gitignored
 [docs/benchmarks.md](docs/benchmarks.md) and its figures are regenerated from
 representative hardware.
 
-Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); install the hash-verified lock with `uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt`.
+Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); install the hash-verified lock with `uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt`. The CycloneDX inventory of that lock plus the vendored libfuse3 debs is [sbom.cdx.json](sbom.cdx.json) (`python3 scripts/sbom.py --check` in the gate).
 
 ## Source layout
 

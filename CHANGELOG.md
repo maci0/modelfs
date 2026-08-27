@@ -6,8 +6,10 @@ Work since `v0.1.0`. A binary built from this tree still prints `0.1.0`
 until the next tag is cut (CONTRIBUTING.md, Cutting a release); pin a
 commit hash if you are not on the tag.
 
-- **The test binary compiles again**: two fuzz-corpus seeds in `src/peer.zig` were both named `seed_req_c1_path` (C1 in a filename vs C1 CSI-style), so `zig build test` died at compile.
-
+- **Python gate tooling no longer pulls matplotlib**: the lock installed numpy, pillow, fonttools, and the rest of that tree so mypy could type-check the benchmark plotter, and every CI job paid for it. Figures are SVG written with the stdlib; `requirements-dev.txt` is ruff and mypy only.
+- **Vendored libfuse3 hashes live in one file and are checked before unpack**: extract used to test only that the `.deb` files exist; `build.zig` and the README each copied the digests. `.deps/fuse3-arm64/SHA256SUMS` is the list extract verifies, `build.zig` reads, and `check.sh` checks. NOTICE and the Debian copyright file sit beside the debs.
+- **A CycloneDX inventory is generated from the lock and the vendored debs**: `scripts/sbom.py` writes `sbom.cdx.json`; `check.sh` fails if it drifted.
+- **The peer request fuzz corpus compiles again**: two C1-path seeds were both named `seed_req_c1_path`, so `zig build test` died with a duplicate struct member. The CSI-shaped seed is `seed_req_c1_csi_path`.
 - **Mount fails fast on silent misconfiguration**: `--listen`/`--advertise`/`--seed` port 0 used to bind (or publish) an undialable address while the lease still said `:0`; origin overlapping the cache wrote piece files onto the shared store; `MODELFS_PSK_VALUE` plus `--psk` or `MODELFS_PSK` silently preferred the env secret; empty `--origin`/`--cache`/`--psk` failed later as "not reachable"; and an over-long `MODELFS_PSK_VALUE` started the daemon then failed every peer head. Each is refused at parse or load with a named message. `modelfs help`, README, docs/architecture.md, and docs/THREAT_MODEL.md match.
 
 - **Unicode line/paragraph separators no longer pass the path and echo gates**: `relOk` and `discover.printable` already refused C0/DEL and UTF-8 C1 so a planted name could not inject into the journal or a terminal, but U+2028/U+2029 (the remaining Unicode line terminators) still passed. A peer path `gguf/a\u2028ERROR.bin` or a lease id `spark1\u2028ERROR forged` would split a log line or `modelfs peers` listing. Both gates now refuse those sequences; incomplete encodings stay legal display noise, matching a trailing 0xC2.

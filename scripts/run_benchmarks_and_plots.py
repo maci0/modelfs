@@ -15,21 +15,14 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path
 
 # Sibling module (this directory is sys.path[0] when the script runs): the
 # daemon-readiness policy shared with cluster_verify.py.
 import peer_ping
-
-try:
-    import matplotlib.pyplot as plt
-except ModuleNotFoundError:
-    sys.exit(
-        "matplotlib not found: install the pinned Python tooling "
-        "(uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt, "
-        "see CONTRIBUTING.md); this script re-execs under .venv automatically once it exists"
-    )
 
 BENCH_PSK = "bench_psk_key_123456789"
 
@@ -53,8 +46,8 @@ def project_root() -> Path:
 _ROOT = project_root()
 
 # Same convention as scripts/check.sh: when the pinned .venv exists, run under
-# it, so benchmarks use the declared interpreter (.python-version) and the
-# locked matplotlib instead of whatever python3 is first on PATH.
+# it, so benchmarks use the declared interpreter (.python-version) instead of
+# whatever python3 is first on PATH.
 _VENV_PYTHON = _ROOT / ".venv" / "bin" / "python3"
 
 # Run artifacts stay on disk in the gitignored scratch dir. The default
@@ -108,12 +101,6 @@ def stop_mount(p: subprocess.Popen[bytes], mount_dir: str) -> None:
     unmount(mount_dir)
 
 
-plt.style.use("seaborn-v0_8-paper" if "seaborn-v0_8-paper" in plt.style.available else "default")
-plt.rcParams["font.sans-serif"] = "DejaVu Sans"
-plt.rcParams["axes.edgecolor"] = "#333333"
-plt.rcParams["axes.linewidth"] = 0.8
-
-
 def build_modelfs() -> str:
     print("=== Building modelfs binary ===")
     # ReleaseFast: these figures document the daemon operators run (README
@@ -128,13 +115,15 @@ def build_modelfs() -> str:
         encoding="utf-8",
         errors="replace",
         check=False,
+        cwd=_ROOT,
     )
     if res.returncode != 0:
         print("Build failed:", res.stderr)
         sys.exit(1)
-    bin_path = os.path.abspath("zig-out/bin/modelfs")
-    assert os.path.exists(bin_path), f"Binary missing at {bin_path}"
-    return bin_path
+    bin_path = _ROOT / "zig-out" / "bin" / "modelfs"
+    if not bin_path.is_file():
+        sys.exit(f"Binary missing at {bin_path}")
+    return os.fspath(bin_path)
 
 
 def make_origin_and_psk(temp_dir: str) -> tuple[str, str]:
@@ -321,6 +310,181 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+_FONT = "DejaVu Sans, sans-serif"
+_HEADROOM = 1.15
+_Y_TICKS = 4
+_BAR_FRACTION = 0.55
+_LINE_BOX = (650, 400, 56, 20, 44, 52)
+_BAR_BOX = (750, 420, 56, 20, 44, 64)
+_TIER_BOX = (650, 420, 56, 20, 44, 64)
+
+
+@dataclass(slots=True)
+class _Box:
+    width: int
+    height: int
+    left: int
+    right: int
+    top: int
+    bottom: int
+
+    @property
+    def plot_w(self) -> int:
+        return self.width - self.left - self.right
+
+    @property
+    def plot_h(self) -> int:
+        return self.height - self.top - self.bottom
+
+
+def _box(dims: tuple[int, int, int, int, int, int]) -> _Box:
+    return _Box(*dims)
+
+
+def _svg_escape(text: str) -> str:
+    return escape(text, quote=True)
+
+
+def _axis_max(values: list[float]) -> float:
+    peak = max(values, default=0.0)
+    if peak <= 0:
+        return 1.0
+    return peak * _HEADROOM
+
+
+def _fmt_tick(value: float) -> str:
+    text = f"{value:.2f}"
+    if text.endswith(".00"):
+        return text[:-3]
+    return text
+
+
+def _write_svg(path: Path, body: str, box: _Box) -> None:
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{box.width}" height="{box.height}" '
+        f'viewBox="0 0 {box.width} {box.height}">\n{body}</svg>\n',
+        encoding="utf-8",
+    )
+
+
+def _chart_frame(box: _Box, title: str, xlabel: str, ylabel: str, y_max: float) -> str:
+    plot_w = box.plot_w
+    plot_h = box.plot_h
+    y_mid = box.top + plot_h / 2
+    parts: list[str] = [
+        f'<rect width="{box.width}" height="{box.height}" fill="#ffffff"/>',
+        (
+            f'<text x="{box.width / 2:.1f}" y="24" text-anchor="middle" '
+            f'font-family="{_FONT}" font-size="14" font-weight="bold">'
+            f"{_svg_escape(title)}</text>"
+        ),
+        (
+            f'<text x="{box.left + plot_w / 2:.1f}" y="{box.height - 10}" text-anchor="middle" '
+            f'font-family="{_FONT}" font-size="11">{_svg_escape(xlabel)}</text>'
+        ),
+        (
+            f'<text x="16" y="{y_mid:.1f}" text-anchor="middle" '
+            f'transform="rotate(-90 16 {y_mid:.1f})" '
+            f'font-family="{_FONT}" font-size="11">{_svg_escape(ylabel)}</text>'
+        ),
+        (
+            f'<rect x="{box.left}" y="{box.top}" width="{plot_w}" height="{plot_h}" '
+            f'fill="none" stroke="#333333" stroke-width="0.8"/>'
+        ),
+    ]
+    for i in range(_Y_TICKS + 1):
+        frac = i / _Y_TICKS
+        y = box.top + plot_h * (1 - frac)
+        value = y_max * frac
+        parts.append(
+            f'<line x1="{box.left}" y1="{y:.1f}" x2="{box.left + plot_w}" y2="{y:.1f}" '
+            f'stroke="#333333" stroke-dasharray="4 4" stroke-opacity="0.35"/>'
+        )
+        parts.append(
+            f'<text x="{box.left - 6}" y="{y + 3:.1f}" text-anchor="end" '
+            f'font-family="{_FONT}" font-size="9">{_svg_escape(_fmt_tick(value))}</text>'
+        )
+    return "\n".join(parts) + "\n"
+
+
+def _require_parallel(left: int, right: int, what: str) -> None:
+    if left != right or left == 0:
+        sys.exit(f"{what} must be non-empty and parallel")
+
+
+def _write_line_chart(path: Path, ys: list[float], x_labels: list[str], title: str) -> None:
+    _require_parallel(len(ys), len(x_labels), "line chart values and labels")
+    box = _box(_LINE_BOX)
+    y_max = _axis_max(ys)
+    frame = _chart_frame(
+        box, title, "Active Cluster Nodes (Count)", "Total Query Latency (ms)", y_max
+    )
+    n = len(ys)
+    span = n - 1 if n > 1 else 1
+    pts: list[str] = []
+    extras: list[str] = []
+    for i, y in enumerate(ys):
+        px = box.left + (i / span) * box.plot_w
+        py = box.top + box.plot_h * (1 - y / y_max)
+        pts.append(f"{px:.1f},{py:.1f}")
+        extras.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="4" fill="#1f77b4"/>')
+        extras.append(
+            f'<text x="{px:.1f}" y="{box.top + box.plot_h + 16}" text-anchor="middle" '
+            f'font-family="{_FONT}" font-size="10">{_svg_escape(x_labels[i])}</text>'
+        )
+    body = (
+        frame
+        + f'<polyline fill="none" stroke="#1f77b4" stroke-width="2.2" points="{" ".join(pts)}"/>\n'
+        + "\n".join(extras)
+        + "\n"
+    )
+    _write_svg(path, body, box)
+
+
+def _write_bar_chart(
+    path: Path,
+    labels: list[str],
+    values: list[float],
+    colors: list[str],
+    title: str,
+) -> None:
+    _require_parallel(len(labels), len(values), "bar chart labels and values")
+    _require_parallel(len(colors), len(values), "bar chart colors and values")
+    box = _box(_TIER_BOX if path.name.startswith("fig3_") else _BAR_BOX)
+    xlabel = "" if path.name.startswith("fig3_") else "Piece Chunk Size"
+    ylabel = (
+        "Fetch Latency per 4MB Block (ms)"
+        if path.name.startswith("fig3_")
+        else "Transfer Throughput (MB/s)"
+    )
+    value_fmt = "{:.2f} ms" if path.name.startswith("fig3_") else "{:.0f} MB/s"
+    y_max = _axis_max(values)
+    frame = _chart_frame(box, title, xlabel, ylabel, y_max)
+    n = len(values)
+    slot = box.plot_w / n
+    bar_w = slot * _BAR_FRACTION
+    extras: list[str] = []
+    for i, (label, value, color) in enumerate(zip(labels, values, colors, strict=True)):
+        bh = box.plot_h * (value / y_max)
+        x = box.left + i * slot + (slot - bar_w) / 2
+        y = box.top + box.plot_h - bh
+        extras.append(
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{bh:.1f}" '
+            f'fill="{_svg_escape(color)}" stroke="#333333" stroke-width="0.8"/>'
+        )
+        extras.append(
+            f'<text x="{x + bar_w / 2:.1f}" y="{y - 6:.1f}" text-anchor="middle" '
+            f'font-family="{_FONT}" font-size="8" font-weight="bold">'
+            f"{_svg_escape(value_fmt.format(value))}</text>"
+        )
+        extras.append(
+            f'<text x="{x + bar_w / 2:.1f}" y="{box.top + box.plot_h + 16}" text-anchor="middle" '
+            f'font-family="{_FONT}" font-size="10">{_svg_escape(label)}</text>'
+        )
+    _write_svg(path, frame + "\n".join(extras) + "\n", box)
+
+
 def plot_figures(
     node_counts: list[int],
     latencies_ms: list[float],
@@ -332,112 +496,37 @@ def plot_figures(
     figures_dir = out_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(6.5, 4), dpi=300)
-    ax.plot(
-        node_counts,
+    fig1_path = figures_dir / "fig1_cluster_latency_scaling.svg"
+    _write_line_chart(
+        fig1_path,
         latencies_ms,
-        marker="o",
-        linewidth=2.2,
-        color="#1f77b4",
-        markersize=6,
-        label="Cluster Response Latency",
-    )
-    ax.set_title(
+        [str(n) for n in node_counts],
         "modelfs Cluster Endpoint Query Latency Scaling",
-        fontsize=12,
-        fontweight="bold",
-        pad=10,
     )
-    ax.set_xlabel("Active Cluster Nodes (Count)", fontsize=10, labelpad=8)
-    ax.set_ylabel("Total Query Latency (ms)", fontsize=10, labelpad=8)
-    ax.set_xticks(node_counts)
-    ax.grid(visible=True, linestyle="--", alpha=0.5)
-    ax.legend(frameon=True, facecolor="white", framealpha=0.9)
-    plt.tight_layout()
-    fig1_path = str(figures_dir / "fig1_cluster_latency_scaling.png")
-    fig.savefig(fig1_path, dpi=300)
-    plt.close(fig)
-    print(f"✓ Saved Figure 1: {fig1_path}")
+    print(f"Saved Figure 1: {fig1_path}")
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.2), dpi=300)
-    bars = ax.bar(
+    fig2_path = figures_dir / "fig2_throughput_vs_piece_size.svg"
+    _write_bar_chart(
+        fig2_path,
         chunk_labels,
         throughputs_mbps,
-        color="#2ca02c",
-        width=0.55,
-        edgecolor="#1b661b",
-        linewidth=0.8,
-    )
-    ax.set_title(
+        ["#2ca02c"] * len(throughputs_mbps),
         "modelfs Zero-Copy HTTP Piece Throughput Across Chunk Sizes",
-        fontsize=12,
-        fontweight="bold",
-        pad=10,
     )
-    ax.set_xlabel("Piece Chunk Size", fontsize=10, labelpad=8)
-    ax.set_ylabel("Transfer Throughput (MB/s)", fontsize=10, labelpad=8)
-    ax.grid(axis="y", linestyle="--", alpha=0.5)
+    print(f"Saved Figure 2: {fig2_path}")
 
-    for bar in bars:
-        height = bar.get_height()
-        ax.annotate(
-            f"{height:.0f} MB/s",
-            xy=(bar.get_x() + bar.get_width() / 2, height),
-            xytext=(0, 4),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=7.5,
-            fontweight="bold",
-        )
-
-    plt.tight_layout()
-    fig2_path = str(figures_dir / "fig2_throughput_vs_piece_size.png")
-    fig.savefig(fig2_path, dpi=300)
-    plt.close(fig)
-    print(f"✓ Saved Figure 2: {fig2_path}")
-
-    fig, ax = plt.subplots(figsize=(6.5, 4), dpi=300)
-    tiers = ["Local NVMe Cache", "Peer HTTP (Sendfile)", "NFS Origin Fallback"]
     # Illustrative design targets, not measured here; the report says so too.
+    tiers = ["Local NVMe Cache", "Peer HTTP (Sendfile)", "NFS Origin Fallback"]
     tier_latencies = [0.15, 0.65, 8.5]
-    colors = ["#1f77b4", "#ff7f0e", "#d62728"]
-
-    bars = ax.bar(
+    fig3_path = figures_dir / "fig3_tier_latency_comparison.svg"
+    _write_bar_chart(
+        fig3_path,
         tiers,
         tier_latencies,
-        color=colors,
-        width=0.45,
-        edgecolor="#333333",
-        linewidth=0.8,
-    )
-    ax.set_title(
+        ["#1f77b4", "#ff7f0e", "#d62728"],
         "modelfs Block Fetch Latency by Storage Tier (illustrative)",
-        fontsize=12,
-        fontweight="bold",
-        pad=10,
     )
-    ax.set_ylabel("Fetch Latency per 4MB Block (ms)", fontsize=10, labelpad=8)
-    ax.grid(axis="y", linestyle="--", alpha=0.5)
-
-    for bar in bars:
-        height = bar.get_height()
-        ax.annotate(
-            f"{height:.2f} ms",
-            xy=(bar.get_x() + bar.get_width() / 2, height),
-            xytext=(0, 4),
-            textcoords="offset points",
-            ha="center",
-            va="bottom",
-            fontsize=8.5,
-            fontweight="bold",
-        )
-
-    plt.tight_layout()
-    fig3_path = str(figures_dir / "fig3_tier_latency_comparison.png")
-    fig.savefig(fig3_path, dpi=300)
-    plt.close(fig)
-    print(f"✓ Saved Figure 3: {fig3_path}")
+    print(f"Saved Figure 3: {fig3_path}")
 
 
 def generate_report(
@@ -481,7 +570,7 @@ per-peer cost falls as the cluster grows instead of scaling linearly. The first
 call carries process warmup. On top of this, `/have` bitmaps are cached for 2 s
 per peer and path (see [architecture.md](architecture.md)).
 
-![Query latency vs cluster size](figures/fig1_cluster_latency_scaling.png)
+![Query latency vs cluster size](figures/fig1_cluster_latency_scaling.svg)
 
 ## 2. Throughput vs piece size
 
@@ -496,7 +585,7 @@ cost being amortised against page-cache and socket-buffer effects rather than a
 clean curve. 16 MiB is the default piece: past it the gain is small, and a miss
 costs the reader the whole piece before the read returns.
 
-![Throughput vs piece size](figures/fig2_throughput_vs_piece_size.png)
+![Throughput vs piece size](figures/fig2_throughput_vs_piece_size.svg)
 
 ## 3. Tier comparison
 
@@ -514,7 +603,7 @@ The ordering is the point: a peer answers roughly an order of magnitude faster
 than the origin, so the first node to pull a model pays NFS once and the rest pay
 peer latency.
 
-![Tier latency comparison](figures/fig3_tier_latency_comparison.png)
+![Tier latency comparison](figures/fig3_tier_latency_comparison.svg)
 """
     report_path = out_dir / "benchmarks.md"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -537,7 +626,7 @@ def main() -> None:
         "the local machine's numbers)",
     )
     args = parser.parse_args()
-    out_dir = Path("docs") if args.update_docs else Path(".scratch") / "benchmarks"
+    out_dir = _ROOT / "docs" if args.update_docs else _SCRATCH / "benchmarks"
     bin_path = build_modelfs()
     node_counts, latencies_ms = run_cluster_latency_benchmark(bin_path)
     chunk_labels, throughputs_mbps = run_throughput_vs_piece_size_benchmark(bin_path)

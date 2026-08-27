@@ -3,7 +3,8 @@
 Target-root libfuse3 for cross-building modelfs on aarch64 spark nodes
 (Ubuntu 24.04 "noble"). The host build uses the system libfuse3; point a
 cross build at this tree instead. On a fresh clone only the two `.deb`
-files and [SHA256SUMS](SHA256SUMS) exist, so extract them before
+files, [SHA256SUMS](SHA256SUMS), [NOTICE](NOTICE), and [copyright](copyright)
+exist, so extract them before
 building. [scripts/cross_aarch64.sh](../../scripts/cross_aarch64.sh) does
 that itself via
 [scripts/extract_fuse3_arm64.sh](../../scripts/extract_fuse3_arm64.sh)
@@ -34,28 +35,32 @@ Downloaded from the Ubuntu noble archive (main/f/fuse3 pool):
 
 - `libfuse3-3_3.14.0-5build1_arm64.deb`
   http://archive.ubuntu.com/ubuntu/pool/main/f/fuse3/libfuse3-3_3.14.0-5build1_arm64.deb
-  sha256: d84990ee2b8e6a079ed6f77d7e5fa1fe70e2462bcf9aecd43f4a65a9ae1486c9
 - `libfuse3-dev_3.14.0-5build1_arm64.deb`
   http://archive.ubuntu.com/ubuntu/pool/main/f/fuse3/libfuse3-dev_3.14.0-5build1_arm64.deb
-  sha256: 9a32e4ed3fe950417074d534207d399c5a80ad06843e265ae75a06ba703feafb
 
-License: LGPL-2.1 (upstream fuse3, same for both packages). The authoritative
-text and copyright list ship inside each `.deb` and land under
-`root/usr/share/doc/libfuse3-3/copyright` after extraction; consult that file
-for the grant covering the exact vendored artifact. This repo is
-GPL-3.0-or-later and links the shared library dynamically.
+Digests: [SHA256SUMS](SHA256SUMS) (GNU `sha256sum` text format). That file
+is the single list [scripts/extract_fuse3_arm64.sh](../../scripts/extract_fuse3_arm64.sh)
+checks before unpack, `build.zig` reads before compiling, and
+`scripts/check.sh` checks on every gate run.
+
+License: the shared library (`lib/*`) is LGPL-2.1-or-later; other upstream
+files are GPL-2. Attribution: [NOTICE](NOTICE). The Debian copyright file
+covering these exact packages is [copyright](copyright) (extracted from
+`libfuse3-3`). This repo is GPL-3.0-or-later and links the shared library
+dynamically.
 
 Verify before use: `sha256sum -c SHA256SUMS` in this directory, then compare
 with `Release` file hashes from archive.ubuntu.com. The extractor and
 `build.zig` both enforce [SHA256SUMS](SHA256SUMS) and fail if either `.deb`
-drifted; after a legitimate refresh, update both digests here and in
-SHA256SUMS.
+drifted; after a legitimate refresh, replace both `.deb`s, regenerate
+SHA256SUMS (`sha256sum libfuse3-*.deb > SHA256SUMS`), and re-extract.
 
 ## Layout
 
 - `*.deb`: pristine downloads; keep as the provenance/integrity source.
 - `SHA256SUMS`: digest list for those `.deb` files; the one input the
   extractor and `build.zig` check.
+- `NOTICE`, `copyright`: grant and Debian copyright for the vendored artifacts.
 - Extracted tree (gitignored, default `.scratch/fuse3-arm64/`):
   - `root/`: extraction of both debs (headers under `usr/include/fuse3`,
     static lib + linker symlink + pkgconfig under `usr/lib/aarch64-linux-gnu`,
@@ -66,8 +71,10 @@ SHA256SUMS.
 ## Refreshing
 
 Bump to a newer noble security update by replacing both `.deb`s with the
-same-versioned builds from the pool, updating [SHA256SUMS](SHA256SUMS) and
-the digests above, then re-running
+same-versioned builds from the pool, regenerating [SHA256SUMS](SHA256SUMS)
+(`sha256sum libfuse3-*.deb > SHA256SUMS`), then re-running
 [scripts/extract_fuse3_arm64.sh](../../scripts/extract_fuse3_arm64.sh) (or
 just [scripts/cross_aarch64.sh](../../scripts/cross_aarch64.sh)), which
 wipes the output tree, re-extracts, and refreshes the `lib/` symlinks.
+If the Debian copyright file changed, refresh `copyright` from
+`.scratch/fuse3-arm64/root/usr/share/doc/libfuse3-3/copyright` after extract.

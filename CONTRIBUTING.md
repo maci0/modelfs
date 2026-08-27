@@ -30,9 +30,9 @@ commands. `zig build --help` lists the `check`/`ci`/`fmt`/`test` steps.
 ```
 
 Formatting, unit tests, the restore-drill stub suite, vendored libfuse3
-digest and extract checks, shellcheck, ruff, and mypy: exactly what the
-`check` CI job runs. Every CI job (that gate, the aarch64 cross-compile,
-and the reproducibility rebuild) as one local step:
+digest and extract checks, shellcheck, ruff, mypy, and the CycloneDX
+inventory: exactly what the `check` CI job runs. Every CI job (that gate, the
+aarch64 cross-compile, and the reproducibility rebuild) as one local step:
 
 ```bash
 ./scripts/ci.sh
@@ -72,7 +72,10 @@ but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) as a dated
 a sibling `## [Name] - date` reads as one; see Cutting a release below),
 and changes to
 [requirements-dev.txt](requirements-dev.txt) must be reflected in the
-hash-pinned lock (regeneration command in the lock's header).
+hash-pinned lock (regeneration command in the lock's header) and in
+[sbom.cdx.json](sbom.cdx.json) (`python3 scripts/sbom.py --write`). A
+refresh of the vendored arm64 libfuse3 `.deb`s must regenerate
+`.deps/fuse3-arm64/SHA256SUMS` and the SBOM the same way.
 
 ## Cutting a release
 
