@@ -1,4 +1,4 @@
-//! Piece arithmetic (count/offset/cover) and the persisted cache bitfield
+//! Piece arithmetic (count/offset/cover/trackedEnd) and the persisted cache bitfield
 //! codec, including pad-bit defenses against corrupt sidecars.
 const std = @import("std");
 const fuzzcorpus = @import("fuzzcorpus.zig");

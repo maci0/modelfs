@@ -485,7 +485,7 @@ fn pathIsDir(zp: [*:0]const u8) bool {
 }
 
 /// Refuses mount-only knobs on the other commands, as the help text promises
-/// ("status/peers/pin take only the flags shown on their Usage line"):
+/// ("status/peers/pin/unpin take only the flags shown on their Usage line"):
 /// accepted-and-ignored they would silently do nothing (a `status --detach`,
 /// a `pin --piece 4M` that changes no piece grid), leaving the caller to
 /// believe an option took effect.
@@ -576,14 +576,14 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // The journal is the only configuration observability this daemon has,
     // so the ceiling is movable per environment: MODELFS_LOG=err quiets a
     // cron'd status loop, debug aids a misbehaving mount. Applied for every
-    // command -- status/peers/pin log warnings too. A value outside the
+    // command -- status/peers/pin/unpin log warnings too. A value outside the
     // documented set is refused like any other malformed knob: silently
     // keeping the default would leave the operator believing verbosity
     // changed. --log overwrites this below (explicit flag wins).
     if (envValue(environ, "MODELFS_LOG")) |v| {
         opts.log_level = try takeLogLevel("MODELFS_LOG", v);
     }
-    // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin
+    // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin/unpin
     // never read the id, so an ambient shell-wide variable must neither leak
     // into them nor fail them with BadId the way the explicit flag is
     // refused by rejectOutsideMount.
@@ -794,7 +794,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // loadPsk prefers MODELFS_PSK_VALUE over the file. Both set on mount
     // would start with the env secret while the operator believed --psk
     // (or MODELFS_PSK) won, matching the documented "explicit flag wins"
-    // for every other pair. status/peers/pin never load the secret, so a
+    // for every other pair. status/peers/pin/unpin never load the secret, so a
     // shell-wide inline value must not fail those commands the way the
     // e2e suites pass --psk to them.
     if (std.mem.eql(u8, cmd, "mount") and opts.psk_value != null and psk_file_set) {
@@ -2800,7 +2800,7 @@ test "the inline secret comes from MODELFS_PSK_VALUE and has no flag" {
         error.ConflictingPsk,
         parseArgs(gpa, &environ, &.{ "mount", "--psk", "/etc/modelfs.psk" }),
     );
-    // status/peers/pin never load the secret; a shell-wide inline value
+    // status/peers/pin/unpin never load the secret; a shell-wide inline value
     // must not fail them the way the e2e suites pass --psk.
     {
         const parsed = try parseArgs(gpa, &environ, &.{ "status", "--psk", "/etc/modelfs.psk" });

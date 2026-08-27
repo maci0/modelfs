@@ -62,6 +62,8 @@ stay in the entries below.
 
 ### Changes
 
+- **Operator docs match intake and PSK setup:** README no longer claims GitHub private vulnerability reporting is live (SECURITY.md is the intake; that feature is off). The PSK quickstart generates once and copies the same file; regenerating per node would desync the fleet. `sys.zig` is the syscall layer (CLOEXEC, owner-only writes, core-dump disable, PSK env scrub), not "no policy beyond EINTR retry". `MODELFS_ID` is mount-only like `--id`; `modelfs pin`/`unpin` both refuse `.cluster`; `modelfs status` as another uid is EACCES, not "not running".
+
 - **A FUSE read no longer hangs when local writes keep discarding piece fills**: `hydratePiece` retried unbounded after `completeFill` dropped a claim whose write generation had moved, so a file being overwritten stalled the FUSE worker. One origin retry is recovery; a second discard returns EIO so the client retries instead of hanging or serving hole zeros.
 - **A zero-duration piece fetch no longer pulls path goodput toward 0 B/s**: `rangeBps` already returned 0 when the clock did not advance (same-ns sample on a tiny `--piece`), but `Catalog.updateGoodput` treated that as a real 0 B/s observation and pulled the EWMA 30% toward zero; Inf/NaN would have poisoned `pickBest` the same way. Those samples are skipped.
 - **Drill age knobs are decimal even with a leading zero**: bash `[[ -gt ]]` treats `08` as invalid octal (abort) and `010` as 8. `MF_DRILL_LOG_MAX_AGE`, `MF_DRILL_MAX_SNAP_AGE`, and `MF_DRILL_MAX_REPLICA_AGE` now force base 10, and a digit run longer than 10 is refused so `$(( ))` cannot wrap.

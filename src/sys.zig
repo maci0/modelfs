@@ -1,5 +1,5 @@
-//! Thin syscall and libc wrappers: fd I/O with EINTR retry, sockets, clocks,
-//! and NUL-terminated path helpers. No policy lives here beyond retry rules.
+//! Syscall and libc wrappers: fd I/O with EINTR retry, CLOEXEC fds, clocks,
+//! path helpers, nofollow/owner-only writes, core-dump disable, PSK env scrub.
 const std = @import("std");
 pub const c = @import("c.zig").c;
 

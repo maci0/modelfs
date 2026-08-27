@@ -41,8 +41,8 @@ commands; each listed script answers `--help` instead of starting work.
 
 Formatting, CHANGELOG headings and tag links versus `build.zig.zon`, unit tests, the
 restore-drill stub suite, vendored libfuse3 digest and extract checks,
-shellcheck, ruff, mypy, and the CycloneDX inventory: exactly what the
-`check` CI job runs. Every CI job (that gate, the
+contributor-script `--help` handlers, shellcheck, ruff, mypy, and the CycloneDX
+inventory: exactly what the `check` CI job runs. Every CI job (that gate, the
 aarch64 cross-compile, and the reproducibility rebuild) as one local step:
 
 ```bash

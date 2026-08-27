@@ -40,7 +40,7 @@ A read that misses blocks until that one piece is filled from a single source. T
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
 
-Releases: `v0.1.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since then is under `[Unreleased]` and a build from this tree still prints `0.1.0` until the next tag. Upgrading a running node or a script written against the tag: start at **Upgrade from v0.1.0** in that file (CLI exit codes, peer status codes, origin layout). Security issues go through private vulnerability reporting: [SECURITY.md](SECURITY.md).
+Releases: `v0.1.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since then is under `[Unreleased]` and a build from this tree still prints `0.1.0` until the next tag. Upgrading a running node or a script written against the tag: start at **Upgrade from v0.1.0** in that file (CLI exit codes, peer status codes, origin layout). How to report a security issue: [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -69,7 +69,8 @@ Non-default libfuse3 locations, e.g. when cross-compiling: the vendored arm64 tr
 # once per node
 sudo mkdir -p /models /var/cache/modelfs
 sudo chown "$(id -u):$(id -g)" /models /var/cache/modelfs
-umask 077; openssl rand -hex 32 | sudo tee /etc/modelfs.psk   # same file on every node
+# generate once; copy the same file to every node (do not regenerate per host)
+umask 077; openssl rand -hex 32 | sudo tee /etc/modelfs.psk
 
 # same command on every node (id defaults to the short hostname)
 modelfs mount /models --origin /net/192.168.0.100/models
@@ -84,7 +85,7 @@ modelfs pin gguf/foo.gguf                         # keep a file out of the cull
 modelfs unpin gguf/foo.gguf
 ```
 
-Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID`, and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount (surrounding whitespace is trimmed like the PSK file; a whitespace-only value is refused); an explicit flag wins and an empty environment value counts as unset. `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
+Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount (surrounding whitespace is trimmed like the PSK file; a whitespace-only value is refused); an explicit flag wins and an empty environment value counts as unset. `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
 
 Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS ([docs/operations.md](docs/operations.md)).
 
@@ -112,7 +113,7 @@ The blocking gate and clone setup (Zig, libfuse3 headers, shellcheck, uv):
 zig build test -Dtest-filter=relOk        # only tests whose names contain this substring
 zig build test --watch                    # rebuild and re-run on change
 zig build fmt                             # apply zig fmt
-./scripts/check.sh                        # fmt, changelog headings, unit tests, restore-drill stub, vendored fuse extract, shellcheck, ruff, mypy, sbom
+./scripts/check.sh                        # fmt, changelog headings, unit tests, restore-drill stub, vendored fuse extract, script --help, shellcheck, ruff, mypy, sbom
 ./scripts/ci.sh                           # every CI job: check, aarch64 cross, repro
 ./scripts/repro_check.sh                  # build twice, require byte-identical output
 ./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end
@@ -142,7 +143,7 @@ Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); instal
 | `piece.zig` | piece arithmetic and the bitfield itself |
 | `peer.zig` | peer HTTP server (`/ping`, `/have`, `/data`) and fetch client |
 | `proto.zig` | wire helpers: sizes, ranges, URL codec, bearer auth |
-| `discover.zig` | origin-side lease files: publish, refresh, sweep |
+| `discover.zig` | origin-side lease files, `/have` probe cache, path scoring |
 | `cull.zig` | cache eviction watermarks |
 | `sys.zig` | syscall wrappers |
 | `c.zig` | the single door to libfuse3/libc |
