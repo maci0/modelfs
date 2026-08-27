@@ -23,12 +23,13 @@ READY_TIMEOUT_S = 30.0
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != ARGC:
+    help_only = argv[1:] == ["-h"] or argv[1:] == ["--help"]
+    if help_only or len(argv) != ARGC:
         print(
             f"usage: {argv[0]} ORIGIN_FILE REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES",
-            file=sys.stderr,
+            file=sys.stdout if help_only else sys.stderr,
         )
-        return 2
+        return 0 if help_only else 2
     origin_file, rel, psk_file = argv[1], argv[2], argv[3]
     try:
         base_port, num_nodes, total_pieces = int(argv[4]), int(argv[5]), int(argv[6])

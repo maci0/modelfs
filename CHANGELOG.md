@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+- **Long options accept `--name=VALUE`**: `--origin=/nas/models` (and the same form on every other value flag) was an unknown flag; both `--name VALUE` and `--name=VALUE` now parse. Boolean flags with an attached payload (`--detach=true`) are refused with a named message and exit 2.
+- **`help`/`version` honor `-h`/`--help`**: the help text promised every command accepts those flags, but `modelfs version --help` exited 2 because extras were refused before any flag scan. Global help/version flags on those commands now succeed; a real extra still exits 2.
+- **Usage errors are one named line, not a help dump**: missing operands, extra positionals, and a missing `--origin` printed the full usage blob through the logger prefix; they now match the unknown-flag channel (plain stderr, `see 'modelfs help'`). `--advertise` trims spaces in comma-separated lists. A refused pin path is rejected before cache dirs are created. Helper scripts send errors to stderr and answer `--help`.
 
 - **The contributor gate no longer pretends PATH ruff/mypy can stand in for the lock**: without `.venv`, `scripts/check.sh` warned and continued, then mypy died on a missing matplotlib stub (or, with a different ruff, only after push). It now fails immediately with the uv install line; `minimum_zig_version` is checked before `zig fmt` so an old toolchain is named rather than formatting under the wrong rules.
 - **Every CI job is one local command**: `./scripts/ci.sh` (also `zig build ci`) runs the check gate, the aarch64 cross-compile into `.scratch/cross-aarch64` so it does not replace a native `zig-out/bin/modelfs`, and `repro_check.sh`. `zig build fmt` applies the same paths `check.sh` verifies. `./scripts/check.sh --help` lists the rest.

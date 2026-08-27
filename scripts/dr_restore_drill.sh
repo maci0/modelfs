@@ -32,15 +32,26 @@ set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-mkdir -p "${SCRATCH_DIR}"
 
 die() {
     echo "drill FAIL: $1" >&2
     exit 1
 }
 
+# Answered before the zfs/scratch setup so --help works on machines that
+# never run the drill (and so extra operands stay a usage error, exit 2,
+# rather than a drill failure).
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    echo "usage: dr_restore_drill.sh [DATASET]"
+    exit 0
+fi
+if [[ $# -gt 1 ]]; then
+    echo "usage: dr_restore_drill.sh [DATASET]" >&2
+    exit 2
+fi
+
+mkdir -p "${SCRATCH_DIR}"
 command -v zfs >/dev/null 2>&1 || die "zfs not found; this drill runs on the NAS"
-[[ $# -le 1 ]] || die "usage: dr_restore_drill.sh [DATASET]"
 
 DATASET="${1:-tank/models}"
 LOG_FILE="${MF_DRILL_LOG:-/var/log/modelfs-drill.log}"

@@ -69,11 +69,12 @@ const usage =
     \\  --detach              Background after mount
     \\  -f, --foreground      Stay in the foreground (default)
     \\
-    \\status/peers/pin take only the flags shown on their Usage line plus
+    \\status/peers/pin/unpin take only the flags shown on their Usage line plus
     \\the shared --origin/--cache/--psk values; mount-only
     \\options are refused elsewhere. Every command also accepts -h/--help,
     \\and -V/--version prints the release. "--" ends flag parsing: later
-    \\arguments are taken literally (paths starting with '-').
+    \\arguments are taken literally (paths starting with '-'). Long options
+    \\accept --name VALUE or --name=VALUE.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID set the same values as their flags; an explicit flag wins.
@@ -104,32 +105,24 @@ pub fn main(init: std.process.Init) !u8 {
     }
     // Bare global forms live at position 0, where parseArgs sees a command
     // name, so they are answered here alongside their subcommand spellings.
-    // Like every other subcommand they refuse extra positional arguments
-    // instead of silently ignoring them.
-    const first = argv.items[0];
-    if (std.mem.eql(u8, first, "help") or
-        std.mem.eql(u8, first, "-h") or
-        std.mem.eql(u8, first, "--help"))
-    {
-        if (argv.items.len != 1) {
-            std.log.err("help takes no arguments", .{});
-            std.debug.print("{s}", .{usage});
+    // Extra arguments are refused unless they are themselves those global
+    // flags: `modelfs version --help` must match the documented "every
+    // command also accepts -h/--help" instead of dying as a positional error.
+    switch (classifyMeta(argv.items)) {
+        .none => {},
+        .help => {
+            writeOut(init.io, usage);
+            return 0;
+        },
+        .version => {
+            printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
+            return 0;
+        },
+        .bad => {
+            const what: []const u8 = if (isHelpTok(argv.items[0])) "help" else "version";
+            std.debug.print("{s} takes no arguments (see 'modelfs help')\n", .{what});
             return 2;
-        }
-        writeOut(init.io, usage);
-        return 0;
-    }
-    if (std.mem.eql(u8, first, "version") or
-        std.mem.eql(u8, first, "-V") or
-        std.mem.eql(u8, first, "--version"))
-    {
-        if (argv.items.len != 1) {
-            std.log.err("version takes no arguments", .{});
-            std.debug.print("{s}", .{usage});
-            return 2;
-        }
-        printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
-        return 0;
+        },
     }
     const parsed = parseArgs(gpa, init.environ_map, argv.items) catch |err| switch (err) {
         error.Help => {
@@ -155,32 +148,28 @@ pub fn main(init: std.process.Init) !u8 {
     // looked like they succeeded with the extras meaning something.
     if (std.mem.eql(u8, parsed.cmd, "mount")) {
         if (parsed.rest.len != 1) {
-            std.log.err("mount takes exactly one directory argument", .{});
-            std.debug.print("{s}", .{usage});
+            std.debug.print("mount takes exactly one directory argument (see 'modelfs help')\n", .{});
             return 2;
         }
         return cmdMount(init, parsed.opts, parsed.rest[0]);
     }
     if (std.mem.eql(u8, parsed.cmd, "status")) {
         if (parsed.rest.len != 0) {
-            std.log.err("status takes no arguments", .{});
-            std.debug.print("{s}", .{usage});
+            std.debug.print("status takes no arguments (see 'modelfs help')\n", .{});
             return 2;
         }
         return cmdStatus(init.io, gpa, parsed.opts);
     }
     if (std.mem.eql(u8, parsed.cmd, "peers")) {
         if (parsed.rest.len != 0) {
-            std.log.err("peers takes no arguments", .{});
-            std.debug.print("{s}", .{usage});
+            std.debug.print("peers takes no arguments (see 'modelfs help')\n", .{});
             return 2;
         }
         return cmdPeers(init.io, gpa, parsed.opts);
     }
     if (std.mem.eql(u8, parsed.cmd, "pin") or std.mem.eql(u8, parsed.cmd, "unpin")) {
         if (parsed.rest.len != 1) {
-            std.log.err("{s} takes exactly one path relative to the mount", .{parsed.cmd});
-            std.debug.print("{s}", .{usage});
+            std.debug.print("{s} takes exactly one path relative to the mount (see 'modelfs help')\n", .{parsed.cmd});
             return 2;
         }
         return cmdPin(init.io, gpa, parsed.opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
@@ -287,14 +276,68 @@ fn parseSize(s: []const u8) !u64 {
     return std.math.mul(u64, n, mul) catch return error.BadSize;
 }
 
-/// Consumes the value after a flag; names the flag when it is missing one.
-fn takeValue(args: []const []const u8, flag: []const u8, i: *usize) ![]const u8 {
+/// GNU long-option attached values: `--origin=/nas/models` is the same as
+/// `--origin /nas/models`. Short flags (`-f`, `-h`, `-V`) have no attached
+/// form here, so `-f=x` stays a single unknown token.
+fn splitFlag(a: []const u8) struct { name: []const u8, value: ?[]const u8 } {
+    if (a.len >= 3 and a[0] == '-' and a[1] == '-') {
+        if (std.mem.indexOfScalar(u8, a, '=')) |eq| {
+            return .{ .name = a[0..eq], .value = a[eq + 1 ..] };
+        }
+    }
+    return .{ .name = a, .value = null };
+}
+
+fn rejectInlineValue(flag: []const u8, inline_val: ?[]const u8) !void {
+    if (inline_val != null) {
+        if (!builtin.is_test) std.debug.print("{s} does not take a value (see 'modelfs help')\n", .{flag});
+        return error.UnexpectedValue;
+    }
+}
+
+/// Consumes the value after a flag, or the attached `--name=VALUE` payload.
+/// Names the flag when a separate value is missing.
+fn takeValue(args: []const []const u8, flag: []const u8, i: *usize, inline_val: ?[]const u8) ![]const u8 {
+    if (inline_val) |v| return v;
     i.* += 1;
     if (i.* >= args.len) {
         if (!builtin.is_test) std.debug.print("{s} needs a value (see 'modelfs help')\n", .{flag});
         return error.MissingValue;
     }
     return args[i.*];
+}
+
+fn isHelpTok(s: []const u8) bool {
+    return std.mem.eql(u8, s, "help") or
+        std.mem.eql(u8, s, "-h") or
+        std.mem.eql(u8, s, "--help");
+}
+
+fn isVersionTok(s: []const u8) bool {
+    return std.mem.eql(u8, s, "version") or
+        std.mem.eql(u8, s, "-V") or
+        std.mem.eql(u8, s, "--version");
+}
+
+/// help/version (and their flag spellings) are answered before parseArgs.
+/// Extra arguments are refused unless they are themselves those global flags,
+/// so `modelfs version --help` shows help instead of dying as a positional
+/// error, matching the documented "every command also accepts -h/--help".
+fn classifyMeta(args: []const []const u8) enum { none, help, version, bad } {
+    if (args.len == 0) return .none;
+    const first_help = isHelpTok(args[0]);
+    const first_ver = isVersionTok(args[0]);
+    if (!first_help and !first_ver) return .none;
+    var help = first_help;
+    for (args[1..]) |a| {
+        if (isHelpTok(a)) {
+            help = true;
+            continue;
+        }
+        if (isVersionTok(a)) continue;
+        return .bad;
+    }
+    return if (help) .help else .version;
 }
 
 /// An exported-but-empty variable ("export MODELFS_CACHE=" left behind by a
@@ -407,8 +450,7 @@ fn badIdLine(buf: []u8, id: []const u8) []const u8 {
 
 /// Watermark percentages: parse failures name the flag instead of surfacing
 /// as a bare InvalidCharacter.
-fn takePercent(args: []const []const u8, flag: []const u8, i: *usize) !u32 {
-    const raw = try takeValue(args, flag, i);
+fn parsePercent(flag: []const u8, raw: []const u8) !u32 {
     const pct = std.fmt.parseInt(u32, raw, 10) catch {
         if (!builtin.is_test) std.debug.print("{s} {s}: not a percentage\n", .{ flag, raw });
         return error.BadWatermark;
@@ -421,6 +463,11 @@ fn takePercent(args: []const []const u8, flag: []const u8, i: *usize) !u32 {
         return error.BadWatermark;
     }
     return pct;
+}
+
+fn takePercent(args: []const []const u8, flag: []const u8, i: *usize) !u32 {
+    const raw = try takeValue(args, flag, i, null);
+    return parsePercent(flag, raw);
 }
 
 /// The command words main() dispatches on; the bare help/version forms are
@@ -498,27 +545,37 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     }
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) return error.Help;
-        if (std.mem.eql(u8, a, "-V") or std.mem.eql(u8, a, "--version")) return error.Version;
         // POSIX end-of-options: everything after "--" is positional, so
         // pin/unpin relpaths and mount dirs that begin with "-" stay
-        // reachable instead of dying as unknown flags.
+        // reachable instead of dying as unknown flags. Checked before
+        // --name=VALUE splitting so a literal "--" cannot be an attached form.
         if (std.mem.eql(u8, a, "--")) {
             try rest.appendSlice(gpa, args[i + 1 ..]);
             break;
         }
-        if (std.mem.eql(u8, a, "--origin")) {
-            opts.origin = try takeValue(args, a, &i);
-        } else if (std.mem.eql(u8, a, "--cache")) {
-            opts.cache = try takeValue(args, a, &i);
-        } else if (std.mem.eql(u8, a, "--id")) {
-            try rejectOutsideMount(cmd, a);
-            opts.id = try takeValue(args, a, &i);
-        } else if (std.mem.eql(u8, a, "--psk")) {
-            opts.psk_file = try takeValue(args, a, &i);
-        } else if (std.mem.eql(u8, a, "--piece")) {
-            try rejectOutsideMount(cmd, a);
-            const raw = try takeValue(args, a, &i);
+        const split = splitFlag(a);
+        const flag = split.name;
+        const inline_val = split.value;
+        if (std.mem.eql(u8, flag, "-h") or std.mem.eql(u8, flag, "--help")) {
+            try rejectInlineValue(flag, inline_val);
+            return error.Help;
+        }
+        if (std.mem.eql(u8, flag, "-V") or std.mem.eql(u8, flag, "--version")) {
+            try rejectInlineValue(flag, inline_val);
+            return error.Version;
+        }
+        if (std.mem.eql(u8, flag, "--origin")) {
+            opts.origin = try takeValue(args, flag, &i, inline_val);
+        } else if (std.mem.eql(u8, flag, "--cache")) {
+            opts.cache = try takeValue(args, flag, &i, inline_val);
+        } else if (std.mem.eql(u8, flag, "--id")) {
+            try rejectOutsideMount(cmd, flag);
+            opts.id = try takeValue(args, flag, &i, inline_val);
+        } else if (std.mem.eql(u8, flag, "--psk")) {
+            opts.psk_file = try takeValue(args, flag, &i, inline_val);
+        } else if (std.mem.eql(u8, flag, "--piece")) {
+            try rejectOutsideMount(cmd, flag);
+            const raw = try takeValue(args, flag, &i, inline_val);
             const psz = parseSize(raw) catch {
                 if (!builtin.is_test) std.debug.print("--piece {s}: bad size (want e.g. 16M)\n", .{raw});
                 return error.BadSize;
@@ -534,43 +591,52 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 return error.ZeroPieceSize;
             }
             opts.piece = @intCast(psz);
-        } else if (std.mem.eql(u8, a, "--brun")) {
-            try rejectOutsideMount(cmd, a);
-            opts.water.brun = try takePercent(args, a, &i);
-        } else if (std.mem.eql(u8, a, "--bcull")) {
-            try rejectOutsideMount(cmd, a);
-            opts.water.bcull = try takePercent(args, a, &i);
-        } else if (std.mem.eql(u8, a, "--bstop")) {
-            try rejectOutsideMount(cmd, a);
-            opts.water.bstop = try takePercent(args, a, &i);
-        } else if (std.mem.eql(u8, a, "--direct-io")) {
-            try rejectOutsideMount(cmd, a);
+        } else if (std.mem.eql(u8, flag, "--brun")) {
+            try rejectOutsideMount(cmd, flag);
+            opts.water.brun = try parsePercent(flag, try takeValue(args, flag, &i, inline_val));
+        } else if (std.mem.eql(u8, flag, "--bcull")) {
+            try rejectOutsideMount(cmd, flag);
+            opts.water.bcull = try parsePercent(flag, try takeValue(args, flag, &i, inline_val));
+        } else if (std.mem.eql(u8, flag, "--bstop")) {
+            try rejectOutsideMount(cmd, flag);
+            opts.water.bstop = try parsePercent(flag, try takeValue(args, flag, &i, inline_val));
+        } else if (std.mem.eql(u8, flag, "--direct-io")) {
+            try rejectOutsideMount(cmd, flag);
+            try rejectInlineValue(flag, inline_val);
             opts.direct_io = true;
-        } else if (std.mem.eql(u8, a, "--kernel-cache")) {
-            try rejectOutsideMount(cmd, a);
+        } else if (std.mem.eql(u8, flag, "--kernel-cache")) {
+            try rejectOutsideMount(cmd, flag);
+            try rejectInlineValue(flag, inline_val);
             opts.direct_io = false;
-        } else if (std.mem.eql(u8, a, "--allow-other")) {
-            try rejectOutsideMount(cmd, a);
+        } else if (std.mem.eql(u8, flag, "--allow-other")) {
+            try rejectOutsideMount(cmd, flag);
+            try rejectInlineValue(flag, inline_val);
             opts.allow_other = true;
-        } else if (std.mem.eql(u8, a, "--detach")) {
-            try rejectOutsideMount(cmd, a);
+        } else if (std.mem.eql(u8, flag, "--detach")) {
+            try rejectOutsideMount(cmd, flag);
+            try rejectInlineValue(flag, inline_val);
             opts.detach = true;
-        } else if (std.mem.eql(u8, a, "-f") or std.mem.eql(u8, a, "--foreground")) {
-            try rejectOutsideMount(cmd, a);
+        } else if (std.mem.eql(u8, flag, "-f") or std.mem.eql(u8, flag, "--foreground")) {
+            try rejectOutsideMount(cmd, flag);
+            try rejectInlineValue(flag, inline_val);
             opts.detach = false;
-        } else if (std.mem.eql(u8, a, "--listen")) {
-            try rejectOutsideMount(cmd, a);
-            const raw = try takeValue(args, a, &i);
+        } else if (std.mem.eql(u8, flag, "--listen")) {
+            try rejectOutsideMount(cmd, flag);
+            const raw = try takeValue(args, flag, &i, inline_val);
             opts.listen_port = listenPort(raw) catch {
                 if (!builtin.is_test) std.debug.print("--listen {s}: bad endpoint (want [IP:]PORT)\n", .{raw});
                 return error.BadListen;
             };
-        } else if (std.mem.eql(u8, a, "--advertise")) {
-            try rejectOutsideMount(cmd, a);
-            const v = try takeValue(args, a, &i);
+        } else if (std.mem.eql(u8, flag, "--advertise")) {
+            try rejectOutsideMount(cmd, flag);
+            const v = try takeValue(args, flag, &i, inline_val);
             var it = std.mem.splitScalar(u8, v, ',');
             while (it.next()) |one| {
-                const hp = parseHostPort(one) catch {
+                // Comma-separated lists are commonly written with a space
+                // after each comma; a leading/trailing space is not part of
+                // the address and would fail parseV4 as a host name.
+                const tok = std.mem.trim(u8, one, " \t");
+                const hp = parseHostPort(tok) catch {
                     if (!builtin.is_test) std.debug.print("--advertise {s}: bad address (want IP[:PORT])\n", .{v});
                     return error.BadHostPort;
                 };
@@ -587,9 +653,9 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 }
                 try opts.advertise.append(gpa, hp);
             }
-        } else if (std.mem.eql(u8, a, "--seed")) {
-            try rejectOutsideMount(cmd, a);
-            const s = try takeValue(args, a, &i);
+        } else if (std.mem.eql(u8, flag, "--seed")) {
+            try rejectOutsideMount(cmd, flag);
+            const s = try takeValue(args, flag, &i, inline_val);
             // Validate now with a named message instead of failing later in
             // mount setup with a bare parseInt error.
             _ = parseHostPort(s) catch {
@@ -597,9 +663,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 return error.BadHostPort;
             };
             try opts.seed.append(gpa, s);
-        } else if (a.len > 0 and a[0] == '-') {
+        } else if (flag.len > 0 and flag[0] == '-') {
             // Plain print, like every other usage error in this loop; the
             // logger's level prefix is noise for a one-shot CLI failure.
+            // Echo the original token so `--nope=x` still names what was typed.
             if (!builtin.is_test) std.debug.print("unknown flag {s} (see 'modelfs help')\n", .{a});
             return error.UnknownFlag;
         } else {
@@ -795,8 +862,7 @@ fn buildSeeds(gpa: std.mem.Allocator, specs: []const []const u8) !SeedList {
 fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     const gpa = init.gpa;
     const origin_raw = opts.origin orelse {
-        std.log.err("mount needs --origin (the NFS path, e.g. /mnt/nas/models)", .{});
-        std.debug.print("{s}", .{usage});
+        std.debug.print("mount needs --origin (the NFS path, e.g. /mnt/nas/models; or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
     const origin = sys.realpathAlloc(gpa, origin_raw) catch {
@@ -1090,8 +1156,7 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 
 fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     const origin = opts.origin orelse {
-        std.log.err("peers needs --origin", .{});
-        std.debug.print("{s}", .{usage});
+        std.debug.print("peers needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
     // Same reachability gate mount applies to --origin: a typo'd path must
@@ -1214,6 +1279,24 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 }
 
 fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: bool) !u8 {
+    var rel = path;
+    if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
+    if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
+    // The pin path joins cache/pin below; ".." would write outside it.
+    // Gate before ensureLayout so a refused path cannot create cache dirs.
+    if (!store_mod.relOk(rel)) {
+        // Suppressed under test like every usage print here, so the refusal
+        // stays assertable without tripping the runner's error-log counter.
+        // `/models/` strips to empty (the prefix convenience for the default
+        // mountpoint) and `..` would write outside cache/pin: name which.
+        if (!builtin.is_test) {
+            if (rel.len == 0)
+                std.debug.print("{s}: empty path (need a path relative to the mount, not /models itself)\n", .{if (on) "pin" else "unpin"})
+            else
+                std.debug.print("{s}: refusing path outside the mount root\n", .{if (on) "pin" else "unpin"});
+        }
+        return 1;
+    }
     var dummy_io = std.Io.Threaded.init(gpa, .{});
     defer dummy_io.deinit();
     var store = store_mod.Store.init(gpa, dummy_io.io(), opts.origin orelse "", opts.cache, opts.piece);
@@ -1223,16 +1306,6 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     const layout_rc = store.ensureLayout();
     if (layout_rc != 0) {
         std.log.err("cannot create cache dirs under {s} (errno {d})", .{ opts.cache, -layout_rc });
-        return 1;
-    }
-    var rel = path;
-    if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
-    if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
-    // The pin path joins cache/pin below; ".." would write outside it.
-    if (!store_mod.relOk(rel)) {
-        // Suppressed under test like every usage print here, so the refusal
-        // stays assertable without tripping the runner's error-log counter.
-        if (!builtin.is_test) std.log.err("pin: refusing path outside the mount root", .{});
         return 1;
     }
     const rc = store.setPin(rel, on);
@@ -1712,6 +1785,20 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     const escape_fp = try std.fmt.bufPrint(&pbuf, "{s}/pin/escape.bin", .{cache_d});
     try std.testing.expect(sys.statPath(try sys.toZ(&zb, escape_fp), &stbuf) != 0);
 
+    // `/models/` is the mount-root prefix strip, not a pinable path: empty
+    // after the convenience strip, same exit-1 refusal as an escape.
+    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "/models/", true));
+
+    // A refused path must not create cache layout.
+    {
+        var nb: [128]u8 = undefined;
+        const cache2 = try sys.scratchDir(&nb, "modelfs-pin-refuse");
+        defer sys.deleteTree(std.testing.io, cache2);
+        try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache2 }, "../escape.bin", true));
+        const pin_dir = try std.fmt.bufPrint(&pbuf, "{s}/pin", .{cache2});
+        try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_dir), &stbuf) != 0);
+    }
+
     // Unpin removes the artifact so the file becomes cullable again.
     try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "gguf/big.gguf", false));
     try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf) != 0);
@@ -1908,7 +1995,7 @@ test "parseArgs rejects mount-only flags on other commands" {
     const gpa = std.testing.allocator;
     var environ = std.process.Environ.Map.init(gpa);
     defer environ.deinit();
-    // The help text promises status/peers/pin take only their Usage-line
+    // The help text promises status/peers/pin/unpin take only their Usage-line
     // flags; mount-only knobs must be refused, not accepted-and-ignored.
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--detach" }));
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--kernel-cache" }));
@@ -1924,6 +2011,99 @@ test "parseArgs rejects mount-only flags on other commands" {
         defer freeParsed(parsed, gpa);
         try std.testing.expectEqualStrings("/c", parsed.opts.cache);
     }
+}
+
+test "classifyMeta answers help/version and refuses real extras" {
+    try std.testing.expectEqual(.help, classifyMeta(&.{"help"}));
+    try std.testing.expectEqual(.help, classifyMeta(&.{"--help"}));
+    try std.testing.expectEqual(.help, classifyMeta(&.{"-h"}));
+    try std.testing.expectEqual(.version, classifyMeta(&.{"version"}));
+    try std.testing.expectEqual(.version, classifyMeta(&.{"--version"}));
+    try std.testing.expectEqual(.version, classifyMeta(&.{"-V"}));
+    // Documented "every command also accepts -h/--help": version --help is
+    // help, not a positional error. Help wins when both globals appear.
+    try std.testing.expectEqual(.help, classifyMeta(&.{ "version", "--help" }));
+    try std.testing.expectEqual(.help, classifyMeta(&.{ "version", "-h" }));
+    try std.testing.expectEqual(.help, classifyMeta(&.{ "help", "--version" }));
+    try std.testing.expectEqual(.version, classifyMeta(&.{ "version", "-V" }));
+    try std.testing.expectEqual(.bad, classifyMeta(&.{ "help", "junk" }));
+    try std.testing.expectEqual(.bad, classifyMeta(&.{ "version", "junk" }));
+    try std.testing.expectEqual(.none, classifyMeta(&.{"mount"}));
+    try std.testing.expectEqual(.none, classifyMeta(&.{}));
+}
+
+test "splitFlag splits --name=VALUE and leaves short flags whole" {
+    {
+        const s = splitFlag("--origin=/nas/models");
+        try std.testing.expectEqualStrings("--origin", s.name);
+        try std.testing.expectEqualStrings("/nas/models", s.value.?);
+    }
+    {
+        const s = splitFlag("--origin");
+        try std.testing.expectEqualStrings("--origin", s.name);
+        try std.testing.expect(s.value == null);
+    }
+    {
+        const s = splitFlag("--origin=");
+        try std.testing.expectEqualStrings("--origin", s.name);
+        try std.testing.expectEqualStrings("", s.value.?);
+    }
+    // Short flags have no attached-value form; `-f=x` is one unknown token.
+    {
+        const s = splitFlag("-f=x");
+        try std.testing.expectEqualStrings("-f=x", s.name);
+        try std.testing.expect(s.value == null);
+    }
+    {
+        const s = splitFlag("-h");
+        try std.testing.expectEqualStrings("-h", s.name);
+        try std.testing.expect(s.value == null);
+    }
+}
+
+test "parseArgs accepts --name=VALUE and refuses it on boolean flags" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{
+            "mount",          "/mnt/models", "--origin=/srv/origin", "--piece=4M",
+            "--listen=19090", "--brun=12",   "--bcull=6",            "--bstop=2",
+        });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/mnt/models", parsed.rest[0]);
+        try std.testing.expectEqualStrings("/srv/origin", parsed.opts.origin.?);
+        try std.testing.expectEqual(@as(u32, 4 * 1024 * 1024), parsed.opts.piece);
+        try std.testing.expectEqual(@as(u16, 19090), parsed.opts.listen_port.?);
+        try std.testing.expectEqual(@as(u32, 12), parsed.opts.water.brun);
+        try std.testing.expectEqual(@as(u32, 6), parsed.opts.water.bcull);
+        try std.testing.expectEqual(@as(u32, 2), parsed.opts.water.bstop);
+    }
+    // Space and attached forms mix: the attached payload is the value, so
+    // the next token stays positional.
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "--cache=/c", "x.bin" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/c", parsed.opts.cache);
+        try std.testing.expectEqualStrings("x.bin", parsed.rest[0]);
+    }
+    try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--detach=true" }));
+    try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--help=foo" }));
+    try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--foreground=1" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--kernel-cache=off" }));
+}
+
+test "parseArgs trims whitespace in --advertise lists" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--advertise", "10.0.0.1, 10.0.0.2:19091" });
+    defer freeParsed(parsed, gpa);
+    try std.testing.expectEqual(@as(usize, 2), parsed.opts.advertise.items.len);
+    try std.testing.expectEqualStrings("10.0.0.1", parsed.opts.advertise.items[0].ip);
+    try std.testing.expectEqual(@as(u16, proto.default_port), parsed.opts.advertise.items[0].port);
+    try std.testing.expectEqualStrings("10.0.0.2", parsed.opts.advertise.items[1].ip);
+    try std.testing.expectEqual(@as(u16, 19091), parsed.opts.advertise.items[1].port);
 }
 
 test "parseArgs treats everything after -- as positional" {
