@@ -4,9 +4,7 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-echo "================================================================="
-echo "=== 9-Node Cluster Performance & Block Exchange E2E Benchmark ==="
-echo "================================================================="
+echo "=== 9-node cluster piece-exchange ==="
 
 cd "${ROOT_DIR}"
 require_fuse
@@ -50,8 +48,6 @@ echo "=== Step 1: Generating ${FILE_SIZE_MB}MB model file on NFS origin ==="
 TEST_FILE="big_model.gguf"
 dd if=/dev/urandom of="${ORIGIN_DIR}/${TEST_FILE}" bs=1M count="${FILE_SIZE_MB}" status=none
 
-ORIGIN_HASH="$(sha256sum "${ORIGIN_DIR}/${TEST_FILE}" | cut -d' ' -f1)"
-echo "Origin file SHA256: ${ORIGIN_HASH}"
 echo "Piece count: ${TOTAL_PIECES} pieces (${PIECE_SIZE_MB}MB per piece)"
 
 BASE_PORT=19080
@@ -62,7 +58,7 @@ for i in $(seq 1 "${NUM_NODES}"); do
     MOUNT_DIR="${TEMP_DIR}/mount_${i}"
     mkdir -p "${CACHE_DIR}" "${MOUNT_DIR}"
     PORT=$((BASE_PORT + i))
-    
+
     "${MODELFS_BIN}" mount "${MOUNT_DIR}" \
         --origin "${ORIGIN_DIR}" \
         --cache "${CACHE_DIR}" \
@@ -102,9 +98,8 @@ done
 echo "=== Step 4: Inspecting active cluster peers ==="
 "${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}" --psk "${PSK_FILE}"
 
-echo "=== Step 5: Executing multi-peer piece exchange benchmark ==="
+echo "=== Step 5: multi-peer piece exchange ==="
 python3 "${SCRIPTS_DIR}/cluster_verify.py" \
-    "${ORIGIN_DIR}/${TEST_FILE}" \
     "${TEST_FILE}" \
     "${PSK_FILE}" \
     "${BASE_PORT}" \
@@ -118,7 +113,6 @@ for i in $(seq 1 "${NUM_NODES}"); do
     # fallback below would report 0 and silently skip the size assertion.
     USAGE_KB=$(du -sk "${CACHE_DIR}" 2>/dev/null | cut -f1 || echo "0")
     USAGE_MB=$((USAGE_KB / 1024))
-    echo "Node spark_${i} Cache Size: ${USAGE_MB} MB (Original file size: ${FILE_SIZE_MB} MB)"
     if [ "${USAGE_MB}" -gt "${FILE_SIZE_MB}" ]; then
         echo "Error: Node spark_${i} cache exceeds file size!"
         exit 1
@@ -128,6 +122,4 @@ for i in $(seq 1 "${NUM_NODES}"); do
     echo "✓ Node spark_${i} cache size (${USAGE_MB} MB) is within the ${FILE_SIZE_MB} MB bound"
 done
 
-echo "================================================================="
-echo "=== 9-Node Cluster Performance Benchmark Passed Successfully ==="
-echo "================================================================="
+echo "=== 9-node cluster piece-exchange passed ==="

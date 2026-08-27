@@ -17,7 +17,7 @@ from pathlib import Path
 # daemon-readiness policy shared with run_benchmarks_and_plots.py.
 import peer_ping
 
-ARGC = 7  # prog + ORIGIN_FILE REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES
+ARGC = 6  # prog + REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES
 MAX_PORT = 65535
 READY_TIMEOUT_S = 30.0
 
@@ -26,13 +26,13 @@ def main(argv: list[str]) -> int:
     help_only = argv[1:] == ["-h"] or argv[1:] == ["--help"]
     if help_only or len(argv) != ARGC:
         print(
-            f"usage: {argv[0]} ORIGIN_FILE REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES",
+            f"usage: {argv[0]} REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES",
             file=sys.stdout if help_only else sys.stderr,
         )
         return 0 if help_only else 2
-    origin_file, rel, psk_file = argv[1], argv[2], argv[3]
+    rel, psk_file = argv[1], argv[2]
     try:
-        base_port, num_nodes, total_pieces = int(argv[4]), int(argv[5]), int(argv[6])
+        base_port, num_nodes, total_pieces = int(argv[3]), int(argv[4]), int(argv[5])
     except ValueError:
         print(
             f"{argv[0]}: BASE_PORT, NUM_NODES, TOTAL_PIECES must be integers",
@@ -63,12 +63,6 @@ def main(argv: list[str]) -> int:
     token = b"Bearer " + Path(psk_file).read_bytes().strip(b" \t\r\n")
     headers = {"Authorization": token.decode("latin-1")}
 
-    # Read raw file from origin for verification
-    with open(origin_file, "rb") as f:
-        raw_data = f.read()
-
-    print("✓ Origin file loaded into python verifier:", len(raw_data), "bytes")
-
     # Wait for every node's listener instead of assuming the spawner's
     # startup sleep was long enough, then start the timed sweep.
     peer_ping.wait_for_peers_ready(
@@ -76,7 +70,6 @@ def main(argv: list[str]) -> int:
     )
     print(f"✓ All {num_nodes} peer nodes responding to HTTP /ping")
 
-    # Query /have across the cluster
     t0 = time.monotonic()
     # Paths are bytes on the daemon side (relOk passes non-UTF-8 names
     # through byte-exact), so encode from the raw argv bytes: os.fsencode

@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-Benchmark & Figure Generator for modelfs
-Runs real latency, throughput, and cluster scaling benchmarks across modelfs peer nodes
-and plots the figures with matplotlib.
+"""Run live latency, throughput, and cluster-scaling benchmarks and plot them.
 
 Numbers come from the machine running the script, so by default the report and
 figures land in .scratch/benchmarks/ (gitignored); pass --update-docs to
@@ -154,7 +151,7 @@ def make_origin_and_psk(temp_dir: str) -> tuple[str, str]:
 
 
 def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]]:
-    print("=== Benchmark 1: Cluster Endpoint Query Latency Scaling ===")
+    print("=== Benchmark 1: /ping latency vs cluster size ===")
     _SCRATCH.mkdir(parents=True, exist_ok=True)
     temp_dir = tempfile.mkdtemp(prefix="bench-cluster-", dir=_SCRATCH)
     try:
@@ -199,13 +196,11 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
             # Every listener must be up before the timed sweep: poll instead
             # of a fixed sleep, whose guess would otherwise surface inside
             # the measured window as ConnectionRefused.
-            for _, port, _ in procs:
-                peer_ping.wait_for_ping(port, bench_headers(), 30.0)
-
             headers = bench_headers()
+            for _, port, _ in procs:
+                peer_ping.wait_for_ping(port, headers, 30.0)
 
             for num_nodes in node_counts:
-                # Measure /ping latency across active nodes
                 t0 = time.monotonic()
                 for i in range(1, num_nodes + 1):
                     port = 19100 + i
@@ -229,7 +224,7 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
 
 
 def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], list[float]]:
-    print("=== Benchmark 2: Expanded Chunk Size Sweep (256KB to 64MB) ===")
+    print("=== Benchmark 2: throughput vs piece size ===")
     _SCRATCH.mkdir(parents=True, exist_ok=True)
     temp_dir = tempfile.mkdtemp(prefix="bench-size-", dir=_SCRATCH)
     try:
@@ -286,17 +281,14 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
             try:
                 # The daemon must be serving before hydration and the timed
                 # fetch; poll its /ping instead of sleeping a constant.
-                peer_ping.wait_for_ping(port, bench_headers(), 30.0)
-
                 headers = bench_headers()
+                peer_ping.wait_for_ping(port, headers, 30.0)
 
-                # Hydrate piece via mount read if file exists
                 mount_file_path = os.path.join(mount_dir, test_file)
                 if os.path.exists(mount_file_path):
                     with open(mount_file_path, "rb") as mf:
                         _ = mf.read(1024)
 
-                # Fetch piece via /data HTTP range request
                 path_enc = urllib.parse.quote(test_file, safe="")
                 data_url = f"http://127.0.0.1:{port}/data?path={path_enc}"
                 req = urllib.request.Request(
@@ -315,7 +307,7 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
                 mbps = round(size_mb / max(elapsed_sec, 0.0001), 2)
                 throughputs_mbps.append(mbps)
                 print(
-                    f"  Chunk Size: {label:>4} ({size_mb:>5.2f} MB) -> "
+                    f"  Piece size: {label:>4} ({size_mb:>5.2f} MB) -> "
                     f"Throughput: {mbps:>7.2f} MB/s (Elapsed: {elapsed_sec * 1000:>6.2f} ms)"
                 )
             finally:
@@ -336,11 +328,10 @@ def plot_figures(
     throughputs_mbps: list[float],
     out_dir: Path,
 ) -> None:
-    print("=== Generating Publication-Quality Benchmark Charts ===")
+    print("=== Plotting figures ===")
     figures_dir = out_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    # Figure 1: Cluster Latency Scaling
     fig, ax = plt.subplots(figsize=(6.5, 4), dpi=300)
     ax.plot(
         node_counts,
@@ -368,7 +359,6 @@ def plot_figures(
     plt.close(fig)
     print(f"✓ Saved Figure 1: {fig1_path}")
 
-    # Figure 2: Throughput vs Expanded Chunk Sizes (256KB to 64MB)
     fig, ax = plt.subplots(figsize=(7.5, 4.2), dpi=300)
     bars = ax.bar(
         chunk_labels,
@@ -388,7 +378,6 @@ def plot_figures(
     ax.set_ylabel("Transfer Throughput (MB/s)", fontsize=10, labelpad=8)
     ax.grid(axis="y", linestyle="--", alpha=0.5)
 
-    # Value labels on top of bars
     for bar in bars:
         height = bar.get_height()
         ax.annotate(
@@ -408,7 +397,6 @@ def plot_figures(
     plt.close(fig)
     print(f"✓ Saved Figure 2: {fig2_path}")
 
-    # Figure 3: Storage Tier Latency Comparison
     fig, ax = plt.subplots(figsize=(6.5, 4), dpi=300)
     tiers = ["Local NVMe Cache", "Peer HTTP (Sendfile)", "NFS Origin Fallback"]
     # Illustrative design targets, not measured here; the report says so too.
@@ -561,7 +549,7 @@ def main() -> None:
             "To regenerate the tracked docs/benchmarks.md and docs/figures/, rerun "
             "with --update-docs from representative hardware."
         )
-    print("=== All Benchmarks and Figure Generations Completed Successfully ===")
+    print("=== Benchmarks complete ===")
 
 
 if __name__ == "__main__":

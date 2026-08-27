@@ -34,7 +34,7 @@ def main(argv: list[str]) -> int:
         if e.code != HTTP_UNAUTHORIZED:
             print(f"Error: Expected 401, got {e.code}", file=sys.stderr)
             return 1
-        print("✓ Correctly rejected invalid PSK with HTTP 401")
+        print("✓ rejected invalid PSK with HTTP 401")
         return 0
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", e)
