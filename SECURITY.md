@@ -2,9 +2,9 @@
 
 ## Supported versions
 
-`v0.1.0` is the current release (tag `v0.1.0`, matching `.version = "0.1.0"`
+`v0.2.0` is the current release (tag `v0.2.0`, matching `.version = "0.2.0"`
 in [build.zig.zon](build.zig.zon), which `modelfs version` prints), and the
-`0.1.x` line receives security fixes. Fixes land on `main`; a fix concerning
+`0.2.x` line receives security fixes. Fixes land on `main`; a fix concerning
 a released line is noted in [CHANGELOG.md](CHANGELOG.md) with the affected
 and fixed versions named, and shipped as the next `v<version>` tag per the
 release procedure in [CONTRIBUTING.md](CONTRIBUTING.md). If you build from an
