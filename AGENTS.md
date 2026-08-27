@@ -20,7 +20,8 @@ this file holds what is specific to this tree.
 `./scripts/check.sh` is the blocking gate: `zig fmt --check`, `zig build test`,
 shellcheck with the extra option set the script names, the restore-drill stub
 suite (`test_dr_restore_drill.sh`), ruff check, ruff format, mypy. CI runs the
-same script plus a cross-aarch64 compile. Never loosen a rule to pass it.
+same script plus a cross-aarch64 compile and the reproducibility rebuild.
+Never loosen a rule to pass it.
 
 The end-to-end suites need `/dev/fuse` and a `fusermount` helper, so they run
 locally rather than in CI: `run_e2e_tests.sh`, `run_cluster_e2e_9nodes.sh`,

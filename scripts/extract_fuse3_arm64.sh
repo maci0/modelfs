@@ -34,25 +34,35 @@ done
 extract_one() {
     if command -v dpkg-deb >/dev/null 2>&1; then
         dpkg-deb -x "$1" root/
-    elif command -v ar >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
+    elif command -v ar >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && command -v zstd >/dev/null 2>&1; then
         # A .deb is an ar archive whose data.tar.zst holds the filesystem;
         # this reproduces what dpkg-deb -x does on non-Debian hosts.
-        local data_tar="data.tar.zst"
-        ar x "$1" "${data_tar}"
-        # GNU tar 1.31+ understands --zstd; older tar still works when the
-        # zstd binary is on PATH (Arch, Rocky, and similar without dpkg).
-        if command -v zstd >/dev/null 2>&1; then
-            zstd -dc "${data_tar}" | tar -xf - -C root/
-        else
-            local tar_help
-            tar_help="$(tar --help 2>/dev/null || true)"
-            if [[ "${tar_help}" == *--zstd* ]]; then
-                tar --zstd -xf "${data_tar}" -C root/
+        # Unpack in scratch, not next to the tracked .deb files: ar writes
+        # members into cwd, and a killed extract used to leave a committable
+        # data.tar.zst under .deps/fuse3-arm64/.
+        local data_tar="data.tar.zst" tmp
+        mkdir -p "${SCRATCH_DIR}"
+        tmp="$(mktemp -d "${SCRATCH_DIR}/deb-XXXXXX")"
+        if ! (
+            cd "${tmp}"
+            ar x "${DEB_DIR}/$1" "${data_tar}"
+            # GNU tar 1.31+ understands --zstd; older tar still works when the
+            # zstd binary is on PATH (Arch, Rocky, and similar without dpkg).
+            if command -v zstd >/dev/null 2>&1; then
+                zstd -dc "${data_tar}" | tar -xf - -C "${DEB_DIR}/root/"
             else
-                fail "need dpkg-deb, or binutils ar plus zstd (or tar --zstd), to extract $1"
+                tar_help="$(tar --help 2>/dev/null || true)"
+                if [[ "${tar_help}" == *--zstd* ]]; then
+                    tar --zstd -xf "${data_tar}" -C "${DEB_DIR}/root/"
+                else
+                    exit 1
+                fi
             fi
+        ); then
+            rm -rf "${tmp}"
+            fail "failed to extract $1 via ar/tar"
         fi
-        rm -f "${data_tar}"
+        rm -rf "${tmp}"
     else
         fail "need dpkg-deb, or binutils ar plus zstd (or tar --zstd), to extract $1"
     fi

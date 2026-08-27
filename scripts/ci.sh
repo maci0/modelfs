@@ -25,7 +25,6 @@ fail() {
     exit 1
 }
 
-command -v file >/dev/null 2>&1 || fail "file not found on PATH (used to assert the aarch64 ELF machine type)"
 command -v zig >/dev/null 2>&1 || fail "zig not found on PATH -- see CONTRIBUTING.md (setup section)"
 
 echo "=== CI job: check ==="
@@ -36,17 +35,7 @@ echo "=== CI job: cross-aarch64 ==="
 CROSS_PREFIX="${SCRATCH_DIR}/cross-aarch64"
 rm -rf "${CROSS_PREFIX}"
 mkdir -p "${SCRATCH_DIR}"
-zig build -Dtarget=aarch64-linux-gnu.2.39 -Doptimize=ReleaseFast \
-    -Dfuse-include=.deps/fuse3-arm64/root/usr/include/fuse3 \
-    -Dfuse-lib=.deps/fuse3-arm64/lib \
-    --prefix "${CROSS_PREFIX}"
-CROSS_BIN="${CROSS_PREFIX}/bin/modelfs"
-[[ -f "${CROSS_BIN}" ]] || fail "cross-aarch64 produced no binary at ${CROSS_BIN}"
-cross_desc="$(file "${CROSS_BIN}")" || fail "file(1) failed on ${CROSS_BIN}"
-case "${cross_desc}" in
-    *ARM\ aarch64*) ;;
-    *) fail "cross-aarch64 produced a binary that is not ARM aarch64: ${cross_desc}" ;;
-esac
+"${SCRIPTS_DIR}/cross_aarch64.sh" --prefix "${CROSS_PREFIX}"
 
 echo "=== CI job: reproducibility ==="
 "${SCRIPTS_DIR}/repro_check.sh"

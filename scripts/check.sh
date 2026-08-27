@@ -22,6 +22,7 @@ Contributor commands (also listed by `zig build --help`):
   zig build test --watch                    rebuild and re-run on change
   zig build check                           this script
   zig build ci / ./scripts/ci.sh            every CI job (this, aarch64, repro)
+  ./scripts/cross_aarch64.sh                aarch64 ReleaseFast (vendored libfuse3)
   ./scripts/run_e2e_tests.sh                CLI and peer protocol; no FUSE
   ./scripts/run_cluster_e2e_9nodes.sh       9 FUSE mounts (/dev/fuse + fusermount3)
   ./scripts/test_fault_tolerance.sh         peer loss and lease expiry

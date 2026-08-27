@@ -93,9 +93,9 @@ Build:
 # this desktop (x86_64)
 zig build -Doptimize=ReleaseFast
 
-# sparks (aarch64, Ubuntu 24.04 fuse 3.14)
-zig build -Dtarget=aarch64-linux-gnu.2.39 -Doptimize=ReleaseFast \
-  -Dfuse-include=.../fuse3 -Dfuse-lib=.../libfuse3
+# sparks (aarch64, Ubuntu 24.04 fuse 3.14): same recipe CI runs
+./scripts/extract_fuse3_arm64.sh
+./scripts/cross_aarch64.sh
 ```
 
 Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are no cycles. New code goes in the module that already owns that concern.

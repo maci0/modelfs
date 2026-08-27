@@ -16,6 +16,10 @@ __pycache__/
 !.deps/fuse3-arm64/
 .deps/fuse3-arm64/root/
 .deps/fuse3-arm64/lib/
+# ar-fallback members if extract_fuse3_arm64.sh is killed mid-unpack
+.deps/fuse3-arm64/data.tar.zst
+.deps/fuse3-arm64/control.tar.zst
+.deps/fuse3-arm64/debian-binary
 
 # Crash artifacts: a core dump from a failed zig test or daemon run lands in
 # the crashing process's cwd, usually the repo root, and must never reach the

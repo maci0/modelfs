@@ -29,8 +29,12 @@ zfs set sharenfs="rw,async,no_root_squash,no_subtree_check" tank/models
 exportfs -v
 showmount -e localhost
 
-firewall-cmd --permanent --add-service={nfs,rpc-bind,mountd}
+# Do not --add-service=nfs: that opens the default zone to every source
+# and makes a later rich rule a no-op. Restrict NFS (and the rpcbind/
+# mountd NFSv3 helpers) to the LAN.
 firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=192.168.0.0/24 service name=nfs accept'
+firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=192.168.0.0/24 service name=rpc-bind accept'
+firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=192.168.0.0/24 service name=mountd accept'
 firewall-cmd --reload
 ```
 
@@ -43,7 +47,10 @@ systemctl enable --now smartd                         # disks complain before th
 
 Reads of cold weight files never surface silent bit rot; scrubs do.
 
-`*` on `showmount` is world-writable as root. The rich rule limits NFS to `192.168.0.0/24`. Or `sharenfs=off` and `/etc/exports`:
+`*` on `showmount` is world-writable as root. The firewall rich rules are
+what actually limits NFS to `192.168.0.0/24` (`--add-service=nfs` would
+open the default zone globally and ignore the source filter). Or
+`sharenfs=off` and `/etc/exports`:
 
 ```
 /export/models  192.168.0.0/24(rw,async,no_root_squash,no_subtree_check)

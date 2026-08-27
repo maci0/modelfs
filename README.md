@@ -61,10 +61,7 @@ Non-default libfuse3 locations, e.g. when cross-compiling: the vendored arm64 tr
 
 ```bash
 ./scripts/extract_fuse3_arm64.sh
-
-zig build -Dtarget=aarch64-linux-gnu.2.39 -Doptimize=ReleaseFast \
-  -Dfuse-include=.deps/fuse3-arm64/root/usr/include/fuse3 \
-  -Dfuse-lib=.deps/fuse3-arm64/lib
+./scripts/cross_aarch64.sh                # ReleaseFast aarch64; same recipe CI runs
 ```
 
 ## Quickstart

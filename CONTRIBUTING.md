@@ -7,8 +7,8 @@ what passes locally is what passes on push.
 ## Setup, once per clone
 
 Requirements: Linux, **Zig 0.16.0 or newer** (`minimum_zig_version` in
-[build.zig.zon](build.zig.zon) enforces this; CI builds with exactly
-0.16.0), libfuse3 headers
+[build.zig.zon](build.zig.zon) is the floor and the version CI installs;
+setup-zig reads that field so a bump updates every job), libfuse3 headers
 (`libfuse3-dev` / `fuse3-devel`), shellcheck, and **uv**. Python tooling is
 pinned and type-checked against 3.12 ([.python-version](.python-version));
 install it with uv:
