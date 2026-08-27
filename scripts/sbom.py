@@ -20,9 +20,13 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 _PKG = re.compile(r"^([A-Za-z0-9_.-]+)==([^\\\s;]+)(?:\s*;\s*([^\\]+?))?\s*\\?\s*$")
+_SHA1_HEX_LEN = 40
 _SHA256_HEX_LEN = 64
 _HASH = re.compile(r"^--hash=sha256:([0-9a-f]{64})\s*\\?\s*$")
-_ZON_VERSION = re.compile(r'\.version\s*=\s*"([^"]+)"')
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+# Line-anchored, same as scripts/check.sh. An unanchored `\.version` also
+# matches `.minimum_zig_version` (it ends in `.version`).
+_ZON_STRING = re.compile(r'^\s*\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]+)"', re.MULTILINE)
 _BOUND = re.compile(r"^([A-Za-z0-9_.-]+)\s*(?:===|==|!=|<=|>=|~=|<|>)")
 _PEP503_PUNCT = re.compile(r"[-_.]+")
 _ACTION = re.compile(
@@ -32,11 +36,13 @@ _ACTION = re.compile(
 _LOCK_REL = "requirements-dev.lock.txt"
 _BOUNDS_REL = "requirements-dev.txt"
 
-# SPDX for every PyPI and deb name this inventory emits. A new lock package
-# or vendored .deb without an entry fails generation instead of shipping an
-# unlicensed component. PyPI ids are License-Expression from the pinned
-# wheel METADATA (pathspec: the Trove classifier; it has no License-Expression).
-# Deb ids follow .deps/fuse3-arm64/NOTICE and copyright.
+# SPDX for every PyPI, deb, GitHub Action, and toolchain name this inventory
+# emits. A new lock package, vendored .deb, or uses: pin without an entry
+# fails generation instead of shipping an unlicensed component. PyPI ids are
+# License-Expression from the pinned wheel METADATA (pathspec: the Trove
+# classifier; it has no License-Expression). Deb ids follow
+# .deps/fuse3-arm64/NOTICE and copyright. Action ids are LICENSE at the
+# pinned commit. zig is MIT (ziglang/zig).
 _SPDX: dict[str, str] = {
     "ast-serialize": "MIT",
     "librt": "MIT",
@@ -47,6 +53,10 @@ _SPDX: dict[str, str] = {
     "typing-extensions": "PSF-2.0",
     "libfuse3-3": "LGPL-2.1-or-later",
     "libfuse3-dev": "GPL-2.0-only AND LGPL-2.1-or-later",
+    "actions/checkout": "MIT",
+    "astral-sh/setup-uv": "MIT",
+    "mlugg/setup-zig": "MIT",
+    "zig": "MIT",
 }
 
 
@@ -72,11 +82,12 @@ def project_root() -> Path:
     sys.exit(f"cannot find build.zig.zon above {here}")
 
 
-def zon_version(text: str) -> str:
-    match = _ZON_VERSION.search(text)
-    if match is None:
-        sys.exit("no .version in build.zig.zon")
-    return match.group(1)
+def zon_string(text: str, field: str) -> str:
+    """Quoted string field in build.zig.zon, matched as a whole identifier."""
+    for match in _ZON_STRING.finditer(text):
+        if match.group(1) == field:
+            return match.group(2)
+    sys.exit(f"no .{field} in build.zig.zon")
 
 
 def _pep503(name: str) -> str:
@@ -131,13 +142,17 @@ def require_bounds_locked(bounds: list[str], packages: list[LockedPackage]) -> N
 
 def parse_sha256sums(text: str) -> list[tuple[str, str]]:
     entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         digest, sep, name = line.partition("  ")
-        if sep == "" or len(digest) != _SHA256_HEX_LEN or "/" in name or name in {".", ".."}:
+        if sep == "" or _HEX64.fullmatch(digest) is None or "/" in name or name in {".", ".."}:
             sys.exit(f"malformed SHA256SUMS line: {line}")
+        if name in seen:
+            sys.exit(f"duplicate SHA256SUMS entry: {name}")
+        seen.add(name)
         entries.append((name, digest))
     if not entries:
         sys.exit("SHA256SUMS has no entries")
@@ -221,6 +236,15 @@ def hashes_cdx(digests: list[str]) -> list[dict[str, str]]:
     return [{"alg": "SHA-256", "content": digest} for digest in dict.fromkeys(digests)]
 
 
+def commit_hashes(digest: str) -> list[dict[str, str]]:
+    """GitHub Actions pins: 40-char SHA-1 or 64-char SHA-256 commit id."""
+    if len(digest) == _SHA256_HEX_LEN:
+        return [{"alg": "SHA-256", "content": digest}]
+    if len(digest) == _SHA1_HEX_LEN:
+        return [{"alg": "SHA-1", "content": digest}]
+    sys.exit(f"unsupported commit digest length {len(digest)}")
+
+
 def licenses_cdx(name: str, *, required: bool) -> list[dict[str, object]]:
     spdx = _SPDX.get(name)
     if spdx is None:
@@ -236,15 +260,16 @@ def licenses_cdx(name: str, *, required: bool) -> list[dict[str, object]]:
 
 
 def build_bom(root: Path) -> dict[str, object]:
-    version = zon_version((root / "build.zig.zon").read_text(encoding="utf-8"))
+    zon_text = (root / "build.zig.zon").read_text(encoding="utf-8")
+    version = zon_string(zon_text, "version")
+    min_zig = zon_string(zon_text, "minimum_zig_version")
     packages = parse_lock((root / _LOCK_REL).read_text(encoding="utf-8"))
     require_bounds_locked(
         parse_bounds((root / _BOUNDS_REL).read_text(encoding="utf-8")),
         packages,
     )
-    debs = parse_sha256sums(
-        (root / ".deps" / "fuse3-arm64" / "SHA256SUMS").read_text(encoding="utf-8")
-    )
+    deb_dir = root / ".deps" / "fuse3-arm64"
+    debs = parse_sha256sums((deb_dir / "SHA256SUMS").read_text(encoding="utf-8"))
     actions = load_actions(root)
     components: list[dict[str, object]] = []
     for pkg in packages:
@@ -263,6 +288,10 @@ def build_bom(root: Path) -> dict[str, object]:
             }
         )
     for filename, digest in debs:
+        if not filename.endswith(".deb"):
+            sys.exit(f"SHA256SUMS entry {filename} is not a .deb")
+        if not (deb_dir / filename).is_file():
+            sys.exit(f"{filename} is listed in SHA256SUMS but missing")
         name, ver, purl = deb_purl(filename)
         components.append(
             {
@@ -275,18 +304,28 @@ def build_bom(root: Path) -> dict[str, object]:
                 "scope": "required",
             }
         )
-    for action in actions:
-        entry: dict[str, object] = {
+    components.extend(
+        {
             "type": "library",
             "name": action.name,
             "version": action.digest,
             "purl": github_purl(action.name, action.digest),
+            "hashes": commit_hashes(action.digest),
+            "licenses": licenses_cdx(action.name, required=True),
             "scope": "excluded",
         }
-        licenses = licenses_cdx(action.name, required=False)
-        if licenses:
-            entry["licenses"] = licenses
-        components.append(entry)
+        for action in actions
+    )
+    components.append(
+        {
+            "type": "application",
+            "name": "zig",
+            "version": min_zig,
+            "purl": f"pkg:github/ziglang/zig@{min_zig}",
+            "licenses": licenses_cdx("zig", required=True),
+            "scope": "excluded",
+        }
+    )
     components.sort(key=lambda c: str(c["purl"]))
     return {
         "bomFormat": "CycloneDX",
@@ -355,8 +394,38 @@ def _self_test_bounds() -> None:
     require_bounds_locked(["Mypy"], [pkg])
 
 
+def _self_test_zon() -> None:
+    text = (
+        ".{\n    .name = .modelfs,\n"
+        '    .minimum_zig_version = "0.16.0",\n'
+        '    .version = "0.1.0",\n}\n'
+    )
+    if zon_string(text, "version") != "0.1.0":
+        sys.exit("self-test failed: zon_string confused .minimum_zig_version for .version")
+    if zon_string(text, "minimum_zig_version") != "0.16.0":
+        sys.exit("self-test failed: zon_string missed .minimum_zig_version")
+    _must_exit(
+        lambda: zon_string('.{\n    .version = "0.1.0",\n}\n', "minimum_zig_version"),
+        "no .minimum_zig_version",
+    )
+
+
+def _self_test_sums() -> None:
+    digest = "a" * _SHA256_HEX_LEN
+    line = f"{digest}  libfuse3-3_1_arm64.deb\n"
+    got = parse_sha256sums(f"# comment\n{line}")
+    if got != [("libfuse3-3_1_arm64.deb", digest)]:
+        sys.exit(f"self-test failed: parse_sha256sums {got}")
+    _must_exit(
+        lambda: parse_sha256sums(("A" * _SHA256_HEX_LEN) + "  foo.deb\n"),
+        "malformed SHA256SUMS line",
+    )
+    _must_exit(lambda: parse_sha256sums(line + line), "duplicate SHA256SUMS entry")
+    _must_exit(lambda: parse_sha256sums("# none\n"), "SHA256SUMS has no entries")
+
+
 def _self_test_actions() -> None:
-    sha = "f" * 40
+    sha = "f" * _SHA1_HEX_LEN
     got = parse_actions(
         f"      - uses: actions/checkout@{sha} # v5\n"
         f"      - uses: actions/checkout@{sha} # duplicate\n"
@@ -383,6 +452,14 @@ def _self_test_actions() -> None:
     purl = github_purl("actions/checkout", sha)
     if purl != f"pkg:github/actions/checkout@{sha}":
         sys.exit(f"self-test failed: github_purl {purl}")
+    sha1 = commit_hashes(sha)
+    if sha1 != [{"alg": "SHA-1", "content": sha}]:
+        sys.exit(f"self-test failed: commit_hashes sha1 {sha1}")
+    sha256 = "b" * _SHA256_HEX_LEN
+    hashed = commit_hashes(sha256)
+    if hashed != [{"alg": "SHA-256", "content": sha256}]:
+        sys.exit(f"self-test failed: commit_hashes sha256 {hashed}")
+    _must_exit(lambda: commit_hashes("abc"), "unsupported commit digest length")
 
 
 def _self_test_spdx() -> None:
@@ -392,9 +469,47 @@ def _self_test_spdx() -> None:
     mixed = licenses_cdx("libfuse3-dev", required=True)
     if mixed != [{"expression": "GPL-2.0-only AND LGPL-2.1-or-later"}]:
         sys.exit(f"self-test failed: libfuse3-dev SPDX {mixed}")
-    if licenses_cdx("actions/checkout", required=False) != []:
+    checkout = licenses_cdx("actions/checkout", required=True)
+    if checkout != [{"license": {"id": "MIT"}}]:
+        sys.exit(f"self-test failed: actions/checkout SPDX {checkout}")
+    if licenses_cdx("nobody/not-an-action", required=False) != []:
         sys.exit("self-test failed: unknown action SPDX should be omitted")
     _must_exit(lambda: licenses_cdx("not-a-real-package", required=True), "has no SPDX entry")
+    _must_exit(lambda: licenses_cdx("nobody/not-an-action", required=True), "has no SPDX entry")
+
+
+def _bom_by_name(bom: dict[str, object]) -> dict[str, dict[str, object]]:
+    raw_components = bom["components"]
+    if not isinstance(raw_components, list):
+        sys.exit("self-test failed: BOM components is not a list")
+    by_name: dict[str, dict[str, object]] = {}
+    for raw in raw_components:
+        if not isinstance(raw, dict):
+            sys.exit("self-test failed: BOM component is not an object")
+        name = raw.get("name")
+        if not isinstance(name, str):
+            sys.exit("self-test failed: BOM component missing name")
+        by_name[name] = raw
+    return by_name
+
+
+def _self_test_bom_pins(root: Path, wanted: set[str]) -> None:
+    by_name = _bom_by_name(build_bom(root))
+    min_zig = zon_string(
+        (root / "build.zig.zon").read_text(encoding="utf-8"),
+        "minimum_zig_version",
+    )
+    zig = by_name.get("zig")
+    if zig is None or zig.get("version") != min_zig:
+        sys.exit("self-test failed: BOM missing zig from minimum_zig_version")
+    if "licenses" not in zig:
+        sys.exit("self-test failed: zig component has no licenses")
+    for name in wanted:
+        entry = by_name.get(name)
+        if entry is None:
+            sys.exit(f"self-test failed: BOM missing {name}")
+        if "hashes" not in entry or "licenses" not in entry:
+            sys.exit(f"self-test failed: {name} missing hashes or licenses")
 
 
 def _self_test_repo(root: Path) -> None:
@@ -412,11 +527,14 @@ def _self_test_repo(root: Path) -> None:
     missing = wanted - got
     if missing:
         sys.exit(f"self-test failed: workflow missing uses: {sorted(missing)}")
+    _self_test_bom_pins(root, wanted)
 
 
 def self_test(root: Path) -> None:
     _self_test_lock()
     _self_test_bounds()
+    _self_test_zon()
+    _self_test_sums()
     _self_test_actions()
     _self_test_spdx()
     _self_test_repo(root)

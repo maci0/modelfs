@@ -40,6 +40,19 @@
       "version": "3.14.0-5build1"
     },
     {
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
       "name": "actions/checkout",
       "purl": "pkg:github/actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
       "scope": "excluded",
@@ -47,6 +60,19 @@
       "version": "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"
     },
     {
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "37802adc94f370d6bfd71619e3f0bf239e1f3b78"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
       "name": "astral-sh/setup-uv",
       "purl": "pkg:github/astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
       "scope": "excluded",
@@ -54,11 +80,38 @@
       "version": "37802adc94f370d6bfd71619e3f0bf239e1f3b78"
     },
     {
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "d1434d08867e3ee9daa34448df10607b98908d29"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
       "name": "mlugg/setup-zig",
       "purl": "pkg:github/mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
       "scope": "excluded",
       "type": "library",
       "version": "d1434d08867e3ee9daa34448df10607b98908d29"
+    },
+    {
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "zig",
+      "purl": "pkg:github/ziglang/zig@0.16.0",
+      "scope": "excluded",
+      "type": "application",
+      "version": "0.16.0"
     },
     {
       "hashes": [

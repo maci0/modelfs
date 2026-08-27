@@ -95,8 +95,10 @@ hash-pinned lock (regeneration command in the lock's header) and in
 [sbom.cdx.json](sbom.cdx.json) (`python3 scripts/sbom.py --write`). A
 new lock package also needs its SPDX id in `scripts/sbom.py` (`_SPDX`,
 from the wheel `License-Expression`). GitHub Actions in
-`.github/workflows` must be pinned to a 40- or 64-character commit SHA;
-the inventory lists them and refuses a moving tag. A refresh of the
+`.github/workflows` must be pinned to a 40- or 64-character commit SHA
+and listed in `_SPDX` (LICENSE at that commit); the inventory records
+the digest as a hash and refuses a moving tag. Zig's
+`minimum_zig_version` is inventoried the same way. A refresh of the
 vendored arm64 libfuse3 `.deb`s must regenerate
 `.deps/fuse3-arm64/SHA256SUMS` and the SBOM the same way.
 
