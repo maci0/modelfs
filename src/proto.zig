@@ -82,7 +82,12 @@ pub fn pathOnly(target: []const u8) []const u8 {
 
 pub const Range = struct { start: u64, end: u64 };
 
-fn parseU64Fast(s: []const u8) ?u64 {
+/// Unsigned decimal (`1*DIGIT`) as used on the wire for Range,
+/// Content-Range, Content-Length, and X-Piece-Size. Rejects the sign and
+/// underscore forms `std.fmt.parseInt` would accept, so a `+16` or `16_0`
+/// length cannot size a body (or an advertised piece grid) differently
+/// from a Range the same peer sent.
+pub fn parseU64Fast(s: []const u8) ?u64 {
     if (s.len == 0 or s.len > 20) return null;
     var n: u64 = 0;
     for (s) |ch| {
@@ -318,6 +323,17 @@ test "range and query" {
     try std.testing.expect(parseRange("bytes=0-99999999999999999999") == null);
     try std.testing.expect(parseRange("bytes=99999999999999999999-0") == null);
     try std.testing.expect(parseRange("bytes=18446744073709551615-18446744073709551615") != null);
+    // The same digit-only rule Range uses: a leading sign or interior
+    // underscore is not a length, so Content-Length/X-Piece-Size cannot
+    // accept what Range would refuse.
+    try std.testing.expectEqual(@as(u64, 0), parseU64Fast("0").?);
+    try std.testing.expectEqual(@as(u64, 16), parseU64Fast("016").?);
+    try std.testing.expect(parseU64Fast("") == null);
+    try std.testing.expect(parseU64Fast("+16") == null);
+    try std.testing.expect(parseU64Fast("16_0") == null);
+    try std.testing.expect(parseU64Fast("16Mi") == null);
+    try std.testing.expect(parseU64Fast("-1") == null);
+    try std.testing.expect(parseU64Fast(" 16") == null);
 
     const cr = parseContentRange("bytes 16-31/48").?;
     try std.testing.expectEqual(@as(u64, 16), cr.start);

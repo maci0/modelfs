@@ -180,7 +180,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 |---|---|
 | 200 | `/ping` (`text/plain`, body `ok`) or `/have` (`application/octet-stream` bitmap + `X-Piece-Size`) |
 | 206 | `/data` partial content (`Content-Range`, `application/octet-stream`) |
-| 400 | Undecodable or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
+| 400 | Missing, empty, undecodable, or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
 | 401 | Missing or wrong bearer token (`WWW-Authenticate: Bearer`), including on non-GET |
 | 404 | Unknown path, or the origin has no regular file at `path` |
 | 405 | Authenticated request whose method is not GET (`Allow: GET`) |
@@ -188,7 +188,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 | 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write) |
 | 502 | The origin is unreachable or failed (stat/pread error), i.e. retry another peer |
 
-A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. The fetching peer requires `206` plus a `Content-Range` whose start matches the request and whose end is at most the request end (EOF clamp); a same-length window at a different offset is refused rather than cached. `v0.1.0` servers already send that header on every 206, so a mixed fleet still fills. Errors carry no body: both peers of a conversation parse only the status line.
+A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. Wire integers (`Range`, `Content-Range`, `Content-Length`, `X-Piece-Size`) are unsigned decimal digits only: a leading sign or interior underscore is malformed, the same rule RFC 9110 uses for Content-Length. The fetching peer requires `206` plus a `Content-Range` whose start matches the request and whose end is at most the request end (EOF clamp); a same-length window at a different offset is refused rather than cached. `v0.1.0` servers already send that header on every 206, so a mixed fleet still fills. Errors carry no body: both peers of a conversation parse only the status line.
 
 Every request requires the bearer token, including `/ping` and non-GET methods (those answer 401 without a token, 405 with one). Listen `0.0.0.0` on each unique advertised port (default 18080); `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status. Listen sockets, accepted connections, and files are opened close-on-exec (`sys.socket`, `sys.accept`, `sys.open`) so the `auto_unmount` fusermount helper spawned at mount cannot inherit them: a helper still holding the listen fd would keep the port bound after `Server.stop`, and the next start would fail to bind.
 

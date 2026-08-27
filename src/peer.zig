@@ -805,13 +805,15 @@ fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, 
         return error.HttpStatus;
     }
     const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
-    const piece_size = std.fmt.parseInt(u32, ps_str, 10) catch return error.BadPieceSize;
+    const piece_size_n = proto.parseU64Fast(ps_str) orelse return error.BadPieceSize;
+    const piece_size = std.math.cast(u32, piece_size_n) orelse return error.BadPieceSize;
     // Refuse absurd bitmaps before the allocation instead of letting
     // finishBodyAlloc honor them up to max_alloc_body_bytes (see
     // max_have_body_bytes). A missing header reads as length 0, matching the
-    // zero-length success below.
+    // zero-length success below. The same 1*DIGIT parser Range uses: a
+    // "+16" or "16_0" length is malformed, not a size.
     const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
-    const declared = std.fmt.parseInt(usize, cl_str, 10) catch 0;
+    const declared = proto.parseU64Fast(cl_str) orelse return error.BadContentLength;
     if (declared > max_have_body_bytes) return error.BodyTooLarge;
     const bits = try finishBodyAlloc(gpa, io, fd, head_buf, head_len, total_read, null, deadline_ms);
     return .{ .bits = bits, .piece_size = piece_size };
@@ -974,9 +976,12 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_
     // one: coercing it to 0 would let e.g. "Content-Length: 16Mi" succeed as
     // an empty body, and the /have caller would then cache an empty bitmap
     // and route every fill away from a healthy peer for the probe TTL. Same
-    // policy as haveFromHead's X-Piece-Size parse. An absent header keeps its
-    // legacy 0 reading; the dest-length contract below still fails those.
-    const want_len = std.fmt.parseInt(usize, cl_str, 10) catch return error.BadContentLength;
+    // policy as haveFromHead's X-Piece-Size parse, and the same 1*DIGIT
+    // rule Range uses so a "+16" or "16_0" length cannot size a body.
+    // An absent header keeps its legacy 0 reading; the dest-length contract
+    // below still fails those.
+    const want_len_n = proto.parseU64Fast(cl_str) orelse return error.BadContentLength;
+    const want_len = std.math.cast(usize, want_len_n) orelse return error.BadContentLength;
 
     // A caller-supplied buffer streams straight into it (no piece-sized
     // allocation and copy per fetch); its length must match exactly. With a
@@ -1508,6 +1513,21 @@ test "readFlexBodyAlloc rejects a malformed Content-Length instead of coercing t
     // Digit runs beyond usize must fail too, not wrap into a small length.
     {
         const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Length: 99999999999999999999999\r\nConnection: close\r\n\r\n");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
+    }
+    // Sign and underscore are parseInt's extras, not RFC 9110 1*DIGIT: the
+    // Range parser already refuses them, and a length must not accept what
+    // a Range on the same peer would reject.
+    {
+        const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: +8\r\nConnection: close\r\n\r\n01234567");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
+    }
+    {
+        const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: 8_0\r\nConnection: close\r\n\r\n01234567");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
@@ -2281,6 +2301,22 @@ test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
         defer sys.close(pair[1]);
         try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
     }
+    // Same 1*DIGIT rule as Content-Length and Range: a signed or grouped
+    // grid is malformed, not "unknown" (0) and not a real piece size.
+    {
+        const head = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: +16\r\nConnection: close\r\n\r\nz";
+        const pair = try responsePair(head);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
+    }
+    {
+        const head = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16_0\r\nConnection: close\r\n\r\nz";
+        const pair = try responsePair(head);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
+    }
 }
 
 test "haveFromHead refuses a bitmap above the /have body bound before allocating" {
@@ -2369,9 +2405,20 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         }
     }
     // A routed path without its ?path= parameter is a client error answered
-    // before any storage touch, not a 404 and not a crash.
+    // before any storage touch, not a 404 and not a crash. /data is the same
+    // even when a Range is present: missing path is not a missing Range.
     {
         var res = try roundTrip(port, "GET /have HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+    {
+        var res = try roundTrip(port, "GET /data HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+    {
+        var res = try roundTrip(port, "GET /have?path= HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
     }
@@ -3007,6 +3054,9 @@ const seed_reply_206_cr_mismatch = fuzzcorpus.entry("HTTP/1.1 206 Partial Conten
 const seed_reply_206_cr_star = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/*\r\nConnection: close\r\n\r\nhi");
 const seed_reply_206_cr_inverted = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 10-1/16\r\nConnection: close\r\n\r\nhi");
 const seed_reply_206_cr_eq = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes=0-1/16\r\nConnection: close\r\n\r\nhi");
+const seed_reply_plus_cl = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: +3\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nabc");
+const seed_reply_underscore_cl = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1_0\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\n0123456789");
+const seed_reply_plus_ps = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: +16\r\nConnection: close\r\n\r\nz");
 
 const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_ok,
@@ -3022,6 +3072,9 @@ const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_206_cr_star,
     &seed_reply_206_cr_inverted,
     &seed_reply_206_cr_eq,
+    &seed_reply_plus_cl,
+    &seed_reply_underscore_cl,
+    &seed_reply_plus_ps,
 };
 
 /// Connected socketpair with `wire` already written into fds[0]: a
@@ -3103,12 +3156,13 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                     defer gpa.free(rep.bits);
                     const head = head_buf[0..head_len];
                     const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
-                    const want_len = std.fmt.parseInt(usize, cl_str, 10) catch 0;
+                    const want_len = std.math.cast(usize, proto.parseU64Fast(cl_str) orelse 0) orelse 0;
                     try std.testing.expectEqual(want_len, rep.bits.len);
                     try std.testing.expect(total_read >= head_len + rep.bits.len);
                     try std.testing.expectEqualSlices(u8, wire[head_len..][0..rep.bits.len], rep.bits);
                     const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
-                    try std.testing.expectEqual(try std.fmt.parseInt(u32, ps_str, 10), rep.piece_size);
+                    const ps_n = proto.parseU64Fast(ps_str) orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(std.math.cast(u32, ps_n) orelse return error.TestUnexpectedResult, rep.piece_size);
                 } else |_| {}
             } else |_| {}
         }
@@ -3146,7 +3200,7 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                 const status_ok = std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 200") or
                     std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 206");
                 const dest_cl_str = proto.headerGet(dest_head, "Content-Length") orelse "0";
-                const dest_want: ?usize = std.fmt.parseInt(usize, dest_cl_str, 10) catch null;
+                const dest_want: ?usize = if (proto.parseU64Fast(dest_cl_str)) |n| std.math.cast(usize, n) else null;
 
                 var dest_buf: [64]u8 = undefined;
                 const dest_len: usize = @intCast(smith.value(usize) % (dest_buf.len + 1));
@@ -3312,6 +3366,8 @@ const seed_serve_unknown_route = fuzzcorpus.entry("GET /nope?path=x HTTP/1.1\r\n
 const seed_serve_bad_escape = fuzzcorpus.entry("GET /have?path=%zz HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_serve_data_no_range = fuzzcorpus.entry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_serve_data_bad_range = fuzzcorpus.entry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=x-\r\n\r\n");
+const seed_serve_data_no_path = fuzzcorpus.entry("GET /data HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-0\r\n\r\n");
+const seed_serve_empty_path = fuzzcorpus.entry("GET /have?path= HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 
 const fuzz_serve_corpus = [_][]const u8{
     &seed_req_have_ok,
@@ -3334,6 +3390,8 @@ const fuzz_serve_corpus = [_][]const u8{
     &seed_serve_bad_escape,
     &seed_serve_data_no_range,
     &seed_serve_data_bad_range,
+    &seed_serve_data_no_path,
+    &seed_serve_empty_path,
 };
 
 /// Every outcome handleConn's published order can produce for a head whose
@@ -3743,7 +3801,7 @@ fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
             const cr = try std.fmt.bufPrint(&crbuf, "bytes {d}-{d}/{d}", .{ pr.start, pr.end, data_file_size });
             try std.testing.expectEqualStrings(cr, proto.headerGet(rep_head, "Content-Range") orelse return error.NoContentRange);
             const cl_str = proto.headerGet(rep_head, "Content-Length") orelse return error.NoContentLength;
-            try std.testing.expectEqual(want_len, try std.fmt.parseInt(u64, cl_str, 10));
+            try std.testing.expectEqual(want_len, proto.parseU64Fast(cl_str) orelse return error.BadContentLength);
             try std.testing.expectEqual(want_len, @as(u64, body.len));
             try std.testing.expectEqualSlices(u8, data_pattern[pr.start..][0..want_len], body);
         },
@@ -3751,7 +3809,7 @@ fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
             try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
             try std.testing.expectEqualStrings("16", proto.headerGet(rep_head, "X-Piece-Size") orelse return error.NoPieceSize);
             const cl_str = proto.headerGet(rep_head, "Content-Length") orelse return error.NoContentLength;
-            try std.testing.expectEqual(hb.bits_bytes, try std.fmt.parseInt(usize, cl_str, 10));
+            try std.testing.expectEqual(hb.bits_bytes, std.math.cast(usize, proto.parseU64Fast(cl_str) orelse return error.BadContentLength) orelse return error.BadContentLength);
             try std.testing.expectEqual(hb.bits_bytes, body.len);
             const mask = havePadMask(hb.nbits);
             for (body) |b| try std.testing.expect(b & mask == 0);
