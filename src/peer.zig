@@ -1456,7 +1456,7 @@ test "haveFromHeadDeadline pairs refusal at an expired budget with success at a 
     const wire = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nok";
     const head_len = std.mem.indexOf(u8, wire, "\r\n\r\n").? + 4;
     // Drains exactly the head bytes off the socket, leaving only the bitmap
-    // body staged -- the state fetchHaveDeadline hands to this function.
+    // body staged -- the state fetchHave hands to this function.
     const drainHead = struct {
         fn go(fd: std.posix.fd_t, head_bytes: usize) !void {
             var sink: [96]u8 = undefined;
@@ -1468,7 +1468,7 @@ test "haveFromHeadDeadline pairs refusal at an expired budget with success at a 
             }
         }
     }.go;
-    // Head pre-read exactly like fetchHaveDeadline leaves it; the bitmap
+    // Head pre-read exactly like fetchHave leaves it; the bitmap
     // bytes stay staged in the socket behind it.
     {
         // Fully staged reply, expired budget: no further byte may move under

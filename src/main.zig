@@ -465,11 +465,6 @@ fn parsePercent(flag: []const u8, raw: []const u8) !u32 {
     return pct;
 }
 
-fn takePercent(args: []const []const u8, flag: []const u8, i: *usize) !u32 {
-    const raw = try takeValue(args, flag, i, null);
-    return parsePercent(flag, raw);
-}
-
 /// The command words main() dispatches on; the bare help/version forms are
 /// answered before parseArgs ever runs. Keeping one list means a newly added
 /// command missing from it fails loudly everywhere instead of slipping past
@@ -690,7 +685,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         }
     }
     // Cross-field gate on the cull watermarks: each value is individually a
-    // percentage (takePercent), but only the strict ordering brun > bcull >
+    // percentage (parsePercent), but only the strict ordering brun > bcull >
     // bstop gives phase() working hysteresis. Out of order, the daemon
     // hard-culls far above the intended floor (bstop >= bcull) or punches
     // candidates every tick in the run/cull flap band (brun <= bcull).
@@ -1511,11 +1506,8 @@ fn fuzzFlagValuesOne(_: void, smith: *std.testing.Smith) anyerror!void {
     // Watermark gate: an unsigned integer 0..100, nothing else.
     const pct_raw: ?u32 = std.fmt.parseInt(u32, s, 10) catch null;
     const want_pct: ?u32 = if (pct_raw) |p| (if (p <= 100) p else null) else null;
-    var val_i: usize = 0;
-    const args = [_][]const u8{ "--brun", s };
-    const pct: ?u32 = takePercent(&args, "--brun", &val_i) catch null;
+    const pct: ?u32 = parsePercent("--brun", s) catch null;
     try std.testing.expectEqual(want_pct, pct);
-    try std.testing.expectEqual(@as(usize, 1), val_i);
 
     // --seed consumes HOST[:PORT]; --listen consumes [IP:]PORT. On any spec
     // both accept as a HOST:PORT form, they must name the same explicit

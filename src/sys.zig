@@ -158,20 +158,10 @@ pub fn close(fd: c_int) void {
     if (fd >= 0) _ = c.close(fd);
 }
 
-/// One pread/pwrite call. Internal step of the *All loops below; every
-/// caller outside them wants the EINTR-retrying loop instead.
-fn pread(fd: c_int, buf: []u8, off: u64) isize {
-    return c.pread(fd, buf.ptr, buf.len, @intCast(off));
-}
-
-fn pwrite(fd: c_int, buf: []const u8, off: u64) isize {
-    return c.pwrite(fd, buf.ptr, buf.len, @intCast(off));
-}
-
 pub fn preadAll(fd: c_int, buf: []u8, off: u64) isize {
     var got: usize = 0;
     while (got < buf.len) {
-        const n = pread(fd, buf[got..], off + got);
+        const n = c.pread(fd, buf[got..].ptr, buf.len - got, @intCast(off + got));
         if (n < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll: a
             // stray signal must not end a multi-chunk transfer midway.
@@ -200,7 +190,7 @@ pub fn punchHole(fd: c_int, off: u64, len: u64) i32 {
 pub fn pwriteAll(fd: c_int, buf: []const u8, off: u64) isize {
     var put: usize = 0;
     while (put < buf.len) {
-        const n = pwrite(fd, buf[put..], off + put);
+        const n = c.pwrite(fd, buf[put..].ptr, buf.len - put, @intCast(off + put));
         if (n < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll; a
             // partial write must never be mistaken for a completed one.
