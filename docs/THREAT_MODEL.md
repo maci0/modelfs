@@ -201,6 +201,6 @@ Trust placed in client-side enforcement: none found. The server validates path, 
 
 ## Maintenance notes
 
-- Every claim above cites a file and line; when code moves, re-verify the citation before trusting the row.
+- Every claim above cites a file and symbol; when code moves, re-verify the citation before trusting the row.
 - Historical security claims live in docs/design.md §9 and are annotated there; do not import them here without checking src/.
 - This document intentionally does not propose designs for the gaps; sec-review passes aimed by the ranking above own those fixes.
