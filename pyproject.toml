@@ -1,4 +1,12 @@
 # Static analysis configuration for the Python tooling under scripts/.
+
+# Floor/ceiling for the uv that resolves the lock and that CI installs.
+# setup-uv reads this field when its `version` input is empty, so a bump
+# here updates local `uv` and the check job together. Cap before the next
+# breaking release the same way requirements-dev.txt caps ruff/mypy.
+[tool.uv]
+required-version = ">=0.12,<0.13"
+
 [tool.ruff]
 line-length = 100
 # Matches .python-version and the CI interpreter: the only runtimes these
@@ -51,9 +59,10 @@ docstring-code-format = true
 
 [tool.mypy]
 strict = true
-# Analyze against the declared runtime (.python-version, CI's setup-uv
-# python-version): a bare mypy run under a different local interpreter must
-# not silently check different stdlib semantics than the gate does.
+# Analyze against the declared runtime (.python-version, which the check
+# job reads into setup-uv's python-version): a bare mypy run under a
+# different local interpreter must not silently check different stdlib
+# semantics than the gate does.
 python_version = "3.12"
 # Same target set scripts/check.sh passes, so a bare `mypy` matches the gate.
 files = ["scripts"]

@@ -50,35 +50,41 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
 
       # README requirement: compiling against libfuse3 needs its headers,
-      # which the runner image does not preinstall. Indexes flake; three
-      # tries beat a red X from a transient mirror (job timeout is the hang
-      # guard).
+      # which the runner image does not preinstall. Same script the
+      # reproducibility job runs, so the retry recipe cannot drift.
       - name: Install libfuse3 development files
-        env:
-          DEBIAN_FRONTEND: noninteractive
+        run: ./scripts/install_libfuse3_dev.sh
+
+      # Python interpreter: .python-version is the single knob (local uv
+      # and this input). setup-uv v7 has no python-version-file input, so
+      # read the file here rather than hardcoding 3.12 a second time.
+      # uv itself: [tool.uv] required-version in pyproject.toml, the field
+      # setup-uv already reads when `version` is empty.
+      - name: Read Python version pin
+        id: py
         run: |
-          ok=0
-          for attempt in 1 2 3; do
-            if sudo apt-get update && sudo apt-get install -y --no-install-recommends libfuse3-dev; then
-              ok=1
-              break
-            fi
-            echo "apt-get failed (attempt ${attempt}/3); retrying" >&2
-            sleep $((attempt * 5))
-          done
-          test "${ok}" -eq 1
+          version="$(tr -d '[:space:]' < .python-version)"
+          if [[ -z "${version}" ]]; then
+            echo "empty .python-version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
       # Python tooling exactly as pinned in requirements-dev.lock.txt
       # (hash-verified install, per README). activate-environment creates
-      # .venv and puts it on PATH; the uv download/toolchain cache is on by
-      # default and keyed below on the requirements files, because setup-uv's
-      # **/uv.lock default glob matches nothing in this repo. setup-uv v7 has
-      # no python-version-file input; activate-environment runs `uv venv`,
-      # which reads .python-version, the same single knob local uv uses.
+      # .venv and puts it on PATH. Cache key includes .python-version so a
+      # pin bump cannot restore a venv built for the previous interpreter;
+      # requirements*.txt is the lock plus the un-hashed bounds file (the
+      # action's default also lists **/uv.lock, which this repo does not
+      # have, and pyproject.toml, whose tool-config edits must not bust
+      # the package cache).
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           activate-environment: true
-          cache-dependency-glob: requirements*.txt
+          python-version: ${{ steps.py.outputs.version }}
+          cache-dependency-glob: |
+            requirements*.txt
+            .python-version
 
       - name: Install pinned Python tooling
         # check.sh invokes ruff/mypy by name from the activated venv.
@@ -141,19 +147,7 @@ jobs:
       # reproducibility is a property of our inputs, not of the headers' bytes
       # being identical across the two build trees (they are only read).
       - name: Install libfuse3 development files
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          ok=0
-          for attempt in 1 2 3; do
-            if sudo apt-get update && sudo apt-get install -y --no-install-recommends libfuse3-dev; then
-              ok=1
-              break
-            fi
-            echo "apt-get failed (attempt ${attempt}/3); retrying" >&2
-            sleep $((attempt * 5))
-          done
-          test "${ok}" -eq 1
+        run: ./scripts/install_libfuse3_dev.sh
 
       - name: Build twice and compare bytes
         run: ./scripts/repro_check.sh

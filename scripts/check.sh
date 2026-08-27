@@ -141,14 +141,9 @@ shellcheck -o add-default-case,avoid-nullary-conditions,avoid-negated-conditions
 echo "=== restore drill (stub zfs) ==="
 "${SCRIPTS_DIR}/test_dr_restore_drill.sh" || fail "restore drill stub tests failed"
 
-# Digests first (coreutils only), then a full extract so a stale-tree or
-# unpack-tool regression fails this gate instead of only the aarch64 job.
-echo "=== vendored libfuse3 digests ==="
-(
-    cd "${ROOT_DIR}/.deps/fuse3-arm64"
-    sha256sum -c SHA256SUMS
-) || fail "vendored libfuse3 integrity check failed; refresh per .deps/fuse3-arm64/README.md"
-
+# Digests already checked above (coreutils only). The extract suite
+# re-verifies them before unpack so a stale-tree or unpack-tool regression
+# fails this gate instead of only the aarch64 job.
 echo "=== vendored libfuse3 extract ==="
 "${SCRIPTS_DIR}/test_extract_fuse3_arm64.sh" || fail "vendored libfuse3 extract tests failed"
 
