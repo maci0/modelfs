@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Durability posture and restore runbook for this cluster; pairs with [operations.md](operations.md) |
-| Date | 2026-08-25 |
+| Date | 2026-08-27 |
 
 The origin (`tank/models` on the NAS) holds the **only copy** of every weight file. `unlink` and `rename` through the mount land there immediately ([architecture.md](architecture.md)), writes are NFS 1:1 with no write-back buffer, and nothing in this repo schedules a snapshot, a replica, or a restore. Until the schedule below exists, any disaster past "a cache was lost" costs the whole dataset.
 
@@ -99,19 +99,22 @@ In order of likelihood.
 
 ### A. A spark or its NVMe died
 
-Nothing to restore. Rebuild per [architecture.md](architecture.md) (Run), remount the origin per [operations.md](operations.md), start `modelfs`. Cache warms on demand. Leases republish themselves; `--seed` bootstraps `.cluster` if it is empty. Re-apply any pins: the markers lived under `/var/cache/modelfs/pin/`, so without them the cull treats every previously pinned file as an ordinary LRU candidate.
+Nothing to restore. Rebuild per [architecture.md](architecture.md) (Run), remount the origin per [operations.md](operations.md), start `modelfs`. Cache warms on demand. Leases republish themselves; `--seed` bootstraps `.cluster` if it is empty. Re-apply any pins: the markers lived under `/var/cache/modelfs/pin/`, so without them the cull treats every previously pinned file as an ordinary LRU candidate. Before a planned cache wipe, `find /var/cache/modelfs/pin -type f` is the re-pin list; after an unplanned NVMe loss that list is gone with the disk.
 
 ### B. Files deleted or corrupted (point in time)
 
-Clone the last good snapshot, copy back, drop the clone:
+Stop engines reading those paths first: vLLM holds file handles, and copying under a live reader serves it torn bytes.
+
+Clone the newest snapshot onto a mountpoint that is **not** the live export. `tank/models` is mounted at `/export/models` ([operations.md](operations.md)); a clone without `-o mountpoint=` inherits that path, so `cp` would read the still-mounted production tree rather than the snapshot.
 
 ```bash
-zfs clone tank/models@autosnap_2026-08-25_00:00:02_hourly tank/recover
-cp -a /tank/recover/gguf/broken-model.gguf /export/models/gguf/
+SNAP=$(zfs list -H -p -t snapshot -o name -s creation tank/models | tail -n 1)
+zfs clone -o mountpoint=/export/modelfs-recover "${SNAP}" tank/recover
+cp -a /export/modelfs-recover/gguf/broken-model.gguf /export/models/gguf/
 zfs unmount tank/recover && zfs destroy tank/recover
 ```
 
-Stop engines reading those paths first: vLLM holds file handles, and copying under a live reader serves it torn bytes. RPO equals the autosnap interval (1 h in the config above).
+RPO equals the autosnap interval (1 h in the config above). After any copy-back that rewinds bytes, wipe node caches as in section C step 3: the stale-piece rule would otherwise keep serving pre-restore data.
 
 ### C. Pool or NAS dead
 
@@ -162,9 +165,11 @@ A backup never restored is a hypothesis. Monthly, on the NAS:
 ./scripts/dr_restore_drill.sh tank/models
 ```
 
-The script ([scripts/dr_restore_drill.sh](../scripts/dr_restore_drill.sh)) picks the newest snapshot by creation time (not name order, where hourly/daily/monthly suffixes would decide), clones it timed, diffs the restored tree against the live dataset, and checksums one size-stable file on both sides before appending the log line that proves the drill ran. Drift inside the RPO window is counted, never failed; a size-stable file that hashes differently fails the drill, and so does an empty snapshot or a missing snapshot schedule: the "no snapshots" exit is the sanoid.timer alarm. The drill also fails when the newest snapshot is older than `MF_DRILL_MAX_SNAP_AGE` (default 25 h): snapshots that exist but stopped refreshing mean sanoid died after the last green drill, and restoring them would miss the RPO table claims. That age rides the log line as `snap_age_s`, so the RPO column above stays a measured number rather than an assumption. Exit status is the verdict; `MF_DRILL_KEEP=1` leaves the clone mounted for inspection and `MF_DRILL_LOG` relocates the artifact log from `/var/log/modelfs-drill.log`.
+The script ([scripts/dr_restore_drill.sh](../scripts/dr_restore_drill.sh)) picks the newest snapshot by creation time (not name order, where hourly/daily/monthly suffixes would decide), clones it onto a mountpoint that is not the live export (sibling `modelfs-drill`, or `MF_DRILL_CLONE_MP`; a collision with the live tree fails the drill, because that path would checksum production against itself), diffs the restored tree against the live dataset, and checksums one size-stable file on both sides before appending the log line that proves the drill ran. `.cluster` leases and the `.zfs` snapdir are skipped in the file count, the diff, and the sample: a snapshot of only heartbeats is "zero files" and fails. Drift inside the RPO window is counted, never failed; a size-stable file that hashes differently fails the drill, and so does an empty snapshot or a missing snapshot schedule: the "no snapshots" exit is the sanoid.timer alarm. The drill also fails when the newest snapshot is older than `MF_DRILL_MAX_SNAP_AGE` (default 25 h): snapshots that exist but stopped refreshing mean sanoid died after the last green drill, and restoring them would miss the RPO table claims. That age rides the log line as `snap_age_s`, so the RPO column above stays a measured number rather than an assumption. Exit status is the verdict; `MF_DRILL_KEEP=1` leaves the clone mounted for inspection and `MF_DRILL_LOG` relocates the artifact log from `/var/log/modelfs-drill.log`.
 
-The timed clone is the measured restore rate that keeps the RTO row honest; the log line is the artifact proving the drill ran. Alert when the newest entry ages past 35 days.
+The pool-loss copy is not visible to a local `zfs list` when syncoid pushed it to another host. Run the same script on the replica host (or import the replica and set `MF_DRILL_REPLICA`), otherwise the log line records `replica=unchecked`. When `MF_DRILL_REPLICA` is set, a missing dataset, an empty snapshot list, or a replica older than `MF_DRILL_MAX_SNAP_AGE` fails the drill the same way a dead sanoid.timer does.
+
+The timed clone is the measured restore rate that keeps the RTO row honest; the log line is the artifact proving the drill ran. Alert when the newest entry ages past 35 days. `scripts/test_dr_restore_drill.sh` (also run by `scripts/check.sh`) drives the drill through a stub `zfs` so a clone-onto-live or empty-snapshot false pass cannot ship.
 
 ## 7. Open questions (not answerable from this repo)
 

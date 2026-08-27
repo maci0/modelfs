@@ -34,8 +34,8 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # exported MODELFS_-spelled knob would make every modelfs invocation in these
 # scripts die with "unknown environment variable" before its command ever
 # ran. Current members: MF_TEST_HOST, MF_TEST_PORT (test_fault_tolerance.sh),
-# MF_DRILL_LOG, MF_DRILL_LIVE, MF_DRILL_KEEP, MF_DRILL_MAX_SNAP_AGE
-# (dr_restore_drill.sh).
+# MF_DRILL_LOG, MF_DRILL_LIVE, MF_DRILL_CLONE_MP, MF_DRILL_KEEP,
+# MF_DRILL_MAX_SNAP_AGE, MF_DRILL_REPLICA (dr_restore_drill.sh).
 
 # FUSE-mounting harnesses call this before spawning daemons so a missing
 # /dev/fuse or helper fails with a named install hint instead of nine

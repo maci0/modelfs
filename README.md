@@ -120,6 +120,7 @@ zig build fmt                             # apply zig fmt
 ./scripts/run_cluster_e2e_9nodes.sh       # 9-instance block exchange
 ./scripts/test_fault_tolerance.sh         # peer loss and lease expiry
 ./scripts/dr_restore_drill.sh             # monthly restore drill, on the NAS (docs/recovery.md)
+./scripts/test_dr_restore_drill.sh        # restore drill against stub zfs (also in check.sh)
 python3 scripts/run_benchmarks_and_plots.py  # live benchmarks -> .scratch/benchmarks/
 ```
 

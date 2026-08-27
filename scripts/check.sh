@@ -93,6 +93,11 @@ echo "=== shellcheck ==="
 # follow those conventions.
 shellcheck -o add-default-case,avoid-nullary-conditions,avoid-negated-conditions,deprecate-which,quote-safe-variables,check-set-e-suppressed,check-unassigned-uppercase,check-extra-masked-returns scripts/*.sh || fail "shellcheck reported violations"
 
+# The NAS drill cannot run here (no zfs pool). The stub suite is what
+# keeps a clone-onto-live or empty-snapshot false pass from shipping.
+echo "=== restore drill (stub zfs) ==="
+"${SCRIPTS_DIR}/test_dr_restore_drill.sh" || fail "restore drill stub tests failed"
+
 echo "=== ruff ==="
 ruff check scripts/ || fail "ruff check reported violations"
 

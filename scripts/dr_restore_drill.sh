@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Monthly restore drill from docs/recovery.md section 6, as one runnable
-# artifact instead of a paste-from-docs procedure: clone the newest snapshot,
-# time the clone (the measured restore rate that keeps the RTO row honest),
-# diff the restored tree against the live dataset, checksum a stable sample
-# file both sides, and append the log line that proves the drill ran.
+# artifact instead of a paste-from-docs procedure: clone the newest snapshot
+# onto a mountpoint that is not the live export, time the clone (the measured
+# restore rate that keeps the RTO row honest), diff the restored tree against
+# the live dataset, checksum a stable sample file both sides, and append the
+# log line that proves the drill ran.
 #
 # Runs on the NAS (Rocky/RHEL, GNU coreutils), not on sparks or the desktop:
 #   ./scripts/dr_restore_drill.sh [DATASET]      # default: tank/models
@@ -11,17 +12,22 @@
 # Environment (deliberately not MODELFS_*: the daemon refuses any unknown
 # MODELFS_* variable as a typo'd knob, so an exported drill setting would
 # fail every modelfs command in the same shell):
-#   MF_DRILL_LOG   artifact log path     (default /var/log/modelfs-drill.log)
-#   MF_DRILL_LIVE  live tree to diff     (default: the dataset's mountpoint)
-#   MF_DRILL_KEEP  set non-empty to keep the drill clone mounted for inspection
+#   MF_DRILL_LOG       artifact log path     (default /var/log/modelfs-drill.log)
+#   MF_DRILL_LIVE      live tree to diff     (default: the dataset's mountpoint)
+#   MF_DRILL_CLONE_MP  clone mountpoint      (default: sibling modelfs-drill
+#                       of the live tree, e.g. /export/modelfs-drill)
+#   MF_DRILL_KEEP      set non-empty to keep the drill clone mounted for inspection
 #   MF_DRILL_MAX_SNAP_AGE  seconds the newest snapshot may be old before
 #                               the drill fails   (default 90000 = 25 h)
+#   MF_DRILL_REPLICA   optional replica dataset on this host; when set, the
+#                       drill also fails if that dataset is missing, has no
+#                       snapshots, or is older than MF_DRILL_MAX_SNAP_AGE
 #
 # Exit status is the drill verdict: 0 means the newest snapshot restored,
-# mounted, and read back verified; anything else is an alarm, including
-# "no snapshots exist" and "newest snapshot older than the age limit", which
-# mean the backup schedule itself is dead or has silently stopped keeping
-# restore points inside the RPO the recovery doc claims.
+# mounted off the live tree, and read back verified; anything else is an
+# alarm, including "no snapshots exist" and "newest snapshot older than the
+# age limit", which mean the backup schedule itself is dead or has silently
+# stopped keeping restore points inside the RPO the recovery doc claims.
 set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
@@ -68,6 +74,27 @@ if [[ "${SNAP_AGE}" -gt "${MAX_SNAP_AGE}" ]]; then
 fi
 echo "drill: newest snapshot ${SNAP} (age ${SNAP_AGE}s)"
 
+# Optional pool-loss copy on this host. A remote syncoid target is not
+# visible to local `zfs list`; run this same script there, or import the
+# replica, rather than treating a missing local dataset as "replica is fine".
+REPLICA_STATUS="unchecked"
+if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
+    zfs list -H -o name "${MF_DRILL_REPLICA}" >/dev/null 2>&1 \
+        || die "replica dataset ${MF_DRILL_REPLICA} does not exist (pool-loss copy missing; docs/recovery.md section 3)"
+    REPLICA_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${MF_DRILL_REPLICA}" | tail -n 1)"
+    REPLICA_SNAP="${REPLICA_LINE%%$'\t'*}"
+    if [[ -z "${REPLICA_SNAP}" ]]; then
+        die "replica ${MF_DRILL_REPLICA} has no snapshots: syncoid is down or was never enabled (docs/recovery.md section 3)"
+    fi
+    REPLICA_CTIME="${REPLICA_LINE##*$'\t'}"
+    REPLICA_AGE=$((NOW - REPLICA_CTIME))
+    if [[ "${REPLICA_AGE}" -gt "${MAX_SNAP_AGE}" ]]; then
+        die "replica newest snapshot ${REPLICA_SNAP} is ${REPLICA_AGE}s old, past the ${MAX_SNAP_AGE}s limit: the replica schedule stopped keeping restore points inside the claimed RPO (docs/recovery.md sections 3 and 5)"
+    fi
+    REPLICA_STATUS="ok"
+    echo "drill: replica ${MF_DRILL_REPLICA} newest ${REPLICA_SNAP} (age ${REPLICA_AGE}s)"
+fi
+
 PARENT="${DATASET%/*}"
 if [[ "${PARENT}" == "${DATASET}" ]]; then
     die "dataset must be nested (pool/data) to derive the clone name, got ${DATASET}"
@@ -107,9 +134,33 @@ case "${LIVE}" in
 esac
 [[ -d "${LIVE}" ]] || die "live tree ${LIVE} is not a directory"
 
+# A clone inherits the origin's mountpoint. tank/models is /export/models, so
+# `zfs clone SNAP tank/drill` would report that same path, and every diff and
+# checksum below would run against the live export: a green drill that never
+# restored anything. Force a distinct mountpoint (sibling modelfs-drill, or
+# MF_DRILL_CLONE_MP) and refuse to proceed if it still collides.
+if [[ -n "${MF_DRILL_CLONE_MP:-}" ]]; then
+    CLONE_MP_WANT="${MF_DRILL_CLONE_MP}"
+else
+    CLONE_MP_WANT="$(dirname "${LIVE}")/modelfs-drill"
+fi
+case "${CLONE_MP_WANT}" in
+    none | legacy | '-' | '')
+        die "clone mountpoint '${CLONE_MP_WANT}' is not a usable path"
+        ;;
+    *)
+        ;;
+esac
+if [[ "${CLONE_MP_WANT}" == "${LIVE}" ]]; then
+    die "clone mountpoint ${CLONE_MP_WANT} collides with the live tree; the drill would hash production against itself"
+fi
+
 T0="$(date +%s.%N)"
-zfs clone "${SNAP}" "${CLONE}" || die "zfs clone of ${SNAP} failed"
+zfs clone -o "mountpoint=${CLONE_MP_WANT}" "${SNAP}" "${CLONE}" || die "zfs clone of ${SNAP} failed"
 CLONE_MP="$(zfs get -H -o value mountpoint "${CLONE}")"
+if [[ "${CLONE_MP}" == "${LIVE}" ]]; then
+    die "clone ${CLONE} mounted at the live tree ${LIVE}; restore is unproven"
+fi
 if [[ ! -d "${CLONE_MP}" ]]; then
     die "clone ${CLONE} did not appear at its mountpoint ${CLONE_MP}"
 fi
@@ -117,19 +168,25 @@ T1="$(date +%s.%N)"
 ELAPSED="$(awk -v a="${T0}" -v b="${T1}" 'BEGIN { printf "%.1f", b - a }')"
 echo "drill: cloned to ${CLONE_MP} in ${ELAPSED}s (recorded in the log; this number keeps recovery.md's RTO row honest)"
 
-# The clone must hold data at all: an empty snapshot passing this drill would
-# prove only that zfs clone works, not that anything would survive a restore.
-FILE_COUNT="$(find "${CLONE_MP}" -type f | wc -l)"
+# Payload files only: .cluster leases republish every 10 s and are not the
+# dataset, and .zfs is the snapshot directory (visible when snapdir=visible).
+# Counting either would let a snapshot of only leases pass as a restore.
+FILE_LIST="$(mktemp "${SCRATCH_DIR}/dr-files-XXXXXX")"
+find "${CLONE_MP}" \( -name .cluster -o -name .zfs \) -prune -o -type f -print >"${FILE_LIST}" ||
+    die "find failed under ${CLONE_MP}"
+FILE_COUNT="$(wc -l <"${FILE_LIST}" | tr -d ' ')"
+rm -f "${FILE_LIST}"
 if [[ "${FILE_COUNT}" -eq 0 ]]; then
     die "snapshot contains zero files; restoring it recovers nothing"
 fi
 
 # Snapshot-vs-live differences are expected within the RPO window (up to an
 # hour of writes behind the newest autosnap): counted and logged, never a
-# failure. A diff that crashes (exit code 2+) is a failure.
+# failure. A diff that crashes (exit code 2+) is a failure. Lease files and
+# the snapdir are excluded so drift reflects model bytes, not heartbeats.
 DRIFT_LINES="$(mktemp "${SCRATCH_DIR}/drift-XXXXXX")"
 DIFF_RC=0
-diff -rq "${CLONE_MP}" "${LIVE}" >"${DRIFT_LINES}" 2>&1 || DIFF_RC=$?
+diff -rq --exclude=.cluster --exclude=.zfs "${CLONE_MP}" "${LIVE}" >"${DRIFT_LINES}" 2>&1 || DIFF_RC=$?
 case "${DIFF_RC}" in
     0 | 1)
         ;;
@@ -151,16 +208,19 @@ pick_sample() {
     MIN_BYTES="$1"
     SAMPLE_PATH=""
     SAMPLE_REL=""
-    # find runs into a file rather than a process substitution: its exit
-    # status is checked instead of masked, and the loop keeps running in this
-    # shell so the SAMPLE_* assignments survive it.
+    # NUL records of "size<TAB>path", largest first. GNU find/sort: this
+    # drill runs on the NAS. find's exit is checked instead of masked, and
+    # the loop keeps running in this shell so the SAMPLE_* assignments
+    # survive it.
     CANDIDATES="$(mktemp "${SCRATCH_DIR}/dr-candidates-XXXXXX")"
-    find "${CLONE_MP}" -type f -size +"${MIN_BYTES}"c -print0 >"${CANDIDATES}" ||
+    find "${CLONE_MP}" \( -name .cluster -o -name .zfs \) -prune -o -type f -size +"${MIN_BYTES}"c -printf '%s\t%p\0' >"${CANDIDATES}.raw" ||
         die "find failed under ${CLONE_MP}"
-    while IFS= read -r -d '' f; do
-        SAMPLE_CLONE_SZ="$(stat -c %s "${f}")"
+    sort -z -nr -o "${CANDIDATES}" "${CANDIDATES}.raw" || die "sort of sample candidates failed"
+    rm -f "${CANDIDATES}.raw"
+    while IFS=$'\t' read -r -d '' sz f; do
+        [[ -n "${f}" ]] || continue
         SAMPLE_LIVE_SZ="$(stat -c %s "${LIVE}${f#"${CLONE_MP}"}" 2>/dev/null || echo -1)"
-        if [[ "${SAMPLE_CLONE_SZ}" == "${SAMPLE_LIVE_SZ}" && "${SAMPLE_CLONE_SZ}" -gt 0 ]]; then
+        if [[ "${sz}" == "${SAMPLE_LIVE_SZ}" && "${sz}" -gt 0 ]]; then
             SAMPLE_PATH="${f}"
             SAMPLE_REL="${f#"${CLONE_MP}"}"
             break
@@ -185,6 +245,6 @@ fi
 
 touch "${LOG_FILE}" || die "cannot write the drill log ${LOG_FILE}"
 STAMP="$(date -Is)"
-echo "${STAMP} ${SNAP} ok snap_age_s=${SNAP_AGE} clone_s=${ELAPSED} drift=${DRIFT} sample=${SAMPLE_REL}" >>"${LOG_FILE}"
+echo "${STAMP} ${SNAP} ok snap_age_s=${SNAP_AGE} clone_s=${ELAPSED} drift=${DRIFT} sample=${SAMPLE_REL} replica=${REPLICA_STATUS}" >>"${LOG_FILE}"
 echo "drill OK: ${SNAP} restored and verified (${FILE_COUNT} files, drift ${DRIFT} lines, sample sha256 match on ${SAMPLE_REL})"
 echo "drill log line appended to ${LOG_FILE}; alert when its newest entry ages past 35 days (docs/recovery.md section 6)"

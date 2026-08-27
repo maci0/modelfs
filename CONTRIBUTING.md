@@ -29,9 +29,9 @@ commands; so does `zig build --help`.
 ./scripts/check.sh
 ```
 
-Formatting, unit tests, shellcheck, ruff, and mypy: exactly what the `check`
-CI job runs. Every CI job (that gate, the aarch64 cross-compile, and the
-reproducibility rebuild) as one local step:
+Formatting, unit tests, the restore-drill stub suite, shellcheck, ruff, and
+mypy: exactly what the `check` CI job runs. Every CI job (that gate, the
+aarch64 cross-compile, and the reproducibility rebuild) as one local step:
 
 ```bash
 ./scripts/ci.sh
@@ -57,6 +57,7 @@ whole import graph, so `-Dtest-filter=store` would miss most of `store.zig`.
 ./scripts/run_e2e_tests.sh             # CLI and peer protocol; no FUSE mount needed
 ./scripts/run_cluster_e2e_9nodes.sh    # mounts 9 FUSE filesystems: needs /dev/fuse and fusermount3
 ./scripts/test_fault_tolerance.sh      # peer loss and lease expiry; some checks skip loudly without a live peer
+./scripts/test_dr_restore_drill.sh     # restore drill against stub zfs; also run by check.sh
 ```
 
 ## PR expectations
