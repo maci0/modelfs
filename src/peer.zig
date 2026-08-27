@@ -132,6 +132,7 @@ fn acceptLoop(self: *Server, fd: c_int) void {
             sys.sleepMs(self.io, 20);
             continue;
         }
+        if (failing) std.log.info("peer http: accept recovered", .{});
         failing = false;
         // Claim-then-check with one atomic: several listen fds run accept
         // loops concurrently, and a load-then-add between two of them lets
@@ -381,6 +382,8 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         return;
     }
     if (std.mem.eql(u8, path, "/have")) {
+        const t0 = sys.monoNs(self.io);
+        defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
         serveHave(self, fd, rel);
         return;
     }
@@ -393,6 +396,8 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
             replyStatus(self, fd, "400 Bad Request");
             return;
         };
+        const t0 = sys.monoNs(self.io);
+        defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
         serveData(self, fd, rel, rg);
     }
 }

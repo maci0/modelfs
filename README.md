@@ -78,7 +78,7 @@ modelfs mount /models --origin /net/192.168.0.100/models
 `mount` stays in the foreground (drop it in a systemd `Type=simple` unit; `--detach` to background it). Then:
 
 ```bash
-modelfs status                                    # liveness, peers, and lifetime counters (reads, fills by source, errors)
+modelfs status                                    # liveness, peers, origin_down, and lifetime counters (reads, fills by source, errors)
 modelfs peers --origin /net/192.168.0.100/models  # cluster leases, each marked live or expired
 modelfs pin gguf/foo.gguf                         # keep a file out of the cull
 modelfs unpin gguf/foo.gguf

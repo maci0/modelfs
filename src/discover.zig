@@ -559,6 +559,10 @@ pub const Catalog = struct {
             .path_too_long => {
                 new_paths.deinit(self.gpa);
                 new_arena.deinit();
+                // Same degrade as missing_dir: keep the last known membership,
+                // but name why it went stale. Silent here used to look like
+                // a frozen peer list with no journal line.
+                std.log.warn("cluster lease path too long at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
                 return;
             },
             .missing_dir => {
@@ -705,6 +709,25 @@ pub const Catalog = struct {
             gpa.free(p.ip);
         }
         gpa.free(paths);
+    }
+
+    /// Unique peer ids currently in the path list. Allocation-free so the
+    /// discovery tick can log membership changes without a snapshot.
+    pub fn peerCount(self: *Catalog) u32 {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        var n: u32 = 0;
+        for (self.paths.items, 0..) |p, i| {
+            var dup = false;
+            for (self.paths.items[0..i]) |q| {
+                if (std.mem.eql(u8, q.peer_id, p.peer_id)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) n += 1;
+        }
+        return n;
     }
 
     test "snapshot frees both strings when any allocation fails" {
@@ -1673,6 +1696,51 @@ test "refresh keeps the previous peer list while .cluster is unreadable" {
     try std.testing.expectEqual(@as(usize, 1), snap.len);
     try std.testing.expectEqualStrings("spark9", snap[0].peer_id);
     try std.testing.expectEqualStrings("10.0.0.1", snap[0].ip);
+}
+
+test "peerCount counts unique peer ids, not raw paths" {
+    const gpa = std.testing.allocator;
+    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    try std.testing.expectEqual(@as(u32, 0), cat.peerCount());
+    try cat.paths.append(gpa, .{ .peer_id = "dup", .ip = "10.0.0.1", .port = 18080, .ewma_bps = 0, .hops = 0 });
+    try cat.paths.append(gpa, .{ .peer_id = "dup", .ip = "10.0.0.2", .port = 18080, .ewma_bps = 0, .hops = 0 });
+    try cat.paths.append(gpa, .{ .peer_id = "other", .ip = "10.0.0.3", .port = 18080, .ewma_bps = 0, .hops = 0 });
+    try std.testing.expectEqual(@as(u32, 2), cat.peerCount());
+}
+
+test "refresh keeps the previous peer list when the cluster path is too long" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-long");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
+    const live = "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.1\",\"port\":18080,\"mbps\":0}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live));
+
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    cat.refresh(sys.nowSec(std.testing.io));
+    try std.testing.expectEqual(@as(u32, 1), cat.peerCount());
+
+    var long_buf: [sys.c.PATH_MAX]u8 = undefined;
+    @memset(&long_buf, 'x');
+    const prev_origin = cat.origin;
+    cat.origin = &long_buf;
+    {
+        const prev_log_level = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = prev_log_level;
+        cat.refresh(sys.nowSec(std.testing.io));
+    }
+    cat.origin = prev_origin;
+    try std.testing.expectEqual(@as(u32, 1), cat.peerCount());
 }
 
 test "refresh skips unreadable and corrupt leases without dropping healthy peers" {

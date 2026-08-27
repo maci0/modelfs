@@ -393,6 +393,10 @@ export fn mf_getattr(path: [*c]const u8, stbuf: ?*fuse.struct_stat, fi: ?*fuse.f
     if (rerr != 0) return rerr;
     var ost: sys.c.struct_stat = undefined;
     const rc = st.store.statOrigin(rel, &ost);
+    // Lookup is the first origin hit on every open/stat. Without this, an
+    // NFS outage during ls/stat never raises origin_down and never logs
+    // until a read or write also fails.
+    st.store.noteOriginIo(rel, rc, "stat");
     if (rc != 0) return rc;
     // Same translated C type; a whole-struct assign keeps every stat field.
     if (stbuf) |out| out.* = ost;
@@ -417,6 +421,7 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     // Return the captured errno, like getattr/read do: re-reading errno here
     // would report whatever ran between the failed stat and this return.
     const rc = st.store.statOrigin(rel, &ost);
+    st.store.noteOriginIo(rel, rc, "stat");
     if (rc != 0) return rc;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
         const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch |err| {
@@ -580,7 +585,13 @@ fn ensureRange(st: *State, file: *store_mod.Store.Cached, fsize: u64, off: u64, 
     while (i < cov.end) : (i += 1) {
         if (st.store.hasPiece(file, i, sys.monoSec(st.io))) continue;
         if (scratch == null)
-            scratch = st.gpa.alloc(u8, st.store.piece_size) catch return -sys.c.ENOMEM;
+            scratch = st.gpa.alloc(u8, st.store.piece_size) catch {
+                // Same operator-trace contract as hydratePiece's claim OOM
+                // and serveData's hydration-buffer OOM: the reader sees
+                // ENOMEM and reads_err moves, so the journal must name why.
+                std.log.warn("hydration buffer alloc failed for {s}; failing read", .{file.rel});
+                return -sys.c.ENOMEM;
+            };
         const rc = hydratePiece(st, file, i, scratch.?);
         if (rc != 0) return rc;
     }
@@ -1090,6 +1101,7 @@ fn discLoop(st: *State) void {
     // Baseline for the per-tick activity summary; the first tick only logs
     // what happened since daemon start.
     var last_stats = st.store.stats.snap();
+    var last_peers: u32 = 0;
     while (st.running.load(.acquire)) {
         // One wall-clock instant per tick: publish and refresh's expiry
         // filter decide against the same sample instead of two reads
@@ -1100,6 +1112,14 @@ fn discLoop(st: *State) void {
         st.catalog.publish(now);
         st.catalog.refresh(now);
         st.catalog.sweepLeases(now);
+        // Membership is a gauge, not a counter, so it never moves the tick
+        // line. An idle node that loses every peer would otherwise stay
+        // silent until the next fill fell through to NFS.
+        const npeers = st.catalog.peerCount();
+        if (npeers != last_peers) {
+            std.log.info("cluster peers {d} -> {d}", .{ last_peers, npeers });
+            last_peers = npeers;
+        }
         writeStatus(st);
         logStatsTick(st, &last_stats);
         napMs(st, 10_000);
@@ -1112,8 +1132,8 @@ fn discLoop(st: *State) void {
 /// steady-state work is aggregated here while failures keep their own
 /// immediate warns. Deltas name the last interval, so a stalled ingest or a
 /// read storm is visible straight from the journal; rd_us/wr_us and the
-/// fill_ms pair are per-op averages over those deltas, the only latency
-/// signal this daemon publishes.
+/// fill_ms pair and http_us are per-op averages over those deltas, the
+/// latency signals this daemon publishes.
 fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     const cur = st.store.stats.snap();
     defer prev.* = cur;
@@ -1129,13 +1149,15 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     const wr_us = if (writes_attempted > 0) @divTrunc(d.write_nanos, writes_attempted * std.time.ns_per_us) else 0;
     const fill_peer_ms = if (d.fills_peer > 0) @divTrunc(d.fill_peer_nanos, d.fills_peer * std.time.ns_per_ms) else 0;
     const fill_origin_ms = if (d.fills_origin > 0) @divTrunc(d.fill_origin_nanos, d.fills_origin * std.time.ns_per_ms) else 0;
+    const http_attempted = d.http_ok + d.http_5xx;
+    const http_us = if (http_attempted > 0) @divTrunc(d.http_nanos, http_attempted * std.time.ns_per_us) else 0;
     std.log.info(
         // Field names mirror Stats.Snap's (what status.json publishes), so
         // the journal line and the machine artifact share one vocabulary and
         // no key collides ("err" used to name both read and write failures).
         "tick: reads_ok={d} reads_err={d} reads_warm={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d} wr_us={d}" ++
             " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache={d}/{d}/{d}" ++
-            " probe_err={d} peer_mib={d} origin_mib={d} serve_mib={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d}",
+            " probe_err={d} peer_mib={d} origin_mib={d} serve_mib={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http_us={d}",
         .{
             d.reads_ok,
             d.reads_err,
@@ -1163,6 +1185,7 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.http_5xx,
             d.http_malformed,
             d.http_dropped,
+            http_us,
         },
     );
 }
@@ -1187,6 +1210,7 @@ fn statusJson(st: *State) !void {
     // Saturation signal for monitors: the same sample culling runs on.
     // -1 means the cache filesystem could not be stat'ed (culling suspended).
     const cache_free_pct: i32 = if (st.store.freePercentChecked()) |pct| @intCast(pct) else -1;
+    const origin_down: i32 = if (st.store.origin_io_down.load(.monotonic)) 1 else 0;
     // Single line like every other machine-read artifact here: consumers
     // tail/grep it and a multi-line document would break line-oriented
     // parsing (journalctl, jq -line, watch loops). The stats object is
@@ -1200,7 +1224,7 @@ fn statusJson(st: *State) !void {
     const now_mono = sys.monoSec(st.io);
     const now_wall = sys.nowSec(st.io);
     var w = std.Io.Writer.fixed(&buf);
-    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"now_s\":{d},\"mono_s\":{d},\"stats\":{{", .{
+    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"origin_down\":{d},\"now_s\":{d},\"mono_s\":{d},\"stats\":{{", .{
         st.catalog.self_id,
         std.os.linux.getpid(),
         now_mono -| st.start_secs,
@@ -1208,6 +1232,7 @@ fn statusJson(st: *State) !void {
         st.store.piece_size,
         st.server.http_inflight.load(.monotonic),
         cache_free_pct,
+        origin_down,
         now_wall,
         now_mono,
     });
@@ -1319,6 +1344,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
         piece: u32,
         inflight: u32,
         cache_free_pct: i32,
+        origin_down: i32,
         now_s: i64,
         mono_s: i64,
         stats: StatsDoc,
@@ -1334,6 +1360,8 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // The saturation gauge rides along: statvfs works here, so a real
     // percentage, not the -1 unknown marker.
     try std.testing.expect(doc.value.cache_free_pct >= 0);
+    try std.testing.expectEqual(@as(i32, 0), doc.value.origin_down);
+    try std.testing.expectEqual(@as(u64, 0), doc.value.stats.http_nanos);
     // now_s is a current epoch second (operators/monitors); mono_s is the
     // same-machine monotonic instant the wedge gate compares against. Zero
     // or a swapped pair would make `status` misread a live node.
@@ -1354,6 +1382,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // carry live stats, not a frozen snapshot.
     _ = st.store.stats.fills_peer.fetchAdd(1, .monotonic);
     _ = st.store.stats.bytes_from_peer.fetchAdd(4096, .monotonic);
+    st.store.origin_io_down.store(true, .monotonic);
     try statusJson(&st);
     const blob2 = try sys.readFileAlloc(gpa, fp, 4096);
     defer gpa.free(blob2);
@@ -1362,6 +1391,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expectEqual(@as(u32, 1), doc2.value.peers);
     try std.testing.expectEqual(@as(u64, 1), doc2.value.stats.fills_peer);
     try std.testing.expectEqual(@as(u64, 4096), doc2.value.stats.bytes_from_peer);
+    try std.testing.expectEqual(@as(i32, 1), doc2.value.origin_down);
 }
 
 test "statusJson unlinks the staging file when rename fails" {
@@ -1424,6 +1454,8 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
     // counts (here: one origin fill of 4096 bytes), not lifetime totals.
     _ = st.store.stats.fills_origin.fetchAdd(1, .monotonic);
     _ = st.store.stats.bytes_from_origin.fetchAdd(4096, .monotonic);
+    _ = st.store.stats.http_ok.fetchAdd(1, .monotonic);
+    _ = st.store.stats.http_nanos.fetchAdd(1000, .monotonic);
     // The expected info line is below the raised threshold; restored on
     // scope exit so unexpected warnings from later tests still surface.
     const prev_log_level = std.testing.log_level;
@@ -1432,4 +1464,6 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
     logStatsTick(&st, &prev);
     try std.testing.expectEqual(@as(u64, 1), prev.fills_origin);
     try std.testing.expectEqual(@as(u64, 4096), prev.bytes_from_origin);
+    try std.testing.expectEqual(@as(u64, 1), prev.http_ok);
+    try std.testing.expectEqual(@as(u64, 1000), prev.http_nanos);
 }

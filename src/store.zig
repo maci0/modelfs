@@ -106,6 +106,11 @@ pub const Stats = struct {
     /// Without the count a saturated server is indistinguishable from a
     /// quiet one -- fetchers time out and nothing on this node says why.
     http_dropped: std.atomic.Value(u64) = .init(0),
+    /// Cumulative wall time inside /have and /data handlers. http_us on the
+    /// tick line is the serving-side twin of rd_us: without it a node whose
+    /// peer replies are slow looks healthy (http_ok climbing, inflight low
+    /// between requests). /ping, 401, and malformed heads stay untimed.
+    http_nanos: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks
     /// and for status.json formatting. Snap's field list is the single
@@ -140,6 +145,7 @@ pub const Stats = struct {
         http_5xx: u64 = 0,
         http_malformed: u64 = 0,
         http_dropped: u64 = 0,
+        http_nanos: u64 = 0,
     };
 
     // Every Stats counter must have a Snap counterpart, or it compiles fine
@@ -195,11 +201,13 @@ pub const Store = struct {
     piece_size: u32,
     water: cull.Water = .{},
     stats: Stats = .{},
-    /// Edge-triggered origin I/O outage flag. FUSE read/write handlers share
-    /// this so an NFS outage logs once (path + errno) instead of once per
-    /// syscall, and recovery logs once too -- same shape as cullLoop's
-    /// statvfs suspension. Peer HTTP keeps its per-request origin-stat
-    /// warns: that path is already bounded by the inflight cap.
+    /// Edge-triggered origin I/O outage flag. FUSE getattr/open/read/write
+    /// share this so an NFS outage logs once (path + errno) instead of once
+    /// per syscall, and recovery logs once too, the same shape as cullLoop's
+    /// statvfs suspension. status.json publishes it as origin_down (0/1) so
+    /// `modelfs status` answers whether NFS is currently failing. Peer HTTP
+    /// keeps its per-request origin-stat warns: that path is already bounded
+    /// by the inflight cap.
     origin_io_down: std.atomic.Value(bool) = .init(false),
     mu: std.Io.Mutex = .init,
     files: std.StringHashMap(*Cached),
