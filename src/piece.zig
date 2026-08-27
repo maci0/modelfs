@@ -463,9 +463,15 @@ test "resize preserves prefix bits and clears grown capacity" {
 test "zero piece_size edge cases" {
     try std.testing.expectEqual(@as(u32, 0), count(100, 0));
     try std.testing.expectEqual(@as(u32, 0), indexAt(100, 0));
+    try std.testing.expectEqual(@as(u64, 0), offset(3, 0));
+    try std.testing.expectEqual(@as(u32, 0), len(100, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0), trackedEnd(100, 0));
     const c = cover(.{ .off = 10, .len = 20 }, 100, 0);
     try std.testing.expectEqual(@as(u32, 0), c.start);
     try std.testing.expectEqual(@as(u32, 0), c.end);
+    const fc = fullCover(.{ .off = 10, .len = 20 }, 0);
+    try std.testing.expectEqual(@as(u32, 0), fc.start);
+    try std.testing.expectEqual(@as(u32, 0), fc.end);
 }
 
 test "fullCover only claims pieces the range fully spans" {

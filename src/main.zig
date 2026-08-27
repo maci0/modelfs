@@ -1617,6 +1617,9 @@ test "listenPort accepts bare port per --listen [IP:]PORT" {
 test "parseSize overflow and invalid" {
     try std.testing.expectError(error.BadSize, parseSize("9999999999999999999999999999999"));
     try std.testing.expectError(error.BadSize, parseSize("18446744073709551615G"));
+    // u64 max + 1 is still 20 digits: the overflow is in the mul/add ladder,
+    // not the longer 31-nines string above which fails earlier.
+    try std.testing.expectError(error.BadSize, parseSize("18446744073709551616"));
     try std.testing.expectError(error.BadSize, parseSize("abc"));
     try std.testing.expectError(error.BadSize, parseSize(""));
     try std.testing.expectError(error.BadSize, parseSize("12x"));
@@ -2320,8 +2323,17 @@ test "parseArgs mount flags" {
     try std.testing.expectEqual(@as(u32, 6), parsed.opts.water.bcull);
     try std.testing.expectEqual(@as(u32, 2), parsed.opts.water.bstop);
     try std.testing.expect(parsed.opts.detach);
-    // --kernel-cache flips direct_io off; default is on
+    // --kernel-cache flips direct_io off; default is on. --allow-other is
+    // off until named: that is the only way a uid other than the mounter
+    // reaches the mount.
     try std.testing.expect(parsed.opts.direct_io);
+    try std.testing.expect(!parsed.opts.allow_other);
+    {
+        const kc = try parseArgs(gpa, &environ, &.{ "mount", "--kernel-cache", "--allow-other" });
+        defer freeParsed(kc, gpa);
+        try std.testing.expect(!kc.opts.direct_io);
+        try std.testing.expect(kc.opts.allow_other);
+    }
 }
 
 test "parseArgs rejects bad values" {
@@ -2551,6 +2563,8 @@ test "parseArgs rejects mount-only flags on other commands" {
     // flags; mount-only knobs must be refused, not accepted-and-ignored.
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--detach" }));
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--kernel-cache" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--allow-other" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--direct-io" }));
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "peers", "--origin", "/o", "--piece", "4M" }));
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "peers", "--id", "spark9" }));
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--listen", "19090" }));
@@ -2643,6 +2657,9 @@ test "parseArgs accepts --name=VALUE and refuses it on boolean flags" {
     try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--detach=true" }));
     try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--help=foo" }));
     try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--foreground=1" }));
+    try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--kernel-cache=off" }));
+    try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--allow-other=1" }));
+    try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "mount", "--direct-io=false" }));
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--kernel-cache=off" }));
 }
 

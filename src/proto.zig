@@ -415,10 +415,17 @@ test "range and query" {
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), open.end);
     try std.testing.expect(parseRange("bytes=-") == null);
     try std.testing.expect(parseRange("chunks=0-5") == null);
-    // 20-digit values above u64 max are rejected, not overflowed
+    // 20-digit values above u64 max are rejected, not overflowed. 21-digit
+    // strings die on the length gate; u64 max+1 is still 20 digits and is
+    // the wrap the mul/add ladder must refuse.
     try std.testing.expect(parseRange("bytes=0-99999999999999999999") == null);
     try std.testing.expect(parseRange("bytes=99999999999999999999-0") == null);
-    try std.testing.expect(parseRange("bytes=18446744073709551615-18446744073709551615") != null);
+    try std.testing.expect(parseU64Fast("18446744073709551616") == null);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), parseU64Fast("18446744073709551615").?);
+    const maxr = parseRange("bytes=18446744073709551615-18446744073709551615").?;
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), maxr.start);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), maxr.end);
+    try std.testing.expect(parseRange("bytes=0-18446744073709551616") == null);
     // The same digit-only rule Range uses: a leading sign or interior
     // underscore is not a length, so Content-Length/X-Piece-Size cannot
     // accept what Range would refuse.

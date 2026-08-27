@@ -1322,6 +1322,17 @@ test "fuse operations wire every supported handler" {
     try std.testing.expectEqual(&mf_statfs, o.statfs);
     try std.testing.expectEqual(&mf_init, o.init);
     try std.testing.expectEqual(&mf_destroy, o.destroy);
+    // Unwired ops stay ENOSYS: a planted symlink/mknod/link/xattr handler
+    // would let a local process create names the path gate never sees.
+    try std.testing.expect(o.readlink == null);
+    try std.testing.expect(o.mknod == null);
+    try std.testing.expect(o.symlink == null);
+    try std.testing.expect(o.link == null);
+    try std.testing.expect(o.chown == null);
+    try std.testing.expect(o.setxattr == null);
+    try std.testing.expect(o.getxattr == null);
+    try std.testing.expect(o.listxattr == null);
+    try std.testing.expect(o.removexattr == null);
 }
 
 test "statusJson publishes parseable liveness atomically and replaces in place" {
