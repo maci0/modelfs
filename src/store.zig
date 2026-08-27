@@ -1197,15 +1197,12 @@ pub const Store = struct {
     /// Filesystem stats for the origin name. A planted final symlink would
     /// otherwise make statvfs(2) report the target's filesystem (df of a
     /// link to `/` leaks the host root's size/free through the mount).
-    /// ELOOP matches originPread/originPwrite and the FUSE lstat gates.
+    /// ELOOP matches originPread/originPwrite: open O_NOFOLLOW, not lstat
+    /// then statvfs, so a racer cannot swap the name to a link in between.
     pub fn originStatvfs(self: *const Store, rel: []const u8, vs: *c.struct_statvfs) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
-        var lst: c.struct_stat = undefined;
-        const lrc = sys.lstatPath(p, &lst);
-        if (lrc != 0) return lrc;
-        if ((lst.st_mode & c.S_IFMT) == c.S_IFLNK) return -c.ELOOP;
-        return sys.statvfsPath(p, vs);
+        return sys.statvfsNoFollow(p, vs);
     }
 
     /// Origin unlink plus cache-identity drop. Forget runs even when the
@@ -1679,9 +1676,12 @@ pub const Store = struct {
         if (depth >= walk_max_depth) return;
         var z: [sys.c.PATH_MAX]u8 = undefined;
         const dz = sys.toZ(&z, dir_path) catch return;
-        const dir = c.opendir(dz) orelse return;
-        defer _ = c.closedir(dir);
-        while (c.readdir(dir)) |ent| {
+        // O_NOFOLLOW: lstat of a child can see S_IFDIR then a racer swap
+        // the name to a symlink before this opendir; following would list
+        // (and consider as cull victims) names under the target.
+        const dir = sys.opendirNoFollow(dz) orelse return;
+        defer sys.closedir(dir);
+        while (sys.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
             // Skip the directory's own `.` / `..` only. relOk allows a
             // leading-dot component (`.hidden.gguf`, `dir/.cache/w.bin`),

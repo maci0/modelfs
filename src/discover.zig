@@ -219,10 +219,18 @@ const lease_file_max: usize = 4096;
 pub fn walkLeases(gpa: std.mem.Allocator, origin: []const u8, visitor: anytype) LeaseWalk {
     var dbuf: [sys.c.PATH_MAX]u8 = undefined;
     const dirz = sys.joinZ(&dbuf, origin, cluster_dir) catch return .path_too_long;
-    const dir = c.opendir(dirz) orelse return .missing_dir;
-    defer _ = c.closedir(dir);
+    // O_NOFOLLOW: a co-tenant replacing `.cluster` with a symlink would
+    // otherwise have this walk parse (and sweepLeases unlink) names under
+    // the target. ENOENT stays the missing-dir reading.
+    const dir = sys.opendirNoFollow(dirz) orelse {
+        const e = sys.errno();
+        if (e != c.ENOENT)
+            std.log.warn("lease walk skipped for {s} (errno {d})", .{ cluster_dir, e });
+        return .missing_dir;
+    };
+    defer sys.closedir(dir);
 
-    while (c.readdir(dir)) |ent| {
+    while (sys.readdir(dir)) |ent| {
         const name = sys.dirName(ent);
         if (name.len == 0 or name[0] == '.') continue;
         if (!std.mem.endsWith(u8, name, ".json")) continue;
@@ -731,8 +739,10 @@ pub const Catalog = struct {
     pub fn sweepLeases(self: *Catalog, now_sec: i64) void {
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
         const dirz = self.clusterDir(&dbuf) catch return;
-        const dir = c.opendir(dirz) orelse return;
-        defer _ = c.closedir(dir);
+        // Same O_NOFOLLOW directory open as walkLeases: following a planted
+        // `.cluster` symlink would unlink names under the target.
+        const dir = sys.opendirNoFollow(dirz) orelse return;
+        defer sys.closedir(dir);
         const cutoff = self.sweepCutoff(dirz, now_sec);
 
         // Collect then sort: NFS readdir order must not decide which stale
@@ -2186,6 +2196,42 @@ test "refresh skips a planted lease symlink instead of ingesting its target" {
     defer Catalog.freeSnapshot(gpa, snap);
     try std.testing.expectEqual(@as(usize, 1), snap.len);
     try std.testing.expectEqualStrings("spark9", snap[0].peer_id);
+}
+
+test "lease walk and sweep refuse a planted .cluster symlink" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-clustersym");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    var obuf: [192]u8 = undefined;
+    var vbuf: [192]u8 = undefined;
+    var cpath: [192]u8 = undefined;
+    var zbuf: [192]u8 = undefined;
+    var sbuf: [192]u8 = undefined;
+    const outside_d = try std.fmt.bufPrint(&obuf, "{s}/outside", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(outside_d, 0o755));
+    const victim_fp = try std.fmt.bufPrint(&vbuf, "{s}/victim.json", .{outside_d});
+    const stale = "{\"id\":\"victim\",\"until\":1,\"addrs\":[]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, victim_fp), stale));
+    const cluster_fp = try std.fmt.bufPrint(&cpath, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), c.symlink("outside", try sys.toZ(&sbuf, cluster_fp)));
+
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+    cat.refresh(sys.nowSec(std.testing.io));
+    cat.sweepLeases(sys.nowSec(std.testing.io));
+
+    const snap = try cat.snapshot(gpa);
+    defer Catalog.freeSnapshot(gpa, snap);
+    try std.testing.expectEqual(@as(usize, 0), snap.len);
+    var stbuf: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(try sys.toZ(&zbuf, victim_fp), &stbuf));
 }
 
 test "refresh uses seeds only while cluster is empty" {

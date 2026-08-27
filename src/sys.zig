@@ -344,6 +344,34 @@ pub fn statvfsPath(path: [*:0]const u8, vs: *c.struct_statvfs) i32 {
     return 0;
 }
 
+pub fn fstatvfs(fd: c_int, vs: *c.struct_statvfs) i32 {
+    if (c.fstatvfs(fd, vs) != 0) return negErrno();
+    return 0;
+}
+
+/// fstat of an O_PATH|O_NOFOLLOW fd: that flag pair opens a final symlink
+/// instead of ELOOP (open(2)), so callers must reject S_IFLNK on the fd
+/// they hold rather than trusting the open errno.
+fn fstatNotLink(fd: c_int) i32 {
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) != 0) return negErrno();
+    if ((st.st_mode & c.S_IFMT) == c.S_IFLNK) return -c.ELOOP;
+    return 0;
+}
+
+/// statvfs(2) without following a final symlink. Open O_PATH|O_NOFOLLOW so a
+/// co-tenant racing the name to a link cannot make df report the target's
+/// filesystem (a link to `/` would leak the host root's size/free), and so a
+/// mode-000 file still stats: O_RDONLY would EACCES after chmod 000.
+pub fn statvfsNoFollow(path: [*:0]const u8, vs: *c.struct_statvfs) i32 {
+    const fd = open(path, c.O_PATH | c.O_NOFOLLOW, 0);
+    if (fd < 0) return negErrno();
+    defer close(fd);
+    const lk = fstatNotLink(fd);
+    if (lk != 0) return lk;
+    return fstatvfs(fd, vs);
+}
+
 pub fn mkdir(path: [*:0]const u8, mode: c.mode_t) i32 {
     if (c.mkdir(path, mode) != 0) return negErrno();
     return 0;
@@ -354,9 +382,64 @@ pub fn rmdir(path: [*:0]const u8) i32 {
     return 0;
 }
 
+/// chmod(2) without following a final symlink. Linux has no lchmod, and
+/// fchmodat(AT_SYMLINK_NOFOLLOW) is a 6.6+ syscall that older kernels reject
+/// with EOPNOTSUPP on every call, including regular files. Open O_PATH|
+/// O_NOFOLLOW, refuse S_IFLNK on that fd (O_PATH opens the link itself),
+/// then fchmodat(AT_EMPTY_PATH): a co-tenant racing the name to a symlink
+/// cannot chmod the link's target, and a mode-000 file still chmods
+/// (O_RDONLY would EACCES; chmod(2) as owner does not).
 pub fn chmod(path: [*:0]const u8, mode: c.mode_t) i32 {
-    if (c.chmod(path, mode) != 0) return negErrno();
-    return 0;
+    const fd = open(path, c.O_PATH | c.O_NOFOLLOW, 0);
+    if (fd < 0) return negErrno();
+    const lk = fstatNotLink(fd);
+    if (lk != 0) {
+        close(fd);
+        return lk;
+    }
+    const rc = c.fchmodat(fd, "", mode, c.AT_EMPTY_PATH);
+    const e: i32 = if (rc != 0) negErrno() else 0;
+    close(fd);
+    return e;
+}
+
+/// opendir(3) without following a final symlink. O_NOFOLLOW (not O_PATH: that
+/// pair opens the link itself) so a co-tenant racing a directory name to a
+/// link cannot have the daemon list the target (FUSE readdir into the mount,
+/// lease walks of `.cluster`). O_NONBLOCK so a FIFO at the name cannot hang
+/// a FUSE handler. fdopendir owns the fd on success; failures close it and
+/// restore errno for negErrno callers.
+pub fn opendirNoFollow(path: [*:0]const u8) ?*c.DIR {
+    const fd = open(path, c.O_RDONLY | c.O_NOFOLLOW | c.O_NONBLOCK, 0);
+    if (fd < 0) return null;
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) != 0) {
+        const e = errno();
+        close(fd);
+        std.c._errno().* = e;
+        return null;
+    }
+    if ((st.st_mode & c.S_IFMT) != c.S_IFDIR) {
+        close(fd);
+        std.c._errno().* = c.ENOTDIR;
+        return null;
+    }
+    const dir = c.fdopendir(fd);
+    if (dir == null) {
+        const e = errno();
+        close(fd);
+        std.c._errno().* = e;
+        return null;
+    }
+    return dir;
+}
+
+pub fn closedir(dir: *c.DIR) void {
+    _ = c.closedir(dir);
+}
+
+pub fn readdir(dir: *c.DIR) ?*c.struct_dirent {
+    return c.readdir(dir);
 }
 
 pub fn rename(old_path: [*:0]const u8, new_path: [*:0]const u8) i32 {
@@ -966,5 +1049,68 @@ test "readFile NoFollow refuses a planted symlink that the following form would 
     try std.testing.expectError(error.OpenFailed, readFileBufNoFollowOpenErrno(&rbuf, try toZ(&lz, link), &buf_errno));
     try std.testing.expectEqual(@as(i32, c.ELOOP), buf_errno);
     // The planted target keeps its bytes.
+    try std.testing.expectEqualStrings("s3cret", try readFileBuf(&rbuf, target_z));
+}
+
+test "chmod statvfs and opendir NoFollow refuse a planted symlink" {
+    var db: [128]u8 = undefined;
+    const scratch = try scratchDir(&db, "modelfs-path-nofollow");
+    defer deleteTree(std.testing.io, scratch);
+
+    var tz: [192]u8 = undefined;
+    var tb: [192]u8 = undefined;
+    var lb: [192]u8 = undefined;
+    const target = try std.fmt.bufPrint(&tb, "{s}/secret.txt", .{scratch});
+    const link = try std.fmt.bufPrint(&lb, "{s}/planted.txt", .{scratch});
+    const target_z = try toZ(&tz, target);
+    try std.testing.expectEqual(@as(i32, 0), writeFile(target_z, "s3cret"));
+    var lz: [192]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), c.symlink("secret.txt", try toZ(&lz, link)));
+
+    var st: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), statPath(target_z, &st));
+    const orig_mode = st.st_mode;
+
+    try std.testing.expectEqual(@as(i32, -c.ELOOP), chmod(try toZ(&lz, link), 0o777));
+    try std.testing.expectEqual(@as(i32, 0), statPath(target_z, &st));
+    try std.testing.expectEqual(orig_mode, st.st_mode);
+
+    var vs: c.struct_statvfs = undefined;
+    try std.testing.expectEqual(@as(i32, -c.ELOOP), statvfsNoFollow(try toZ(&lz, link), &vs));
+    try std.testing.expectEqual(@as(i32, 0), statvfsNoFollow(target_z, &vs));
+    try std.testing.expect(vs.f_blocks > 0);
+
+    try std.testing.expect(opendirNoFollow(try toZ(&lz, link)) == null);
+    try std.testing.expectEqual(@as(i32, c.ELOOP), errno());
+
+    var db2: [192]u8 = undefined;
+    var dlbuf: [192]u8 = undefined;
+    var dz: [192]u8 = undefined;
+    const other_dir = try std.fmt.bufPrint(&db2, "{s}/otherdir", .{scratch});
+    try std.testing.expectEqual(@as(i32, 0), mkdirAll(other_dir, 0o755));
+    const dirlink = try std.fmt.bufPrint(&dlbuf, "{s}/dirlink", .{scratch});
+    try std.testing.expectEqual(@as(i32, 0), c.symlink("otherdir", try toZ(&dz, dirlink)));
+    try std.testing.expect(opendirNoFollow(try toZ(&dz, dirlink)) == null);
+    try std.testing.expectEqual(@as(i32, c.ELOOP), errno());
+
+    var sz: [192]u8 = undefined;
+    const dir = opendirNoFollow(try toZ(&sz, scratch)) orelse return error.OpendirFailed;
+    defer closedir(dir);
+    var saw_secret = false;
+    while (readdir(dir)) |ent| {
+        if (std.mem.eql(u8, dirName(ent), "secret.txt")) saw_secret = true;
+    }
+    try std.testing.expect(saw_secret);
+
+    // chmod of a mode-000 file must still succeed: chmod(2) as owner does
+    // not need the file readable, and FUSE chmod 000 then 644 is a legal
+    // pair. O_RDONLY|fchmod would EACCES here.
+    try std.testing.expectEqual(@as(i32, 0), chmod(target_z, 0o000));
+    try std.testing.expectEqual(@as(i32, 0), lstatPath(target_z, &st));
+    try std.testing.expectEqual(@as(c.mode_t, 0o000), st.st_mode & 0o777);
+    try std.testing.expectEqual(@as(i32, 0), chmod(target_z, 0o644));
+    try std.testing.expectEqual(@as(i32, 0), lstatPath(target_z, &st));
+    try std.testing.expectEqual(@as(c.mode_t, 0o644), st.st_mode & 0o777);
+    var rbuf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("s3cret", try readFileBuf(&rbuf, target_z));
 }

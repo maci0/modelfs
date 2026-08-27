@@ -933,13 +933,9 @@ export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_i
     // plant the special bit one step after a masked create.
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    // Linux has no atomic lchmod, so gate the link case with lstat first: a
-    // planted origin symlink must not route the daemon's (root's) chmod onto
-    // the target file -- setuid bits included. ELOOP matches O_NOFOLLOW.
-    var lst: sys.c.struct_stat = undefined;
-    const lrc = sys.lstatPath(op, &lst);
-    if (lrc != 0) return lrc;
-    if ((lst.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
+    // sys.chmod opens O_NOFOLLOW then fchmods the fd: a planted origin
+    // symlink (or a racer swapping the name after a lstat) must not route
+    // the daemon's chmod onto the link's target. ELOOP matches O_NOFOLLOW.
     return sys.chmod(op, clientCreateMode(mode));
 }
 
@@ -954,13 +950,12 @@ export fn mf_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: fuse.fuse_fil
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&pbuf, rel) catch return -sys.c.ENAMETOOLONG;
     // A planted directory symlink must not have the daemon list its target's
-    // (client-local) contents into this mount; lstat first, ELOOP on links.
-    var lst: sys.c.struct_stat = undefined;
-    const lrc = sys.lstatPath(op, &lst);
-    if (lrc != 0) return lrc;
-    if ((lst.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
-    const dir = sys.c.opendir(op) orelse return sys.negErrno();
-    defer _ = sys.c.closedir(dir);
+    // (client-local) contents into this mount. Open O_NOFOLLOW rather than
+    // lstat-then-opendir: a racer swapping the name to a link in that window
+    // would otherwise list the target. ELOOP on links, ENOTDIR on a file,
+    // matching the previous lstat gates.
+    const dir = sys.opendirNoFollow(op) orelse return sys.negErrno();
+    defer sys.closedir(dir);
     const fill = filler orelse return -sys.c.EIO;
     var names = OriginDirNames{ .dir = dir, .hide_cluster = rel.len == 0 };
     const emit = DirFiller{ .buf = buf, .fill = fill };
@@ -1003,7 +998,7 @@ const OriginDirNames = struct {
     hide_cluster: bool,
 
     fn next(self: *OriginDirNames) ?[]const u8 {
-        while (sys.c.readdir(@ptrCast(self.dir))) |ent| {
+        while (sys.readdir(@ptrCast(self.dir))) |ent| {
             const name = sys.dirName(ent);
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             if (self.hide_cluster and std.mem.eql(u8, name, discover.cluster_dir)) continue;
