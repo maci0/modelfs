@@ -26,4 +26,3 @@ vgcore.*
 # Scratch and runtime state
 .scratch/
 .gauntlet.lock
-vgcore*
