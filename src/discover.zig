@@ -245,13 +245,16 @@ pub const Catalog = struct {
     have_mu: std.Io.Mutex = .init,
     have_cache: std.ArrayList(HaveEntry) = .empty,
 
-    /// Positive /have bitmaps from recent probes, keyed by (rel, ip, port).
+    /// /have answers from recent probes, keyed by (rel, ip, port).
     /// fillFromPeers runs once per piece; without this cache a sequential
     /// read of one large model re-probes the whole cluster for every piece
     /// (one connect plus round trip and a full bitmap transfer per peer per
-    /// 16 MiB). Only hits are cached: a stale entry can at worst send us to
-    /// a peer that no longer has the piece, which the fetch-failure
-    /// fallback already handles.
+    /// 16 MiB). Hits and healthy 404 misses are cached (a 404 is stored as
+    /// an empty bitmap): a stale hit can at worst send us to a peer that no
+    /// longer has the piece, which the fetch-failure fallback already
+    /// handles, and a stale miss delays noticing that peer for one TTL.
+    /// Connection failures are never cached, so a down peer is retried on
+    /// the next piece.
     const have_ttl_ms: i64 = 2000;
     const have_cache_cap: usize = 32;
 
@@ -313,9 +316,11 @@ pub const Catalog = struct {
         return (proto.HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
     }
 
-    /// Caches a successful probe result; failures are never cached so a
-    /// transiently down peer is retried on the next piece. `now_ms` is the
-    /// caller's monotonic-ms instant (see haveGet).
+    /// Caches one /have answer: a 200 bitmap, or a healthy 404 stored as
+    /// an empty field so the next piece of this file does not re-dial a
+    /// peer that already said it has nothing. Connection failures must not
+    /// reach here; a down peer is retried on the next piece. `now_ms` is
+    /// the caller's monotonic-ms instant (see haveGet).
     pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, now_ms: i64) void {
         const gpa = self.gpa;
         self.have_mu.lockUncancelable(self.io);
@@ -368,6 +373,60 @@ pub const Catalog = struct {
             gpa.free(ip_own);
             gpa.free(rel_own);
         };
+    }
+
+    /// IPv4 dotted-quad cap (INET_ADDRSTRLEN minus the NUL). pushPath only
+    /// admits parseV4 addresses, so every live path fits.
+    pub const ip4_text_max: usize = 15;
+
+    /// Stack bound for collectCachedCands: a fleet well past this falls
+    /// through to the allocating probe path instead of truncating.
+    pub const cached_cand_cap: usize = 64;
+
+    /// Fills `out` with one PathCand per live path using only unexpired
+    /// /have cache lines. ip slices alias `ip_buf[i][0..]` for cand i.
+    /// Null when any unique peer_id has no cache line (caller must probe)
+    /// or when the live list does not fit `out`/`ip_buf`. An empty return
+    /// is a fully-answered empty cluster, not a miss.
+    pub fn collectCachedCands(
+        self: *Catalog,
+        rel: []const u8,
+        idx: u32,
+        local_piece_size: u32,
+        now_ms: i64,
+        out: []PathCand,
+        ip_buf: [][ip4_text_max]u8,
+    ) ?[]PathCand {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        const paths = self.paths.items;
+        if (paths.len > out.len or paths.len > ip_buf.len) return null;
+        var n: usize = 0;
+        for (paths) |p| {
+            if (p.ip.len > ip4_text_max) return null;
+            var answered: ?bool = null;
+            for (paths) |q| {
+                if (!std.mem.eql(u8, q.peer_id, p.peer_id)) continue;
+                if (self.haveLookup(rel, q.ip, q.port, now_ms)) |e| {
+                    answered = (proto.HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
+                    break;
+                }
+            }
+            if (answered == null) return null;
+            @memcpy(ip_buf[n][0..p.ip.len], p.ip);
+            out[n] = .{
+                .ip = ip_buf[n][0..p.ip.len],
+                .port = p.port,
+                .ewma_bps = p.ewma_bps,
+                .hops = p.hops,
+                .inflight = p.inflight.load(.monotonic),
+                .have = answered.?,
+            };
+            n += 1;
+        }
+        return out[0..n];
     }
 
     /// Lease files are claims on shared NFS storage; without a teardown path
@@ -943,6 +1002,44 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     if (cat.haveGet(gpa, "f31.bin", "10.1.0.1", 18080, t0)) |fresh| {
         gpa.free(fresh.bits);
     } else return error.TestUnexpectedResult;
+}
+
+test "collectCachedCands answers from the have cache and skips incomplete clusters" {
+    const gpa = std.testing.allocator;
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+    const t0 = sys.monoMs(std.testing.io);
+
+    try cat.paths.append(gpa, .{ .peer_id = "a", .ip = "10.0.0.1", .port = 1, .ewma_bps = 1e8, .hops = 0 });
+    try cat.paths.append(gpa, .{ .peer_id = "a", .ip = "10.0.0.2", .port = 1, .ewma_bps = 1e8, .hops = 1 });
+    try cat.paths.append(gpa, .{ .peer_id = "b", .ip = "10.1.0.1", .port = 1, .ewma_bps = 1e8, .hops = 0 });
+
+    var cand_buf: [Catalog.cached_cand_cap]PathCand = undefined;
+    var ip_buf: [Catalog.cached_cand_cap][Catalog.ip4_text_max]u8 = undefined;
+
+    // No cache lines yet: the caller must probe.
+    try std.testing.expect(cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf) == null);
+
+    // One peer answered; the other is still unknown.
+    cat.havePut("m.bin", "10.0.0.1", 1, &.{0b0000_0001}, 4096, t0);
+    try std.testing.expect(cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf) == null);
+
+    // A healthy 404 is an empty bitmap: both peers have now answered, and
+    // the miss peer's addresses all inherit that group's !have bit.
+    cat.havePut("m.bin", "10.1.0.1", 1, &.{}, 0, t0);
+    const cands = cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf).?;
+    try std.testing.expectEqual(@as(usize, 3), cands.len);
+    try std.testing.expect(cands[0].have);
+    try std.testing.expect(cands[1].have);
+    try std.testing.expect(!cands[2].have);
+    try std.testing.expectEqualStrings("10.0.0.1", cands[0].ip);
+    try std.testing.expectEqualStrings("10.0.0.2", cands[1].ip);
+    try std.testing.expectEqualStrings("10.1.0.1", cands[2].ip);
+
+    // Empty bits still occupy a cache line: haveHas is false, not null.
+    try std.testing.expectEqual(@as(?bool, false), cat.haveHas("m.bin", "10.1.0.1", 1, 0, 4096, t0));
+    try std.testing.expectEqual(@as(?bool, true), cat.haveHas("m.bin", "10.0.0.1", 1, 0, 4096, t0));
 }
 
 test "printable gates lease names and ids for log echo" {

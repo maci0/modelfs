@@ -1050,15 +1050,17 @@ const ProbeCtx = struct {
     next: std.atomic.Value(u32) = .init(0),
 };
 
-/// Claims one unprobed group at a time and records its /have answer (null on
-/// failure). Addresses are tried best-first: the first answer wins, so a
+/// Claims one unprobed group at a time and records its /have answer (null
+/// on connection failure; false on a cached 404). Addresses are tried
+/// best-first: the first answer wins, so a
 /// healthy multi-homed node costs one wire round trip total, and a dead
 /// preferred address falls through to the same node's remaining interfaces
 /// instead of hiding the whole node behind one unreachable NIC. Successes
 /// feed the catalog's short-TTL have cache so later pieces of the same file
-/// skip the probe entirely. A failed address is counted unless it answered
-/// 404 (a healthy peer without the file): without this count, PSK drift or
-/// a partitioned peer silently degrades every fill to the origin tier.
+/// skip the probe entirely, including a 404 (cached as an empty bitmap).
+/// A failed address is counted unless it answered 404 (a healthy peer
+/// without the file): without this count, PSK drift or a partitioned peer
+/// silently degrades every fill to the origin tier.
 fn probeWorker(ctx: *ProbeCtx) void {
     while (true) {
         const t = ctx.next.fetchAdd(1, .monotonic);
@@ -1067,9 +1069,15 @@ fn probeWorker(ctx: *ProbeCtx) void {
         for (ctx.groups[gi]) |pi| {
             const p = ctx.paths[pi];
             const rep = fetchHave(ctx.gpa, ctx.cat.io, ctx.psk, p.ip, p.port, ctx.rel) catch |err| {
-                if (err != error.PeerMiss) {
-                    if (ctx.stats) |s| _ = s.probe_err.fetchAdd(1, .monotonic);
+                if (err == error.PeerMiss) {
+                    // Healthy miss: cache as empty so the next piece of
+                    // this file does not re-dial a peer that already said
+                    // it has nothing. Connection failures stay uncached.
+                    ctx.cat.havePut(ctx.rel, p.ip, p.port, &.{}, 0, ctx.now_ms);
+                    ctx.slots[gi] = false;
+                    break;
                 }
+                if (ctx.stats) |s| _ = s.probe_err.fetchAdd(1, .monotonic);
                 continue;
             };
             defer ctx.gpa.free(rep.bits);
@@ -1133,16 +1141,25 @@ fn probeSlots(
         .stats = stats,
         .now_ms = now_ms,
     };
+    // One remaining peer: run the walk here. Spawning a thread to do a
+    // single connect would cost more than the probe itself on loopback
+    // and still serialize behind the join.
+    if (todo.items.len == 1) {
+        probeWorker(&ctx);
+        return;
+    }
     // Cap at the server's own inflight limit: probing harder than a peer
-    // accepts would only buy rejections.
+    // accepts would only buy rejections. Run one worker on this thread so
+    // a spawn is not paid for the last slot.
     const nthreads = @min(todo.items.len, Server.max_inflight);
     var workers: [Server.max_inflight]?std.Thread = .{null} ** Server.max_inflight;
     var spawned: usize = 0;
-    while (spawned < nthreads) : (spawned += 1) {
+    const spawn_n = nthreads - 1;
+    while (spawned < spawn_n) : (spawned += 1) {
         workers[spawned] = std.Thread.spawn(.{}, probeWorker, .{&ctx}) catch break;
     }
+    probeWorker(&ctx);
     for (workers[0..spawned]) |w| w.?.join();
-    if (spawned < todo.items.len) probeWorker(&ctx);
 }
 
 /// Total order for the probe walk inside one peer-id group: higher lease
@@ -1258,11 +1275,11 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
     return cands.toOwnedSlice(gpa);
 }
 
-/// Hydrate one piece from the cluster: probe one best-first address walk
-/// per peer, then fetch from the max-score path whose /have bit is set.
-/// Sequential fallback (never two sources at once); error.NoPeer means the
-/// caller should take the origin.
-pub fn fillFromPeers(
+/// Fetch from the max-score candidate whose /have bit is set. Sequential
+/// fallback (never two sources at once); error.NoPeer means the caller
+/// should take the origin. Mutates `cands` (clears .have on a failed fetch)
+/// so the same buffer can be retried without rebuilding it.
+fn fetchFromCands(
     gpa: std.mem.Allocator,
     psk: []const u8,
     cat: *discover.Catalog,
@@ -1270,15 +1287,9 @@ pub fn fillFromPeers(
     idx: u32,
     piece_size: u32,
     out: []u8,
+    cands: []discover.PathCand,
     stats: ?*store_mod.Stats,
 ) !void {
-    const cands = try probeCandidates(gpa, psk, cat, rel, idx, piece_size, stats);
-    defer {
-        for (cands) |cand| gpa.free(cand.ip);
-        gpa.free(cands);
-    }
-
-    // exclusive: one winner, then next on failure, then error (caller uses NFS)
     var remaining = cands;
     while (discover.pickBest(remaining)) |bi| {
         const win = remaining[bi];
@@ -1310,6 +1321,38 @@ pub fn fillFromPeers(
         return;
     }
     return error.NoPeer;
+}
+
+/// Hydrate one piece from the cluster: probe one best-first address walk
+/// per peer, then fetch from the max-score path whose /have bit is set.
+/// Sequential fallback (never two sources at once); error.NoPeer means the
+/// caller should take the origin.
+pub fn fillFromPeers(
+    gpa: std.mem.Allocator,
+    psk: []const u8,
+    cat: *discover.Catalog,
+    rel: []const u8,
+    idx: u32,
+    piece_size: u32,
+    out: []u8,
+    stats: ?*store_mod.Stats,
+) !void {
+    // Sequential fills of one file spend the 2s TTL here after the first
+    // piece: every live peer already has a cache line (hit or healthy 404),
+    // so there is no snapshot, no grouping, and no probe thread.
+    var cand_buf: [discover.Catalog.cached_cand_cap]discover.PathCand = undefined;
+    var ip_buf: [discover.Catalog.cached_cand_cap][discover.Catalog.ip4_text_max]u8 = undefined;
+    const now_ms = sys.monoMs(cat.io);
+    if (cat.collectCachedCands(rel, idx, piece_size, now_ms, &cand_buf, &ip_buf)) |cached| {
+        return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cached, stats);
+    }
+
+    const cands = try probeCandidates(gpa, psk, cat, rel, idx, piece_size, stats);
+    defer {
+        for (cands) |cand| gpa.free(cand.ip);
+        gpa.free(cands);
+    }
+    return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cands, stats);
 }
 
 test "rangeBps" {
@@ -2977,6 +3020,12 @@ test "fillFromPeers probes concurrently and streams piece into out" {
     // fleet miss, never a probe failure. The counter must stay at zero here
     // or it would cry wolf on every replica-skewed cluster.
     try std.testing.expectEqual(@as(u64, 0), srv.store.stats.probe_err.load(.monotonic));
+    // That 404 is cached as an empty bitmap so the next piece does not
+    // re-dial a peer that already said it has nothing. haveHas is false,
+    // not null: null would send the next fill back onto the wire.
+    const t_hit = sys.monoMs(cat.io);
+    try std.testing.expectEqual(@as(?bool, false), cat.haveHas("one.bin", "127.0.0.1", port2, 0, 16, t_hit));
+    try std.testing.expectEqual(@as(?bool, true), cat.haveHas("one.bin", "127.0.0.1", port, 0, 16, t_hit));
 
     // Regression: a zero-length out (reachable only when a truncate raced
     // hydration) must fail cleanly instead of underflowing the requested
@@ -2999,6 +3048,14 @@ test "fillFromPeers probes concurrently and streams piece into out" {
 
     // No candidate has the piece: NoPeer surfaces (caller falls back to NFS).
     try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "missing.bin", 0, 16, &out, &srv.store.stats));
+    try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
+    // Both 404s are cached: a second fill of the same missing path must
+    // not re-probe (probe_err stays 0) and must still return NoPeer with
+    // no fetch attempt (fill_err_peer stays 1).
+    try std.testing.expectEqual(@as(?bool, false), cat.haveHas("missing.bin", "127.0.0.1", port, 0, 16, sys.monoMs(cat.io)));
+    try std.testing.expectEqual(@as(?bool, false), cat.haveHas("missing.bin", "127.0.0.1", port2, 0, 16, sys.monoMs(cat.io)));
+    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "missing.bin", 0, 16, &out, &srv.store.stats));
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.probe_err.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
 }
 

@@ -29,6 +29,8 @@ below.
 
 ### Changes
 
+- **Healthy `/have` 404s are cached for the same 2 s TTL as hits**: a sequential fill used to re-dial every peer that already answered "not cached here" on every 16 MiB piece. Connection failures stay uncached so a down peer is still retried on the next piece. Once every live peer has a cache line, `fillFromPeers` skips the catalog snapshot and probe threads (`Catalog.collectCachedCands`).
+- **`reapIdle` no longer holds the store lock across pin stats and bitfield scans**: the same split `cullOne` already made. Idle emptiness uses `lastSet` (returns on the first set bit) instead of counting every bit with `filled()`.
 - **Disk culling visits cache files whose names start with a dot**: `walkData` skipped every readdir name with a leading `.`, which hid `.` and `..` but also `.hidden.gguf` and `dir/.cache/w.bin` -- paths `relOk` admits. After a restart those files never became disk-cull victims, so they filled the cache filesystem past the watermarks. Only `.` and `..` are skipped now.
 - **Nested `pin/` and `meta/` directories are owner-only (0700)**: `data/` nested parents already used 0700, but `setPin` and sidecar saves created `pin/gguf` and `meta/gguf` as 0755, so a local user blocked by origin modes could list which nested weights were pinned or cached. All cache-tree mkdirs share `cache_dir_mode`.
 - **Origin outages are visible from `modelfs status` and from getattr/open**: `origin_down` rides status.json (1 while an EIO/ESTALE/ETIMEDOUT origin op has not recovered). FUSE getattr and open now raise the same edge-triggered journal (`origin stat failed` / `origin recovered`) that read and write already did, so an NFS outage during `ls` is no longer silent until a read fails.

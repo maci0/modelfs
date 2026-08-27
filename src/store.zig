@@ -804,47 +804,77 @@ pub const Store = struct {
     /// bytes). Bounds the files map on nodes that churn through many model
     /// paths without unlinks.
     pub fn reapIdle(self: *Store, now_sec: i64, min_idle_secs: i64) void {
-        var victims: std.ArrayList(*Cached) = .empty;
-        defer victims.deinit(self.gpa);
+        var cands: std.ArrayList(*Cached) = .empty;
+        defer cands.deinit(self.gpa);
 
-        // Collection, map removal, artifact unlinks, and destruction share
-        // one store.mu window so forget()/get() cannot interleave: a racing
-        // get() must never recreate the entry (and hydrate fresh bytes into
-        // it) between removal and unlink.
-        self.mu.lockUncancelable(self.io);
-        defer self.mu.unlock(self.io);
-        var it = self.files.iterator();
-        while (it.next()) |e| {
-            const f = e.value_ptr.*;
-            // Cheap gates outside file.mu: busy entries and steady-state
-            // warm ones (fd closed, pieces cached) cost one atomic load.
-            if (f.refs.load(.acquire) != 0) continue;
-            if (now_sec -| f.last_access.load(.monotonic) < min_idle_secs) continue;
+        // Phase 1 is memory-only under store.mu: pin idle unreferenced
+        // entries. pinExists (a stat) and the bitfield scan used to run
+        // here, holding the same global lock every get() takes behind
+        // O(files) disk I/O -- the same split cullOne already made.
+        {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            var it = self.files.iterator();
+            while (it.next()) |e| {
+                const f = e.value_ptr.*;
+                if (f.refs.load(.acquire) != 0) continue;
+                if (now_sec -| f.last_access.load(.monotonic) < min_idle_secs) continue;
+                _ = f.refs.fetchAdd(1, .monotonic);
+                cands.append(self.gpa, f) catch {
+                    _ = f.refs.fetchSub(1, .monotonic);
+                    continue;
+                };
+            }
+        }
+
+        // Phase 2: close idle fds; drop entries that still hold pieces or
+        // a pin. lastSet returns on the first set bit from the end;
+        // filled() scanned the whole field to count. pinExists is a stat
+        // and must not run under store.mu.
+        var n_evict: usize = 0;
+        for (cands.items) |f| {
             var evict = false;
             f.mu.lockUncancelable(self.io);
-            candidate: {
-                if (f.filling.count() != 0) break :candidate;
-                if (now_sec -| f.last_access.load(.monotonic) < min_idle_secs) break :candidate;
+            if (f.filling.count() == 0 and
+                now_sec -| f.last_access.load(.monotonic) >= min_idle_secs)
+            {
                 if (f.cache_fd >= 0) {
                     sys.close(f.cache_fd);
                     f.cache_fd = -1;
                 }
-                // Pieces still cached are worth keeping; nothing else to do.
-                if (f.bits.filled() != 0) break :candidate;
-                if (self.pinExists(f.rel)) break :candidate;
-                evict = true;
+                evict = f.bits.lastSet() == null;
             }
             f.mu.unlock(self.io);
-            if (!evict) continue;
-            _ = f.refs.fetchAdd(1, .monotonic);
-            victims.append(self.gpa, f) catch {
-                _ = f.refs.fetchSub(1, .monotonic);
-                continue;
-            };
+            if (evict and self.pinExists(f.rel)) evict = false;
+            if (evict) {
+                cands.items[n_evict] = f;
+                n_evict += 1;
+            } else {
+                self.releaseFile(f);
+            }
         }
-        for (victims.items) |f| {
+        if (n_evict == 0) return;
+
+        // Phase 3: remove and unlink in one store.mu window so get() cannot
+        // rebuild the entry between those two steps. Revalidate: a get()
+        // that raced phase 2 holds another ref, and a pin that landed
+        // between the two phases must keep its pin file.
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        for (cands.items[0..n_evict]) |f| {
+            if (f.dead.load(.acquire) or f.refs.load(.acquire) != 1) {
+                self.releaseFile(f);
+                continue;
+            }
+            f.mu.lockUncancelable(self.io);
+            const still_empty = f.filling.count() == 0 and f.bits.lastSet() == null;
+            f.mu.unlock(self.io);
+            if (!still_empty or self.pinExists(f.rel)) {
+                self.releaseFile(f);
+                continue;
+            }
             if (!self.files.remove(f.rel)) {
-                _ = f.refs.fetchSub(1, .monotonic);
+                self.releaseFile(f);
                 continue;
             }
             f.mu.lockUncancelable(self.io);
@@ -857,10 +887,9 @@ pub const Store = struct {
             // Same builder-invalidation contract as forget: a get() whose
             // sidecar read raced this purge must not publish its stale bits.
             self.purge_epoch += 1;
-            // We hold the only reference (store.mu blocked any other taker),
-            // so this always destroys.
-            _ = f.refs.fetchSub(1, .acq_rel);
-            f.deinit(self.gpa);
+            // Our pin is the last reference (store.mu blocked any other
+            // taker past the refs==1 check); releaseFile destroys.
+            self.releaseFile(f);
         }
     }
 

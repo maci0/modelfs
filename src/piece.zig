@@ -382,8 +382,8 @@ test "filled masks pad bits inside a full trailing word" {
     const gpa = std.testing.allocator;
     // nbits=60: bytesLen=8, so the whole field is one full-width u64 word
     // whose top four bits (60..63) are pad. Regression: the word loop counted
-    // them unmasked, so a corrupt field inflated filled() (which reapIdle
-    // gates eviction on) while lastSet correctly ignored the same bits.
+    // them unmasked, so a corrupt field inflated filled() (cull accounting)
+    // while lastSet (which reapIdle uses for emptiness) ignored the same bits.
     var bf = try Bitfield.init(gpa, 60);
     defer bf.deinit(gpa);
     bf.set(0);
