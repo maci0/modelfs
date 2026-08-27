@@ -460,6 +460,22 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     return 0;
 }
 
+fn originFillBuf(st: *State, file: *store_mod.Store.Cached, idx: u32, buf: []u8) i32 {
+    const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
+    if (n == @as(isize, @intCast(buf.len))) return 0;
+    st.store.finishPiece(file, idx, false, sys.monoSec(st.io));
+    _ = st.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
+    // The reader sees EIO and nothing else names the cause; keep the
+    // same sender-side trace serveData's hydration branch does,
+    // distinguishing a real errno from a short read.
+    if (n < 0)
+        std.log.warn("origin fill failed for {s} piece {d} (errno {d}); failing read", .{ file.rel, idx, -n })
+    else
+        std.log.warn("origin fill short for {s} piece {d} ({d}/{d} bytes); failing read", .{ file.rel, idx, n, buf.len });
+    if (n < 0) return @intCast(n);
+    return -sys.c.EIO;
+}
+
 fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []u8) i32 {
     // piece.len() never exceeds piece_size, even when a concurrent append
     // grows the tail piece after cover() was computed, so the caller's
@@ -469,53 +485,60 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     // Claim and completion are separate clock samples on purpose: a slow
     // fill must land a fresh recency stamp (finishPiece), not the claim's
     // pre-transfer one, or a piece that filled for minutes is born punchable.
-    const cl = st.store.beginFill(file, idx, sys.monoSec(st.io)) catch return -sys.c.ENOMEM;
-    const ln = switch (cl) {
-        // Filled by someone else, or a truncate shrank the file below the
-        // piece between claim and sample (the claim was dropped unmarked):
-        // report success either way -- the bounds-checked read below then
-        // returns a short count against the new size. Passing an empty
-        // buffer onward would underflow fillFromPeers' range end computation
-        // (out.len - 1) and abort the daemon.
-        .filled, .raced => return 0,
-        .len => |n| n,
-    };
-    const buf = scratch[0..ln];
-    var from_peer = true;
     // Miss latency is claim-to-cache-write: exactly the stall the reader
     // eats for this piece. Failed fills keep their error counts and no time.
     const fill_t0 = sys.monoNs(st.io);
-    peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
-        from_peer = false;
-        const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
-        if (n != @as(isize, @intCast(ln))) {
-            st.store.finishPiece(file, idx, false, sys.monoSec(st.io));
-            _ = st.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
-            // The reader sees EIO and nothing else names the cause; keep the
-            // same sender-side trace serveData's hydration branch does,
-            // distinguishing a real errno from a short read.
-            if (n < 0)
-                std.log.warn("origin fill failed for {s} piece {d} (errno {d}); failing read", .{ file.rel, idx, -n })
-            else
-                std.log.warn("origin fill short for {s} piece {d} ({d}/{d} bytes); failing read", .{ file.rel, idx, n, ln });
-            if (n < 0) return @intCast(n);
-            return -sys.c.EIO;
+    var from_peer = false;
+    var prefer_origin = st.store.wroteLocally(file);
+    var ln: u32 = 0;
+    while (true) {
+        if (file.dead.load(.acquire)) return 0;
+        const cl = st.store.beginFill(file, idx, sys.monoSec(st.io)) catch return -sys.c.ENOMEM;
+        ln = switch (cl) {
+            // Filled by someone else, or a truncate shrank the file below the
+            // piece between claim and sample (the claim was dropped unmarked):
+            // report success either way -- the bounds-checked read below then
+            // returns a short count against the new size. Passing an empty
+            // buffer onward would underflow fillFromPeers' range end computation
+            // (out.len - 1) and abort the daemon.
+            .filled, .raced => return 0,
+            .len => |n| n,
+        };
+        const buf = scratch[0..ln];
+        if (!prefer_origin) {
+            from_peer = true;
+            peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
+                from_peer = false;
+                const oe = originFillBuf(st, file, idx, buf);
+                if (oe != 0) return oe;
+            };
+        } else {
+            from_peer = false;
+            const oe = originFillBuf(st, file, idx, buf);
+            if (oe != 0) return oe;
         }
-    };
+        const rc = st.store.completeFill(file, idx, buf, sys.monoSec(st.io));
+        if (rc != 0) {
+            // Hydrated bytes the cache fs refused: the piece stays unmarked and
+            // the reader gets EIO, so name the refusal like serveData's twin
+            // branch. Failed fills keep their error counts and no time (and no
+            // fill or byte totals): the tick line's averages stay miss-only.
+            _ = st.store.stats.fill_err_cache.fetchAdd(1, .monotonic);
+            std.log.warn("cache write refused {s} piece {d} (errno {d}); failing read", .{ file.rel, idx, -rc });
+            return rc;
+        }
+        if (st.store.hasPiece(file, idx, sys.monoSec(st.io))) break;
+        // A local write-through discarded this fill (peer bytes would have
+        // overwritten it). Retry from origin; sleep so a simulator can
+        // interleave the writer the way beginFill yields on an in-flight claim.
+        prefer_origin = true;
+        from_peer = false;
+        sys.sleepMs(st.io, 2);
+    }
     // Counted per fill instead of logged: a single model read covers hundreds
     // of pieces, and the totals land in status.json and the discovery tick's
     // summary line. Failures keep their own warns at the failure sites.
     const s = &st.store.stats;
-    const rc = st.store.completeFill(file, idx, buf, sys.monoSec(st.io));
-    if (rc != 0) {
-        // Hydrated bytes the cache fs refused: the piece stays unmarked and
-        // the reader gets EIO, so name the refusal like serveData's twin
-        // branch. Failed fills keep their error counts and no time (and no
-        // fill or byte totals): the tick line's averages stay miss-only.
-        _ = s.fill_err_cache.fetchAdd(1, .monotonic);
-        std.log.warn("cache write refused {s} piece {d} (errno {d}); failing read", .{ file.rel, idx, -rc });
-        return rc;
-    }
     // Sampled after the cache write lands: the published average is the full
     // claim-to-cache-write stall the reader ate for this piece.
     const fill_dt: u64 = @intCast(sys.monoNs(st.io) - fill_t0);
@@ -739,6 +762,7 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
         var ob = file.bits;
         file.size = new_size;
         file.bits = nb;
+        file.writes += 1;
         // Save while the new bits are still under the lock: saveBits encodes
         // size/bits and must never race the swap below (or another thread's
         // encode) on freed storage. The fd truncate shares this window so

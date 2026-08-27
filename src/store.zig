@@ -156,9 +156,21 @@ pub const Store = struct {
         size: u64,
         mu: std.Io.Mutex = .init,
         bits: piece.Bitfield,
-        filling: std.AutoHashMap(u32, void),
+        /// In-flight fill claims: piece index -> `writes` sampled at beginFill.
+        /// completeFill drops a claim whose generation no longer matches, so a
+        /// peer fill cannot land over bytes this node just wrote through.
+        filling: std.AutoHashMap(u32, u64),
         cache_fd: c_int = -1,
         last_access: std.atomic.Value(i64) = .init(0),
+        /// Serializes write-through pwrite+mark with completeFill pwrite+mark.
+        /// Without it the two pwrites race on the cache fd: a fill that claimed
+        /// before the write can overwrite the write-through bytes and then
+        /// mark them filled.
+        content_mu: std.Io.Mutex = .init,
+        /// Count of local origin mutations observed on this entry (write-through,
+        /// distrust, truncate wipe). Nonzero means peer bytes for this path
+        /// may predate those mutations; hydrates take the origin instead.
+        writes: u64 = 0,
         /// Active users of this pointer. Taken under store.mu together with
         /// the map lookup; released by releaseFile. An entry removed from the
         /// map (forget/reap) can no longer be acquired, so the last release
@@ -391,7 +403,10 @@ pub const Store = struct {
         // Same builder-invalidation contract as forget: a builder whose
         // sidecar read raced this unlink must not publish its stale bits.
         self.purge_epoch += 1;
-        if (f) |file| @memset(file.bits.bytes, 0);
+        if (f) |file| {
+            @memset(file.bits.bytes, 0);
+            file.writes += 1;
+        }
     }
 
     /// Outcome of loading a sidecar: `bits` is always sized for the caller's
@@ -618,7 +633,7 @@ pub const Store = struct {
                     .rel = rel_own,
                     .size = file_size,
                     .bits = loaded.bits,
-                    .filling = std.AutoHashMap(u32, void).init(self.gpa),
+                    .filling = std.AutoHashMap(u32, u64).init(self.gpa),
                     .last_access = .init(now_sec),
                 };
                 break :blk raw;
@@ -797,7 +812,7 @@ pub const Store = struct {
                 sys.sleepMs(self.io, 2);
                 continue;
             }
-            file.filling.put(idx, {}) catch |err| {
+            file.filling.put(idx, file.writes) catch |err| {
                 file.mu.unlock(self.io);
                 return err;
             };
@@ -819,13 +834,42 @@ pub const Store = struct {
 
     /// Lands one claimed fill: writes buf at the piece offset and marks the
     /// piece only when every byte reached the cache fd, so an unmarked piece
-    /// refills instead of serving hole zeros. Returns 0 on success, else the
-    /// negative errno from the write. `now_sec` is the caller's monotonic
-    /// instant for the completion stamp (finishPiece).
+    /// refills instead of serving hole zeros. Returns 0 on success (including
+    /// when a local write-through already won the piece or invalidated this
+    /// claim), else the negative errno from the write. `now_sec` is the
+    /// caller's monotonic instant for the completion stamp (finishPiece).
     pub fn completeFill(self: *Store, file: *Cached, idx: u32, buf: []const u8, now_sec: i64) i32 {
+        file.content_mu.lockUncancelable(self.io);
+        defer file.content_mu.unlock(self.io);
+
+        file.mu.lockUncancelable(self.io);
+        const skip = blk: {
+            if (file.dead.load(.acquire)) break :blk true;
+            if (file.bits.get(idx)) break :blk true;
+            const gen = file.filling.get(idx) orelse break :blk true;
+            if (gen != file.writes) break :blk true;
+            break :blk false;
+        };
+        if (skip) {
+            _ = file.filling.remove(idx);
+            file.mu.unlock(self.io);
+            return 0;
+        }
+        file.mu.unlock(self.io);
+
         const w = self.writePiece(file, idx, buf);
         self.finishPiece(file, idx, w == 0, now_sec);
         return w;
+    }
+
+    /// True when this node has mutated the path through the mount (or dropped
+    /// trust after a write whose post-size could not be observed). Peer
+    /// `/have` bits for the path can predate that mutation; hydrates must
+    /// take origin bytes rather than resurrect pre-write peer data.
+    pub fn wroteLocally(self: *Store, file: *Cached) bool {
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        return file.writes != 0;
     }
 
     pub fn hasPiece(self: *Store, file: *Cached, idx: u32, now_sec: i64) bool {
@@ -1024,32 +1068,41 @@ pub const Store = struct {
     /// pwrite extends the fd to its own end by itself, so growth needs no
     /// truncate; a fresh openCache sizes the descriptor under file.mu.
     pub fn copyIntoCache(self: *Store, file: *Cached, off: u64, data: []const u8) bool {
+        file.content_mu.lockUncancelable(self.io);
+        defer file.content_mu.unlock(self.io);
+
         const cfd = self.openCache(file);
+        var copied = false;
         if (cfd < 0) {
             std.log.warn("cache fill skipped for {s} (errno {d}); reads fall back to origin", .{ file.rel, -cfd });
-            return false;
+        } else {
+            const w = sys.pwriteAll(cfd, data, off);
+            if (w != @as(isize, @intCast(data.len))) {
+                std.log.warn("cache fill failed for {s} (errno {d}); reads fall back to origin", .{ file.rel, -w });
+            } else {
+                sys.fadviseDontneed(cfd, off, data.len);
+                copied = true;
+            }
         }
-        const w = sys.pwriteAll(cfd, data, off);
-        if (w != @as(isize, @intCast(data.len))) {
-            std.log.warn("cache fill failed for {s} (errno {d}); reads fall back to origin", .{ file.rel, -w });
-            return false;
-        }
-        sys.fadviseDontneed(cfd, off, data.len);
         const cov = piece.fullCover(off, data.len, self.piece_size);
-        // Marking and the sidecar save share file.mu: saveBits encodes
-        // size/bits, and a concurrent truncate may swap and free them.
+        // Marking, the write generation, and the sidecar save share file.mu:
+        // saveBits encodes size/bits, and a concurrent truncate may swap and
+        // free them. Bump writes even when the cache copy failed: the origin
+        // already has the new bytes, and a later peer fill would resurrect
+        // pre-write content.
         file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
         // Same dead-entry contract as finishPiece: a forget that raced this
         // write-through unlinked these artifacts; marking plus saving would
         // resurrect a sidecar claiming filled pieces over missing bytes.
-        const dead = file.dead.load(.acquire);
-        if (!dead) {
+        if (file.dead.load(.acquire)) return false;
+        file.writes += 1;
+        if (copied) {
             var i = cov.start;
             while (i < cov.end) : (i += 1) file.bits.set(i);
             _ = self.saveBits(file, false);
         }
-        file.mu.unlock(self.io);
-        return !dead;
+        return copied;
     }
 
     /// Null when the cache filesystem cannot be stat'ed; callers must not
@@ -1469,7 +1522,7 @@ test "rangeFilled is true only when every covered piece is marked" {
     defer bits.deinit(gpa);
     bits.set(0);
     bits.set(1);
-    var filling = std.AutoHashMap(u32, void).init(gpa);
+    var filling = std.AutoHashMap(u32, u64).init(gpa);
     defer filling.deinit();
     var rel = [_]u8{ 't', '.', 'b', 'i', 'n' };
     var file = Store.Cached{
@@ -1892,6 +1945,70 @@ test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
     }
 }
 
+test "completeFill does not overwrite a racing write-through" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-wt-race");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-wt-race");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("race.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+
+    var fresh: [16]u8 = undefined;
+    @memset(&fresh, 0xAA);
+    var stale: [16]u8 = undefined;
+    @memset(&stale, 0xBB);
+
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
+    try std.testing.expect(st.copyIntoCache(f, 0, &fresh));
+    try std.testing.expect(st.wroteLocally(f));
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, &stale, sys.monoSec(std.testing.io)));
+    try std.testing.expect(st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+
+    var rd: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqualSlices(u8, &fresh, &rd);
+}
+
+test "completeFill drops a stale peer buffer after a partial write-through" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-wt-part");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-wt-part");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("part.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+
+    const patch = [_]u8{ 0xAA, 0xAA, 0xAA, 0xAA };
+    var stale: [16]u8 = undefined;
+    @memset(&stale, 0xBB);
+
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
+    try std.testing.expect(st.copyIntoCache(f, 0, &patch));
+    try std.testing.expect(st.wroteLocally(f));
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, &stale, sys.monoSec(std.testing.io)));
+    try std.testing.expect(!st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+
+    var rd: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqualSlices(u8, &patch, rd[0..4]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 12), rd[4..]);
+}
+
 test "relOk rejects traversal and absolute paths" {
     try std.testing.expect(relOk("gguf/a.gguf"));
     try std.testing.expect(relOk("a.bin"));
@@ -2218,6 +2335,7 @@ test "distrust drops sidecar and live marks but keeps data bytes and pins" {
     f2.mu.lockUncancelable(std.testing.io);
     try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
     f2.mu.unlock(std.testing.io);
+    try std.testing.expect(st.wroteLocally(f2));
 
     // A rel with no live entry still loses its persisted sidecar.
     _ = try st.cacheMetaPath(&mb, "ghost.bin");
@@ -3510,7 +3628,7 @@ test "beginFill surfaces allocation failure instead of spinning" {
     // into EIO/500) rather than retry forever and wedge the reader.
     var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
     f.filling.deinit();
-    f.filling = std.AutoHashMap(u32, void).init(failing.allocator());
+    f.filling = std.AutoHashMap(u32, u64).init(failing.allocator());
     try std.testing.expectError(error.OutOfMemory, st.beginFill(f, 0, sys.monoSec(std.testing.io)));
 }
 

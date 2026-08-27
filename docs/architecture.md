@@ -154,7 +154,7 @@ score = ewma_goodput_bps / (1 + hops) / (1 + inflight)
 - **hops**: 0 if same IPv4 /24 as a local addr, else 1.
 - **inflight**: pieces already assigned to that path.
 
-On miss: among paths whose `/have` bit is set, max score. GET fails: next path, then NFS. Never two sources for one piece.
+On miss: among paths whose `/have` bit is set, max score. GET fails: next path, then NFS. Never two sources for one piece. A node that has written the path through the mount (`Store.wroteLocally`) hydrates further misses of that path from the origin, not from peers: a peer's cached piece can predate the write, and landing it would hide the writer's own bytes.
 
 Probe answers are cached per (path, file) for 2 s (`Catalog.have_ttl_ms`), so a sequential fill of one large model sends `/have` once per peer per TTL window instead of once per peer per piece. Sequential fills consult that line through `Catalog.haveHas` (one bit, no bitmap copy); `haveGet` still returns an owned `proto.HaveBits` for callers that need the whole field. Only hits are cached: a stale bitmap can at worst route a fetch to a peer that no longer has the piece, which the next-path fallback already handles; failed probes are never cached, so a down peer is retried on the next piece.
 
@@ -212,7 +212,7 @@ Culling punches 16 MiB holes (`FALLOC_FL_PUNCH_HOLE`), clears that bit, leaves t
 
 ## Writes and races
 
-Write is NFS 1:1, then a copy into this node's cache. If NFS fails, the write fails. No write-back buffer.
+Write is NFS 1:1, then a copy into this node's cache. If NFS fails, the write fails. No write-back buffer. `Store.copyIntoCache` bumps a per-entry write generation; `Store.completeFill` drops an in-flight fill whose generation no longer matches, so a peer fill that claimed the piece before the write cannot overwrite the write-through bytes. Further misses on the writing node take the origin (`hydratePiece` in `src/fuse_fs.zig`).
 
 Two writers on the same path: last `pwrite` on NFS wins. No cluster lock. The other node's cache can keep stale pieces until cull or size change. Ingest on one node; everyone else reads. Second copy of a model: new path.
 
