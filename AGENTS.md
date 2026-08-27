@@ -2,27 +2,28 @@
 
 Single Zig binary: a FUSE mount at `/models` backed by a local NVMe piece
 cache, peer-to-peer piece transfers over plaintext HTTP with one shared PSK,
-and an NFS origin as the write authority. Linux only. Global rules apply;
-this file holds what is specific to this tree.
+and an NFS origin as the write authority. Linux only.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `src/*.zig` | The daemon. Tests live beside the code they cover; `root.zig` aggregates them into the test binary |
+| `src/*.zig` | The daemon. Tests live beside the code they cover; a new file is invisible to `zig build test` until `root.zig` imports it |
 | `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once; import via `c.zig` / `sys.c`, never `@cImport` |
 | `scripts/` | Gates and harnesses. `lib.sh` is sourced by every shell script for `ROOT_DIR`, `SCRIPTS_DIR`, `SCRATCH_DIR` |
-| `docs/` | `README.md` indexes them. `architecture.md` is authoritative for shipped behavior |
+| `docs/` | `README.md` indexes them. `architecture.md` is shipped behavior; `design.md` is history |
 | `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files, `SHA256SUMS`, NOTICE, and copyright. `build.zig` and `scripts/extract_fuse3_arm64.sh` verify the digests; extract writes under `.scratch/fuse3-arm64/`; `check.sh` checks them too |
 
 ## Gates
 
-`./scripts/check.sh` is the blocking gate: `zig fmt --check`, `zig build test`,
-shellcheck (`-o` extras on `scripts/*.sh`), `test_dr_restore_drill.sh`,
-vendored libfuse3 digest and extract checks, `ruff check`, `ruff format --check`,
-mypy, and `scripts/sbom.py --check`. CI runs that plus the aarch64 cross-compile
+`./scripts/check.sh` is the blocking gate: `zig fmt --check`, changelog `##`
+headings (`[Unreleased]` and semver matching `build.zig.zon`; dated notes are
+`###`), `zig build test`, shellcheck (`-o` extras on `scripts/*.sh`),
+`test_dr_restore_drill.sh`, vendored libfuse3 digest and extract checks,
+`ruff check scripts/`, `ruff format --check scripts/`, `mypy scripts/`, and
+`scripts/sbom.py --check`. CI runs that plus the aarch64 cross-compile
 and the reproducibility rebuild.
-Never loosen a rule to pass it.
+Never loosen a gate to pass it.
 
 `run_cluster_e2e_9nodes.sh` needs `/dev/fuse` and `fusermount3`, so it runs
 locally rather than in CI. `run_e2e_tests.sh` is CLI/protocol only (no FUSE).
@@ -38,8 +39,9 @@ stand-in (stub `zfs`).
   piece cache written there is charged to RAM.
 - **Harness knobs use `MF_`, never `MODELFS_`.** The daemon refuses unknown
   `MODELFS_*` as typo'd knobs.
-- **Every peer input is untrusted.** Request heads, lease JSON, and encoded
-  paths have fuzzed parsers; paths also pass `relOk` before origin or cache.
+- **Every external path is untrusted.** Request heads, lease JSON, and encoded
+  paths have fuzzed parsers. FUSE handlers go through `resolveRel`; peer and
+  CLI paths pass `relOk` before origin or cache.
 - **No hot-path allocation.** Piece hydration and request parsing use stack
   buffers or one reusable piece-sized buffer; allocating functions take an
   explicit `gpa`.
