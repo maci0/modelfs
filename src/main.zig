@@ -319,6 +319,18 @@ fn parseLogLevel(s: []const u8) ?std.log.Level {
     return null;
 }
 
+/// Refusal line for a MODELFS_-prefixed variable no flag answers to. The
+/// name goes through discover.displayName, never verbatim: like MODELFS_ID,
+/// it arrives from whatever composed this process's environment (a systemd
+/// Environment= line, CI wrapper, remote shell), and a name holding ESC,
+/// CR/LF, or their UTF-8 C1 spellings must refuse without injecting terminal
+/// escapes or forging log lines. Names longer than the staging buffer render
+/// as the generic line; the refusal itself is the point and stays
+/// unconditional either way.
+fn unknownEnvLine(buf: []u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "unknown environment variable {s} (see 'modelfs help')\n", .{discover.displayName(name)}) catch "unknown environment variable (see 'modelfs help')\n";
+}
+
 /// The MODELFS_ prefix is this CLI's environment namespace; anything under
 /// it that no flag answers to is a misspelling, not a foreign variable.
 /// Variables outside the namespace are never this binary's business and
@@ -332,8 +344,10 @@ fn checkKnownEnv(environ: *const std.process.Environ.Map) !void {
         for (known) |k| {
             if (std.mem.eql(u8, name, k)) break;
         } else {
-            if (!builtin.is_test)
-                std.debug.print("unknown environment variable {s} (see 'modelfs help')\n", .{name});
+            if (!builtin.is_test) {
+                var lbuf: [512]u8 = undefined;
+                std.debug.print("{s}", .{unknownEnvLine(&lbuf, name)});
+            }
             return error.UnknownEnv;
         }
     }
@@ -1508,6 +1522,37 @@ test "parseArgs refuses unknown MODELFS_ variables as typos" {
         defer freeParsed(parsed, gpa);
         try std.testing.expectEqualStrings("/env/cache", parsed.opts.cache);
     }
+}
+
+test "unknownEnvLine renders refused names through the displayName echo gate" {
+    // An unknown MODELFS_ variable arrives from whatever composed this
+    // process's environment (systemd unit, CI wrapper, remote shell), so the
+    // refusal must never echo the raw name: ESC (OSC title escape) or CR/LF
+    // (forged follow-up lines) would inject into the operator's terminal,
+    // exactly the exposure badIdLine's gate closes for MODELFS_ID.
+    var buf: [512]u8 = undefined;
+    {
+        const line = unknownEnvLine(&buf, "MODELFS_\x1b]0;pwned\x07");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+    }
+    // The UTF-8 C1 spellings get the same withholding as their raw C0
+    // counterparts.
+    {
+        const line = unknownEnvLine(&buf, "MODELFS_\xc2\x9d0;pwned\xc2\x9c");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\xc2\x9d") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+    }
+    // A printable misspelling still names itself verbatim, so the operator
+    // sees which variable was refused.
+    {
+        const line = unknownEnvLine(&buf, "MODELFS_CACHEE");
+        try std.testing.expect(std.mem.indexOf(u8, line, "unknown environment variable MODELFS_CACHEE") != null);
+    }
+    // A name that cannot fit the staging buffer degrades to the generic
+    // line: the refusal stays unconditional either way.
+    const long = unknownEnvLine(buf[0..64], "MODELFS_" ** 20);
+    try std.testing.expectEqualStrings("unknown environment variable (see 'modelfs help')\n", long);
 }
 
 test "cmdStatus retires a crashed daemon's status.json as not running" {
