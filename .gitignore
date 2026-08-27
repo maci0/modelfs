@@ -17,9 +17,11 @@ __pycache__/
 .deps/fuse3-arm64/root/
 .deps/fuse3-arm64/lib/
 
-# Crash artifacts: a core dump from a failed zig test or daemon run must
-# never land in the index again (a 4 MB vgcore.<pid> was committed once).
+# Crash artifacts: a core dump from a failed zig test or daemon run lands in
+# the crashing process's cwd, usually the repo root, and must never reach the
+# index again (a 4 MB vgcore.<pid> was committed once).
 core
+core.*
 vgcore.*
 *.core
 

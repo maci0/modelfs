@@ -104,3 +104,31 @@ jobs:
             -Dfuse-include=.deps/fuse3-arm64/root/usr/include/fuse3 \
             -Dfuse-lib=.deps/fuse3-arm64/lib
           file zig-out/bin/modelfs | grep -q 'ARM aarch64'
+
+  # Enforces what CONTRIBUTING promises under "Cutting a release": two
+  # ReleaseFast builds from differently named trees, with TZ/locale/
+  # SOURCE_DATE_EPOCH varied between them, must produce byte-identical
+  # binaries. scripts/repro_check.sh owns the recipe; this job only runs it,
+  # so local verification and CI cannot drift apart.
+  reproducibility:
+    runs-on: ubuntu-latest
+    # Two cold ReleaseFast builds plus checkout fit well inside the same hang
+    # guard every other job carries.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      # Same setup-zig behavior as above: exact version resolved from
+      # build.zig.zon, tarball minisign-verified.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+
+      # The script builds against the system libfuse3 like the check job does;
+      # reproducibility is a property of our inputs, not of the headers' bytes
+      # being identical across the two build trees (they are only read).
+      - name: Install libfuse3 development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libfuse3-dev
+
+      - name: Build twice and compare bytes
+        run: ./scripts/repro_check.sh

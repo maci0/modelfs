@@ -17,6 +17,10 @@
   in the log line as `snap_age_s`, making the recovery doc's RPO column a
   measured number instead of an assumption.
 
+## [Build review pass 2] - 2026-08-26
+- **A 4 MB core dump of the test binary is out of the tree**: `vgcore.3049480`, an ELF core from a crashed `modelfs-test` run, was committed by accident and shipped inside the repo forever after. Deleted, and `.gitignore` now rejects crash dumps (`vgcore.*`, `core`, `core.*`) so the next failed test run cannot be committed either.
+- **Reproducible release builds are now enforced, not just claimed**: CONTRIBUTING promised byte-identical ReleaseFast binaries across path/host/locale/timezone and asked for a manual double-build check that nobody had to run. The new `scripts/repro_check.sh` does it mechanically (two cold builds of the tracked sources from differently named trees, second one under `TZ=Asia/Tokyo`, `LC_ALL=C.UTF-8`, fixed `SOURCE_DATE_EPOCH`; each with its own Zig cache; fails with a diffoscope pointer if the bytes differ), CI runs it as a blocking `reproducibility` job on every PR, and README/CONTRIBUTING point at the script instead of prose instructions.
+
 ## [CLI review pass 3] - 2026-08-26
 - **A regular file at `--origin` is refused instead of silently misbehaving**: both `mount` and `peers` gated only on reachability, which a file satisfies, so the mount proceeded past the origin check (mountpoint and cache layout created, peer port bound) while every lookup died ENOTDIR behind the NFS fallback, and `peers` reported a healthy empty cluster for a path that can never hold `.cluster` leases. Both commands now require the origin to be an existing directory right after the realpath gate (named message, exit 1, nothing created), matching the documented contract ("any POSIX dir"); `modelfs help` says "Existing".
 
