@@ -65,12 +65,16 @@ whole import graph, so `-Dtest-filter=store` would miss most of `store.zig`.
 
 The blocking requirement is green CI: `./scripts/check.sh`, the
 `cross-aarch64` compile job, and the `reproducibility` job
-(`./scripts/ci.sh` runs all three). There are no
-sign-off or changelog-entry gates,
-but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) as a dated
-`###` section under `[Unreleased]` (`## [version]` headings are releases;
-a sibling `## [Name] - date` reads as one; see Cutting a release below),
-and changes to
+(`./scripts/ci.sh` runs all three). There is no sign-off gate and no
+requirement that a PR add a changelog entry, but `scripts/check.sh`
+requires CHANGELOG.md's `##` headings to be `[Unreleased]` or a semver
+version matching build.zig.zon. Behavior changes belong in
+[CHANGELOG.md](CHANGELOG.md) as a dated
+`###` section under `[Unreleased]` (`## [Unreleased]` and `## [x.y.z] - date`
+are the only `##` headings; a sibling `## [Name] - date` reads as a
+release, so history that shipped in a version nests as `###` under it;
+`scripts/check.sh` pins that against `.version` in build.zig.zon), and
+changes to
 [requirements-dev.txt](requirements-dev.txt) must be reflected in the
 hash-pinned lock (regeneration command in the lock's header) and in
 [sbom.cdx.json](sbom.cdx.json) (`python3 scripts/sbom.py --write`). A
@@ -90,7 +94,8 @@ sync:
    unreleased work (dated `###` sections sit there so they are not read as
    versions); move the sections this release covers under a heading named
    after the new version and today's date, leaving `[Unreleased]` empty at
-   the top of the file.
+   the top of the file. Point the `[Unreleased]` compare link at the new
+   tag and add a `[x.y.z]` tag link beside it.
 3. Tag `v<version>`, exactly matching the manifest (`v0.1.0` for
    `.version = "0.1.0"`), so a checkout can be matched to a version.
 4. Confirm the built binary answers with the declared version before

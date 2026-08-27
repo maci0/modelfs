@@ -160,8 +160,9 @@ llama-server --cache-list    # what is already in LLAMA_CACHE
 hf download bartowski/Llama-3.2-3B-Instruct-GGUF --include '*Q8_0*.gguf' --local-dir /models/gguf/llama-3.2-3b
 llama-server -m /models/gguf/llama-3.2-3b/*.Q8_0.gguf
 
-hf download meta-llama/Meta-Llama-3-70B-Instruct
-vllm serve meta-llama/Meta-Llama-3-70B-Instruct
+# spark FUSE will not follow hub-cache snapshot symlinks; --local-dir writes regular files
+hf download meta-llama/Meta-Llama-3-70B-Instruct --local-dir /models/hf/Meta-Llama-3-70B-Instruct
+vllm serve /models/hf/Meta-Llama-3-70B-Instruct
 ```
 
 One node downloads a repo at a time. Docker/enroot: `-e` those vars, bind `/models`.

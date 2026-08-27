@@ -12,10 +12,11 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<'EOF'
 Usage: ./scripts/check.sh
 
-The blocking static gate: zig fmt, unit tests, the restore-drill stub
-suite, vendored libfuse3 digests and extract, shellcheck, ruff, mypy,
-sbom. Same command the CI `check` job runs. Requires the pinned .venv
-from setup.
+The blocking static gate: zig fmt, changelog headings versus
+build.zig.zon, unit tests, the restore-drill stub suite, vendored
+libfuse3 digests and extract, shellcheck, ruff, mypy, sbom. Same
+command the CI `check` job runs. Requires the pinned .venv from
+setup.
 
 Contributor commands (also listed by `zig build --help`):
   zig build                                 build the binary
@@ -83,6 +84,35 @@ fi
 
 echo "=== zig fmt --check ==="
 zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported unformatted files; fix with: zig build fmt"
+
+# ## [Name] is a release to changelog readers and tools. Dated notes nest
+# as ### under a version so they are not read as one (CONTRIBUTING.md).
+echo "=== changelog headings ==="
+zon_ver="$(sed -n 's/^[[:space:]]*\.version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
+[[ -n "${zon_ver}" ]] || fail "cannot read .version from build.zig.zon"
+saw_unreleased=0
+saw_current=0
+while IFS= read -r line; do
+    case "${line}" in
+        '## [Unreleased]')
+            saw_unreleased=1
+            ;;
+        '## ['*)
+            name="${line#\#\# \[}"
+            name="${name%%]*}"
+            if [[ ! "${name}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)*$ ]]; then
+                fail "changelog heading is not Unreleased or semver: ${line}"
+            fi
+            if [[ "${name}" == "${zon_ver}" ]]; then
+                saw_current=1
+            fi
+            ;;
+        *)
+            ;;
+    esac
+done < "${ROOT_DIR}/CHANGELOG.md"
+[[ "${saw_unreleased}" -eq 1 ]] || fail "CHANGELOG.md missing ## [Unreleased]"
+[[ "${saw_current}" -eq 1 ]] || fail "CHANGELOG.md missing ## [${zon_ver}] (build.zig.zon .version)"
 
 echo "=== vendored fuse3 hashes ==="
 (
