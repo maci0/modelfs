@@ -19,43 +19,56 @@ pub fn negErrno() i32 {
 
 /// Wall-clock epoch seconds: for instants shared across processes and
 /// machines (cluster lease expiry). Never for elapsed-time math; that is
-/// monoSec's job.
-pub fn nowSec() i64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-    return ts.sec;
+/// monoSec's job. Sampled through `io` so a simulator substitutes a virtual
+/// clock; production Threaded Io reads CLOCK_REALTIME.
+pub fn nowSec(io: std.Io) i64 {
+    return std.Io.Clock.now(.real, io).toSeconds();
 }
 
 /// Monotonic seconds: for elapsed-time comparisons within this process only
-/// (never persisted, never shared across processes or machines).
-pub fn monoSec() i64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return ts.sec;
+/// (never persisted, never shared across processes or machines). Sampled
+/// through `io` (CLOCK_MONOTONIC via Clock.awake) so recency, reap, and
+/// fill stamps stay a function of the injected clock.
+pub fn monoSec(io: std.Io) i64 {
+    return std.Io.Clock.now(.awake, io).toSeconds();
 }
 
 /// Monotonic milliseconds: elapsed-time comparisons within this process
-/// where second resolution is too coarse (short-lived cache TTLs).
-pub fn monoMs() i64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+/// where second resolution is too coarse (short-lived cache TTLs, peer
+/// transfer budgets). Same injected clock as monoSec.
+pub fn monoMs(io: std.Io) i64 {
+    return std.Io.Clock.now(.awake, io).toMilliseconds();
 }
 
 /// Monotonic nanoseconds: same clock as monoSec at sub-second precision,
 /// for throughput samples over short intervals.
-pub fn monoNs() i128 {
+pub fn monoNs(io: std.Io) i128 {
+    return @intCast(std.Io.Clock.now(.awake, io).toNanoseconds());
+}
+
+/// Relative sleep on the injected clock. A simulator's Io can elide the
+/// wait; production Threaded Io blocks for `ms` of CLOCK_MONOTONIC time.
+/// Cancelation is ignored: these sleeps are shutdown-sliced waits and
+/// fill-claim yields, not cancelable tasks.
+pub fn sleepMs(io: std.Io, ms: u32) void {
+    std.Io.sleep(io, .fromMilliseconds(ms), .awake) catch {};
+}
+
+/// Kernel CLOCK_MONOTONIC nanoseconds for syscall wrappers that implement
+/// their own timeout (connectIn). Policy clocks go through nowSec/monoSec
+/// and `io`; this is the I/O primitive, not a decision instant.
+fn monoNsRaw() i128 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
     return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
 }
 
-pub fn sleepMs(ms: u32) void {
-    var ts = std.os.linux.timespec{
-        .sec = @intCast(ms / 1000),
-        .nsec = @intCast((ms % 1000) * 1_000_000),
-    };
-    _ = std.os.linux.nanosleep(&ts, null);
+/// Kernel CLOCK_REALTIME seconds for test-scratch uniqueness (pid-colliding
+/// names). Not a policy instant: scratch dirs are not simulated.
+fn nowSecRaw() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    return ts.sec;
 }
 
 pub fn joinZ(buf: []u8, a: []const u8, b: []const u8) ![*:0]u8 {
@@ -391,10 +404,10 @@ pub fn connectIn(fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
     if (e0 != c.EINPROGRESS) return -e0;
     // EINTR during poll must not fail the dial: retry against the original
     // deadline, like the read/write loops retry their syscalls.
-    const deadline = monoNs() + @as(i128, ms) * std.time.ns_per_ms;
+    const deadline = monoNsRaw() + @as(i128, ms) * std.time.ns_per_ms;
     while (true) {
         var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
-        const remain_ms = @divTrunc(deadline - monoNs(), std.time.ns_per_ms);
+        const remain_ms = @divTrunc(deadline - monoNsRaw(), std.time.ns_per_ms);
         if (remain_ms <= 0) return -c.ETIMEDOUT;
         const wait: c_int = @intCast(@min(remain_ms, @as(i128, std.math.maxInt(c_int))));
         const prc = c.poll(@ptrCast(&pfd), 1, wait);
@@ -467,7 +480,7 @@ pub fn deleteTree(io: std.Io, path: []const u8) void {
 /// resolution stamps collide otherwise). Returns the path in buf; remove it
 /// with deleteTree.
 pub fn scratchDir(buf: []u8, name: []const u8) ![]const u8 {
-    const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSec(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSecRaw(), std.os.linux.getpid() });
     if (mkdirAll(p, 0o755) != 0) return error.MkdirFailed;
     return p;
 }
@@ -488,9 +501,10 @@ test "joinZ" {
 }
 
 test "monoSec never goes backwards" {
-    const m0 = monoSec();
-    sleepMs(5);
-    const m1 = monoSec();
+    const io = std.testing.io;
+    const m0 = monoSec(io);
+    sleepMs(io, 5);
+    const m1 = monoSec(io);
     try std.testing.expect(m1 >= m0);
 }
 
@@ -540,10 +554,10 @@ test "connectIn bounds a dead dial" {
     // kernel's full TCP timeout. A fast refusal (ENETUNREACH/ECONNREFUSED)
     // also satisfies rc != 0, so sandboxed environments pass either way.
     addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x0AFFFFFF); // 10.255.255.255
-    const t0 = monoSec();
+    const t0 = monoSec(std.testing.io);
     const rc = connectIn(fd, &addr, 250);
     try std.testing.expect(rc != 0);
-    try std.testing.expect(monoSec() - t0 <= 5);
+    try std.testing.expect(monoSec(std.testing.io) - t0 <= 5);
 }
 
 test "resolveIpv4 passes numeric quads and resolves localhost" {
@@ -567,7 +581,7 @@ test "sendfileAll zero copy" {
     var z_buf: [128]u8 = undefined;
     // pid suffix: two test processes starting in the same second must not
     // share the scratch file (second-resolution stamps collide otherwise)
-    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/sf-{d}-{d}.tmp", .{ nowSec(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/sf-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
     const z = try toZ(&z_buf, p);
     const data = "hello zero-copy sendfile world!";
     try std.testing.expectEqual(@as(i32, 0), writeFile(z, data));

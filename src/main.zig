@@ -955,7 +955,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
             .store = undefined,
         },
         .direct_io = opts.direct_io,
-        .start_secs = sys.monoSec(),
+        .start_secs = sys.monoSec(init.io),
     };
     st.server.store = &st.store;
     st.store.water = opts.water;
@@ -974,7 +974,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     // (discLoop): publish's until stamp and refresh's expiry filter decide
     // against the same sample instead of two reads drifting across startup,
     // which could persist a lease a same-tick refresh would call expired.
-    const cluster_now = sys.nowSec();
+    const cluster_now = sys.nowSec(init.io);
     st.catalog.publish(cluster_now);
     st.catalog.refresh(cluster_now);
     st.server.bindAll(addrs.items) catch |err| {
@@ -1043,7 +1043,7 @@ fn teardownMount(st: *fuse_fs.State) void {
     st.workers.deinit(st.gpa);
     var waited: u32 = 0;
     while (st.server.http_inflight.load(.monotonic) != 0 and waited < 400) : (waited += 1) {
-        sys.sleepMs(100);
+        sys.sleepMs(st.io, 100);
     }
     if (st.server.http_inflight.load(.monotonic) != 0) {
         // A detached handler outlived the drain (stalled peer sink resets
@@ -1143,7 +1143,7 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // monitor keying on this command's exit code. A wall-clock step backward
     // makes the age negative, which reads as fresh; only real aging retires.
     if (doc.value.now_s) |stamp| {
-        const age = sys.nowSec() - stamp;
+        const age = sys.nowSec(io) - stamp;
         if (age > max_status_age_secs) {
             if (!builtin.is_test)
                 std.debug.print("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ opts.cache, fuse_fs.status_file, age });
@@ -1182,7 +1182,7 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     };
     if (sys.c.opendir(dirz)) |dir| {
         defer _ = sys.c.closedir(dir);
-        const now = sys.nowSec();
+        const now = sys.nowSec(io);
 
         // Collect before printing: readdir order is filesystem-dependent (and
         // the origin is NFS), so sorting by lease file name keeps the listing a
@@ -1660,12 +1660,12 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     // a healthy node; inside the window it still serves.
     {
         var old_buf: [128]u8 = undefined;
-        const old_doc = try std.fmt.bufPrint(&old_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec() - 121 });
+        const old_doc = try std.fmt.bufPrint(&old_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) - 121 });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), old_doc));
         try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
 
         var fresh_buf: [128]u8 = undefined;
-        const fresh_doc = try std.fmt.bufPrint(&fresh_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec() });
+        const fresh_doc = try std.fmt.bufPrint(&fresh_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), fresh_doc));
         try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
     }

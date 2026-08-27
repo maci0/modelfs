@@ -367,7 +367,7 @@ fn cachedFor(st: *State, rel: []const u8) ?*store_mod.Store.Cached {
     var ost: sys.c.struct_stat = undefined;
     if (st.store.statOrigin(rel, &ost) != 0) return null;
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return null;
-    return st.store.get(rel, @intCast(ost.st_size), sys.monoSec()) catch null;
+    return st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch null;
 }
 
 export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
@@ -383,7 +383,7 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     const src = st.store.statOrigin(rel, &ost);
     if (src != 0) return src;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
-        const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec()) catch return -sys.c.ENOMEM;
+        const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch return -sys.c.ENOMEM;
         defer st.store.releaseFile(file);
         const fd = st.store.openCache(file);
         if (fd < 0) return fd;
@@ -410,7 +410,7 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     // warmup OOM) would tell the caller the create failed over a file that
     // exists and was possibly truncated. Warmup is best-effort; the next
     // open/read rebuilds the entry.
-    if (st.store.get(rel, 0, sys.monoSec())) |file| {
+    if (st.store.get(rel, 0, sys.monoSec(st.io))) |file| {
         st.store.releaseFile(file);
     } else |err| {
         std.log.warn("cache entry warmup failed for {s} ({t}); rebuilding on next open", .{ rel, err });
@@ -427,7 +427,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     // Claim and completion are separate clock samples on purpose: a slow
     // fill must land a fresh recency stamp (finishPiece), not the claim's
     // pre-transfer one, or a piece that filled for minutes is born punchable.
-    const cl = st.store.beginFill(file, idx, sys.monoSec()) catch return -sys.c.ENOMEM;
+    const cl = st.store.beginFill(file, idx, sys.monoSec(st.io)) catch return -sys.c.ENOMEM;
     const ln = switch (cl) {
         // Filled by someone else, or a truncate shrank the file below the
         // piece between claim and sample (the claim was dropped unmarked):
@@ -442,12 +442,12 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     var from_peer = true;
     // Miss latency is claim-to-cache-write: exactly the stall the reader
     // eats for this piece. Failed fills keep their error counts and no time.
-    const fill_t0 = sys.monoNs();
+    const fill_t0 = sys.monoNs(st.io);
     peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
         from_peer = false;
         const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
         if (n != @as(isize, @intCast(ln))) {
-            st.store.finishPiece(file, idx, false, sys.monoSec());
+            st.store.finishPiece(file, idx, false, sys.monoSec(st.io));
             _ = st.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
             // The reader sees EIO and nothing else names the cause; keep the
             // same sender-side trace serveData's hydration branch does,
@@ -464,7 +464,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     // of pieces, and the totals land in status.json and the discovery tick's
     // summary line. Failures keep their own warns at the failure sites.
     const s = &st.store.stats;
-    const rc = st.store.completeFill(file, idx, buf, sys.monoSec());
+    const rc = st.store.completeFill(file, idx, buf, sys.monoSec(st.io));
     if (rc != 0) {
         // Hydrated bytes the cache fs refused: the piece stays unmarked and
         // the reader gets EIO, so name the refusal like serveData's twin
@@ -476,7 +476,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     }
     // Sampled after the cache write lands: the published average is the full
     // claim-to-cache-write stall the reader ate for this piece.
-    const fill_dt: u64 = @intCast(sys.monoNs() - fill_t0);
+    const fill_dt: u64 = @intCast(sys.monoNs(st.io) - fill_t0);
     if (from_peer) {
         _ = s.fills_peer.fetchAdd(1, .monotonic);
         _ = s.bytes_from_peer.fetchAdd(ln, .monotonic);
@@ -502,7 +502,7 @@ fn ensureRange(st: *State, file: *store_mod.Store.Cached, fsize: u64, off: u64, 
     defer if (scratch) |s| st.gpa.free(s);
     var i = cov.start;
     while (i < cov.end) : (i += 1) {
-        if (st.store.hasPiece(file, i, sys.monoSec())) continue;
+        if (st.store.hasPiece(file, i, sys.monoSec(st.io))) continue;
         if (scratch == null)
             scratch = st.gpa.alloc(u8, st.store.piece_size) catch return -sys.c.ENOMEM;
         const rc = hydratePiece(st, file, i, scratch.?);
@@ -517,8 +517,8 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     const st = statePtr();
     // Latency covers the whole handler: warm reads too, so the tick line's
     // average tracks real reader-perceived latency, not just miss stalls.
-    const rd_t0 = sys.monoNs();
-    defer _ = st.store.stats.read_nanos.fetchAdd(@intCast(sys.monoNs() - rd_t0), .monotonic);
+    const rd_t0 = sys.monoNs(st.io);
+    defer _ = st.store.stats.read_nanos.fetchAdd(@intCast(sys.monoNs(st.io) - rd_t0), .monotonic);
     var rel: []const u8 = "";
     const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
     if (rerr != 0) return rerr;
@@ -534,7 +534,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         return src;
     }
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return -sys.c.EISDIR;
-    const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec()) catch {
+    const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         return -sys.c.ENOMEM;
     };
@@ -554,7 +554,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     // covered bits in this same window lets a fully-cached range skip
     // ensureRange's per-piece lock (hasPiece stamps and re-checks what we
     // already know).
-    file.last_access.store(sys.monoSec(), .monotonic);
+    file.last_access.store(sys.monoSec(st.io), .monotonic);
     if (uoff >= fsize) {
         file.mu.unlock(st.io);
         return 0;
@@ -570,7 +570,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         return rc;
     }
-    const got = st.store.readServed(file, buf[0..n], uoff, sys.monoSec());
+    const got = st.store.readServed(file, buf[0..n], uoff, sys.monoSec(st.io));
     if (got < 0) {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
     } else {
@@ -612,7 +612,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     const src = st.store.statOrigin(rel, &ost);
     const regular = src == 0 and (ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG;
     if (regular and @as(u64, @intCast(ost.st_size)) == end) {
-        st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)], sys.monoSec());
+        st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)], sys.monoSec(st.io));
         return @intCast(n);
     }
     // One referenced entry for every remaining shape, resolved from the stat
@@ -623,7 +623,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     // observed size lagged the write (the common ingest shape).
     const live = blk: {
         if (regular)
-            break :blk st.store.get(rel, @intCast(ost.st_size), sys.monoSec()) catch null;
+            break :blk st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch null;
         // Failed observation: one retry through cachedFor's own stat before
         // trust is dropped below, so a single flaky GETATTR cannot wipe marks.
         break :blk cachedFor(st, rel);
@@ -642,7 +642,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
             };
             file.size = end;
         }
-        file.last_access.store(sys.monoSec(), .monotonic);
+        file.last_access.store(sys.monoSec(st.io), .monotonic);
         file.mu.unlock(st.io);
         // The origin write already succeeded, so a failed cache copy only
         // costs re-hydration; the helper logs it and skips piece marking.
@@ -922,7 +922,7 @@ export fn mf_destroy(ud: ?*anyopaque) callconv(.c) void {
 fn napMs(st: *State, ms: u32) void {
     var waited: u32 = 0;
     while (waited < ms and st.running.load(.acquire)) : (waited += 100)
-        sys.sleepMs(@min(ms - waited, 100));
+        sys.sleepMs(st.io, @min(ms - waited, 100));
 }
 
 fn cullLoop(st: *State) void {
@@ -936,7 +936,7 @@ fn cullLoop(st: *State) void {
     // nodes churning through many model paths stay bounded without unlinks.
     const reap_every_secs: i64 = 30;
     const reap_idle_secs: i64 = 300;
-    var last_reap = sys.monoSec();
+    var last_reap = sys.monoSec(st.io);
     while (st.running.load(.acquire)) {
         // One monotonic instant per round: the reap gate, reapIdle's cutoff,
         // its reschedule stamp, and every cullOne recency decision below run
@@ -944,7 +944,7 @@ fn cullLoop(st: *State) void {
         // punchPiece/cullOne/reapIdle take the instant in precisely so their
         // decisions stay pure functions of state plus one clock sample
         // (see store.zig), which only holds if the driver samples once.
-        const now = sys.monoSec();
+        const now = sys.monoSec(st.io);
         if (now - last_reap >= reap_every_secs) {
             st.store.reapIdle(now, reap_idle_secs);
             last_reap = now;
@@ -982,7 +982,7 @@ fn discLoop(st: *State) void {
         // One wall-clock instant per tick: publish, refresh's expiry filter,
         // and the sweep cutoff all decide against the same sample instead of
         // three reads drifting across the tick.
-        const now = sys.nowSec();
+        const now = sys.nowSec(st.io);
         st.catalog.publish(now);
         st.catalog.refresh(now);
         st.catalog.sweepLeases(now);
@@ -1077,12 +1077,12 @@ fn statusJson(st: *State) !void {
     try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"now_s\":{d},\"stats\":{{", .{
         st.catalog.self_id,
         std.os.linux.getpid(),
-        sys.monoSec() - st.start_secs,
+        sys.monoSec(st.io) - st.start_secs,
         npeers,
         st.store.piece_size,
         st.server.http_inflight.load(.monotonic),
         cache_free_pct,
-        sys.nowSec(),
+        sys.nowSec(st.io),
     });
     inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields, 0..) |f, i| {
         if (i != 0) try w.writeByte(',');
@@ -1156,7 +1156,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
         .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
         .server = undefined,
         .direct_io = true,
-        .start_secs = sys.monoSec(),
+        .start_secs = sys.monoSec(std.testing.io),
     };
     // statusJson reads server.http_inflight; give the test a real Server so
     // it does not sample undefined memory.
@@ -1209,7 +1209,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // The wall-clock stamp is what lets `status` (and any monitor) tell a
     // wedged daemon from a ticking one from a single read: it must be a
     // current epoch second, not zero or a monotonic value.
-    try std.testing.expect(doc.value.now_s >= sys.nowSec() - 5);
+    try std.testing.expect(doc.value.now_s >= sys.nowSec(st.io) - 5);
     // Counters ride along with the liveness fields: an operator answers
     // "is it serving, from where, is it failing" from one artifact.
     try std.testing.expectEqual(@as(u64, 0), doc.value.stats.reads_ok);
@@ -1244,7 +1244,7 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
         .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
         .server = undefined,
         .direct_io = true,
-        .start_secs = sys.monoSec(),
+        .start_secs = sys.monoSec(std.testing.io),
     };
     defer st.store.deinit();
     defer st.catalog.deinit();

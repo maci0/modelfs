@@ -130,7 +130,7 @@ fn acceptLoop(self: *Server, fd: c_int) void {
             // noise that hides everything else.
             if (!failing) std.log.warn("peer http: accept failed (errno {d}); retrying", .{e});
             failing = true;
-            sys.sleepMs(20);
+            sys.sleepMs(self.io, 20);
             continue;
         }
         failing = false;
@@ -207,9 +207,9 @@ const body_deadline_per_mib_ms: i64 = 1_000;
 
 /// Deadline instant for the body budget above, stamped at the call so every
 /// chunk check compares against one sample.
-fn bodyDeadlineFor(want_len: u64) i64 {
+fn bodyDeadlineFor(io: std.Io, want_len: u64) i64 {
     const mibs: i64 = @intCast(want_len / (1024 * 1024));
-    return sys.monoMs() + body_deadline_base_ms + mibs * body_deadline_per_mib_ms;
+    return sys.monoMs(io) + body_deadline_base_ms + mibs * body_deadline_per_mib_ms;
 }
 
 /// Arms one blocking chunk against a total wall-clock budget. False when
@@ -221,8 +221,8 @@ fn bodyDeadlineFor(want_len: u64) i64 {
 /// between them. Connections close when a transfer stage ends, so the
 /// clamp never needs restoring mid-stage (readHeadFull restores it for the
 /// body stages that follow a completed head).
-fn armChunkTimeout(fd: std.posix.fd_t, deadline_ms: i64) bool {
-    const remain_ms = deadline_ms - sys.monoMs();
+fn armChunkTimeout(io: std.Io, fd: std.posix.fd_t, deadline_ms: i64) bool {
+    const remain_ms = deadline_ms - sys.monoMs(io);
     if (remain_ms <= 0) return false;
     if (remain_ms < sock_timeout_ms)
         sys.setSockTimeout(fd, @intCast(remain_ms));
@@ -242,29 +242,29 @@ const max_alloc_body_bytes: usize = 512 * 1024 * 1024;
 /// entries), pinning copies of it past the probe.
 const max_have_body_bytes: usize = 16 * 1024 * 1024;
 
-fn readHeadFull(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize) !void {
-    return readHeadFullDeadline(fd, buf, out_head_len, out_total_read, sys.monoMs() + head_deadline_ms);
+fn readHeadFull(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize) !void {
+    return readHeadFullDeadline(io, fd, buf, out_head_len, out_total_read, sys.monoMs(io) + head_deadline_ms);
 }
 
 /// readHeadFull with an injectable budget: a non-null deadline drives the
 /// head stage directly (virtual time in tests and any caller that already
-/// holds an instant), null stamps the real clock here like every production
+/// holds an instant), null stamps through `io` here like every production
 /// entry point. One branch so the expiry rule stays in readHeadFullDeadline.
-fn readHeadFullAt(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: ?i64) !void {
-    if (deadline_ms) |d| return readHeadFullDeadline(fd, buf, out_head_len, out_total_read, d);
-    return readHeadFull(fd, buf, out_head_len, out_total_read);
+fn readHeadFullAt(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: ?i64) !void {
+    if (deadline_ms) |d| return readHeadFullDeadline(io, fd, buf, out_head_len, out_total_read, d);
+    return readHeadFull(io, fd, buf, out_head_len, out_total_read);
 }
 
-fn readHeadFullDeadline(fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: i64) !void {
+fn readHeadFullDeadline(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: i64) !void {
     var n: usize = 0;
     while (n < buf.len) {
-        if (!armChunkTimeout(fd, deadline_ms)) return error.HeadTimeout;
+        if (!armChunkTimeout(io, fd, deadline_ms)) return error.HeadTimeout;
         const r = sys.readOnce(fd, buf[n..]) catch {
-            if (deadline_ms - sys.monoMs() <= 0) return error.HeadTimeout;
+            if (deadline_ms - sys.monoMs(io) <= 0) return error.HeadTimeout;
             return error.Head;
         };
         if (r == 0) {
-            if (deadline_ms - sys.monoMs() <= 0) return error.HeadTimeout;
+            if (deadline_ms - sys.monoMs(io) <= 0) return error.HeadTimeout;
             return error.Head;
         }
         const old_n = n;
@@ -312,7 +312,7 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
     var head_buf: [max_head_bytes]u8 = undefined;
     var n: usize = 0;
     var total_read: usize = 0;
-    readHeadFull(fd, &head_buf, &n, &total_read) catch {
+    readHeadFull(self.io, fd, &head_buf, &n, &total_read) catch {
         // Connect-and-drop scanners, dribbled heads, oversized heads: the
         // request never became routable, so there is nothing to answer and
         // logging each one would only hand scanners a log-flooding lever.
@@ -411,7 +411,7 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
         replyStatus(self, fd, "404 Not Found");
         return;
     }
-    const file = self.store.get(rel, @intCast(st.st_size), sys.monoSec()) catch |err| {
+    const file = self.store.get(rel, @intCast(st.st_size), sys.monoSec(self.io)) catch |err| {
         // The fetching peer only sees 500; without this line the serving
         // node's log says nothing about why.
         std.log.warn("cache entry open failed for {s} ({t}); replying 500", .{ rel, err });
@@ -459,7 +459,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
     defer if (pbuf) |b| self.gpa.free(b);
     var pi = cov.start;
     while (pi < cov.end) : (pi += 1) {
-        if (!self.store.hasPiece(file, pi, sys.monoSec())) {
+        if (!self.store.hasPiece(file, pi, sys.monoSec(self.io))) {
             // Allocate before claiming: nothing but finishPiece removes a
             // filling entry, so an allocation failure after the claim would
             // leave the piece claimed forever and wedge every later filler
@@ -473,7 +473,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             // Claim and completion take separate samples, like the FUSE
             // hydration path: a fill that streamed for minutes must land a
             // fresh recency stamp at completion, not the claim's.
-            const cl = self.store.beginFill(file, pi, sys.monoSec()) catch {
+            const cl = self.store.beginFill(file, pi, sys.monoSec(self.io)) catch {
                 std.log.warn("fill claim failed for {s} piece {d}; replying 500", .{ file.rel, pi });
                 replyStatus(self, fd, "500 Internal Server Error");
                 return false;
@@ -489,7 +489,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                 .len => |ln| {
                     const got = self.store.originPread(file.rel, pbuf.?[0..ln], piece.offset(pi, piece_size));
                     if (got == @as(isize, @intCast(ln))) {
-                        const w = self.store.completeFill(file, pi, pbuf.?[0..ln], sys.monoSec());
+                        const w = self.store.completeFill(file, pi, pbuf.?[0..ln], sys.monoSec(self.io));
                         if (w != 0) {
                             // The bytes are in hand but the cache fs refused them
                             // (full or failing disk). Falling through to the
@@ -500,7 +500,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                             return false;
                         }
                     } else {
-                        self.store.finishPiece(file, pi, false, sys.monoSec());
+                        self.store.finishPiece(file, pi, false, sys.monoSec(self.io));
                         // statOrigin passed, so the file exists: a failed or short
                         // read is an upstream (origin) failure. Reporting 404 here
                         // would make peers believe the path is gone. Log it too:
@@ -516,7 +516,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             // already cached above skips this entirely, halving the per-piece
             // lock traffic on fully-warm transfers. Punches cannot land under
             // us either way -- serveData holds xfer across the whole response.
-            if (!self.store.hasPiece(file, pi, sys.monoSec())) {
+            if (!self.store.hasPiece(file, pi, sys.monoSec(self.io))) {
                 replyStatus(self, fd, "404 Not Found");
                 return false;
             }
@@ -542,11 +542,11 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     if (cfd >= 0) {
         var done: u64 = 0;
         while (done < want) {
-            if (!armChunkTimeout(fd, deadline_ms)) {
+            if (!armChunkTimeout(self.io, fd, deadline_ms)) {
                 std.log.warn("range send budget expired for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, start + done, done, want });
                 return;
             }
-            file.last_access.store(sys.monoSec(), .monotonic);
+            file.last_access.store(sys.monoSec(self.io), .monotonic);
             const take: usize = @intCast(@min(want - done, @as(u64, self.store.piece_size)));
             const sent = sys.sendfileAll(fd, cfd, start + done, take);
             if (sent != @as(isize, @intCast(take))) {
@@ -583,12 +583,12 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     var off = start;
     var remaining = want;
     while (remaining > 0) {
-        if (!armChunkTimeout(fd, deadline_ms)) {
+        if (!armChunkTimeout(self.io, fd, deadline_ms)) {
             std.log.warn("range send budget expired for {s} at offset {d} ({d}/{d}); dropping peer transfer", .{ file.rel, off, want - remaining, want });
             return;
         }
         const take = @min(remaining, buf.len);
-        const n = self.store.readCache(file, buf[0..take], off, sys.monoSec());
+        const n = self.store.readCache(file, buf[0..take], off, sys.monoSec(self.io));
         if (n < 0 or @as(u64, @intCast(n)) != take) {
             // Same contract as the sendfile path: the peer sees a truncated
             // body, so the local log must carry where and why. A negative
@@ -648,7 +648,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     // here would break ordinary HTTP clients asking for the rest of the file;
     // the internal peer protocol always sends exact piece bounds.
     const rg_end = @min(rg.end, size - 1);
-    const file = self.store.get(rel, size, sys.monoSec()) catch |err| {
+    const file = self.store.get(rel, size, sys.monoSec(self.io)) catch |err| {
         // Same operator-trace contract as serveHave's 500: the peer sees the
         // status alone, so the local log must carry the cause.
         std.log.warn("cache entry open failed for {s} ({t}); replying 500", .{ rel, err });
@@ -673,7 +673,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     }) catch return;
     _ = sys.writeAll(fd, h);
 
-    streamRange(self, fd, file, rg.start, want, bodyDeadlineFor(want));
+    streamRange(self, fd, file, rg.start, want, bodyDeadlineFor(self.io, want));
 }
 
 fn reply(fd: std.posix.fd_t, s: []const u8) void {
@@ -717,32 +717,32 @@ fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) 
 /// reads as 0, meaning unknown; consumers assume alignment for those. A
 /// malformed header fails the probe like any other bad reply so failures
 /// stay uncached and retried.
-fn fetchHave(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !discover.HaveBits {
-    return fetchHaveDeadline(gpa, psk, ip, port, rel, null);
+fn fetchHave(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !discover.HaveBits {
+    return fetchHaveDeadline(gpa, io, psk, ip, port, rel, null);
 }
 
 /// fetchHave with an injectable budget (see readHeadFullAt): a non-null
 /// deadline bounds the dial, the head stage, and the bitmap body as one
 /// span, so tests expire the probe virtually instead of waiting out
 /// connect(2) or SO_RCVTIMEO.
-fn fetchHaveDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, deadline_ms: ?i64) !discover.HaveBits {
-    const fd = try sendRequest(psk, ip, port, rel, null, deadline_ms);
+fn fetchHaveDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, deadline_ms: ?i64) !discover.HaveBits {
+    const fd = try sendRequest(io, psk, ip, port, rel, null, deadline_ms);
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    readHeadFullAt(fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
-    return haveFromHeadDeadline(gpa, fd, &head_buf, head_len, total_read, deadline_ms);
+    readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
+    return haveFromHeadDeadline(gpa, io, fd, &head_buf, head_len, total_read, deadline_ms);
 }
 
 /// Parses one /have response head (already read, body bytes possibly
 /// pipelined behind it in head_buf) and completes the bitmap body. The
 /// seam between dialing and parsing so tests can drive replies directly.
-fn haveFromHead(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize) !discover.HaveBits {
-    return haveFromHeadDeadline(gpa, fd, head_buf, head_len, total_read, null);
+fn haveFromHead(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize) !discover.HaveBits {
+    return haveFromHeadDeadline(gpa, io, fd, head_buf, head_len, total_read, null);
 }
 
-fn haveFromHeadDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, deadline_ms: ?i64) !discover.HaveBits {
+fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, deadline_ms: ?i64) !discover.HaveBits {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 200")) {
@@ -763,7 +763,7 @@ fn haveFromHeadDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []
     const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
     const declared = std.fmt.parseInt(usize, cl_str, 10) catch 0;
     if (declared > max_have_body_bytes) return error.BodyTooLarge;
-    const bits = try finishBodyAlloc(gpa, fd, head_buf, head_len, total_read, null, deadline_ms);
+    const bits = try finishBodyAlloc(gpa, io, fd, head_buf, head_len, total_read, null, deadline_ms);
     return .{ .bits = bits, .piece_size = piece_size };
 }
 
@@ -774,7 +774,7 @@ fn haveFromHeadDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []
 /// dial: the connect wait clamps to the budget's remainder, so an injected
 /// deadline spans the whole wire round trip instead of starting only after
 /// connect(2) returned on its own.
-fn sendRequest(psk: []const u8, ip: []const u8, port: u16, rel: []const u8, range: ?proto.Range, deadline_ms: ?i64) !c_int {
+fn sendRequest(io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, range: ?proto.Range, deadline_ms: ?i64) !c_int {
     var qbuf: [4096 * 3]u8 = undefined;
     const enc = try proto.urlEncode(&qbuf, rel);
     var req: [max_head_bytes]u8 = undefined;
@@ -786,37 +786,37 @@ fn sendRequest(psk: []const u8, ip: []const u8, port: u16, rel: []const u8, rang
         try std.fmt.bufPrint(&req, "GET /have?path={s} HTTP/1.1\r\nHost: {s}:{d}\r\nAuthorization: Bearer {s}\r\nConnection: close\r\n\r\n", .{
             enc, ip, port, psk,
         });
-    const fd = try dial(ip, port, deadline_ms);
+    const fd = try dial(io, ip, port, deadline_ms);
     errdefer sys.close(fd);
     if (sys.writeAll(fd, s) < 0) return error.Write;
     return fd;
 }
 
-fn fetchRange(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64) ![]u8 {
-    return fetchRangeDeadline(gpa, psk, ip, port, rel, start, end, null);
+fn fetchRange(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64) ![]u8 {
+    return fetchRangeDeadline(gpa, io, psk, ip, port, rel, start, end, null);
 }
 
 /// Fetch variants with an injectable budget (see readHeadFullAt): a non-null
 /// deadline bounds the dial plus head and body stages as one span, so a test
 /// expires the transfer virtually instead of holding real connect waits or
 /// socket timeouts open.
-fn fetchRangeDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, deadline_ms: ?i64) ![]u8 {
-    const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
+fn fetchRangeDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, deadline_ms: ?i64) ![]u8 {
+    const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
     defer sys.close(fd);
-    return readFlexBodyAllocDeadline(gpa, fd, null, deadline_ms);
+    return readFlexBodyAllocDeadline(gpa, io, fd, null, deadline_ms);
 }
 
 /// Like fetchRange, but streams the body directly into `out` (whose length
 /// must match the peer's Content-Length): one fewer piece-sized allocation
 /// and copy per fetched piece.
-fn fetchRangeInto(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8) !void {
-    return fetchRangeIntoDeadline(gpa, psk, ip, port, rel, start, end, out, null);
+fn fetchRangeInto(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8) !void {
+    return fetchRangeIntoDeadline(gpa, io, psk, ip, port, rel, start, end, out, null);
 }
 
-fn fetchRangeIntoDeadline(gpa: std.mem.Allocator, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8, deadline_ms: ?i64) !void {
-    const fd = try sendRequest(psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
+fn fetchRangeIntoDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8, deadline_ms: ?i64) !void {
+    const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
     defer sys.close(fd);
-    _ = try readFlexBodyAllocDeadline(gpa, fd, out, deadline_ms);
+    _ = try readFlexBodyAllocDeadline(gpa, io, fd, out, deadline_ms);
 }
 
 fn rangeBps(bytes: u64, dt_ns: i128) f64 {
@@ -841,17 +841,17 @@ fn sockaddrV4(ip: []const u8, port: u16, out: *c.struct_sockaddr_in) !void {
 /// production entry point; a live deadline clamps the wait to its remainder;
 /// a spent one refuses before any blocking syscall, so a simulator expires
 /// the wire round trip at the dial instead of after it.
-fn dialBudgetMs(deadline_ms: ?i64) u32 {
+fn dialBudgetMs(io: std.Io, deadline_ms: ?i64) u32 {
     const d = deadline_ms orelse return dial_timeout_ms;
-    const remain_ms = d - sys.monoMs();
+    const remain_ms = d - sys.monoMs(io);
     if (remain_ms <= 0) return 0;
     return @intCast(@min(remain_ms, @as(i64, dial_timeout_ms)));
 }
 
-fn dial(ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
+fn dial(io: std.Io, ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     var addr: c.struct_sockaddr_in = undefined;
     try sockaddrV4(ip, port, &addr);
-    const budget_ms = dialBudgetMs(deadline_ms);
+    const budget_ms = dialBudgetMs(io, deadline_ms);
     if (budget_ms == 0) return error.Connect;
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (fd < 0) return error.Socket;
@@ -867,16 +867,16 @@ fn dial(ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     return fd;
 }
 
-fn readFlexBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8) ![]u8 {
-    return readFlexBodyAllocDeadline(gpa, fd, dest, null);
+fn readFlexBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, dest: ?[]u8) ![]u8 {
+    return readFlexBodyAllocDeadline(gpa, io, fd, dest, null);
 }
 
-fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
+fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    readHeadFullAt(fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
-    return finishBodyAlloc(gpa, fd, &head_buf, head_len, total_read, dest, deadline_ms);
+    readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
+    return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, dest, deadline_ms);
 }
 
 /// Completes a response body whose head is already read: validates the
@@ -885,7 +885,7 @@ fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, fd: std.posix.fd_t, dest: ?
 /// The one body reader every fetch path shares, so the length-matching
 /// contract cannot drift between them. head_buf must stay alive for the
 /// call; the returned slice never aliases it.
-fn finishBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
+fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
@@ -921,7 +921,7 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const
         if (want_len == 0) return try gpa.alloc(u8, 0);
     }
     // Now that the expected length is known, size the total budget to it.
-    const deadline = deadline_ms orelse bodyDeadlineFor(want_len);
+    const deadline = deadline_ms orelse bodyDeadlineFor(io, want_len);
 
     const buf = dest orelse try gpa.alloc(u8, want_len);
     errdefer if (dest == null) gpa.free(buf);
@@ -935,13 +935,13 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, fd: std.posix.fd_t, head_buf: []const
     }
 
     while (got < want_len) {
-        if (!armChunkTimeout(fd, deadline)) return error.BodyTimeout;
+        if (!armChunkTimeout(io, fd, deadline)) return error.BodyTimeout;
         const n = sys.readOnce(fd, buf[got..]) catch {
-            if (deadline - sys.monoMs() <= 0) return error.BodyTimeout;
+            if (deadline - sys.monoMs(io) <= 0) return error.BodyTimeout;
             return error.Read;
         };
         if (n == 0) {
-            if (deadline - sys.monoMs() <= 0) return error.BodyTimeout;
+            if (deadline - sys.monoMs(io) <= 0) return error.BodyTimeout;
             break;
         }
         got += n;
@@ -991,7 +991,7 @@ fn probeWorker(ctx: *ProbeCtx) void {
         const gi = ctx.todo[t];
         for (ctx.groups[gi]) |pi| {
             const p = ctx.paths[pi];
-            const rep = fetchHave(ctx.gpa, ctx.psk, p.ip, p.port, ctx.rel) catch |err| {
+            const rep = fetchHave(ctx.gpa, ctx.cat.io, ctx.psk, p.ip, p.port, ctx.rel) catch |err| {
                 if (err != error.PeerMiss) {
                     if (ctx.stats) |s| _ = s.probe_err.fetchAdd(1, .monotonic);
                 }
@@ -1029,7 +1029,7 @@ fn probeSlots(
     // share the same clock sample instead of drifting mid-walk, and the
     // probe workers stamp their fresh answers into the have cache with this
     // same sample (see ProbeCtx.now_ms).
-    const now_ms = sys.monoMs();
+    const now_ms = sys.monoMs(cat.io);
     for (groups, 0..) |g, gi| {
         var answered = false;
         for (g) |pi| {
@@ -1208,10 +1208,10 @@ pub fn fillFromPeers(
         // Saturating: a caller passing an empty buffer (only possible via an
         // out-of-band truncate race today) must not underflow the range end.
         const end = start +| out.len -| 1;
-        const t0 = sys.monoNs();
+        const t0 = sys.monoNs(cat.io);
         // Stream the body straight into out: no piece-sized allocation or
         // copy on the fetch path.
-        fetchRangeInto(gpa, psk, win.ip, win.port, rel, start, end, out) catch |err| {
+        fetchRangeInto(gpa, cat.io, psk, win.ip, win.port, rel, start, end, out) catch |err| {
             // The loop falls through to the next candidate (then the caller
             // falls back to the origin), but without this line nothing
             // records which dependency failed and why -- the read would
@@ -1226,7 +1226,7 @@ pub fn fillFromPeers(
             continue;
         };
         _ = cat.inflight(win.ip, win.port, -1);
-        const dt = sys.monoNs() - t0;
+        const dt = sys.monoNs(cat.io) - t0;
         cat.updateGoodput(win.ip, win.port, rangeBps(out.len, dt));
         return;
     }
@@ -1320,7 +1320,7 @@ test "readFlexBodyAlloc consumes body bytes pipelined with the header" {
     const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678");
     defer sys.close(pair[0]);
     defer sys.close(pair[1]);
-    const body = try readFlexBodyAlloc(gpa, pair[1], null);
+    const body = try readFlexBodyAlloc(gpa, std.testing.io, pair[1], null);
     defer gpa.free(body);
     try std.testing.expectEqualStrings("12345678", body);
 }
@@ -1333,14 +1333,14 @@ test "readFlexBodyAlloc rejects hostile responses" {
         const pair = try responsePair("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        try std.testing.expectError(error.HttpStatus, readFlexBodyAlloc(gpa, pair[1], null));
+        try std.testing.expectError(error.HttpStatus, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
     }
     // Content-Length above the 512MiB cap is refused before any allocation.
     {
         const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: 536870913\r\nConnection: close\r\n\r\n");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        try std.testing.expectError(error.BodyTooLarge, readFlexBodyAlloc(gpa, pair[1], null));
+        try std.testing.expectError(error.BodyTooLarge, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
     }
     // A caller-supplied buffer must match Content-Length exactly.
     {
@@ -1348,7 +1348,7 @@ test "readFlexBodyAlloc rejects hostile responses" {
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         var short_dest: [3]u8 = undefined;
-        try std.testing.expectError(error.LengthMismatch, readFlexBodyAlloc(gpa, pair[1], &short_dest));
+        try std.testing.expectError(error.LengthMismatch, readFlexBodyAlloc(gpa, std.testing.io, pair[1], &short_dest));
     }
     // EOF before Content-Length is data loss: ReadIncomplete, not a short read.
     {
@@ -1356,7 +1356,7 @@ test "readFlexBodyAlloc rejects hostile responses" {
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         _ = c.shutdown(pair[0], c.SHUT_WR);
-        try std.testing.expectError(error.ReadIncomplete, readFlexBodyAlloc(gpa, pair[1], null));
+        try std.testing.expectError(error.ReadIncomplete, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
     }
 }
 
@@ -1370,14 +1370,14 @@ test "readFlexBodyAlloc keeps the dest contract when Content-Length is absent" {
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         var dest: [8]u8 = undefined;
-        try std.testing.expectError(error.LengthMismatch, readFlexBodyAlloc(gpa, pair[1], &dest));
+        try std.testing.expectError(error.LengthMismatch, readFlexBodyAlloc(gpa, std.testing.io, pair[1], &dest));
     }
     // An explicit zero length against an explicitly empty destination is fine.
     {
         const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        _ = try readFlexBodyAlloc(gpa, pair[1], &.{});
+        _ = try readFlexBodyAlloc(gpa, std.testing.io, pair[1], &.{});
     }
 }
 
@@ -1392,14 +1392,14 @@ test "readFlexBodyAlloc rejects a malformed Content-Length instead of coercing t
         const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: 16Mi\r\nConnection: close\r\n\r\n0123456789abcdef");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, pair[1], null));
+        try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
     }
     // Digit runs beyond usize must fail too, not wrap into a small length.
     {
         const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Length: 99999999999999999999999\r\nConnection: close\r\n\r\n");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, pair[1], null));
+        try std.testing.expectError(error.BadContentLength, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
     }
 }
 
@@ -1414,10 +1414,10 @@ test "readHeadFullDeadline aborts a dribbled head at the deadline" {
     var head_len: usize = 0;
     var total: usize = 0;
     var buf: [64]u8 = undefined;
-    const t0 = sys.monoMs();
-    const err = readHeadFullDeadline(pair[1], &buf, &head_len, &total, t0 + 150);
+    const t0 = sys.monoMs(std.testing.io);
+    const err = readHeadFullDeadline(std.testing.io, pair[1], &buf, &head_len, &total, t0 + 150);
     try std.testing.expectError(error.HeadTimeout, err);
-    try std.testing.expect(sys.monoMs() - t0 <= 2000);
+    try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }
 
 test "readFlexBodyAllocDeadline aborts a dribbled body at the deadline" {
@@ -1428,10 +1428,10 @@ test "readFlexBodyAllocDeadline aborts a dribbled body at the deadline" {
     const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n1234");
     defer sys.close(pair[0]);
     defer sys.close(pair[1]);
-    const t0 = sys.monoMs();
-    const err = readFlexBodyAllocDeadline(std.testing.allocator, pair[1], null, t0 + 150);
+    const t0 = sys.monoMs(std.testing.io);
+    const err = readFlexBodyAllocDeadline(std.testing.allocator, std.testing.io, pair[1], null, t0 + 150);
     try std.testing.expectError(error.BodyTimeout, err);
-    try std.testing.expect(sys.monoMs() - t0 <= 2000);
+    try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }
 
 test "readHeadFullAt expires an injected budget without waiting real time" {
@@ -1445,10 +1445,10 @@ test "readHeadFullAt expires an injected budget without waiting real time" {
     var head_len: usize = 0;
     var total: usize = 0;
     var buf: [64]u8 = undefined;
-    const t0 = sys.monoMs();
-    const err = readHeadFullAt(pair[1], &buf, &head_len, &total, t0 - 1);
+    const t0 = sys.monoMs(std.testing.io);
+    const err = readHeadFullAt(std.testing.io, pair[1], &buf, &head_len, &total, t0 - 1);
     try std.testing.expectError(error.HeadTimeout, err);
-    try std.testing.expect(sys.monoMs() - t0 <= 2000);
+    try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }
 
 test "haveFromHeadDeadline pairs refusal at an expired budget with success at a live one" {
@@ -1478,8 +1478,8 @@ test "haveFromHeadDeadline pairs refusal at an expired budget with success at a 
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         try drainHead(pair[1], head_len);
-        const t0 = sys.monoMs();
-        try std.testing.expectError(error.BodyTimeout, haveFromHeadDeadline(gpa, pair[1], wire[0..head_len], head_len, head_len, t0 - 1));
+        const t0 = sys.monoMs(std.testing.io);
+        try std.testing.expectError(error.BodyTimeout, haveFromHeadDeadline(gpa, std.testing.io, pair[1], wire[0..head_len], head_len, head_len, t0 - 1));
     }
     {
         // The identical reply under a live injected budget parses exactly as
@@ -1489,7 +1489,7 @@ test "haveFromHeadDeadline pairs refusal at an expired budget with success at a 
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         try drainHead(pair[1], head_len);
-        const rep = try haveFromHeadDeadline(gpa, pair[1], wire[0..head_len], head_len, head_len, sys.monoMs() + 60_000);
+        const rep = try haveFromHeadDeadline(gpa, std.testing.io, pair[1], wire[0..head_len], head_len, head_len, sys.monoMs(std.testing.io) + 60_000);
         defer gpa.free(rep.bits);
         try std.testing.expectEqualSlices(u8, "ok", rep.bits);
         try std.testing.expectEqual(@as(u32, 4096), rep.piece_size);
@@ -1517,7 +1517,7 @@ test "streamRange honors the response body budget in both directions" {
     const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
     defer srv.stop();
 
-    const warm = try fetchRange(gpa, "secret", "127.0.0.1", srv.port(), "budget.bin", 0, 31);
+    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", srv.port(), "budget.bin", 0, 31);
     gpa.free(warm);
 
     const f = srv.store.lookupRef("budget.bin").?;
@@ -1535,9 +1535,9 @@ test "streamRange honors the response body budget in both directions" {
         const pair = try responsePair("");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        const t0 = sys.monoMs();
+        const t0 = sys.monoMs(std.testing.io);
         streamRange(&srv.server, pair[1], f, 0, pattern.len, t0 - 1);
-        try std.testing.expect(sys.monoMs() - t0 <= 2000);
+        try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
         var probe: [1]u8 = undefined;
         try std.testing.expect(c.recv(pair[0], &probe, probe.len, c.MSG_PEEK | c.MSG_DONTWAIT) < 0);
     }
@@ -1546,7 +1546,7 @@ test "streamRange honors the response body budget in both directions" {
         const pair = try responsePair("");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        streamRange(&srv.server, pair[1], f, 0, pattern.len, sys.monoMs() + 60_000);
+        streamRange(&srv.server, pair[1], f, 0, pattern.len, sys.monoMs(std.testing.io) + 60_000);
         var got: [pattern.len]u8 = undefined;
         const n = sys.readOnce(pair[0], &got) catch 0;
         try std.testing.expectEqual(@as(usize, got.len), n);
@@ -1665,7 +1665,7 @@ test "fault tolerance: bad psk fetchHave fails with http status" {
     const prev_log_level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
-    const err = fetchHave(gpa, "wrong_secret", "127.0.0.1", port, "foo.bin");
+    const err = fetchHave(gpa, std.testing.io, "wrong_secret", "127.0.0.1", port, "foo.bin");
     try std.testing.expectError(error.HttpStatus, err);
 
     // The rejection must land in the counter status.json publishes -- and
@@ -1706,15 +1706,15 @@ test "fault tolerance: traversal path is rejected with 400" {
     // The wire carries these percent-encoded (urlEncode escapes "/"), and
     // the server decodes exactly once, so this arrives back as ".." and is
     // refused with 400.
-    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "correct_secret", "127.0.0.1", port, "../secret.txt"));
-    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "correct_secret", "127.0.0.1", port, "../secret.txt", 0, 8));
+    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "correct_secret", "127.0.0.1", port, "../secret.txt"));
+    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, std.testing.io, "correct_secret", "127.0.0.1", port, "../secret.txt", 0, 8));
     // Pre-encoded dots survive the single-pass decode as a literal "%2e%2e"
     // filename: no traversal component, so the boundary passes it through
     // and the origin simply misses (404, seen here as PeerMiss). Nothing
     // outside the origin is reachable either way.
-    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, "correct_secret", "127.0.0.1", port, "%2e%2e/secret.txt"));
+    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, std.testing.io, "correct_secret", "127.0.0.1", port, "%2e%2e/secret.txt"));
     // Absolute paths are refused too, not silently re-rooted into the origin.
-    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "correct_secret", "127.0.0.1", port, "/etc/passwd"));
+    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "correct_secret", "127.0.0.1", port, "/etc/passwd"));
 }
 
 test "origin stat failures answer 502 while true misses stay healthy 404s" {
@@ -1750,8 +1750,8 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
     // operator must be able to tell "nobody has this file" from "the origin
     // is broken" -- fillFromPeers keys probe_err and its fallback tier on
     // exactly this distinction.
-    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, "secret", "127.0.0.1", port, "loop/x.bin"));
-    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "loop/x.bin", 0, 8));
+    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "secret", "127.0.0.1", port, "loop/x.bin"));
+    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "loop/x.bin", 0, 8));
 
     // Both failures are server-side trouble: each must land in the http_5xx
     // counter status.json publishes (one per reply, bumped before the head
@@ -1761,7 +1761,7 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
 
     // A genuinely absent path stays a healthy miss (404 => PeerMiss), the
     // shape fillFromPeers relies on to keep probe_err clean on skewed fleets.
-    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, "secret", "127.0.0.1", port, "gone.bin"));
+    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, std.testing.io, "secret", "127.0.0.1", port, "gone.bin"));
 
     // The healthy miss must not have fed the failure gauge: 404s are fleet
     // skew, not broken nodes.
@@ -1840,8 +1840,8 @@ test "a symlink planted at an origin model path is a miss, never served" {
     // client folds every non-success status into HttpStatus), and no byte of
     // the target may come back or land in the local cache. The zeroed 5xx
     // counter below pins "healthy miss", not an origin failure.
-    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, "secret", "127.0.0.1", port, "steal.bin"));
-    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "steal.bin", 0, 8));
+    try std.testing.expectError(error.PeerMiss, fetchHave(gpa, std.testing.io, "secret", "127.0.0.1", port, "steal.bin"));
+    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "steal.bin", 0, 8));
     try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
 
     // The target file still holds exactly what the planter wrote.
@@ -1852,7 +1852,7 @@ test "a symlink planted at an origin model path is a miss, never served" {
     var fz: [192]u8 = undefined;
     const real_z = try sys.toZ(&fz, try std.fmt.bufPrint(&lz, "{s}/real.bin", .{origin_d}));
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(real_z, "modelbytes"));
-    const got = try fetchRange(gpa, "secret", "127.0.0.1", port, "real.bin", 0, 9);
+    const got = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "real.bin", 0, 9);
     defer gpa.free(got);
     try std.testing.expectEqualStrings("modelbytes", got);
 }
@@ -1937,7 +1937,7 @@ const TestServer = struct {
         // frees. Bounded so a wedged handler cannot hang the runner.
         var waited: u32 = 0;
         while (self.server.http_inflight.load(.monotonic) != 0 and waited < 300) : (waited += 1)
-            sys.sleepMs(10);
+            sys.sleepMs(self.server.io, 10);
         self.server.stop();
         self.store.deinit();
         self.gpa.destroy(self);
@@ -1947,7 +1947,7 @@ const TestServer = struct {
 test "fault tolerance: dial unreachable peer fails gracefully" {
     // Reserve a kernel-picked free port, then release it: dialing a closed
     // port must fail with Connect.
-    const err = dial("127.0.0.1", try freeTcpPort(), null);
+    const err = dial(std.testing.io, "127.0.0.1", try freeTcpPort(), null);
     try std.testing.expectError(error.Connect, err);
 }
 
@@ -1957,10 +1957,10 @@ test "dial expires an injected budget that is already spent" {
     // head, and body as one budget, so a test (or any simulator driving
     // virtual deadlines) can expire a wire round trip without connect(2)
     // ever running against a real address.
-    const t0 = sys.monoMs();
-    const err = dial("10.255.255.255", 18080, t0 - 1);
+    const t0 = sys.monoMs(std.testing.io);
+    const err = dial(std.testing.io, "10.255.255.255", 18080, t0 - 1);
     try std.testing.expectError(error.Connect, err);
-    try std.testing.expect(sys.monoMs() - t0 <= 2000);
+    try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }
 
 test "dial clamps the connect wait to an injected budget's remainder" {
@@ -1969,10 +1969,10 @@ test "dial clamps the connect wait to an injected budget's remainder" {
     // this dial would hold the fill path for the full dial_timeout_ms no
     // matter what budget the caller injected; with it, expiry lands with the
     // deadline instead of after the steady-state window.
-    const t0 = sys.monoMs();
-    const err = dial("10.255.255.255", 18080, t0 + 250);
+    const t0 = sys.monoMs(std.testing.io);
+    const err = dial(std.testing.io, "10.255.255.255", 18080, t0 + 250);
     try std.testing.expectError(error.Connect, err);
-    try std.testing.expect(sys.monoMs() - t0 <= 2000);
+    try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }
 
 /// One raw request over its own connection; returns everything the server
@@ -2074,7 +2074,7 @@ test "serveHave answers with the exact cached bitfield blob" {
     const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
     defer srv.stop();
     const port = srv.port();
-    const warm = try fetchRange(gpa, "secret", "127.0.0.1", port, "bits.bin", 0, 31);
+    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "bits.bin", 0, 31);
     gpa.free(warm);
 
     // The /have body is the raw cache bitfield: bit i names piece i, one
@@ -2082,7 +2082,7 @@ test "serveHave answers with the exact cached bitfield blob" {
     // bits are indexed against, so a fetcher running a different --piece
     // can tell the answer apart from its own; fillFromPeers' candidate
     // "have" decisions are computed from exactly these bytes.
-    const rep = try fetchHave(gpa, "secret", "127.0.0.1", port, "bits.bin");
+    const rep = try fetchHave(gpa, std.testing.io, "secret", "127.0.0.1", port, "bits.bin");
     defer gpa.free(rep.bits);
     try std.testing.expectEqual(@as(usize, 1), rep.bits.len);
     try std.testing.expectEqual(@as(u8, 0b00000011), rep.bits[0]);
@@ -2105,7 +2105,7 @@ test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
         const pair = try responsePair(head ++ "ab");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        const rep = try haveFromHead(gpa, pair[1], head ++ "ab", head.len, head.len + 2);
+        const rep = try haveFromHead(gpa, std.testing.io, pair[1], head ++ "ab", head.len, head.len + 2);
         defer gpa.free(rep.bits);
         try std.testing.expectEqualStrings("ab", rep.bits);
         try std.testing.expectEqual(@as(u32, 4 * 1024 * 1024), rep.piece_size);
@@ -2116,7 +2116,7 @@ test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
         const pair = try responsePair(head ++ "z");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        const rep = try haveFromHead(gpa, pair[1], head ++ "z", head.len, head.len + 1);
+        const rep = try haveFromHead(gpa, std.testing.io, pair[1], head ++ "z", head.len, head.len + 1);
         defer gpa.free(rep.bits);
         try std.testing.expectEqual(@as(u32, 0), rep.piece_size);
     }
@@ -2127,7 +2127,7 @@ test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
         const pair = try responsePair(head);
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        try std.testing.expectError(error.PeerMiss, haveFromHead(gpa, pair[1], head, head.len, head.len));
+        try std.testing.expectError(error.PeerMiss, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
     }
     // A malformed header fails the probe like any other bad reply so it is
     // never cached and retried on the next piece.
@@ -2136,7 +2136,7 @@ test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
         const pair = try responsePair(head);
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, pair[1], head, head.len, head.len));
+        try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
     }
 }
 
@@ -2155,7 +2155,7 @@ test "haveFromHead refuses a bitmap above the /have body bound before allocating
         const pair = try responsePair(head);
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        try std.testing.expectError(error.BodyTooLarge, haveFromHead(gpa, pair[1], head, head.len, head.len));
+        try std.testing.expectError(error.BodyTooLarge, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
     }
 }
 
@@ -2296,12 +2296,12 @@ test "serveData replies 500 when the cache refuses hydrated bytes" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
-    const fd = try sendRequest("secret", "127.0.0.1", port, "ro.bin", .{ .start = 0, .end = 15 }, null);
+    const fd = try sendRequest(std.testing.io, "secret", "127.0.0.1", port, "ro.bin", .{ .start = 0, .end = 15 }, null);
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    try readHeadFull(fd, &head_buf, &head_len, &total_read);
+    try readHeadFull(std.testing.io, fd, &head_buf, &head_len, &total_read);
     // The status must name the server-side cache failure (500), not 404.
     try std.testing.expect(std.mem.startsWith(u8, head_buf[0..head_len], "HTTP/1.1 500"));
     // The same event feeds the http_5xx counter status.json publishes (the
@@ -2395,7 +2395,7 @@ test "acceptLoop closes connections beyond the inflight handler cap" {
             if (c.recv(fd, &probe, probe.len, c.MSG_PEEK | c.MSG_DONTWAIT) == 0) eof += 1;
         }
         if (eof >= expect_eof) break;
-        sys.sleepMs(10);
+        sys.sleepMs(std.testing.io, 10);
     }
     try std.testing.expectEqual(@as(usize, expect_eof), eof);
 }
@@ -2422,7 +2422,7 @@ test "serveData fills every piece of a multi-piece range" {
     defer srv.stop();
     const port = srv.port();
 
-    const body = try fetchRange(gpa, "secret", "127.0.0.1", port, "two.bin", 0, 31);
+    const body = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "two.bin", 0, 31);
     defer gpa.free(body);
     try std.testing.expectEqual(@as(usize, 32), body.len);
     try std.testing.expectEqualSlices(u8, &pattern, body);
@@ -2455,7 +2455,7 @@ test "serveData serves ranges beyond the old 64MiB transfer cap" {
     const port = srv.port();
 
     const total: u64 = 70 * 1024 * 1024;
-    const body = try fetchRange(gpa, "secret", "127.0.0.1", port, "big.bin", 0, total - 1);
+    const body = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "big.bin", 0, total - 1);
     defer gpa.free(body);
     try std.testing.expectEqual(total, body.len);
     for (body, 0..) |b, i| {
@@ -2488,13 +2488,13 @@ test "serveData clamps an over-long range end to EOF" {
     defer srv.stop();
     const port = srv.port();
 
-    const body = try fetchRange(gpa, "secret", "127.0.0.1", port, "tail.bin", 0, pattern.len + 999_999);
+    const body = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "tail.bin", 0, pattern.len + 999_999);
     defer gpa.free(body);
     try std.testing.expectEqual(pattern.len, body.len);
     try std.testing.expectEqualSlices(u8, &pattern, body);
 
     // A start inside the file with an over-long end serves only the tail.
-    const tail = try fetchRange(gpa, "secret", "127.0.0.1", port, "tail.bin", 30, 999_999);
+    const tail = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "tail.bin", 30, 999_999);
     defer gpa.free(tail);
     try std.testing.expectEqualSlices(u8, pattern[30..], tail);
 }
@@ -2528,7 +2528,7 @@ test "serveData answers an open-ended range with the file tail" {
     var req_buf: [256]u8 = undefined;
     const req = try std.fmt.bufPrint(&req_buf, "GET /data?path=open.bin HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret\r\nRange: bytes=16-\r\nConnection: close\r\n\r\n", .{});
     try std.testing.expectEqual(@as(isize, @intCast(req.len)), sys.writeAll(fd, req));
-    const body = try readFlexBodyAlloc(gpa, fd, null);
+    const body = try readFlexBodyAlloc(gpa, std.testing.io, fd, null);
     defer gpa.free(body);
     try std.testing.expectEqual(pattern.len - 16, body.len);
     try std.testing.expectEqualSlices(u8, pattern[16..], body);
@@ -2556,7 +2556,7 @@ test "serveData counts as access for cull recency" {
     defer srv.stop();
     const port = srv.port();
 
-    const warm = try fetchRange(gpa, "secret", "127.0.0.1", port, "rec.bin", 0, 31);
+    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "rec.bin", 0, 31);
     defer gpa.free(warm);
 
     // Age the entry past punchPiece's 10s recency window, as it would sit
@@ -2565,20 +2565,20 @@ test "serveData counts as access for cull recency" {
         const f = srv.store.lookupRef("rec.bin").?;
         defer srv.store.releaseFile(f);
         f.mu.lockUncancelable(std.testing.io);
-        f.last_access.store(sys.monoSec() - 3600, .monotonic);
+        f.last_access.store(sys.monoSec(std.testing.io) - 3600, .monotonic);
         f.mu.unlock(std.testing.io);
     }
 
     // Regression: serving a cached range over sendfile left last_access
     // ancient, so cullOne could punch a piece mid-stream and ship hole zeros
     // that the fetching peer then marked filled.
-    const body = try fetchRange(gpa, "secret", "127.0.0.1", port, "rec.bin", 0, 31);
+    const body = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "rec.bin", 0, 31);
     defer gpa.free(body);
     try std.testing.expectEqualSlices(u8, &pattern, body);
 
     const f = srv.store.lookupRef("rec.bin").?;
     defer srv.store.releaseFile(f);
-    try std.testing.expect(sys.monoSec() - f.last_access.load(.monotonic) < 10);
+    try std.testing.expect(sys.monoSec(std.testing.io) - f.last_access.load(.monotonic) < 10);
 }
 
 test "serveData serves a legal path whose encoded form exceeds 8KiB" {
@@ -2619,7 +2619,7 @@ test "serveData serves a legal path whose encoded form exceeds 8KiB" {
     const srv = try TestServer.start(gpa, origin_d, cache_d, 16, psk);
     defer srv.stop();
 
-    const got = try fetchRange(gpa, psk, "127.0.0.1", srv.port(), rel, 0, body.len - 1);
+    const got = try fetchRange(gpa, std.testing.io, psk, "127.0.0.1", srv.port(), rel, 0, body.len - 1);
     defer gpa.free(got);
     try std.testing.expectEqualStrings(body, got);
 }
@@ -2644,10 +2644,10 @@ test "serveData refuses ranges starting past EOF with 416" {
 
     // Start at/after EOF is genuinely unsatisfiable; the non-200/206 status
     // surfaces as HttpStatus through fetchRange.
-    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "tiny.bin", 3, 9));
-    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "tiny.bin", 100, 200));
+    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "tiny.bin", 3, 9));
+    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "tiny.bin", 100, 200));
     // Inverted range stays refused too.
-    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, "secret", "127.0.0.1", port, "tiny.bin", 2, 1));
+    try std.testing.expectError(error.HttpStatus, fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "tiny.bin", 2, 1));
 
     // The 416 names the complete length (RFC 9110 §15.5.17/§14.4) so a
     // client can recompute a satisfiable range instead of probing.
@@ -2680,7 +2680,7 @@ test "fillFromPeers probes concurrently and streams piece into out" {
 
     // Warm the having peer through its own /data path: /have advertises
     // cached pieces only, so piece 0 must be hydrated before any probe.
-    const warm = try fetchRange(gpa, "secret", "127.0.0.1", port, "one.bin", 0, 15);
+    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "one.bin", 0, 15);
     gpa.free(warm);
 
     var ob2: [128]u8 = undefined;
@@ -2799,7 +2799,7 @@ test "fillFromPeers excludes peers whose advertised piece size differs" {
     defer sys.deleteTree(std.testing.io, cache_mis);
     const srv_mis = try TestServer.start(gpa, origin_d, cache_mis, 64 * 1024 * 1024, "secret");
     defer srv_mis.stop();
-    const warm = try fetchRange(gpa, "secret", "127.0.0.1", srv_mis.port(), "grid.bin", 0, 15);
+    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", srv_mis.port(), "grid.bin", 0, 15);
     gpa.free(warm);
 
     // Aligned peer on our own grid, serving identical bytes from the shared
@@ -2809,7 +2809,7 @@ test "fillFromPeers excludes peers whose advertised piece size differs" {
     defer sys.deleteTree(std.testing.io, cache_ok);
     const srv_ok = try TestServer.start(gpa, origin_d, cache_ok, 16, "secret");
     defer srv_ok.stop();
-    const warm2 = try fetchRange(gpa, "secret", "127.0.0.1", srv_ok.port(), "grid.bin", 0, 15);
+    const warm2 = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", srv_ok.port(), "grid.bin", 0, 15);
     gpa.free(warm2);
 
     var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
@@ -2884,8 +2884,8 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
             var head_buf: [8192]u8 = undefined;
             var head_len: usize = 0;
             var total_read: usize = 0;
-            if (readHeadFull(fds[1], &head_buf, &head_len, &total_read)) |_| {
-                if (haveFromHead(gpa, fds[1], &head_buf, head_len, total_read)) |rep| {
+            if (readHeadFull(std.testing.io, fds[1], &head_buf, &head_len, &total_read)) |_| {
+                if (haveFromHead(gpa, std.testing.io, fds[1], &head_buf, head_len, total_read)) |rep| {
                     defer gpa.free(rep.bits);
                     const head = head_buf[0..head_len];
                     const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
@@ -2912,7 +2912,7 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
             var dest_head_buf: [8192]u8 = undefined;
             var dest_head_len: usize = 0;
             var dest_total: usize = 0;
-            if (readHeadFull(dest_fds[1], &dest_head_buf, &dest_head_len, &dest_total)) |_| {
+            if (readHeadFull(std.testing.io, dest_fds[1], &dest_head_buf, &dest_head_len, &dest_total)) |_| {
                 const dest_head = dest_head_buf[0..dest_head_len];
                 const status_end = std.mem.find(u8, dest_head, "\r\n") orelse return;
                 const status_ok = std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 200") or
@@ -2922,7 +2922,7 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
                 var dest_buf: [64]u8 = undefined;
                 const dest_len: usize = @intCast(smith.value(usize) % (dest_buf.len + 1));
-                const dest_call = finishBodyAlloc(gpa, dest_fds[1], &dest_head_buf, dest_head_len, dest_total, dest_buf[0..dest_len], null);
+                const dest_call = finishBodyAlloc(gpa, std.testing.io, dest_fds[1], &dest_head_buf, dest_head_len, dest_total, dest_buf[0..dest_len], null);
                 if (!status_ok) {
                     try std.testing.expectError(error.HttpStatus, dest_call);
                     return;

@@ -733,7 +733,10 @@ pub const Store = struct {
             }
             if (file.filling.contains(idx)) {
                 file.mu.unlock(self.io);
-                sys.sleepMs(2);
+                // Yield through the injected Io, not nanosleep: a simulator
+                // can interleave the in-flight filler instead of blocking
+                // real time while this claim spins.
+                sys.sleepMs(self.io, 2);
                 continue;
             }
             file.filling.put(idx, {}) catch |err| {
@@ -1004,7 +1007,7 @@ pub const Store = struct {
     /// Punches piece idx when it may be culled at instant `now_sec`. The
     /// caller's monotonic instant keeps the decision a pure function of
     /// entry state plus time, drivable virtually in tests; cull drivers
-    /// sample sys.monoSec() once per round.
+    /// sample sys.monoSec(io) once per round.
     pub fn punchPiece(self: *Store, file: *Cached, idx: u32, now_sec: i64) bool {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
@@ -1449,7 +1452,7 @@ test "cacheFill grows entry preserving earlier piece marks" {
     var fbuf2: [160]u8 = undefined;
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fbuf2, fp), ""));
     try std.testing.expectEqual(@as(isize, 16), st.originPwrite("app.bin", &w1, 0));
-    st.cacheFill("app.bin", 16, 0, &w1, sys.monoSec());
+    st.cacheFill("app.bin", 16, 0, &w1, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("app.bin").?;
@@ -1464,7 +1467,7 @@ test "cacheFill grows entry preserving earlier piece marks" {
     var w2: [24]u8 = undefined;
     @memset(&w2, 0xBB);
     try std.testing.expectEqual(@as(isize, 24), st.originPwrite("app.bin", &w2, 16));
-    st.cacheFill("app.bin", 40, 16, &w2, sys.monoSec());
+    st.cacheFill("app.bin", 40, 16, &w2, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("app.bin").?;
@@ -1483,7 +1486,7 @@ test "cacheFill grows entry preserving earlier piece marks" {
     var w3: [8]u8 = undefined;
     @memset(&w3, 0xCC);
     try std.testing.expectEqual(@as(isize, 8), st.originPwrite("app.bin", &w3, 40));
-    st.cacheFill("app.bin", 48, 40, &w3, sys.monoSec());
+    st.cacheFill("app.bin", 48, 40, &w3, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("app.bin").?;
@@ -1501,9 +1504,9 @@ test "cacheFill grows entry preserving earlier piece marks" {
     var w2_full: [24]u8 = undefined;
     @memset(&w2_full, 0xBB);
     var rd: [48]u8 = undefined;
-    const f = try st.get("app.bin", 48, sys.monoSec());
+    const f = try st.get("app.bin", 48, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
-    const n = st.readCache(f, &rd, 0, sys.monoSec());
+    const n = st.readCache(f, &rd, 0, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(@as(isize, 48), n);
     try std.testing.expectEqualSlices(u8, &w1, rd[0..16]);
     try std.testing.expectEqualSlices(u8, &w2_full, rd[16..40]);
@@ -1533,7 +1536,7 @@ test "cacheFill resets every mark when an external truncate shrinks the file" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zz0, fp), ""));
     for ([_]u64{ 0, 16, 32 }) |off| {
         try std.testing.expectEqual(@as(isize, 16), st.originPwrite("ext.bin", &chunk, off));
-        st.cacheFill("ext.bin", off + 16, off, &chunk, sys.monoSec());
+        st.cacheFill("ext.bin", off + 16, off, &chunk, sys.monoSec(std.testing.io));
     }
     {
         const f = st.lookupRef("ext.bin").?;
@@ -1557,7 +1560,7 @@ test "cacheFill resets every mark when an external truncate shrinks the file" {
         try std.testing.expectEqual(@as(i32, 0), sys.ftruncate(fd, 32));
         try std.testing.expectEqual(@as(isize, 16), sys.pwriteAll(fd, &chunk, 16));
     }
-    st.cacheFill("ext.bin", 32, 16, &chunk, sys.monoSec());
+    st.cacheFill("ext.bin", 32, 16, &chunk, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("ext.bin").?;
@@ -1605,7 +1608,7 @@ test "get reconciles an externally shrunken origin by wiping marks and truncatin
 
     // Warm entry at 64 bytes: pieces 0 and 3 cached, sidecar saved, cache fd
     // opened (openCache sizes it to the entry with ftruncate).
-    const f = try st.get("shrunk.bin", 64, sys.monoSec());
+    const f = try st.get("shrunk.bin", 64, sys.monoSec(std.testing.io));
     f.mu.lockUncancelable(std.testing.io);
     f.bits.set(0);
     f.bits.set(3);
@@ -1621,7 +1624,7 @@ test "get reconciles an externally shrunken origin by wiping marks and truncatin
     // origin: the hit path must reconcile DOWN too. reconcileSize's contract
     // is an empty field sized for the new length plus an fd truncate, so no
     // stale piece can serve bytes past (or underneath) the new end.
-    const f2 = try st.get("shrunk.bin", 32, sys.monoSec());
+    const f2 = try st.get("shrunk.bin", 32, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(f, f2);
     st.releaseFile(f2);
 
@@ -1657,7 +1660,7 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
     var mb: [sys.c.PATH_MAX]u8 = undefined;
     const mp = try st.cacheMetaPath(&mb, "rc.bin");
     {
-        const f = try st.get("rc.bin", 64, sys.monoSec());
+        const f = try st.get("rc.bin", 64, sys.monoSec(std.testing.io));
         defer st.releaseFile(f);
         f.mu.lockUncancelable(std.testing.io);
         f.bits.set(0);
@@ -1678,7 +1681,7 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
     // cleanly against a file back at 64 bytes -- pre-truncate marks served
     // over post-truncate content.
     {
-        const g = try st.get("rc.bin", 0, sys.monoSec());
+        const g = try st.get("rc.bin", 0, sys.monoSec(std.testing.io));
         defer st.releaseFile(g);
         try std.testing.expectEqual(@as(u64, 0), g.size);
     }
@@ -1699,7 +1702,7 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
         var zz: [160]u8 = undefined;
         const fp = try std.fmt.bufPrint(&zb, "{s}/rc.bin", .{origin_d});
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zz, fp), ""));
-        const f = try st.get("rc.bin", 64, sys.monoSec());
+        const f = try st.get("rc.bin", 64, sys.monoSec(std.testing.io));
         defer st.releaseFile(f);
         f.mu.lockUncancelable(std.testing.io);
         f.bits.set(0);
@@ -1709,7 +1712,7 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
 
         var chunk: [32]u8 = undefined;
         @memset(&chunk, 0x5A);
-        st.cacheFill("rc.bin", 32, 0, &chunk, sys.monoSec());
+        st.cacheFill("rc.bin", 32, 0, &chunk, sys.monoSec(std.testing.io));
 
         const blob = try sys.readFileAlloc(gpa, mp, 4096);
         defer gpa.free(blob);
@@ -1745,8 +1748,8 @@ test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
     var w2: [24]u8 = undefined;
     @memset(&w2, 0xBB);
 
-    st.cacheFill("app.bin", 16, 0, &w1, sys.monoSec());
-    st.cacheFill("app.bin", 40, 16, &w2, sys.monoSec());
+    st.cacheFill("app.bin", 16, 0, &w1, sys.monoSec(std.testing.io));
+    st.cacheFill("app.bin", 40, 16, &w2, sys.monoSec(std.testing.io));
     {
         const f = st.lookupRef("app.bin").?;
         defer st.releaseFile(f);
@@ -1762,7 +1765,7 @@ test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
         try std.testing.expect(bit1);
 
         var rd: [40]u8 = undefined;
-        try std.testing.expectEqual(@as(isize, 40), st.readCache(f, &rd, 0, sys.monoSec()));
+        try std.testing.expectEqual(@as(isize, 40), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
         try std.testing.expectEqualSlices(u8, &w1, rd[0..16]);
         try std.testing.expectEqualSlices(u8, &w2, rd[16..40]);
     }
@@ -1831,12 +1834,12 @@ test "store get file size update and pin" {
     defer st.deinit();
     try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
 
-    const f1 = try st.get("bar.bin", 32, sys.monoSec());
+    const f1 = try st.get("bar.bin", 32, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(@as(u64, 32), f1.size);
     try std.testing.expectEqual(@as(u32, 2), f1.bits.nbits);
 
     // Resizing file
-    const f2 = try st.get("bar.bin", 64, sys.monoSec());
+    const f2 = try st.get("bar.bin", 64, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(f1, f2);
     try std.testing.expectEqual(@as(u64, 64), f2.size);
     try std.testing.expectEqual(@as(u32, 4), f2.bits.nbits);
@@ -1866,7 +1869,7 @@ test "forget drops bits, fd, and disk artifacts for the path" {
     defer st.deinit();
     try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
 
-    const f1 = try st.get("gone.bin", 64, sys.monoSec());
+    const f1 = try st.get("gone.bin", 64, sys.monoSec(std.testing.io));
     f1.mu.lockUncancelable(std.testing.io);
     f1.bits.set(0);
     f1.bits.set(3);
@@ -1887,7 +1890,7 @@ test "forget drops bits, fd, and disk artifacts for the path" {
     // bits were emptied so no stale state survives. The cache fd also stays
     // valid until that release (closing it under live holders would let the
     // descriptor number be reused mid-I/O); it dies with the entry.
-    const f2 = try st.get("gone.bin", 64, sys.monoSec());
+    const f2 = try st.get("gone.bin", 64, sys.monoSec(std.testing.io));
     try std.testing.expect(f2 != f1);
     f1.mu.lockUncancelable(std.testing.io);
     try std.testing.expectEqual(@as(u32, 0), f1.bits.filled());
@@ -1929,7 +1932,7 @@ test "corrupt sidecar degrades to empty bitfield" {
     const torn = try st.cacheMetaPath(&mb, "torn.bin");
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(torn, "MF"));
 
-    const f1 = try st.get("torn.bin", 64, sys.monoSec());
+    const f1 = try st.get("torn.bin", 64, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(@as(u32, 4), f1.bits.nbits);
     try std.testing.expectEqual(@as(u32, 0), f1.bits.filled());
 
@@ -1938,7 +1941,7 @@ test "corrupt sidecar degrades to empty bitfield" {
     const bad = try st.cacheMetaPath(&bb, "bad.bin");
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(bad, "XXXX" ** 8));
 
-    const f2 = try st.get("bad.bin", 64, sys.monoSec());
+    const f2 = try st.get("bad.bin", 64, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(@as(u32, 4), f2.bits.nbits);
     try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
     st.releaseFile(f1);
@@ -1975,7 +1978,7 @@ test "unreadable sidecar degrades to empty bitfield with a named warning" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
-    const f = try st.get("blocker/x.bin", 64, sys.monoSec());
+    const f = try st.get("blocker/x.bin", 64, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     try std.testing.expectEqual(@as(u32, 4), f.bits.nbits);
     try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
@@ -2061,7 +2064,7 @@ test "distrust drops sidecar and live marks but keeps data bytes and pins" {
 
     // Cached piece with landed bytes plus an operator pin: distrust must
     // drop the trust state (sidecar + marks) without destroying either.
-    const f = try st.get("d.bin", 32, sys.monoSec());
+    const f = try st.get("d.bin", 32, sys.monoSec(std.testing.io));
     try std.testing.expect(st.openCache(f) >= 0);
     try std.testing.expectEqual(@as(isize, 32), sys.pwriteAll(f.cache_fd, "0123456789abcdef0123456789abcdef", 0));
     f.mu.lockUncancelable(std.testing.io);
@@ -2107,7 +2110,7 @@ test "distrust drops sidecar and live marks but keeps data bytes and pins" {
     try std.testing.expect(sys.statPath(mp, &stbuf) != 0);
 
     // The next build starts from nothing instead of the dropped bits.
-    const f3 = try st.get("ghost.bin", 32, sys.monoSec());
+    const f3 = try st.get("ghost.bin", 32, sys.monoSec(std.testing.io));
     defer st.releaseFile(f3);
     f3.mu.lockUncancelable(std.testing.io);
     try std.testing.expectEqual(@as(u32, 0), f3.bits.filled());
@@ -2133,7 +2136,7 @@ test "a finisher racing distrust never republishes the wiped marks" {
     defer st.deinit();
     try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
 
-    const f = try st.get("dt.bin", 64, sys.monoSec());
+    const f = try st.get("dt.bin", 64, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     try std.testing.expect(st.openCache(f) >= 0);
 
@@ -2143,8 +2146,8 @@ test "a finisher racing distrust never republishes the wiped marks" {
             while (!halt.load(.acquire)) {
                 // Piece 3 is the concurrent filler's own fresh post-write
                 // hydration: re-marking it across a distrust is legitimate.
-                if ((s.beginFill(file, 3, sys.monoSec()) catch return) == .len)
-                    s.finishPiece(file, 3, true, sys.monoSec());
+                if ((s.beginFill(file, 3, sys.monoSec(std.testing.io)) catch return) == .len)
+                    s.finishPiece(file, 3, true, sys.monoSec(std.testing.io));
             }
         }
     }.run, .{ &st, f, &stop });
@@ -2292,23 +2295,23 @@ test "a piece filled twice ends in the same state as filled once" {
     try std.testing.expectEqual(@as(i32, 0), twice.ensureLayout());
 
     const content = "0123456789abcdef";
-    const f1 = try once.get("fill.bin", 64, sys.monoSec());
+    const f1 = try once.get("fill.bin", 64, sys.monoSec(std.testing.io));
     defer once.releaseFile(f1);
-    const f2 = try twice.get("fill.bin", 64, sys.monoSec());
+    const f2 = try twice.get("fill.bin", 64, sys.monoSec(std.testing.io));
     defer twice.releaseFile(f2);
 
     // Once...
-    try std.testing.expect((try once.beginFill(f1, 0, sys.monoSec())) == .len);
-    try std.testing.expectEqual(@as(i32, 0), once.completeFill(f1, 0, content, sys.monoSec()));
+    try std.testing.expect((try once.beginFill(f1, 0, sys.monoSec(std.testing.io))) == .len);
+    try std.testing.expectEqual(@as(i32, 0), once.completeFill(f1, 0, content, sys.monoSec(std.testing.io)));
 
     // ...and twice. The second claim must answer .filled -- the dedup a
     // retried fetch depends on: the piece is skipped, not re-fetched.
-    try std.testing.expect((try twice.beginFill(f2, 0, sys.monoSec())) == .len);
-    try std.testing.expectEqual(@as(i32, 0), twice.completeFill(f2, 0, content, sys.monoSec()));
-    try std.testing.expect((try twice.beginFill(f2, 0, sys.monoSec())) == .filled);
+    try std.testing.expect((try twice.beginFill(f2, 0, sys.monoSec(std.testing.io))) == .len);
+    try std.testing.expectEqual(@as(i32, 0), twice.completeFill(f2, 0, content, sys.monoSec(std.testing.io)));
+    try std.testing.expect((try twice.beginFill(f2, 0, sys.monoSec(std.testing.io))) == .filled);
 
-    try std.testing.expect(once.hasPiece(f1, 0, sys.monoSec()));
-    try std.testing.expect(twice.hasPiece(f2, 0, sys.monoSec()));
+    try std.testing.expect(once.hasPiece(f1, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expect(twice.hasPiece(f2, 0, sys.monoSec(std.testing.io)));
 
     var mbuf1: [sys.c.PATH_MAX]u8 = undefined;
     var mbuf2: [sys.c.PATH_MAX]u8 = undefined;
@@ -2322,8 +2325,8 @@ test "a piece filled twice ends in the same state as filled once" {
 
     var dbuf1: [content.len]u8 = undefined;
     var dbuf2: [content.len]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, content.len), once.readCache(f1, &dbuf1, 0, sys.monoSec()));
-    try std.testing.expectEqual(@as(isize, content.len), twice.readCache(f2, &dbuf2, 0, sys.monoSec()));
+    try std.testing.expectEqual(@as(isize, content.len), once.readCache(f1, &dbuf1, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqual(@as(isize, content.len), twice.readCache(f2, &dbuf2, 0, sys.monoSec(std.testing.io)));
     try std.testing.expectEqualStrings(&dbuf1, &dbuf2);
 }
 
@@ -2353,9 +2356,9 @@ test "write-through copied twice marks the same pieces as one copy" {
     try std.testing.expectEqual(@as(i32, 0), twice.ensureLayout());
 
     const chunk = "abcdefghijklmnop";
-    const f1 = try once.get("wt.bin", 32, sys.monoSec());
+    const f1 = try once.get("wt.bin", 32, sys.monoSec(std.testing.io));
     defer once.releaseFile(f1);
-    const f2 = try twice.get("wt.bin", 32, sys.monoSec());
+    const f2 = try twice.get("wt.bin", 32, sys.monoSec(std.testing.io));
     defer twice.releaseFile(f2);
 
     try std.testing.expect(once.copyIntoCache(f1, 0, chunk));
@@ -2365,9 +2368,9 @@ test "write-through copied twice marks the same pieces as one copy" {
     try std.testing.expect(twice.copyIntoCache(f2, 0, chunk));
     try std.testing.expect(twice.copyIntoCache(f2, 0, chunk));
 
-    try std.testing.expect(once.hasPiece(f1, 0, sys.monoSec()));
-    try std.testing.expect(twice.hasPiece(f2, 0, sys.monoSec()));
-    try std.testing.expect(!twice.hasPiece(f2, 1, sys.monoSec()));
+    try std.testing.expect(once.hasPiece(f1, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expect(twice.hasPiece(f2, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expect(!twice.hasPiece(f2, 1, sys.monoSec(std.testing.io)));
 
     var mbuf1: [sys.c.PATH_MAX]u8 = undefined;
     var mbuf2: [sys.c.PATH_MAX]u8 = undefined;
@@ -2489,7 +2492,7 @@ test "unlinkOrigin twice matches once, and a retry after origin-only unlink stil
     try std.testing.expectEqual(@as(i32, 0), twice.ensureLayout());
 
     const content = "0123456789abcdef";
-    const now = sys.monoSec();
+    const now = sys.monoSec(std.testing.io);
     var op1: [sys.c.PATH_MAX]u8 = undefined;
     var op2: [sys.c.PATH_MAX]u8 = undefined;
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try once.originPath(&op1, "gone.bin"), content));
@@ -2573,7 +2576,7 @@ test "renameOrigin on a retry after origin-only rename still drops cache" {
     try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
 
     const content = "0123456789abcdef";
-    const now = sys.monoSec();
+    const now = sys.monoSec(std.testing.io);
     var oa: [sys.c.PATH_MAX]u8 = undefined;
     var obuf: [sys.c.PATH_MAX]u8 = undefined;
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try st.originPath(&oa, "a.bin"), content));
@@ -2675,7 +2678,7 @@ test "cullOne punches the least recently used live entry first" {
     // caller-supplied instant: the victim must be picked by last_access
     // alone, never by map iteration order. Virtual stamps pin the exact
     // boundary with no sleeping.
-    const t0 = sys.monoSec();
+    const t0 = sys.monoSec(std.testing.io);
     {
         // Creation stamps are caller-supplied instants: old.bin is born an
         // hour before new.bin, no poking required.
@@ -2735,7 +2738,7 @@ test "cullOne breaks equal-recency ties by rel bytes, not map order" {
     // Identical stamps on every entry: the tie must resolve by rel bytes
     // ("a.bin" before "b.bin"), so the victim is a function of durable state
     // alone even though b.bin entered the map first.
-    const t0 = sys.monoSec();
+    const t0 = sys.monoSec(std.testing.io);
     for ([_][]const u8{ "b.bin", "a.bin" }) |rel| {
         // Both entries born stamped t0: the tie is real, not an artifact of
         // creation order or clock granularity.
@@ -2813,7 +2816,7 @@ test "punchDisk refuses a rel owned by a live entry" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(dp, pattern));
     try writeFilledSidecar(&st, "live.bin", pattern.len, &.{0});
 
-    const f = try st.get("live.bin", pattern.len, sys.monoSec());
+    const f = try st.get("live.bin", pattern.len, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     try std.testing.expect(!st.punchDisk("live.bin"));
 
@@ -2859,7 +2862,7 @@ test "punchDisk punches an orphaned rel and publishes cleared bits" {
     defer decoded.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 0), decoded.filled());
 
-    const f = try st.get("orph.bin", pattern.len, sys.monoSec());
+    const f = try st.get("orph.bin", pattern.len, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     try std.testing.expect(!f.bits.get(0));
 }
@@ -2889,7 +2892,7 @@ test "punchDisk reclaims a data file no sidecar vouches for" {
 
     // A rel with a live map entry is still refused, empty bits or not:
     // the membership gate protects the unclaimed path like the marked one.
-    const kept = try st.get("kept.bin", 16, sys.monoSec());
+    const kept = try st.get("kept.bin", 16, sys.monoSec(std.testing.io));
     defer st.releaseFile(kept);
     var kb: [sys.c.PATH_MAX]u8 = undefined;
     const kp = try st.cacheDataPath(&kb, "kept.bin");
@@ -2970,7 +2973,7 @@ test "readServed falls back to origin when the cache tier cannot answer" {
     const fp = try std.fmt.bufPrint(&zbuf, "{s}/fb.bin", .{origin_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fbuf, fp), ""));
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), st.originPwrite("fb.bin", pattern, 0));
-    const f = try st.get("fb.bin", pattern.len, sys.monoSec());
+    const f = try st.get("fb.bin", pattern.len, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
 
     // Break the cache tier for this file: a directory planted at the data
@@ -2988,13 +2991,13 @@ test "readServed falls back to origin when the cache tier cannot answer" {
     const prev_log_level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
-    const n = st.readServed(f, &rb, 0, sys.monoSec());
+    const n = st.readServed(f, &rb, 0, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
     try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
 
     // The plain cache read still reports the failure itself: the fallback
     // must not swallow the errno from callers that want it.
-    try std.testing.expect(st.readCache(f, &rb, 0, sys.monoSec()) < 0);
+    try std.testing.expect(st.readCache(f, &rb, 0, sys.monoSec(std.testing.io)) < 0);
 }
 
 test "considerVictim keeps a bounded oldest-first sample" {
@@ -3071,8 +3074,8 @@ test "walkData samples oldest-first disk-only files across subdirs" {
         const fp = try std.fmt.bufPrint(&fb, "{s}/data/{s}", .{ cache_d, e.rel });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "cached"));
         const past = [2]std.os.linux.timespec{
-            .{ .sec = sys.nowSec() - e.age, .nsec = 0 },
-            .{ .sec = sys.nowSec() - e.age, .nsec = 0 },
+            .{ .sec = sys.nowSec(std.testing.io) - e.age, .nsec = 0 },
+            .{ .sec = sys.nowSec(std.testing.io) - e.age, .nsec = 0 },
         };
         const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zbuf, fp), &past, 0);
         try std.testing.expectEqual(@as(usize, 0), rc);
@@ -3123,8 +3126,8 @@ test "walkData keeps the oldest cap files when candidates exceed the sample" {
         // Descending age with index: f00 is the oldest, fNN the youngest.
         const age: i64 = @intCast(100 * (n - i));
         const past = [2]std.os.linux.timespec{
-            .{ .sec = sys.nowSec() - age, .nsec = 0 },
-            .{ .sec = sys.nowSec() - age, .nsec = 0 },
+            .{ .sec = sys.nowSec(std.testing.io) - age, .nsec = 0 },
+            .{ .sec = sys.nowSec(std.testing.io) - age, .nsec = 0 },
         };
         const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zbuf, fp), &past, 0);
         try std.testing.expectEqual(@as(usize, 0), rc);
@@ -3221,7 +3224,7 @@ test "get survives concurrent artifact invalidation between loadBits and insert"
 
     // forget bumps the epoch exactly once per purge.
     {
-        const f = try st.get("epoch.bin", 64, sys.monoSec());
+        const f = try st.get("epoch.bin", 64, sys.monoSec(std.testing.io));
         st.releaseFile(f);
         const e0 = st.purge_epoch;
         st.forget("epoch.bin");
@@ -3238,7 +3241,7 @@ test "get survives concurrent artifact invalidation between loadBits and insert"
                 s.mu.lockUncancelable(s.io);
                 s.purge_epoch +%= 1;
                 s.mu.unlock(s.io);
-                sys.sleepMs(1);
+                sys.sleepMs(std.testing.io, 1);
             }
         }
     }.run, .{ &st, &done });
@@ -3251,7 +3254,7 @@ test "get survives concurrent artifact invalidation between loadBits and insert"
     // bumper keeps invalidating builds mid-flight, exercising the retry.
     var i: usize = 0;
     while (i < 200) : (i += 1) {
-        const f = try st.get("race.bin", 64, sys.monoSec());
+        const f = try st.get("race.bin", 64, sys.monoSec(std.testing.io));
         try std.testing.expectEqual(@as(u64, 64), f.size);
         try std.testing.expectEqual(@as(u32, 64 / 16), f.bits.nbits);
         st.releaseFile(f);
@@ -3326,7 +3329,7 @@ test "punchPiece refuses to cut the hole unless the cleared bits persist" {
     try std.testing.expectEqualSlices(u8, &pattern, &back);
 
     // Once saves work again the same piece culls normally. Same virtual
-    // clock as the entry's 40_000 creation stamp: sys.monoSec() here would
+    // clock as the entry's 40_000 creation stamp: sys.monoSec(std.testing.io) here would
     // compare seconds-since-boot against that stamp, so the punch would be
     // refused as too recent on any host up for less than 11 hours.
     broken.undo();
@@ -3369,7 +3372,7 @@ test "disk cull refuses to cut the hole unless the cleared bits persist" {
 
     // With persistence possible again the orphan punches through cullOne.
     broken.undo();
-    try std.testing.expect(st.cullOne(sys.monoSec()));
+    try std.testing.expect(st.cullOne(sys.monoSec(std.testing.io)));
     const after = sys.readFileBuf(&rb, dp) catch return error.ReadFailed;
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** pattern.len), after);
 }
@@ -3378,7 +3381,7 @@ test "beginFill surfaces allocation failure instead of spinning" {
     const gpa = std.testing.allocator;
     var st = Store.init(gpa, std.testing.io, "/unused", "/unused", 16);
     defer st.deinit();
-    const f = try st.get("oom.bin", 64, sys.monoSec());
+    const f = try st.get("oom.bin", 64, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
 
     // Rebind the entry's filling map to an allocator whose first allocation
@@ -3387,7 +3390,7 @@ test "beginFill surfaces allocation failure instead of spinning" {
     var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
     f.filling.deinit();
     f.filling = std.AutoHashMap(u32, void).init(failing.allocator());
-    try std.testing.expectError(error.OutOfMemory, st.beginFill(f, 0, sys.monoSec()));
+    try std.testing.expectError(error.OutOfMemory, st.beginFill(f, 0, sys.monoSec(std.testing.io)));
 }
 
 test "beginFill answers filled and raced without claiming or marking" {
@@ -3406,12 +3409,12 @@ test "beginFill answers filled and raced without claiming or marking" {
     // Already filled (including by a concurrent filler that finished while
     // we waited): the second hydrator must see .filled and take no claim,
     // so the first filler's finishPiece never finds a dangling entry.
-    const f = try st.get("claim.bin", 48, sys.monoSec());
+    const f = try st.get("claim.bin", 48, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     f.mu.lockUncancelable(std.testing.io);
     f.bits.set(0);
     f.mu.unlock(std.testing.io);
-    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec())) == .filled);
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .filled);
     f.mu.lockUncancelable(std.testing.io);
     const no_dangling_claim = !f.filling.contains(0);
     f.mu.unlock(std.testing.io);
@@ -3422,7 +3425,7 @@ test "beginFill answers filled and raced without claiming or marking" {
     // dropped with nothing marked -- a hydrator treating this as data would
     // mark hole zeros as a filled piece (the underflow hazard hydratePiece
     // documents for an empty buf).
-    try std.testing.expect((try st.beginFill(f, 5, sys.monoSec())) == .raced);
+    try std.testing.expect((try st.beginFill(f, 5, sys.monoSec(std.testing.io))) == .raced);
     f.mu.lockUncancelable(std.testing.io);
     const dropped_unmarked = !f.bits.get(5) and f.filling.count() == 0;
     f.mu.unlock(std.testing.io);
@@ -3436,9 +3439,9 @@ test "beginFill answers filled and raced without claiming or marking" {
     f.bits = try piece.Bitfield.init(gpa, piece.count(112, st.piece_size));
     f.size = 112;
     f.mu.unlock(std.testing.io);
-    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 5, sys.monoSec())).len);
-    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 5, "0123456789abcdef", sys.monoSec()));
-    try std.testing.expect(st.hasPiece(f, 5, sys.monoSec()));
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 5, sys.monoSec(std.testing.io))).len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 5, "0123456789abcdef", sys.monoSec(std.testing.io)));
+    try std.testing.expect(st.hasPiece(f, 5, sys.monoSec(std.testing.io)));
 }
 
 test "sidecar save and cache open recreate a deleted parent directory" {
@@ -3458,7 +3461,7 @@ test "sidecar save and cache open recreate a deleted parent directory" {
     // (one failed mkdir per component) before every write and open. The
     // retry-on-ENOENT shape they replaced must still create the directory
     // when it is genuinely missing.
-    const f = try st.get("deep/sub/x.bin", 64, sys.monoSec());
+    const f = try st.get("deep/sub/x.bin", 64, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     try std.testing.expect(st.openCache(f) >= 0);
 
@@ -3517,7 +3520,7 @@ test "openCache refuses a symlink planted at the data path" {
     const dp = try st.cacheDataPath(&db, "sym.bin");
     try std.testing.expectEqual(@as(i32, 0), c.symlink(target_z, dp));
 
-    const f = try st.get("sym.bin", 32, sys.monoSec());
+    const f = try st.get("sym.bin", 32, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     try std.testing.expect(st.openCache(f) < 0);
 
@@ -3592,17 +3595,17 @@ test "late finisher on a forgotten entry does not resurrect the sidecar" {
     // the claim without saving. Regression: saving unconditionally recreated
     // a sidecar naming filled pieces over a data file that no longer exists,
     // and a same-size recreate would trust those bits and serve hole zeros.
-    const f = try st.get("late.bin", 64, sys.monoSec());
-    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec())) == .len);
+    const f = try st.get("late.bin", 64, sys.monoSec(std.testing.io));
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
     st.forget("late.bin");
-    st.finishPiece(f, 0, true, sys.monoSec());
+    st.finishPiece(f, 0, true, sys.monoSec(std.testing.io));
     const mp = try st.cacheMetaPath(&mb, "late.bin");
     try std.testing.expect(sys.statPath(mp, &stbuf) != 0);
     st.releaseFile(f);
 
     // Same contract for the write-through path: copyIntoCache on a dead
     // entry reports failure instead of marking and saving bits.
-    const f2 = try st.get("late2.bin", 64, sys.monoSec());
+    const f2 = try st.get("late2.bin", 64, sys.monoSec(std.testing.io));
     defer st.releaseFile(f2);
     try std.testing.expect(st.openCache(f2) >= 0);
     st.forget("late2.bin");
@@ -3613,7 +3616,7 @@ test "late finisher on a forgotten entry does not resurrect the sidecar" {
     // The dead stamp must be visible to any file.mu holder that follows the
     // purge: finishPiece's skip runs under the same lock forget stamped in,
     // so there is no window where the save slips through.
-    const f3 = try st.get("late3.bin", 64, sys.monoSec());
+    const f3 = try st.get("late3.bin", 64, sys.monoSec(std.testing.io));
     defer st.releaseFile(f3);
     st.forget("late3.bin");
     f3.mu.lockUncancelable(std.testing.io);

@@ -789,7 +789,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
 
     // One edge read of the real clock; every decision below runs on this
     // instant or offsets of it, so the TTL behavior is replayable exactly.
-    const t0 = sys.monoMs();
+    const t0 = sys.monoMs(std.testing.io);
 
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0) == null);
 
@@ -1014,7 +1014,7 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     // One edge instant drives both the mtime stamps and the sweep call, so
     // every file sits exactly sweep_min_age_secs outside the cutoff no
     // matter how long the test takes between those steps.
-    const sweep_now = sys.nowSec();
+    const sweep_now = sys.nowSec(std.testing.io);
     const past = [2]std.os.linux.timespec{
         .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
         .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
@@ -1237,7 +1237,7 @@ test "publish stages a parseable lease, leaves no tmp, and replaces in place" {
     };
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
     defer cat.deinit();
-    const pub_now = sys.nowSec();
+    const pub_now = sys.nowSec(std.testing.io);
     cat.publish(pub_now);
 
     // The lease lands at <id>.json under .cluster with no .json.tmp staging
@@ -1327,7 +1327,7 @@ test "refresh skips self and expired leases" {
     const local_ips = [_][]const u8{"192.168.100.77"};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &local_ips, &.{});
     defer cat.deinit();
-    cat.refresh(sys.nowSec());
+    cat.refresh(sys.nowSec(std.testing.io));
 
     const snap = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap);
@@ -1377,7 +1377,7 @@ test "refresh drops lease addresses that are not dialable dotted quads" {
     const addrs = [_]proto.LeaseAddr{};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
     defer cat.deinit();
-    cat.refresh(sys.nowSec());
+    cat.refresh(sys.nowSec(std.testing.io));
 
     const snap = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap);
@@ -1403,7 +1403,7 @@ test "refresh keeps the previous peer list while .cluster is unreadable" {
     const addrs = [_]proto.LeaseAddr{};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
     defer cat.deinit();
-    cat.refresh(sys.nowSec());
+    cat.refresh(sys.nowSec(std.testing.io));
 
     // A transient origin outage (NFS unmounted, control dir swept) makes
     // opendir fail. Regression shape: rebuilding from an empty walk here
@@ -1414,7 +1414,7 @@ test "refresh keeps the previous peer list while .cluster is unreadable" {
         std.testing.log_level = .err;
         defer std.testing.log_level = prev_log_level;
         sys.deleteTree(std.testing.io, cluster_d);
-        cat.refresh(sys.nowSec());
+        cat.refresh(sys.nowSec(std.testing.io));
     }
 
     const snap = try cat.snapshot(gpa);
@@ -1463,7 +1463,7 @@ test "refresh skips unreadable and corrupt leases without dropping healthy peers
     const prev_log_level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
-    cat.refresh(sys.nowSec());
+    cat.refresh(sys.nowSec(std.testing.io));
 
     const snap = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap);
@@ -1488,7 +1488,7 @@ test "refresh uses seeds only while cluster is empty" {
     const local_ips = [_][]const u8{"192.168.100.77"};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &local_ips, &seeds);
     defer cat.deinit();
-    cat.refresh(sys.nowSec());
+    cat.refresh(sys.nowSec(std.testing.io));
 
     const snap = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap);
@@ -1506,7 +1506,7 @@ test "refresh uses seeds only while cluster is empty" {
     const fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
     const live = "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.9.9.9\",\"port\":18080,\"mbps\":0}]}";
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live));
-    cat.refresh(sys.nowSec());
+    cat.refresh(sys.nowSec(std.testing.io));
 
     const snap2 = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap2);
@@ -1532,7 +1532,7 @@ test "refresh carries learned goodput and inflight across ticks" {
     const addrs = [_]proto.LeaseAddr{};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &seeds);
     defer cat.deinit();
-    cat.refresh(sys.nowSec());
+    cat.refresh(sys.nowSec(std.testing.io));
     try std.testing.expectEqual(@as(f64, 1e8), cat.paths.items[0].ewma_bps);
 
     // Learn something about the seed address: one measured transfer plus an
@@ -1545,7 +1545,7 @@ test "refresh carries learned goodput and inflight across ticks" {
     // A later tick republishes leases; the same address must keep its
     // measured goodput and its in-flight slot instead of restarting from
     // the prior.
-    cat.refresh(sys.nowSec());
+    cat.refresh(sys.nowSec(std.testing.io));
     try std.testing.expectEqual(@as(usize, 1), cat.paths.items.len);
     try std.testing.expectEqual(learned, cat.paths.items[0].ewma_bps);
     try std.testing.expectEqual(@as(u32, 1), cat.paths.items[0].inflight.load(.monotonic));
