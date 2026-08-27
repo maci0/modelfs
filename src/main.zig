@@ -1986,6 +1986,78 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     }
 }
 
+const seed_status_live = fuzzcorpus.entry("{\"id\":\"me\",\"pid\":1,\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"now_s\":1710000060,\"mono_s\":100,\"stats\":{}}\n");
+const seed_status_pid_only = fuzzcorpus.entry("{\"pid\":1}");
+const seed_status_now_only = fuzzcorpus.entry("{\"pid\":1,\"now_s\":1710000060}");
+const seed_status_missing_pid = fuzzcorpus.entry("{\"id\":\"me\",\"now_s\":1}");
+const seed_status_truncated = fuzzcorpus.entry("{\"pid\":");
+const seed_status_not_json = fuzzcorpus.entry("not json at all");
+const seed_status_now_min = fuzzcorpus.entry("{\"pid\":1,\"now_s\":-9223372036854775808}");
+const seed_status_mono_max = fuzzcorpus.entry("{\"pid\":1,\"now_s\":1,\"mono_s\":9223372036854775807}");
+const seed_status_dup_pid = fuzzcorpus.entry("{\"pid\":1,\"pid\":2,\"now_s\":0}");
+const seed_status_float_pid = fuzzcorpus.entry("{\"pid\":1.5}");
+const seed_status_string_pid = fuzzcorpus.entry("{\"pid\":\"1\"}");
+const seed_status_deep_unknown = fuzzcorpus.entry("{\"pid\":1,\"z\":[[[[[[[[]]]]]]]]}");
+const seed_status_empty = fuzzcorpus.entry("");
+const seed_status_null_stamps = fuzzcorpus.entry("{\"pid\":1,\"now_s\":null,\"mono_s\":null}");
+
+const fuzz_status_corpus = [_][]const u8{
+    &seed_status_live,
+    &seed_status_pid_only,
+    &seed_status_now_only,
+    &seed_status_missing_pid,
+    &seed_status_truncated,
+    &seed_status_not_json,
+    &seed_status_now_min,
+    &seed_status_mono_max,
+    &seed_status_dup_pid,
+    &seed_status_float_pid,
+    &seed_status_string_pid,
+    &seed_status_deep_unknown,
+    &seed_status_empty,
+    &seed_status_null_stamps,
+};
+
+/// Leftover status.json is untrusted twice over: a crashed daemon leaves
+/// whatever it last published, and a local uid that can write the cache
+/// root can plant a document. cmdStatus must fail closed on anything that
+/// is not a liveness object, and statusAgeSecs must not overflow on a
+/// hostile i64 stamp. The harness asserts fail-closed parsing, determinism
+/// across re-reads, and that age is the absolute monotonic gap when
+/// mono_s is present (the reboot leftover / future-stamp case).
+fn fuzzStatusLivenessOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var doc_buf: [512]u8 = undefined;
+    const json = doc_buf[0..smith.slice(&doc_buf)];
+    const parsed = std.json.parseFromSlice(StatusLiveness, gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    const live = parsed.value;
+
+    {
+        const again = try std.json.parseFromSlice(StatusLiveness, gpa, json, .{ .ignore_unknown_fields = true });
+        defer again.deinit();
+        try std.testing.expectEqual(live.pid, again.value.pid);
+        try std.testing.expectEqual(live.now_s, again.value.now_s);
+        try std.testing.expectEqual(live.mono_s, again.value.mono_s);
+    }
+
+    const age = statusAgeSecs(std.testing.io, live);
+    if (live.mono_s) |stamp| {
+        const now = sys.monoSec(std.testing.io);
+        const want = if (stamp > now) stamp -| now else now -| stamp;
+        try std.testing.expectEqual(want, age.?);
+        try std.testing.expect(age.? >= 0);
+    } else if (live.now_s) |stamp| {
+        try std.testing.expectEqual(sys.nowSec(std.testing.io) -| stamp, age.?);
+    } else {
+        try std.testing.expect(age == null);
+    }
+}
+
+test "fuzz status.json liveness parsing fails closed and ages without overflow" {
+    try std.testing.fuzz({}, fuzzStatusLivenessOne, .{ .corpus = &fuzz_status_corpus });
+}
+
 test "ensureDirReal creates a missing dir and refuses a file" {
     const gpa = std.testing.allocator;
     var cb: [128]u8 = undefined;

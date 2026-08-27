@@ -3394,6 +3394,11 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                 if (haveFromHead(gpa, std.testing.io, fds[1], &head_buf, head_len, total_read)) |rep| {
                     defer gpa.free(rep.bits);
                     const head = head_buf[0..head_len];
+                    const status_end = std.mem.find(u8, head, "\r\n") orelse return error.TestUnexpectedResult;
+                    try std.testing.expect(proto.httpStatusIs(head[0..status_end], 200));
+                    try std.testing.expect(refHttpStatusIs(head[0..status_end], 200));
+                    try std.testing.expect(!refHttpStatusIs(head[0..status_end], 206));
+                    try std.testing.expect(!refHttpStatusIs(head[0..status_end], 404));
                     const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
                     const want_len = std.math.cast(usize, proto.parseU64Fast(cl_str) orelse 0) orelse 0;
                     try std.testing.expectEqual(want_len, rep.bits.len);
@@ -3436,6 +3441,18 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                     }
                 }
                 const status_end = std.mem.find(u8, dest_head, "\r\n") orelse return;
+                try std.testing.expectEqual(
+                    refHttpStatusIs(dest_head[0..status_end], 200),
+                    proto.httpStatusIs(dest_head[0..status_end], 200),
+                );
+                try std.testing.expectEqual(
+                    refHttpStatusIs(dest_head[0..status_end], 206),
+                    proto.httpStatusIs(dest_head[0..status_end], 206),
+                );
+                try std.testing.expectEqual(
+                    refHttpStatusIs(dest_head[0..status_end], 404),
+                    proto.httpStatusIs(dest_head[0..status_end], 404),
+                );
                 const status_ok = proto.httpStatusIs(dest_head[0..status_end], 200) or
                     proto.httpStatusIs(dest_head[0..status_end], 206);
                 const dest_cl_str = proto.headerGet(dest_head, "Content-Length") orelse "0";

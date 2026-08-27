@@ -747,18 +747,20 @@ test "fuzz url codec round-trips across the peer trust boundary" {
     try std.testing.fuzz({}, fuzzUrlCodecOne, .{ .corpus = &fuzz_codec_corpus });
 }
 
-// headerGet, queryGet, parseRange, and parseContentRange are the extraction
-// layer every untrusted-byte decision rides: Authorization on both server
-// and client, Content-Length and X-Piece-Size sizing the bitmap allocation,
-// the path= query parameter feeding the relOk gate, the Range clamp before
-// origin reads, and Content-Range binding a 206 body to the offset the
-// fetch asked for. The harnesses above execute them on every input but
-// read their expectations back through these same functions -- a drift
-// there (returning the last duplicate instead of the first, matching a
-// prefix of the name, trimming more than OWS, wrapping a 21-digit value)
-// would reconfirm itself in every assertion and ship silently. These
-// oracles restate each contract independently so the fuzzer sees the
-// difference.
+// headerGet, queryGet, parseRange, parseContentRange, and httpStatusIs
+// are the extraction layer every untrusted-byte decision rides:
+// Authorization on both server and client, Content-Length and
+// X-Piece-Size sizing the bitmap allocation, the path= query parameter
+// feeding the relOk gate, the Range clamp before origin reads,
+// Content-Range binding a 206 body to the offset the fetch asked for,
+// and the 3-digit status gate that decides whether a /have 200, /have
+// 404, or /data 206 is even a reply. The harnesses above execute them
+// on every input but read their expectations back through these same
+// functions -- a drift there (returning the last duplicate instead of
+// the first, matching a prefix of the name, trimming more than OWS,
+// wrapping a 21-digit value, treating `2000` as `200`) would reconfirm
+// itself in every assertion and ship silently. These oracles restate
+// each contract independently so the fuzzer sees the difference.
 
 fn refHeaderGet(head: []const u8, name: []const u8) ?[]const u8 {
     // Manual offset walk instead of splitSequence: skip the status/request
@@ -840,6 +842,23 @@ fn refParseContentRange(h: []const u8) ?ContentRange {
     else
         refDigitsU64(complete_s) orelse return null;
     return .{ .start = start, .end = end, .complete = complete };
+}
+
+/// Independent restatement of httpStatusIs: "HTTP/1.1" SP 3DIGIT, then
+/// end-of-line or SP. Digit math instead of parseU64Fast so a corrupted
+/// 3-digit slice cannot self-confirm.
+fn refHttpStatusIs(status_line: []const u8, code: u16) bool {
+    const tag = "HTTP/1.1 ";
+    if (status_line.len < tag.len + 3) return false;
+    if (!std.mem.eql(u8, status_line[0..tag.len], tag)) return false;
+    const d0 = status_line[tag.len];
+    const d1 = status_line[tag.len + 1];
+    const d2 = status_line[tag.len + 2];
+    if (d0 < '0' or d0 > '9' or d1 < '0' or d1 > '9' or d2 < '0' or d2 > '9') return false;
+    const n: u16 = (@as(u16, d0 - '0') * 100) + (@as(u16, d1 - '0') * 10) + (d2 - '0');
+    if (n != code) return false;
+    if (status_line.len == tag.len + 3) return true;
+    return status_line[tag.len + 3] == ' ';
 }
 
 /// Five framed slices per corpus entry: the raw head, the header name to
@@ -947,6 +966,41 @@ const seed_extract_cr_ows = extractEntry(
     "bytes=8-15",
     "  bytes 8-15/16\t",
 );
+const seed_extract_status_2000 = extractEntry(
+    "HTTP/1.1 2000 OK\r\nContent-Length: 1\r\n\r\nz",
+    "Content-Length",
+    "/have",
+    "bytes=0-0",
+    "bytes 0-0/1",
+);
+const seed_extract_status_200ok = extractEntry(
+    "HTTP/1.1 200OK\r\nContent-Length: 0\r\n\r\n",
+    "Content-Length",
+    "/have",
+    "bytes=0-0",
+    "bytes 0-0/1",
+);
+const seed_extract_status_4040 = extractEntry(
+    "HTTP/1.1 4040 Not Found\r\nContent-Length: 0\r\n\r\n",
+    "Content-Length",
+    "/have",
+    "bytes=0-0",
+    "bytes 0-0/1",
+);
+const seed_extract_status_http10 = extractEntry(
+    "HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\nz",
+    "Content-Length",
+    "/have",
+    "bytes=0-0",
+    "bytes 0-0/1",
+);
+const seed_extract_status_bare = extractEntry(
+    "HTTP/1.1 206\r\nContent-Length: 2\r\n\r\nhi",
+    "Content-Length",
+    "/data",
+    "bytes=0-1",
+    "bytes 0-1/2",
+);
 
 const fuzz_extract_corpus = [_][]const u8{
     &seed_extract_ok,
@@ -962,15 +1016,21 @@ const fuzz_extract_corpus = [_][]const u8{
     &seed_extract_cr_inverted,
     &seed_extract_cr_eq,
     &seed_extract_cr_ows,
+    &seed_extract_status_2000,
+    &seed_extract_status_200ok,
+    &seed_extract_status_4040,
+    &seed_extract_status_http10,
+    &seed_extract_status_bare,
 };
 
 /// Asserts each extractor against its independent oracle on arbitrary bytes:
 /// identical accept/reject and identical values for headerGet, queryGet,
-/// parseRange, and parseContentRange; a canonically reformatted accepted
-/// range or Content-Range reparses to the same bounds; and the
-/// first-match-wins property the wire depends on holds for duplicated
-/// headers and repeated query keys (synthesized only when the fuzzed
-/// name/key cannot corrupt the frame itself).
+/// parseRange, parseContentRange, and httpStatusIs; a canonically
+/// reformatted accepted range, Content-Range, or 3-digit status reparses
+/// to the same bounds/code; and the first-match-wins property the wire
+/// depends on holds for duplicated headers and repeated query keys
+/// (synthesized only when the fuzzed name/key cannot corrupt the frame
+/// itself).
 fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var head_buf: [512]u8 = undefined;
     const head = head_buf[0..smith.slice(&head_buf)];
@@ -983,6 +1043,28 @@ fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
         if (want) |w| {
             try std.testing.expectEqualStrings(w, got orelse return error.HeaderOracleMismatch);
         } else try std.testing.expect(got == null);
+    }
+
+    {
+        const status_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+        const status_line = head[0..status_end];
+        for ([_]u16{ 200, 206, 404 }) |code| {
+            try std.testing.expectEqual(refHttpStatusIs(status_line, code), httpStatusIs(status_line, code));
+        }
+        const matched: ?u16 = if (httpStatusIs(status_line, 200))
+            200
+        else if (httpStatusIs(status_line, 206))
+            206
+        else if (httpStatusIs(status_line, 404))
+            404
+        else
+            null;
+        if (matched) |n| {
+            var canon: [16]u8 = undefined;
+            const rt = try std.fmt.bufPrint(&canon, "HTTP/1.1 {d}", .{n});
+            try std.testing.expect(httpStatusIs(rt, n));
+            try std.testing.expect(refHttpStatusIs(rt, n));
+        }
     }
 
     var target_buf: [256]u8 = undefined;
@@ -1057,8 +1139,16 @@ fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
         const dup = try std.fmt.bufPrint(&dup_target, "/x?{s}=2&{s}=1", .{ name, name });
         try std.testing.expectEqualStrings("2", queryGet(dup, name).?);
     }
+
+    // Drawn after the five framed slices so existing corpus entries keep
+    // their field mapping; 200/206/404 already ran on the status line.
+    {
+        const status_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+        const drawn: u16 = @truncate(smith.value(u64));
+        try std.testing.expectEqual(refHttpStatusIs(head[0..status_end], drawn), httpStatusIs(head[0..status_end], drawn));
+    }
 }
 
-test "fuzz header query range and content-range extraction match an independent scan" {
+test "fuzz header query range content-range and status-line extraction match an independent scan" {
     try std.testing.fuzz({}, fuzzExtractorsOne, .{ .corpus = &fuzz_extract_corpus });
 }
