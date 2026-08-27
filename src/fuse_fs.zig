@@ -407,7 +407,8 @@ fn cachedFor(st: *State, rel: []const u8) ?*store_mod.Store.Cached {
     var ost: sys.c.struct_stat = undefined;
     if (st.store.statOrigin(rel, &ost) != 0) return null;
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return null;
-    return st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch null;
+    const size = sys.sizeFromStat(ost.st_size) orelse return null;
+    return st.store.get(rel, size, sys.monoSec(st.io)) catch null;
 }
 
 export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
@@ -425,7 +426,11 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     if (rc != 0) return rc;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
-        const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch |err| {
+        const size = sys.sizeFromStat(ost.st_size) orelse {
+            std.log.warn("origin size unusable for {s}; failing open", .{rel});
+            return -sys.c.EIO;
+        };
+        const file = st.store.get(rel, size, sys.monoSec(st.io)) catch |err| {
             std.log.warn("cache entry open failed for {s} ({t}); failing open", .{ rel, err });
             return -sys.c.ENOMEM;
         };
@@ -627,7 +632,12 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         return rc_stat;
     }
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return -sys.c.EISDIR;
-    const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch |err| {
+    const origin_size = sys.sizeFromStat(ost.st_size) orelse {
+        _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
+        std.log.warn("origin size unusable for {s}; failing read", .{rel});
+        return -sys.c.EIO;
+    };
+    const file = st.store.get(rel, origin_size, sys.monoSec(st.io)) catch |err| {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         std.log.warn("cache entry open failed for {s} ({t}); failing read", .{ rel, err });
         return -sys.c.ENOMEM;
@@ -711,9 +721,12 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     var ost: sys.c.struct_stat = undefined;
     const rc = st.store.statOrigin(rel, &ost);
     const regular = rc == 0 and (ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG;
-    if (regular and @as(u64, @intCast(ost.st_size)) == end) {
-        st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)], sys.monoSec(st.io));
-        return @intCast(n);
+    const osize: ?u64 = if (regular) sys.sizeFromStat(ost.st_size) else null;
+    if (osize) |sz| {
+        if (sz == end) {
+            st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)], sys.monoSec(st.io));
+            return @intCast(n);
+        }
     }
     // One referenced entry for every remaining shape, resolved from the stat
     // sample this handler already paid for. The old shape stat'ed the origin
@@ -722,8 +735,8 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     // were real GETATTR round trips -- two per written chunk whenever the
     // observed size lagged the write (the common ingest shape).
     const live = blk: {
-        if (regular)
-            break :blk st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch null;
+        if (osize) |sz|
+            break :blk st.store.get(rel, sz, sys.monoSec(st.io)) catch null;
         // Failed observation: one retry through cachedFor's own stat before
         // trust is dropped below, so a single flaky GETATTR cannot wipe marks.
         break :blk cachedFor(st, rel);
@@ -1065,7 +1078,7 @@ fn cullLoop(st: *State) void {
         // decisions stay pure functions of state plus one clock sample
         // (see store.zig), which only holds if the driver samples once.
         const now = sys.monoSec(st.io);
-        if (now - last_reap >= reap_every_secs) {
+        if (now -| last_reap >= reap_every_secs) {
             st.store.reapIdle(now, reap_idle_secs);
             last_reap = now;
         }
@@ -1123,6 +1136,14 @@ fn discLoop(st: *State) void {
     }
 }
 
+/// Mean of `total` time in `unit` ticks per op. Divides by the unit first so
+/// `count * unit` cannot overflow u64 (debug panic / wrapped average).
+/// Equivalent to `total / (count * unit)` for positive integers.
+fn meanPerOp(total: u64, count: u64, unit: u64) u64 {
+    if (count == 0 or unit == 0) return 0;
+    return @divTrunc(total, unit) / count;
+}
+
 /// One summary line per discovery tick, and only when some counter moved:
 /// the daemon's activity heartbeat. Per-event logging at piece granularity
 /// would flood the journal (one model read covers hundreds of pieces), so
@@ -1141,13 +1162,13 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     if (std.meta.eql(d, store_mod.Stats.Snap{})) return;
     const mib = 1024 * 1024;
     const reads_attempted = d.reads_ok + d.reads_err;
-    const rd_us = if (reads_attempted > 0) @divTrunc(d.read_nanos, reads_attempted * std.time.ns_per_us) else 0;
+    const rd_us = meanPerOp(d.read_nanos, reads_attempted, std.time.ns_per_us);
     const writes_attempted = d.writes_ok + d.writes_err;
-    const wr_us = if (writes_attempted > 0) @divTrunc(d.write_nanos, writes_attempted * std.time.ns_per_us) else 0;
-    const fill_peer_ms = if (d.fills_peer > 0) @divTrunc(d.fill_peer_nanos, d.fills_peer * std.time.ns_per_ms) else 0;
-    const fill_origin_ms = if (d.fills_origin > 0) @divTrunc(d.fill_origin_nanos, d.fills_origin * std.time.ns_per_ms) else 0;
+    const wr_us = meanPerOp(d.write_nanos, writes_attempted, std.time.ns_per_us);
+    const fill_peer_ms = meanPerOp(d.fill_peer_nanos, d.fills_peer, std.time.ns_per_ms);
+    const fill_origin_ms = meanPerOp(d.fill_origin_nanos, d.fills_origin, std.time.ns_per_ms);
     const http_attempted = d.http_ok + d.http_5xx;
-    const http_us = if (http_attempted > 0) @divTrunc(d.http_nanos, http_attempted * std.time.ns_per_us) else 0;
+    const http_us = meanPerOp(d.http_nanos, http_attempted, std.time.ns_per_us);
     std.log.info(
         // Field names mirror Stats.Snap's (what status.json publishes), so
         // the journal line and the machine artifact share one vocabulary and
@@ -1422,6 +1443,17 @@ test "statusJson unlinks the staging file when rename fails" {
     const tmp_fp = try sys.appendExt(&zbuf, fp, ".tmp");
     var stbuf: sys.c.struct_stat = undefined;
     try std.testing.expect(sys.statPath(tmp_fp, &stbuf) != 0);
+}
+
+test "meanPerOp does not overflow the per-op divisor" {
+    // Old form `total / (count * ns_per_us)` panics in safe builds when
+    // count > maxInt(u64)/1000. Concrete: 2^64/1000 + 1 ops, 0 ns.
+    const count: u64 = std.math.maxInt(u64) / 1000 + 1;
+    try std.testing.expectEqual(@as(u64, 0), meanPerOp(0, count, 1000));
+    try std.testing.expectEqual(@as(u64, 2), meanPerOp(5, 2, 1));
+    try std.testing.expectEqual(@as(u64, 1), meanPerOp(2500, 2, 1000));
+    try std.testing.expectEqual(@as(u64, 0), meanPerOp(100, 0, 1000));
+    try std.testing.expectEqual(@as(u64, 0), meanPerOp(100, 1, 0));
 }
 
 test "logStatsTick summarizes deltas and stays silent when idle" {

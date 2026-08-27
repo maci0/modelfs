@@ -186,7 +186,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 | 405 | Authenticated request whose method is not GET (`Allow: GET`) |
 | 416 | `/data` range start at/after EOF, with `Content-Range: bytes */<size>` naming the complete length (an over-long end clamps to EOF instead) |
 | 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write) |
-| 502 | The origin is unreachable or failed (stat/pread error), i.e. retry another peer |
+| 502 | The origin is unreachable or failed (stat/pread error, or a size that does not fit `off_t`), i.e. retry another peer |
 
 A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. Wire integers (`Range`, `Content-Range`, `Content-Length`, `X-Piece-Size`) are unsigned decimal digits only: a leading sign or interior underscore is malformed, the same rule RFC 9110 uses for Content-Length. Status lines are `HTTP/1.1` plus a 3-digit code: `2000` is not 200, and `4040` is not a healthy miss. The fetching peer requires `206` plus a `Content-Range` whose start matches the request, whose end is at most the request end (EOF clamp), and whose selected length equals `Content-Length` (a shorter body under a matching window is refused rather than cached). `v0.1.0` servers already send that header on every 206, so a mixed fleet still fills. Errors carry no body: both peers of a conversation parse only the status line.
 

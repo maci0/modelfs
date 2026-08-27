@@ -193,10 +193,26 @@ pub fn scrubPskEnv() void {
     _ = c.unsetenv("MODELFS_PSK_VALUE");
 }
 
+/// `stat.st_size` is signed off_t. NFS fattr is u64, so a size of 2^63 or
+/// more shows up negative here; `@intCast` into piece/cache math panics in
+/// safe builds and wraps to a multi-exabyte length in ReleaseFast.
+pub fn sizeFromStat(st_size: c.off_t) ?u64 {
+    if (st_size < 0) return null;
+    return @intCast(st_size);
+}
+
+/// Kernel file offsets are signed. A u64 that does not fit must not become
+/// a truncated (often negative) off_t: that would pread/pwrite/ftruncate
+/// at the wrong address instead of failing the op.
+fn offT(n: u64) ?c.off_t {
+    return std.math.cast(c.off_t, n);
+}
+
 pub fn preadAll(fd: c_int, buf: []u8, off: u64) isize {
     var got: usize = 0;
     while (got < buf.len) {
-        const n = c.pread(fd, buf[got..].ptr, buf.len - got, @intCast(off + got));
+        const pos = offT(off +| got) orelse return -c.EFBIG;
+        const n = c.pread(fd, buf[got..].ptr, buf.len - got, pos);
         if (n < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll: a
             // stray signal must not end a multi-chunk transfer midway.
@@ -210,11 +226,15 @@ pub fn preadAll(fd: c_int, buf: []u8, off: u64) isize {
 }
 
 pub fn fadviseDontneed(fd: c_int, off: u64, len: u64) void {
-    _ = c.posix_fadvise(fd, @intCast(off), @intCast(len), c.POSIX_FADV_DONTNEED);
+    const o = offT(off) orelse return;
+    const n = offT(len) orelse return;
+    _ = c.posix_fadvise(fd, o, n, c.POSIX_FADV_DONTNEED);
 }
 
 pub fn punchHole(fd: c_int, off: u64, len: u64) i32 {
-    const rc = c.fallocate(fd, c.FALLOC_FL_PUNCH_HOLE | c.FALLOC_FL_KEEP_SIZE, @intCast(off), @intCast(len));
+    const o = offT(off) orelse return -c.EFBIG;
+    const n = offT(len) orelse return -c.EFBIG;
+    const rc = c.fallocate(fd, c.FALLOC_FL_PUNCH_HOLE | c.FALLOC_FL_KEEP_SIZE, o, n);
     if (rc != 0) return negErrno();
     return 0;
 }
@@ -222,7 +242,8 @@ pub fn punchHole(fd: c_int, off: u64, len: u64) i32 {
 pub fn pwriteAll(fd: c_int, buf: []const u8, off: u64) isize {
     var put: usize = 0;
     while (put < buf.len) {
-        const n = c.pwrite(fd, buf[put..].ptr, buf.len - put, @intCast(off + put));
+        const pos = offT(off +| put) orelse return -c.EFBIG;
+        const n = c.pwrite(fd, buf[put..].ptr, buf.len - put, pos);
         if (n < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll; a
             // partial write must never be mistaken for a completed one.
@@ -236,7 +257,7 @@ pub fn pwriteAll(fd: c_int, buf: []const u8, off: u64) isize {
 }
 
 pub fn sendfileAll(out_fd: c_int, in_fd: c_int, off: u64, count: usize) isize {
-    var offset: c.off_t = @intCast(off);
+    var offset = offT(off) orelse return -c.EFBIG;
     var sent: usize = 0;
     while (sent < count) {
         const rc = std.c.sendfile(out_fd, in_fd, &offset, count - sent);
@@ -301,7 +322,8 @@ pub fn rename(old_path: [*:0]const u8, new_path: [*:0]const u8) i32 {
 }
 
 pub fn ftruncate(fd: c_int, size: u64) i32 {
-    if (c.ftruncate(fd, @intCast(size)) != 0) return negErrno();
+    const off = offT(size) orelse return -c.EFBIG;
+    if (c.ftruncate(fd, off) != 0) return negErrno();
     return 0;
 }
 
@@ -405,10 +427,8 @@ fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, e
     defer close(fd);
     var st: c.struct_stat = undefined;
     if (fstat(fd, &st) != 0) return error.StatFailed;
-    // st_size is signed; a negative value would panic the usize cast in
-    // safe builds instead of failing this one read.
-    if (st.st_size < 0) return error.StatFailed;
-    const size: usize = @intCast(st.st_size);
+    const n64 = sizeFromStat(st.st_size) orelse return error.StatFailed;
+    const size = std.math.cast(usize, n64) orelse return error.FileTooBig;
     if (size > max) return error.FileTooBig;
     const buf = try gpa.alloc(u8, size);
     errdefer gpa.free(buf);
@@ -578,6 +598,39 @@ pub fn scratchDir(buf: []u8, name: []const u8) ![]const u8 {
     const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSecRaw(), std.os.linux.getpid() });
     if (mkdirAll(p, 0o755) != 0) return error.MkdirFailed;
     return p;
+}
+
+test "sizeFromStat rejects a signed overflow" {
+    try std.testing.expectEqual(@as(?u64, 0), sizeFromStat(0));
+    try std.testing.expectEqual(@as(?u64, 1), sizeFromStat(1));
+    try std.testing.expectEqual(@as(?u64, @intCast(std.math.maxInt(c.off_t))), sizeFromStat(std.math.maxInt(c.off_t)));
+    // Concrete miss: NFS fattr 2^64-1 stored in off_t is -1. @intCast to
+    // u64 panics in safe builds and becomes maxInt(u64) in ReleaseFast,
+    // so piece.count would clamp to a 512 MiB bitfield for one file.
+    try std.testing.expect(sizeFromStat(-1) == null);
+    try std.testing.expect(sizeFromStat(std.math.minInt(c.off_t)) == null);
+}
+
+test "I/O wrappers refuse offsets that do not fit off_t" {
+    var path_buf: [128]u8 = undefined;
+    var z_buf: [128]u8 = undefined;
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/off-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const z = try toZ(&z_buf, p);
+    try std.testing.expectEqual(@as(i32, 0), writeFile(z, "x"));
+    defer _ = c.unlink(z);
+    const fd = open(z, c.O_RDWR, 0);
+    try std.testing.expect(fd >= 0);
+    defer close(fd);
+
+    const too_big: u64 = @as(u64, std.math.maxInt(c.off_t)) + 1;
+    var buf: [1]u8 = .{0};
+    try std.testing.expectEqual(@as(isize, -c.EFBIG), preadAll(fd, &buf, too_big));
+    try std.testing.expectEqual(@as(isize, -c.EFBIG), pwriteAll(fd, &buf, too_big));
+    try std.testing.expectEqual(@as(i32, -c.EFBIG), ftruncate(fd, too_big));
+    try std.testing.expectEqual(@as(i32, -c.EFBIG), punchHole(fd, too_big, 1));
+    try std.testing.expectEqual(@as(isize, -c.EFBIG), sendfileAll(fd, fd, too_big, 1));
+    // void path: must not panic on the same too-big offset.
+    fadviseDontneed(fd, too_big, 1);
 }
 
 test "joinZ" {

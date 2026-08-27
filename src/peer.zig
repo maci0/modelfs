@@ -424,7 +424,12 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
         replyStatus(self, fd, "404 Not Found");
         return;
     }
-    const file = self.store.get(rel, @intCast(st.st_size), sys.monoSec(self.io)) catch |err| {
+    const size = sys.sizeFromStat(st.st_size) orelse {
+        std.log.warn("origin size unusable for {s}; replying 502", .{rel});
+        replyStatus(self, fd, "502 Bad Gateway");
+        return;
+    };
+    const file = self.store.get(rel, size, sys.monoSec(self.io)) catch |err| {
         // The fetching peer only sees 500; without this line the serving
         // node's log says nothing about why.
         std.log.warn("cache entry open failed for {s} ({t}); replying 500", .{ rel, err });
@@ -680,7 +685,11 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
         replyStatus(self, fd, "404 Not Found");
         return;
     }
-    const size: u64 = @intCast(st.st_size);
+    const size = sys.sizeFromStat(st.st_size) orelse {
+        std.log.warn("origin size unusable for {s}; replying 502", .{rel});
+        replyStatus(self, fd, "502 Bad Gateway");
+        return;
+    };
     if (rg.start >= size or rg.end < rg.start) {
         // RFC 9110 §15.5.17/§14.4: a 416 should carry the selected
         // representation's complete length, so a client can recompute a

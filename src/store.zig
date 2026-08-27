@@ -1592,7 +1592,7 @@ pub const Store = struct {
         defer sys.close(fd);
         var st: c.struct_stat = undefined;
         if (sys.fstat(fd, &st) != 0) return false;
-        const size: u64 = @intCast(st.st_size);
+        const size = sys.sizeFromStat(st.st_size) orelse return false;
         // Builder-contract sample: if any artifact mutation (forget, reap
         // purge, another punch) lands between this and the critical section
         // below, the bits loaded here describe artifacts that no longer
