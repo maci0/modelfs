@@ -66,10 +66,10 @@ The blocking requirement is green CI: `./scripts/check.sh`, the
 `cross-aarch64` compile job, and the `reproducibility` job
 (`./scripts/ci.sh` runs all three). There are no
 sign-off or changelog-entry gates,
-but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) as their own
-dated section under `[Unreleased]` (everything outside a version heading is
-unreleased work toward the next one; see Cutting a release below), and
-changes to
+but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) as a dated
+`###` section under `[Unreleased]` (`## [version]` headings are releases;
+a sibling `## [Name] - date` reads as one; see Cutting a release below),
+and changes to
 [requirements-dev.txt](requirements-dev.txt) must be reflected in the
 hash-pinned lock (regeneration command in the lock's header).
 
@@ -83,9 +83,10 @@ sync:
 
 1. Bump `.version` in [build.zig.zon](build.zig.zon).
 2. Regroup [CHANGELOG.md](CHANGELOG.md): every entry under `[Unreleased]` is
-   unreleased work; move the sections this release covers under a heading
-   named after the new version and today's date, leaving `[Unreleased]`
-   empty at the top of the file.
+   unreleased work (dated `###` sections sit there so they are not read as
+   versions); move the sections this release covers under a heading named
+   after the new version and today's date, leaving `[Unreleased]` empty at
+   the top of the file.
 3. Tag `v<version>`, exactly matching the manifest (`v0.1.0` for
    `.version = "0.1.0"`), so a checkout can be matched to a version.
 4. Confirm the built binary answers with the declared version before

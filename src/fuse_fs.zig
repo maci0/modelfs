@@ -1346,7 +1346,7 @@ test "statusJson unlinks the staging file when rename fails" {
     defer st.catalog.deinit();
 
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const fp = try sys.joinZ(&pbuf, cache_d, status_file);
+    const fp = try st.store.cacheStatusPath(&pbuf);
     // Destination is a directory: rename(status.json.tmp, status.json) fails
     // and must not leave the staging file (a retry every tick would refresh
     // mtime with no sweeper to age it out).

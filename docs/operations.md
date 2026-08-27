@@ -130,6 +130,8 @@ Mount stuck: `umount -l` the mountpoint. `timeout 5 bash -c "echo >/dev/tcp/192.
 
 On sparks those paths are the FUSE `/models` (bytes from NVMe/peers/NFS). On the desktop they are the NFS mount.
 
+Hub cache snapshot trees are symlink farms into `blobs/`. The mount does not follow a symlink at a model path (`O_NOFOLLOW` on `originPread` / `originPwrite` in src/store.zig), so engines on a spark must open regular files: `hf download ... --local-dir` (below) or llama.cpp's `LLAMA_CACHE`, not a snapshot path under `HF_HUB_CACHE`. Desktop NFS still follows links in the kernel.
+
 Token stays in `$HOME`. Triton / inductor / CUDA / vLLM compile caches stay local.
 
 `/etc/profile.d/models-hf.sh` (systemd needs the same `Environment=`):

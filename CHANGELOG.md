@@ -1,10 +1,42 @@
 # Changelog
 
 ## [Unreleased]
+
+Work since `v0.1.0`. A binary built from this tree still prints `0.1.0`
+until the next tag is cut (CONTRIBUTING.md, Cutting a release); pin a
+commit hash if you are not on the tag.
+
 - **Unicode line/paragraph separators no longer pass the path and echo gates**: `relOk` and `discover.printable` already refused C0/DEL and UTF-8 C1 so a planted name could not inject into the journal or a terminal, but U+2028/U+2029 (the remaining Unicode line terminators) still passed. A peer path `gguf/a\u2028ERROR.bin` or a lease id `spark1\u2028ERROR forged` would split a log line or `modelfs peers` listing. Both gates now refuse those sequences; incomplete encodings stay legal display noise, matching a trailing 0xC2.
+- **`--kernel-cache` actually enables the kernel page cache**: `mf_init`
+  hardcoded `kernel_cache = 0`, so the flag only flipped `direct_io` off
+  (mmap could succeed) while the page cache stayed disabled. It now
+  mirrors `direct_io`, which is the UMA-RAM tradeoff the flag documents.
+- **`modelfs status` no longer treats a leftover `status.json` as live**: a
+  document naming an exited pid, or whose `now_s` is more than 120 s old,
+  now exits 1 instead of printing the stale artifact. `now_s` is optional
+  so a leftover from `v0.1.0` still parses; without it only the pid check
+  runs. Saturation at the 16-handler cap is visible as `http_dropped` /
+  `httpdrop` on the tick line and in the document.
+- **Origin and cache opens do not follow a planted symlink**:
+  `originPread` / `originPwrite` and cache data opens use `O_NOFOLLOW`,
+  so a symlink at a model path fails closed (`ELOOP`) instead of serving
+  the link's target. Weight files on the origin must be regular files: a
+  Hugging Face hub-cache snapshot tree (symlinks into `blobs/`) will not
+  serve through the mount; `hf download --local-dir` (the llama.cpp
+  example in operations.md) writes regular files.
+- **A path too long to name under the origin answers 400, not 502**:
+  `replyOriginStat` treated `ENAMETOOLONG` as an origin failure, which
+  fed `http_5xx` and sent peers retrying every node for a request that
+  can never succeed.
+- **The test binary compiles again**: the status.json rename-failure test
+  called `status_file`, which is not in scope in `fuse_fs.zig`, and the
+  cold-sidecar wipe test called `sys.monoSec()` without the `std.Io` the
+  function takes. `zig build test` failed to compile. The former uses
+  `Store.cacheStatusPath` like the sibling liveness test; the latter
+  passes `std.testing.io`.
 - **A stale cache sidecar no longer survives a cold size change**: `Store.get` on a miss used to load an empty field when the on-disk sidecar's piece or file size did not match, but left that sidecar on disk. After a restart, a file restored to the previous length decoded the old marks and could serve pre-truncate bytes (or hole zeros) as current. The miss path now persists the wipe the live-entry path already did. `create` (`O_TRUNC`) and `truncate` with no live entry also `distrust` the path, matching the identity drop unlink and rename already perform.
 - **A local write is no longer clobbered by a racing peer fill**: `copyIntoCache` and `completeFill` now serialize on the cache fd, and a fill claimed before the write is dropped if the entry's write generation moved. Miss hydrations on a node that has written the path go to the origin rather than peers, so a subsequent miss cannot resurrect pre-write peer bytes as the writer's own read.
-- **Peer `/data` fetches require `Content-Range` to match the request**: the 206 body was accepted on `Content-Length` alone, so a same-sized window at a different offset (or a 200 of the file prefix) would be marked filled. The client now requires a 206 whose `Content-Range` start is the requested start and whose end is at most the requested end (EOF clamp).
+- **Peer `/data` fetches require `Content-Range` to match the request**: the 206 body was accepted on `Content-Length` alone, so a same-sized window at a different offset (or a 200 of the file prefix) would be marked filled. The client now requires a 206 whose `Content-Range` start is the requested start and whose end is at most the requested end (EOF clamp). `v0.1.0` servers already send that header on every 206, so a mixed fleet still fills; replies that omit it or advertise a different window are what fail.
 - **The aarch64 cross-compile recipe lives in one script**: CI's `cross-aarch64` job and `scripts/ci.sh` each inlined `zig build -Dtarget=aarch64-linux-gnu.2.39 -Doptimize=ReleaseFast` plus the vendored fuse paths and an ELF-machine check (`grep -q` in CI, a named `file` case in ci.sh). They now both run `scripts/cross_aarch64.sh`, so a flag edit cannot pass CI while failing a local pre-push (or the reverse). README, docs/architecture.md, and the vendored fuse README call the same script.
 - **NAS firewall no longer opens NFS to the world**: operations.md's `--add-service={nfs,rpc-bind,mountd}` allowed those services from every source in the default zone, so the LAN rich rule was a no-op despite the comment claiming it limited NFS to `192.168.0.0/24`. Only the source-filtered rich rules remain.
 - **CI runners match the spark OS, and apt flakes retry**: jobs pin `ubuntu-24.04` instead of `ubuntu-latest`, checkout does not persist credentials into `.git/config`, and the libfuse3-dev install retries three times. `minimum_zig_version` remains the toolchain CI installs; CONTRIBUTING no longer claims a parallel 0.16.0 pin.
@@ -28,16 +60,16 @@
 - **Sidecar saves encode onto the stack**: `Bitfield.encodeTo` writes the on-disk blob into a caller buffer, and `Store.saveBits` uses a 16 KiB stack slot (heap only past a 2 TiB file at the default piece size) instead of heap-allocating a copy of bits the entry already holds, once per hydrated piece.
 - **Warm FUSE reads skip per-piece lock traffic**: `mf_read` checks covered bits under the size-sample lock via `Store.rangeFilled`, so a fully-cached range does not bounce `file.mu` again in `ensureRange`/`hasPiece`.
 
-## [Restore drill clones off the live export] - 2026-08-27
+### Restore drill clones off the live export - 2026-08-27
 - **The monthly restore drill no longer checksums the live export against itself.** `zfs clone` of `tank/models` inherits `mountpoint=/export/models`, so the drill's clone and the production tree were the same path: a green log line proved `diff` and `sha256sum` of a directory with itself, not a restore. The clone now always gets a distinct mountpoint (sibling `modelfs-drill`, overridable with `MF_DRILL_CLONE_MP`), and a collision with the live tree fails the drill. Restore procedure B in recovery.md had the same trap (`/tank/recover` is not where a clone of `/export/models` lands) and now uses `-o mountpoint=` plus the newest snapshot by creation time, and it stops engines before the copy.
 - **A snapshot of only `.cluster` leases no longer counts as a restore.** File count, sample checksum, and the clone-vs-live diff skip `.cluster` and `.zfs`, so the drill has to read a real weight file. Sample pick walks largest-first as the comment already claimed.
 - **The drill has a CI-runnable test, and an optional replica gate.** `scripts/test_dr_restore_drill.sh` drives it through a stub `zfs` with fixture trees (success with drift, empty, lease-only, stale, hash mismatch, size-changed skip, mountpoint collision, replica missing/fresh/stale) and `scripts/check.sh` runs it. `MF_DRILL_REPLICA` fails the drill when the pool-loss copy is missing or stale; without it the log line records `replica=unchecked` so an unproven replica is visible.
 
-## [Config pass] - 2026-08-26
+### Config pass - 2026-08-26
 - **Harness and drill environment knobs no longer squat on the daemon's `MODELFS_` namespace**: `test_fault_tolerance.sh` read `MODELFS_TEST_HOST`/`MODELFS_TEST_PORT` and `dr_restore_drill.sh` read `MODELFS_DRILL_LOG/LIVE/KEEP`, but every `modelfs` invocation refuses any unknown `MODELFS_*` variable as a typo'd knob — so exporting one of these settings (the natural way to keep it for a session) made every command in that shell exit 2 with "unknown environment variable". They are renamed to `MF_TEST_*` and `MF_DRILL_*`; recovery.md's drill section matches.
 - **The log level is runtime configuration, not a compile-time constant**: verbosity was fixed at info inside `main.zig`, so quieting a cron'd `status` loop or debugging a misbehaving mount meant a rebuild. `MODELFS_LOG` (`err`, `warn`, `info` default, `debug`) moves the ceiling for every command; values outside that set are refused at startup like any other malformed knob, and an empty value counts as unset. Documented in `modelfs help`, README, docs/architecture.md, and docs/THREAT_MODEL.md.
 
-## [Restore drill staleness alarm] - 2026-08-26
+### Restore drill staleness alarm - 2026-08-26
 - **A dead autosnap schedule no longer passes the restore drill.** The drill
   only failed when a dataset had no snapshots at all, so sanoid dying after a
   green drill left the newest restore point aging silently past the RPO table's
@@ -48,11 +80,11 @@
   in the log line as `snap_age_s`, making the recovery doc's RPO column a
   measured number instead of an assumption.
 
-## [Build review pass 2] - 2026-08-26
+### Build review pass 2 - 2026-08-26
 - **A 4 MB core dump of the test binary is out of the tree**: `vgcore.3049480`, an ELF core from a crashed `modelfs-test` run, was committed by accident and shipped inside the repo forever after. Deleted, and `.gitignore` now rejects crash dumps (`vgcore.*`, `core`, `core.*`) so the next failed test run cannot be committed either.
 - **Reproducible release builds are now enforced, not just claimed**: CONTRIBUTING promised byte-identical ReleaseFast binaries across path/host/locale/timezone and asked for a manual double-build check that nobody had to run. The new `scripts/repro_check.sh` does it mechanically (two cold builds of the tracked sources from differently named trees, second one under `TZ=Asia/Tokyo`, `LC_ALL=C.UTF-8`, fixed `SOURCE_DATE_EPOCH`; each with its own Zig cache; fails with a diffoscope pointer if the bytes differ), CI runs it as a blocking `reproducibility` job on every PR, and README/CONTRIBUTING point at the script instead of prose instructions.
 
-## [CLI review pass 3] - 2026-08-26
+### CLI review pass 3 - 2026-08-26
 - **A regular file at `--origin` is refused instead of silently misbehaving**: both `mount` and `peers` gated only on reachability, which a file satisfies, so the mount proceeded past the origin check (mountpoint and cache layout created, peer port bound) while every lookup died ENOTDIR behind the NFS fallback, and `peers` reported a healthy empty cluster for a path that can never hold `.cluster` leases. Both commands now require the origin to be an existing directory right after the realpath gate (named message, exit 1, nothing created), matching the documented contract ("any POSIX dir"); `modelfs help` says "Existing".
 
 ## [0.1.0] - 2026-08-26

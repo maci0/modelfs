@@ -40,7 +40,7 @@ A read that misses blocks until that one piece is filled from a single source. T
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
 
-Releases: `v0.1.0` is the first tag ([CHANGELOG.md](CHANGELOG.md)). Security issues go through private vulnerability reporting: [SECURITY.md](SECURITY.md).
+Releases: `v0.1.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since then is under `[Unreleased]` and a build from this tree still prints `0.1.0` until the next tag. Security issues go through private vulnerability reporting: [SECURITY.md](SECURITY.md).
 
 ---
 
