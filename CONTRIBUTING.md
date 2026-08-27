@@ -6,24 +6,32 @@ what passes locally is what passes on push.
 
 ## Setup, once per clone
 
-Requirements: Linux, **Zig 0.16.0 or newer** (`minimum_zig_version` in
+Requirements: Linux, **Zig 0.16.0 or newer** from
+https://ziglang.org/download/ (`minimum_zig_version` in
 [build.zig.zon](build.zig.zon) is the floor and the version CI installs;
 setup-zig reads that field so a bump updates every job), libfuse3 headers
-(`libfuse3-dev` / `fuse3-devel`), shellcheck, and **uv**. Python tooling is
-pinned and type-checked against 3.12 ([.python-version](.python-version);
-CI reads that file into setup-uv, so a bump updates the check job). uv
-itself is `[tool.uv] required-version` in [pyproject.toml](pyproject.toml)
-(the field setup-uv installs from). Install the lock with uv:
+(`libfuse3-dev` / `fuse3-devel`), shellcheck (`shellcheck` / `ShellCheck`
+from the package manager), and **uv** (https://docs.astral.sh/uv/).
+Python tooling is pinned and type-checked against 3.12
+([.python-version](.python-version); CI reads that file into setup-uv, so
+a bump updates the check job). uv itself is `[tool.uv] required-version`
+in [pyproject.toml](pyproject.toml) (the field setup-uv installs from).
+The 9-node cluster suite also needs the FUSE helper (`fuse3` / `fuse`,
+providing `/dev/fuse` and `fusermount3`). Install the lock with uv:
 
 ```bash
 uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
 ```
 
+`.python-version` selects 3.12; if uv cannot find an interpreter, run
+`uv python install 3.12` first.
+
 `scripts/check.sh` requires `.venv` and puts it on PATH, so you never
 need to activate it. If `zig build` stops with "libfuse3 headers not found",
 install the package it names (or point `-Dfuse-include=<dir>` at a
 non-default location). `./scripts/check.sh --help` lists the contributor
-commands. `zig build --help` lists the `check`/`ci`/`fmt`/`test` steps.
+commands; each listed script answers `--help` instead of starting work.
+`zig build --help` lists the `check`/`ci`/`fmt`/`test` steps.
 
 ## The one command that matters
 
@@ -59,7 +67,7 @@ whole import graph, so `-Dtest-filter=store` would miss most of `store.zig`.
 
 ```bash
 ./scripts/run_e2e_tests.sh             # CLI and peer protocol; no FUSE mount needed
-./scripts/run_cluster_e2e_9nodes.sh    # mounts 9 FUSE filesystems: needs /dev/fuse and fusermount3
+./scripts/run_cluster_e2e_9nodes.sh    # mounts 9 FUSE filesystems: needs /dev/fuse and fusermount3 (fuse3 / fuse)
 ./scripts/test_fault_tolerance.sh      # peer loss and lease expiry; some checks skip loudly without a live peer
 ./scripts/test_dr_restore_drill.sh     # restore drill against stub zfs; also run by check.sh
 ```

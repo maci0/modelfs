@@ -10,12 +10,21 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+usage_no_args "$@" <<'EOF'
+Usage: ./scripts/repro_check.sh
+
+Two ReleaseFast builds from differently named trees (TZ/locale varied);
+fails unless the binaries are byte-identical. Same recipe as CI's
+reproducibility job. See CONTRIBUTING.md (Cutting a release).
+EOF
+
 fail() {
     echo "FAIL: $1" >&2
     exit 1
 }
 
-for tool in git zig sha256sum; do
+require_zig
+for tool in git sha256sum; do
     command -v "${tool}" >/dev/null 2>&1 || fail "${tool} not found on PATH"
 done
 

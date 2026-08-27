@@ -37,6 +37,33 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # MF_DRILL_LOG, MF_DRILL_LIVE, MF_DRILL_CLONE_MP, MF_DRILL_KEEP,
 # MF_DRILL_MAX_SNAP_AGE, MF_DRILL_REPLICA (dr_restore_drill.sh).
 
+# Named preflight for scripts that invoke `zig build`: a missing toolchain
+# otherwise dies as bash "command not found" with no pointer at setup.
+require_zig() {
+    if command -v zig >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "cannot run: zig not found on PATH -- see CONTRIBUTING.md (setup section)" >&2
+    exit 1
+}
+
+# Usage text is read from stdin so each script keeps its own --help body.
+# -h/--help prints it on stdout and exits 0; any other argument prints it
+# on stderr and exits 2, so `./scripts/foo.sh --help` cannot start a build,
+# a FUSE mount, or a test run.
+usage_no_args() {
+    local text
+    text="$(cat)" || exit 1
+    if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+        printf '%s\n' "${text}"
+        exit 0
+    fi
+    if [[ $# -gt 0 ]]; then
+        printf '%s\n' "${text}" >&2
+        exit 2
+    fi
+}
+
 # FUSE-mounting harnesses call this before spawning daemons so a missing
 # /dev/fuse or helper fails with a named install hint instead of nine
 # "fusermount: mount failed" lines after the cluster is already half up.

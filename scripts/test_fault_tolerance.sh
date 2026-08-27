@@ -4,9 +4,18 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+usage_no_args "$@" <<'EOF'
+Usage: ./scripts/test_fault_tolerance.sh
+
+Peer-auth rejection and expired-lease listing. The auth check skips
+loudly unless a peer is listening (MF_TEST_HOST / MF_TEST_PORT, default
+127.0.0.1:19081). See CONTRIBUTING.md.
+EOF
+
 echo "=== Fault tolerance tests ==="
 
 cd "${ROOT_DIR}"
+require_zig
 zig build
 
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"

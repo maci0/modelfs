@@ -9,23 +9,15 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "${ROOT_DIR}"
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    cat <<'EOF'
+usage_no_args "$@" <<'EOF'
 Usage: ./scripts/ci.sh
 
 Run every CI job locally (check, aarch64 cross-compile, reproducibility).
 See CONTRIBUTING.md and `zig build --help` for the rest of the contributor
 commands. Daily loop is ./scripts/check.sh; this is the pre-push full gate.
 EOF
-    exit 0
-fi
 
-fail() {
-    echo "FAIL: $1" >&2
-    exit 1
-}
-
-command -v zig >/dev/null 2>&1 || fail "zig not found on PATH -- see CONTRIBUTING.md (setup section)"
+require_zig
 
 echo "=== CI job: check ==="
 "${SCRIPTS_DIR}/check.sh"

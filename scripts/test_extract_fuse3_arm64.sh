@@ -13,14 +13,11 @@ fail() {
     exit 1
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    cat <<'EOF'
+usage_no_args "$@" <<'EOF'
 Usage: ./scripts/test_extract_fuse3_arm64.sh
 
 Hermeticity checks for the vendored arm64 libfuse3 extractor.
 EOF
-    exit 0
-fi
 
 OUT="${SCRATCH_DIR}/extract-fuse3-test"
 rm -rf "${OUT}"

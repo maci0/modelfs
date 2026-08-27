@@ -38,7 +38,7 @@ if [[ $# -gt 0 ]]; then
 fi
 
 command -v file >/dev/null 2>&1 || fail "file not found on PATH (used to assert the aarch64 ELF machine type)"
-command -v zig >/dev/null 2>&1 || fail "zig not found on PATH -- see CONTRIBUTING.md (setup section)"
+require_zig
 
 "${SCRIPTS_DIR}/extract_fuse3_arm64.sh"
 FUSE_INC="${SCRATCH_DIR}/fuse3-arm64/root/usr/include/fuse3"

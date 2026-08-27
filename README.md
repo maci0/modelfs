@@ -105,6 +105,9 @@ The piece-size sweep is why the default piece is 16 MiB: past it the gain is sma
 
 ## Tests
 
+The blocking gate and clone setup (Zig, libfuse3 headers, shellcheck, uv):
+[CONTRIBUTING.md](CONTRIBUTING.md). `./scripts/check.sh --help` lists the rest.
+
 ```bash
 zig build test -Dtest-filter=relOk        # only tests whose names contain this substring
 zig build test --watch                    # rebuild and re-run on change
@@ -156,6 +159,11 @@ Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); instal
 * [docs/benchmarks.md](docs/benchmarks.md): numbers, with the caveats that qualify them.
 * [docs/audits.md](docs/audits.md): review findings and their fixes; [docs/review-guides/](docs/review-guides/) holds the checklists they came from.
 * [docs/design.md](docs/design.md): the original sketch, kept for history. It marks what never shipped.
+
+## Contributing
+
+Setup, the `./scripts/check.sh` gate (the same command CI runs), the
+edit-test loop, and PR expectations: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

@@ -8,8 +8,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "${ROOT_DIR}"
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    cat <<'EOF'
+usage_no_args "$@" <<'EOF'
 Usage: ./scripts/check.sh
 
 The blocking static gate: zig fmt, changelog headings versus
@@ -18,7 +17,8 @@ libfuse3 digests and extract, shellcheck, ruff, mypy, sbom. Same
 command the CI `check` job runs. Requires the pinned .venv from
 setup.
 
-Contributor commands (also listed by `zig build --help`):
+Contributor commands (also listed by `zig build --help`; each script
+answers --help):
   zig build                                 build the binary
   zig build fmt                             apply zig fmt
   zig build test                            unit tests
@@ -35,8 +35,6 @@ Contributor commands (also listed by `zig build --help`):
 
 Setup, once per clone: see CONTRIBUTING.md.
 EOF
-    exit 0
-fi
 
 fail() {
     echo "FAIL: $1" >&2
@@ -81,6 +79,12 @@ if ! awk -v cur="${zig_ver}" -v min="${min_zig}" 'BEGIN {
 }'; then
     fail "zig ${zig_ver} is older than minimum_zig_version ${min_zig} in build.zig.zon"
 fi
+
+# Instant, and must run before any suite: a missing --help handler used to
+# start e2e / FUSE / ReleaseFast work. timeout is the safety net if a handler
+# regresses (the test also rejects output that is not usage).
+echo "=== script --help ==="
+"${SCRIPTS_DIR}/test_scripts_help.sh" || fail "contributor script --help handlers failed"
 
 echo "=== zig fmt --check ==="
 zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported unformatted files; fix with: zig build fmt"

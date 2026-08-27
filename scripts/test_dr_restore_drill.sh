@@ -8,6 +8,13 @@ set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+usage_no_args "$@" <<'EOF'
+Usage: ./scripts/test_dr_restore_drill.sh
+
+Restore-drill regressions against a stub zfs(8). Also run by check.sh.
+EOF
+
 mkdir -p "${SCRATCH_DIR}"
 
 FAILS=0

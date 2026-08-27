@@ -4,8 +4,15 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+usage_no_args "$@" <<'EOF'
+Usage: ./scripts/run_e2e_tests.sh
+
+CLI and peer protocol end to end; no FUSE mount needed.
+EOF
+
 echo "=== Building modelfs binary ==="
 cd "${ROOT_DIR}"
+require_zig
 zig build
 
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"

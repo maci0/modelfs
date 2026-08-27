@@ -4,10 +4,18 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+usage_no_args "$@" <<'EOF'
+Usage: ./scripts/run_cluster_e2e_9nodes.sh
+
+Nine FUSE-mounted instances exchanging pieces. Needs /dev/fuse and
+fusermount3 (fuse3 / fuse package). See CONTRIBUTING.md.
+EOF
+
 echo "=== 9-node cluster piece-exchange ==="
 
 cd "${ROOT_DIR}"
 require_fuse
+require_zig
 zig build
 
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"
