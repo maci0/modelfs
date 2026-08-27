@@ -72,6 +72,8 @@ a PIE with full RELRO, BIND_NOW, and a non-executable stack.
 ./scripts/run_cluster_e2e_9nodes.sh    # mounts 9 FUSE filesystems: needs /dev/fuse and fusermount3 (fuse3 / fuse)
 ./scripts/test_fault_tolerance.sh      # peer loss and lease expiry; some checks skip loudly without a live peer
 ./scripts/test_dr_restore_drill.sh     # restore drill against stub zfs; also run by check.sh
+./scripts/check_drill_log.sh           # fail if the monthly drill log is missing or stale
+./scripts/install_nas_backup.sh        # copy NAS snapshot/replica/drill units (dry-run; --install writes)
 ```
 
 ## PR expectations

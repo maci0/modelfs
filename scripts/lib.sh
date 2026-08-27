@@ -35,7 +35,9 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # scripts die with "unknown environment variable" before its command ever
 # ran. Current members: MF_TEST_HOST, MF_TEST_PORT (test_fault_tolerance.sh),
 # MF_DRILL_LOG, MF_DRILL_LIVE, MF_DRILL_CLONE_MP, MF_DRILL_KEEP,
-# MF_DRILL_MAX_SNAP_AGE, MF_DRILL_REPLICA (dr_restore_drill.sh).
+# MF_DRILL_MAX_SNAP_AGE, MF_DRILL_MAX_REPLICA_AGE, MF_DRILL_REPLICA,
+# MF_DRILL_SCRATCH (dr_restore_drill.sh), MF_DRILL_LOG_MAX_AGE
+# (check_drill_log.sh), MF_NAS_DEST (install_nas_backup.sh).
 
 # Named preflight for scripts that invoke `zig build`: a missing toolchain
 # otherwise dies as bash "command not found" with no pointer at setup.

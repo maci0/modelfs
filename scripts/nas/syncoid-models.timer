@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily pull of tank/models onto this replica host
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

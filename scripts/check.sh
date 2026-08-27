@@ -31,6 +31,8 @@ answers --help):
   ./scripts/run_cluster_e2e_9nodes.sh       9 FUSE mounts (/dev/fuse + fusermount3)
   ./scripts/test_fault_tolerance.sh         peer loss and lease expiry
   ./scripts/test_dr_restore_drill.sh        restore drill against stub zfs (also in this script)
+  ./scripts/check_drill_log.sh              alarm if the monthly drill log is stale
+  ./scripts/install_nas_backup.sh           copy NAS snapshot/replica/drill units (dry-run by default)
   ./scripts/repro_check.sh                  two ReleaseFast builds, compare bytes
 
 Setup, once per clone: see CONTRIBUTING.md.

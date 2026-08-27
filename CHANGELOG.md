@@ -6,6 +6,12 @@ Work since `v0.1.0`. A binary built from this tree still prints `0.1.0`
 until the next tag is cut (CONTRIBUTING.md, Cutting a release); pin a
 commit hash if you are not on the tag.
 
+### NAS backup units and drill-log alarm - 2026-08-27
+- **Pool-loss restore no longer points at a stream file this repo never writes.** Procedure C said `zfs recv -Fs tank/models < latest.zfsstream` while section 3's backup is a syncoid replica; following the runbook after a dead NAS dead-ended. It now pulls with `syncoid --force-delete` from the replica host (or `zfs send -R | zfs recv -Fs` from a locally imported replica) and sets the export properties after the dataset exists.
+- **Backup and drill schedules are files, not paste-blocks.** `scripts/nas/` holds `sanoid.conf`, the replica **pull** timer (runs on the replica host so NAS root cannot destroy both copies), monthly drill and daily drill-log timers, and `OnFailure=` drop-ins on the **services** (a drop-in on `sanoid.timer` stayed green while `sanoid.service` failed to snapshot). `scripts/install_nas_backup.sh` copies them (dry-run by default; `--install` writes; `MF_NAS_DEST` prefixes the tree). `notify-admin@.service` logs a syslog line until a site mailer replaces it. The replica unit `zfs hold`s monthly snapshots.
+- **A missed monthly drill is a daily alarm.** "Alert when the log ages past 35 days" was prose. `scripts/check_drill_log.sh` fails on a missing, empty, unparseable, future, or too-old log stamp; `modelfs-drill-log.timer` runs it. The drill now fails before clone if the artifact log is unwritable, uses `MF_DRILL_MAX_REPLICA_AGE` (default 36 h) so a daily syncoid is not a 25 h false alarm, and runs from `/usr/local/sbin` without the repo (scratch falls back to `/var/tmp/modelfs-drill`).
+- **operations.md's NAS setup now requires the recovery timers.** Scrub and smartd were the only scheduled NAS jobs in the ops runbook, so a reader who never opened recovery.md brought up an origin with no snapshot.
+
 ### Upgrade from v0.1.0
 
 CLI, peer-wire, and on-disk changes that will surprise a node still

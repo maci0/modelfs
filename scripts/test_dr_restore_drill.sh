@@ -487,6 +487,141 @@ expect_fail "mounted leftover clone is refused" "already exists and is mounted" 
     "${LIVE12}" "${LOG12}"
 rm -f "${STUB_STATE}/clone"
 
+# --- 13. unwritable artifact log fails before clone
+LIVE13="${TEMP}/live13"
+SNAP13="${TEMP}/snap13"
+mkdir -p "${LIVE13}/gguf" "${SNAP13}/gguf"
+echo weight >"${SNAP13}/gguf/m.gguf"
+cp -a "${SNAP13}/gguf/m.gguf" "${LIVE13}/gguf/m.gguf"
+LOG13="${TEMP}/readonly.log"
+touch "${LOG13}"
+chmod a-w "${LOG13}"
+write_env tank/models "${LIVE13}" tank/models@ok "${FRESH}" "${SNAP13}"
+expect_fail "unwritable log is an alarm" "cannot write the drill log" \
+    "${LIVE13}" "${LOG13}"
+chmod u+w "${LOG13}"
+
+# --- 14. replica inside daily slack (26 h) is not an alarm
+LIVE14="${TEMP}/live14"
+SNAP14="${TEMP}/snap14"
+mkdir -p "${LIVE14}/gguf" "${SNAP14}/gguf"
+echo weight >"${SNAP14}/gguf/m.gguf"
+cp -a "${SNAP14}/gguf/m.gguf" "${LIVE14}/gguf/m.gguf"
+LOG14="${TEMP}/drill14.log"
+REPLICA_26H=$((NOW - 93600))
+write_env tank/models "${LIVE14}" tank/models@ok "${FRESH}" "${SNAP14}" \
+    tank/models-backup tank/models-backup@ok "${REPLICA_26H}"
+expect_ok "replica 26h old is inside the daily slack" "${LIVE14}" "${LOG14}" \
+    MF_DRILL_REPLICA="tank/models-backup"
+
+# --- check_drill_log.sh: the daily alarm for a missed monthly drill
+CHECK_LOG="${SCRIPTS_DIR}/check_drill_log.sh"
+expect_check() {
+    local name="$1"
+    local want_rc="$2"
+    local needle="$3"
+    shift 3
+    local out rc
+    rc=0
+    out="$(env "$@" "${CHECK_LOG}" 2>&1)" || rc=$?
+    if [[ "${rc}" -ne "${want_rc}" ]]; then
+        fail "${name}: expected rc=${want_rc}, got ${rc}: ${out}"
+        return 0
+    fi
+    if ! grep -q "${needle}" <<<"${out}"; then
+        fail "${name}: expected '${needle}' in: ${out}"
+        return 0
+    fi
+    pass "${name}"
+}
+
+expect_check "missing drill log is an alarm" 1 "is missing" \
+    MF_DRILL_LOG="${TEMP}/no-such-drill.log"
+
+: >"${TEMP}/empty-drill.log"
+expect_check "empty drill log is an alarm" 1 "is empty" \
+    MF_DRILL_LOG="${TEMP}/empty-drill.log"
+
+echo "not-a-stamp tank/models@x ok" >"${TEMP}/bad-stamp.log"
+expect_check "non-UTC stamp is an alarm" 1 "not a UTC stamp" \
+    MF_DRILL_LOG="${TEMP}/bad-stamp.log"
+
+FUTURE_STAMP="$(date -u -d "+2 hours" +%Y-%m-%dT%H:%M:%SZ)"
+echo "${FUTURE_STAMP} tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+    >"${TEMP}/future-drill.log"
+expect_check "future drill log stamp is an alarm" 1 "in the future" \
+    MF_DRILL_LOG="${TEMP}/future-drill.log"
+
+STALE_STAMP="$(date -u -d "-40 days" +%Y-%m-%dT%H:%M:%SZ)"
+echo "${STALE_STAMP} tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+    >"${TEMP}/stale-drill.log"
+expect_check "stale drill log is an alarm" 1 "has not succeeded recently" \
+    MF_DRILL_LOG="${TEMP}/stale-drill.log"
+
+FRESH_STAMP="$(date -u -d "-1 hour" +%Y-%m-%dT%H:%M:%SZ)"
+echo "${FRESH_STAMP} tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+    >"${TEMP}/fresh-drill.log"
+expect_check "fresh drill log is ok" 0 "drill-log OK" \
+    MF_DRILL_LOG="${TEMP}/fresh-drill.log"
+
+expect_check "bad MF_DRILL_LOG_MAX_AGE is an alarm" 1 "whole number of seconds" \
+    MF_DRILL_LOG="${TEMP}/fresh-drill.log" MF_DRILL_LOG_MAX_AGE="30d"
+
+# --- install_nas_backup.sh: dry-run writes nothing; --install lands files under dest
+INSTALLER="${SCRIPTS_DIR}/install_nas_backup.sh"
+DRY_OUT=""
+DRY_RC=0
+DRY_OUT="$("${INSTALLER}" 2>&1)" || DRY_RC=$?
+if [[ "${DRY_RC}" -ne 0 ]]; then
+    fail "installer dry-run: expected success, rc=${DRY_RC}: ${DRY_OUT}"
+elif ! grep -q "would copy" <<<"${DRY_OUT}"; then
+    fail "installer dry-run missing 'would copy': ${DRY_OUT}"
+elif ! grep -q "etc/sanoid/sanoid.conf" <<<"${DRY_OUT}"; then
+    fail "installer dry-run missing sanoid.conf: ${DRY_OUT}"
+else
+    pass "installer dry-run lists the NAS units"
+fi
+
+INSTALL_DEST="${TEMP}/nas-root"
+INSTALL_OUT=""
+INSTALL_RC=0
+INSTALL_OUT="$(MF_NAS_DEST="${INSTALL_DEST}" "${INSTALLER}" --install 2>&1)" || INSTALL_RC=$?
+if [[ "${INSTALL_RC}" -ne 0 ]]; then
+    fail "installer --install: expected success, rc=${INSTALL_RC}: ${INSTALL_OUT}"
+else
+    missing=""
+    for rel in \
+        etc/sanoid/sanoid.conf \
+        etc/systemd/system/notify-admin@.service \
+        etc/systemd/system/sanoid.service.d/fail.conf \
+        etc/systemd/system/sanoid-prune.service.d/fail.conf \
+        etc/systemd/system/syncoid-models.service \
+        etc/systemd/system/syncoid-models.timer \
+        etc/systemd/system/modelfs-drill.service \
+        etc/systemd/system/modelfs-drill.timer \
+        etc/systemd/system/modelfs-drill-log.service \
+        etc/systemd/system/modelfs-drill-log.timer \
+        usr/local/sbin/modelfs-restore-drill \
+        usr/local/sbin/modelfs-check-drill-log \
+        usr/local/share/doc/modelfs/recovery.md; do
+        if [[ ! -f "${INSTALL_DEST}/${rel}" ]]; then
+            missing="${missing} ${rel}"
+        fi
+    done
+    if [[ -n "${missing}" ]]; then
+        fail "installer --install missing:${missing}"
+    elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-restore-drill" ]]; then
+        fail "installer --install drill wrapper is not executable"
+    elif ! grep -q "OnFailure=notify-admin@%n.service" \
+        "${INSTALL_DEST}/etc/systemd/system/sanoid.service.d/fail.conf"; then
+        fail "installer --install sanoid drop-in lost OnFailure"
+    elif grep -q "OnFailure" "${INSTALL_DEST}/etc/systemd/system/modelfs-drill.timer"; then
+        fail "installer --install put OnFailure on the drill timer (belongs on the service)"
+    else
+        pass "installer --install lands units, wrappers, and the service OnFailure"
+    fi
+fi
+
 if [[ "${FAILS}" -ne 0 ]]; then
     echo "FAIL: ${FAILS} restore-drill stub test(s) failed" >&2
     exit 1

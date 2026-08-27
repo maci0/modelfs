@@ -1,0 +1,9 @@
+[Unit]
+Description=Alarm if the ModelFS restore-drill log is missing or stale
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+OnFailure=notify-admin@%n.service
+
+[Service]
+Type=oneshot
+Environment=MF_DRILL_LOG=/var/log/modelfs-drill.log
+ExecStart=/usr/local/sbin/modelfs-check-drill-log

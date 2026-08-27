@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily check that the ModelFS restore drill has run
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

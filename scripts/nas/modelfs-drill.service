@@ -1,0 +1,14 @@
+[Unit]
+Description=Monthly ModelFS restore drill for tank/models
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+OnFailure=notify-admin@%n.service
+
+[Service]
+Type=oneshot
+Environment=MF_DRILL_SCRATCH=/var/tmp/modelfs-drill
+Environment=MF_DRILL_LOG=/var/log/modelfs-drill.log
+# Set MF_DRILL_REPLICA to the local replica dataset when this host holds
+# the pool-loss copy; leave unset on the NAS (the log then records
+# replica=unchecked and the replica host runs this same unit).
+# Environment=MF_DRILL_REPLICA=tank/models
+ExecStart=/usr/local/sbin/modelfs-restore-drill tank/models

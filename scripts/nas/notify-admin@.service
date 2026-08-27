@@ -1,0 +1,13 @@
+[Unit]
+Description=Record that %i failed (backup, replica, or restore drill)
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+
+# Instantiated as notify-admin@<failed-unit>.service via OnFailure=.
+# Ships as a journal/syslog line so a missed snapshot is not silent even
+# when no mailer is configured. Replace ExecStart with the site notifier
+# (mail, webhook) when one exists; keep the logger line or the replacement
+# still has to fail loudly.
+
+[Service]
+Type=oneshot
+ExecStart=/bin/logger -t modelfs-backup -p daemon.err -- "unit %i failed; snapshot, replica, or restore drill needs attention (docs/recovery.md)"

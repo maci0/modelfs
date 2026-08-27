@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Monthly restore drill from docs/recovery.md section 6, as one runnable
 # artifact instead of a paste-from-docs procedure: clone the newest snapshot
-# onto a mountpoint that is not the live export, time the clone (the measured
-# restore rate that keeps the RTO row honest), diff the restored tree against
+# onto a mountpoint that is not the live export, time the clone (procedure B
+# CoW time; pool-loss RTO is the syncoid pull in recovery.md section 4C),
+# diff the restored tree against
 # the live dataset, checksum a stable sample file both sides, and append the
 # log line that proves the drill ran.
 #
@@ -21,7 +22,11 @@
 #                               the drill fails   (default 90000 = 25 h)
 #   MF_DRILL_REPLICA   optional replica dataset on this host; when set, the
 #                       drill also fails if that dataset is missing, has no
-#                       snapshots, or is older than MF_DRILL_MAX_SNAP_AGE
+#                       snapshots, or is older than MF_DRILL_MAX_REPLICA_AGE
+#                       (default 129600 = 36 h, a daily syncoid plus slack)
+#   MF_DRILL_SCRATCH   temp dir for file lists (default: repo .scratch, or
+#                       /var/tmp/modelfs-drill when this script is copied
+#                       out of the tree)
 #
 # Exit status is the drill verdict: 0 means the newest snapshot restored,
 # mounted off the live tree, and read back verified; anything else is an
@@ -29,9 +34,6 @@
 # age limit", which mean the backup schedule itself is dead or has silently
 # stopped keeping restore points inside the RPO the recovery doc claims.
 set -euo pipefail
-
-# shellcheck source=scripts/lib.sh
-source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 die() {
     echo "drill FAIL: $1" >&2
@@ -50,11 +52,29 @@ if [[ $# -gt 1 ]]; then
     exit 2
 fi
 
-mkdir -p "${SCRATCH_DIR}"
+# Repo runs keep using .scratch via lib.sh. A copy at /usr/local/sbin
+# (scripts/install_nas_backup.sh) has no build.zig.zon above it, so
+# MF_DRILL_SCRATCH or /var/tmp/modelfs-drill stands in; never /tmp
+# (tmpfs on these hosts).
+if [[ -n "${MF_DRILL_SCRATCH:-}" ]]; then
+    SCRATCH_DIR="${MF_DRILL_SCRATCH}"
+elif [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib.sh" ]]; then
+    # shellcheck source=scripts/lib.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+else
+    SCRATCH_DIR="/var/tmp/modelfs-drill"
+fi
+mkdir -p "${SCRATCH_DIR}" || die "cannot create scratch dir ${SCRATCH_DIR}"
 command -v zfs >/dev/null 2>&1 || die "zfs not found; this drill runs on the NAS"
 
 DATASET="${1:-tank/models}"
 LOG_FILE="${MF_DRILL_LOG:-/var/log/modelfs-drill.log}"
+# A restore with no writable artifact is not a drill. Fail before clone
+# so an unwritable /var/log does not spend minutes proving a snapshot
+# we then cannot record. `touch` is not enough: the owner can update
+# timestamps on a mode-000 file they own, and the append would then
+# fail after the clone. Opening for append is the write we need.
+: >>"${LOG_FILE}" || die "cannot write the drill log ${LOG_FILE}"
 
 zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
     || die "dataset ${DATASET} does not exist on this host"
@@ -70,12 +90,27 @@ if [[ -z "${SNAP}" ]]; then
     die "no snapshots of ${DATASET}: sanoid.timer is down or was never enabled (docs/recovery.md section 3)"
 fi
 SNAP_CTIME="${SNAP_LINE##*$'\t'}"
+case "${SNAP_CTIME}" in
+    '' | *[!0-9]*)
+        die "newest snapshot creation is not an epoch second: ${SNAP_LINE}"
+        ;;
+    *)
+        ;;
+esac
 NOW="$(date +%s)"
 SNAP_AGE=$((NOW - SNAP_CTIME))
 MAX_SNAP_AGE="${MF_DRILL_MAX_SNAP_AGE:-90000}"
 case "${MAX_SNAP_AGE}" in
     '' | *[!0-9]*)
         die "MF_DRILL_MAX_SNAP_AGE must be a whole number of seconds, got '${MAX_SNAP_AGE}'"
+        ;;
+    *)
+        ;;
+esac
+MAX_REPLICA_AGE="${MF_DRILL_MAX_REPLICA_AGE:-129600}"
+case "${MAX_REPLICA_AGE}" in
+    '' | *[!0-9]*)
+        die "MF_DRILL_MAX_REPLICA_AGE must be a whole number of seconds, got '${MAX_REPLICA_AGE}'"
         ;;
     *)
         ;;
@@ -105,12 +140,19 @@ if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
         die "replica ${MF_DRILL_REPLICA} has no snapshots: syncoid is down or was never enabled (docs/recovery.md section 3)"
     fi
     REPLICA_CTIME="${REPLICA_LINE##*$'\t'}"
+    case "${REPLICA_CTIME}" in
+        '' | *[!0-9]*)
+            die "replica newest snapshot creation is not an epoch second: ${REPLICA_LINE}"
+            ;;
+        *)
+            ;;
+    esac
     REPLICA_AGE=$((NOW - REPLICA_CTIME))
     if [[ "${REPLICA_AGE}" -lt 0 ]]; then
         die "replica newest snapshot ${REPLICA_SNAP} has creation ${REPLICA_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"
     fi
-    if [[ "${REPLICA_AGE}" -gt "${MAX_SNAP_AGE}" ]]; then
-        die "replica newest snapshot ${REPLICA_SNAP} is ${REPLICA_AGE}s old, past the ${MAX_SNAP_AGE}s limit: the replica schedule stopped keeping restore points inside the claimed RPO (docs/recovery.md sections 3 and 5)"
+    if [[ "${REPLICA_AGE}" -gt "${MAX_REPLICA_AGE}" ]]; then
+        die "replica newest snapshot ${REPLICA_SNAP} is ${REPLICA_AGE}s old, past the ${MAX_REPLICA_AGE}s limit: the replica schedule stopped keeping restore points inside the claimed RPO (docs/recovery.md sections 3 and 5)"
     fi
     REPLICA_STATUS="ok"
     echo "drill: replica ${MF_DRILL_REPLICA} newest ${REPLICA_SNAP} (age ${REPLICA_AGE}s)"
@@ -190,7 +232,7 @@ if [[ ! -d "${CLONE_MP}" ]]; then
 fi
 T1="$(awk '{print $1}' /proc/uptime)"
 ELAPSED="$(awk -v a="${T0}" -v b="${T1}" 'BEGIN { printf "%.1f", (b - a < 0) ? 0 : b - a }')"
-echo "drill: cloned to ${CLONE_MP} in ${ELAPSED}s (recorded in the log; this number keeps recovery.md's RTO row honest)"
+echo "drill: cloned to ${CLONE_MP} in ${ELAPSED}s (recorded in the log; snapshot-clone time, not pool-loss recv)"
 
 # Payload files only: .cluster leases republish every 10 s and are not the
 # dataset, and .zfs is the snapshot directory (visible when snapdir=visible).
@@ -267,7 +309,6 @@ if [[ "${HASH_CLONE}" != "${HASH_LIVE}" ]]; then
     die "restored ${SAMPLE_REL} hashes ${HASH_CLONE} but the live copy hashes ${HASH_LIVE}: the snapshot did not faithfully capture this file"
 fi
 
-touch "${LOG_FILE}" || die "cannot write the drill log ${LOG_FILE}"
 # UTC, second precision, trailing Z: lexicographically sortable and the
 # same on every host, unlike `date -Is` which is local time with a DST
 # offset (fall-back 01:30 happens twice; string sort then disagrees with

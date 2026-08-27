@@ -28,10 +28,12 @@ command -v timeout >/dev/null 2>&1 || fail "timeout not found on PATH (coreutils
 # handler that happens to finish inside the timeout still fails.
 scripts=(
     scripts/check.sh
+    scripts/check_drill_log.sh
     scripts/ci.sh
     scripts/cross_aarch64.sh
     scripts/extract_fuse3_arm64.sh
     scripts/install_libfuse3_dev.sh
+    scripts/install_nas_backup.sh
     scripts/repro_check.sh
     scripts/run_cluster_e2e_9nodes.sh
     scripts/run_e2e_tests.sh

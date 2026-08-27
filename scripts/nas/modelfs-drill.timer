@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly ModelFS restore drill
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
