@@ -33,7 +33,7 @@ Transfer units are not the same as dedup units:
 - **Chunks** (64 KiB to 1 MiB, content-defined): dedup and integrity.
 - **Pieces** (4 MiB to 16 MiB, concatenated chunks): what the swarm moves.
 
-Mount is immediately usable because the namespace is tiny. This sketch assumed `ls /models` and `stat` are local after catalog sync, and that the 140 GiB payload would hydrate in the background and on demand and, once on NVMe, leave the agent out of the I/O path so mmap went native. What shipped: `stat` / `readdir` hit the origin (no local catalog; `mf_getattr` / `mf_readdir` in src/fuse_fs.zig); on-demand per piece only (a miss blocks until that one piece fills, no background stripe); `direct_io` by default, so FUSE mmap fails unless `--kernel-cache` is set — see architecture.md.
+Mount is immediately usable because the namespace is tiny. This sketch assumed `ls /models` and `stat` are local after catalog sync, and that the 140 GiB payload would hydrate in the background and on demand and, once on NVMe, leave the agent out of the I/O path so mmap went native. What shipped: `stat` / `readdir` hit the origin (no local catalog; `mf_getattr` / `mf_readdir` in src/fuse_fs.zig); on-demand per piece only (a miss blocks until that one piece fills, no background stripe); `direct_io` by default, so FUSE mmap fails unless `--kernel-cache` is set (see architecture.md).
 
 ```mermaid
 flowchart TB

@@ -107,6 +107,40 @@ def stop_mount(p: subprocess.Popen[bytes], mount_dir: str) -> None:
     unmount(mount_dir)
 
 
+@dataclass(slots=True)
+class _MountSpec:
+    mount_dir: str
+    cache_dir: str
+    node_id: str
+    port: int
+    piece: str
+
+
+def start_mount(
+    bin_path: str, origin_dir: str, psk_file: str, spec: _MountSpec
+) -> subprocess.Popen[bytes]:
+    # argv is this tree's zig-out binary plus fixed mount flags.
+    return subprocess.Popen(  # noqa: S603
+        [
+            bin_path,
+            "mount",
+            spec.mount_dir,
+            "--origin",
+            origin_dir,
+            "--cache",
+            spec.cache_dir,
+            "--id",
+            spec.node_id,
+            "--listen",
+            f"127.0.0.1:{spec.port}",
+            "--psk",
+            psk_file,
+            "--piece",
+            spec.piece,
+        ]
+    )
+
+
 def build_modelfs() -> str:
     print("=== Building modelfs binary ===")
     # ReleaseFast: these figures document the daemon operators run (README
@@ -170,26 +204,11 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
                 os.makedirs(cache_dir, exist_ok=True)
                 os.makedirs(mount_dir, exist_ok=True)
                 port = 19100 + i
-
-                # argv is this tree's zig-out binary plus fixed mount flags.
-                p = subprocess.Popen(  # noqa: S603
-                    [
-                        bin_path,
-                        "mount",
-                        mount_dir,
-                        "--origin",
-                        origin_dir,
-                        "--cache",
-                        cache_dir,
-                        "--id",
-                        f"node_{i}",
-                        "--listen",
-                        f"127.0.0.1:{port}",
-                        "--psk",
-                        psk_file,
-                        "--piece",
-                        "4M",
-                    ]
+                p = start_mount(
+                    bin_path,
+                    origin_dir,
+                    psk_file,
+                    _MountSpec(mount_dir, cache_dir, f"node_{i}", port, "4M"),
                 )
                 procs.append((p, port, mount_dir))
 
@@ -260,26 +279,11 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
             os.makedirs(cache_dir, exist_ok=True)
             os.makedirs(mount_dir, exist_ok=True)
             port = 19600 + idx
-
-            # argv is this tree's zig-out binary plus fixed mount flags.
-            p = subprocess.Popen(  # noqa: S603
-                [
-                    bin_path,
-                    "mount",
-                    mount_dir,
-                    "--origin",
-                    origin_dir,
-                    "--cache",
-                    cache_dir,
-                    "--id",
-                    f"node_size_{label}",
-                    "--listen",
-                    f"127.0.0.1:{port}",
-                    "--psk",
-                    psk_file,
-                    "--piece",
-                    label,
-                ]
+            p = start_mount(
+                bin_path,
+                origin_dir,
+                psk_file,
+                _MountSpec(mount_dir, cache_dir, f"node_size_{label}", port, label),
             )
             try:
                 # The daemon must be serving before hydration and the timed
@@ -354,8 +358,13 @@ class _Box:
         return self.height - self.top - self.bottom
 
 
-def _box(dims: tuple[int, int, int, int, int, int]) -> _Box:
-    return _Box(*dims)
+@dataclass(slots=True)
+class _BarSpec:
+    title: str
+    box: _Box
+    xlabel: str
+    ylabel: str
+    value_fmt: str
 
 
 def _svg_escape(text: str) -> str:
@@ -432,7 +441,7 @@ def _require_parallel(left: int, right: int, what: str) -> None:
 
 def _write_line_chart(path: Path, ys: list[float], x_labels: list[str], title: str) -> None:
     _require_parallel(len(ys), len(x_labels), "line chart values and labels")
-    box = _box(_LINE_BOX)
+    box = _Box(*_LINE_BOX)
     y_max = _axis_max(ys)
     frame = _chart_frame(
         box, title, "Active Cluster Nodes (Count)", "Total Query Latency (ms)", y_max
@@ -464,20 +473,13 @@ def _write_bar_chart(
     labels: list[str],
     values: list[float],
     colors: list[str],
-    title: str,
+    spec: _BarSpec,
 ) -> None:
     _require_parallel(len(labels), len(values), "bar chart labels and values")
     _require_parallel(len(colors), len(values), "bar chart colors and values")
-    box = _box(_TIER_BOX if path.name.startswith("fig3_") else _BAR_BOX)
-    xlabel = "" if path.name.startswith("fig3_") else "Piece Chunk Size"
-    ylabel = (
-        "Fetch Latency per 4MB Block (ms)"
-        if path.name.startswith("fig3_")
-        else "Transfer Throughput (MB/s)"
-    )
-    value_fmt = "{:.2f} ms" if path.name.startswith("fig3_") else "{:.0f} MB/s"
+    box = spec.box
     y_max = _axis_max(values)
-    frame = _chart_frame(box, title, xlabel, ylabel, y_max)
+    frame = _chart_frame(box, spec.title, spec.xlabel, spec.ylabel, y_max)
     n = len(values)
     slot = box.plot_w / n
     bar_w = slot * _BAR_FRACTION
@@ -493,7 +495,7 @@ def _write_bar_chart(
         extras.append(
             f'<text x="{x + bar_w / 2:.1f}" y="{y - 6:.1f}" text-anchor="middle" '
             f'font-family="{_FONT}" font-size="8" font-weight="bold">'
-            f"{_svg_escape(value_fmt.format(value))}</text>"
+            f"{_svg_escape(spec.value_fmt.format(value))}</text>"
         )
         extras.append(
             f'<text x="{x + bar_w / 2:.1f}" y="{box.top + box.plot_h + 16}" text-anchor="middle" '
@@ -528,7 +530,13 @@ def plot_figures(
         chunk_labels,
         throughputs_mbps,
         ["#2ca02c"] * len(throughputs_mbps),
-        "modelfs Zero-Copy HTTP Piece Throughput Across Chunk Sizes",
+        _BarSpec(
+            "modelfs Zero-Copy HTTP Piece Throughput Across Chunk Sizes",
+            _Box(*_BAR_BOX),
+            "Piece Chunk Size",
+            "Transfer Throughput (MB/s)",
+            "{:.0f} MB/s",
+        ),
     )
     print(f"Saved Figure 2: {fig2_path}")
 
@@ -541,7 +549,13 @@ def plot_figures(
         tiers,
         tier_latencies,
         ["#1f77b4", "#ff7f0e", "#d62728"],
-        "modelfs Block Fetch Latency by Storage Tier (illustrative)",
+        _BarSpec(
+            "modelfs Block Fetch Latency by Storage Tier (illustrative)",
+            _Box(*_TIER_BOX),
+            "",
+            "Fetch Latency per 4MB Block (ms)",
+            "{:.2f} ms",
+        ),
     )
     print(f"Saved Figure 3: {fig3_path}")
 

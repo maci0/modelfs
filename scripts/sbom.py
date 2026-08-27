@@ -95,13 +95,7 @@ def deb_purl(filename: str) -> tuple[str, str, str]:
 
 def hashes_cdx(digests: list[str]) -> list[dict[str, str]]:
     # One component, every wheel/sdist digest from the lock: scanners match any.
-    unique: list[str] = []
-    seen: set[str] = set()
-    for digest in digests:
-        if digest not in seen:
-            seen.add(digest)
-            unique.append(digest)
-    return [{"alg": "SHA-256", "content": digest} for digest in unique]
+    return [{"alg": "SHA-256", "content": digest} for digest in dict.fromkeys(digests)]
 
 
 def build_bom(root: Path) -> dict[str, object]:
