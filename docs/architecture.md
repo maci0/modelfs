@@ -51,7 +51,7 @@ One piece, one source. Misses block the read until that hole is filled. No full-
 
 Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run `modelfs` there.
 
-`stat` / `readdir` / `mkdir` / `unlink` / `rename` → origin. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`.
+`stat` / `readdir` / `mkdir` / `unlink` / `rename` → origin. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `create` (`O_TRUNC`) and `truncate` with no live cache entry drop persisted marks via `Store.distrust` for the same reason; a cold `Store.get` whose sidecar geometry does not match the origin size persists that wipe so a restart cannot reload the old marks. `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`.
 
 Origin is **required**. It can be any POSIX dir both nodes see, not only NFS. Two-node with no shared store is not implemented.
 
@@ -188,7 +188,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 | 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write) |
 | 502 | The origin is unreachable or failed (stat/pread error), i.e. retry another peer |
 
-A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. Errors carry no body: both peers of a conversation parse only the status line.
+A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. The fetching peer requires `206` plus a `Content-Range` whose start matches the request and whose end is at most the request end (EOF clamp); a same-length window at a different offset is refused rather than cached. Errors carry no body: both peers of a conversation parse only the status line.
 
 Every endpoint requires the bearer token, including `/ping`. Listen `0.0.0.0:18080`; `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status.
 

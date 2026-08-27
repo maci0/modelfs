@@ -112,6 +112,32 @@ pub fn parseRange(h: []const u8) ?Range {
     return .{ .start = a, .end = b };
 }
 
+pub const ContentRange = struct { start: u64, end: u64, complete: u64 };
+
+/// Parses an HTTP Content-Range header value ("bytes start-end/complete").
+/// End is inclusive. An unknown complete length ("bytes start-end/*") is
+/// recorded as maxInt(u64). The fetch client uses this to bind a 206 body
+/// to the range it asked for: Content-Length alone cannot tell a piece at
+/// offset 0 from the piece that was requested.
+pub fn parseContentRange(h: []const u8) ?ContentRange {
+    const p = "bytes ";
+    const s = std.mem.trim(u8, h, " \t");
+    if (!std.mem.startsWith(u8, s, p)) return null;
+    const body = s[p.len..];
+    const dash = std.mem.findScalar(u8, body, '-') orelse return null;
+    const rest = body[dash + 1 ..];
+    const slash = std.mem.findScalar(u8, rest, '/') orelse return null;
+    const a = parseU64Fast(body[0..dash]) orelse return null;
+    const b = parseU64Fast(rest[0..slash]) orelse return null;
+    if (b < a) return null;
+    const complete_s = rest[slash + 1 ..];
+    const complete = if (complete_s.len == 1 and complete_s[0] == '*')
+        std.math.maxInt(u64)
+    else
+        parseU64Fast(complete_s) orelse return null;
+    return .{ .start = a, .end = b, .complete = complete };
+}
+
 pub fn headerGet(head: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, head, "\r\n");
     _ = it.next(); // status / request line
@@ -266,6 +292,20 @@ test "range and query" {
     try std.testing.expect(parseRange("bytes=0-99999999999999999999") == null);
     try std.testing.expect(parseRange("bytes=99999999999999999999-0") == null);
     try std.testing.expect(parseRange("bytes=18446744073709551615-18446744073709551615") != null);
+
+    const cr = parseContentRange("bytes 16-31/48").?;
+    try std.testing.expectEqual(@as(u64, 16), cr.start);
+    try std.testing.expectEqual(@as(u64, 31), cr.end);
+    try std.testing.expectEqual(@as(u64, 48), cr.complete);
+    const cr_star = parseContentRange("bytes 0-7/*").?;
+    try std.testing.expectEqual(@as(u64, 0), cr_star.start);
+    try std.testing.expectEqual(@as(u64, 7), cr_star.end);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), cr_star.complete);
+    try std.testing.expect(parseContentRange("bytes 10-1/20") == null);
+    try std.testing.expect(parseContentRange("bytes=0-7/8") == null);
+    try std.testing.expect(parseContentRange("bytes 0-7") == null);
+    try std.testing.expect(parseContentRange("bytes 0-/8") == null);
+
     const q = queryGet("/have?path=foo%2Fbar&x=1", "path").?;
     try std.testing.expectEqualStrings("foo%2Fbar", q);
     // key must match whole token, not a suffix

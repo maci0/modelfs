@@ -803,7 +803,7 @@ fn fetchRange(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u
 fn fetchRangeDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, deadline_ms: ?i64) ![]u8 {
     const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
     defer sys.close(fd);
-    return readFlexBodyAllocDeadline(gpa, io, fd, null, deadline_ms);
+    return readRangeBodyAllocDeadline(gpa, io, fd, start, end, null, deadline_ms);
 }
 
 /// Like fetchRange, but streams the body directly into `out` (whose length
@@ -816,7 +816,31 @@ fn fetchRangeInto(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []con
 fn fetchRangeIntoDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8, deadline_ms: ?i64) !void {
     const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
     defer sys.close(fd);
-    _ = try readFlexBodyAllocDeadline(gpa, io, fd, out, deadline_ms);
+    _ = try readRangeBodyAllocDeadline(gpa, io, fd, start, end, out, deadline_ms);
+}
+
+/// Binds a 206 body to the range we asked for. Content-Length alone cannot
+/// tell piece i from a same-sized window at a different offset (or a 200
+/// of the file prefix), and the server already sends Content-Range on
+/// every /data success. An over-long request end is clamped at EOF (RFC
+/// 9110), so a smaller advertised end is accepted; a start that is not
+/// ours, or an end past what we asked, is not.
+fn checkRangeReply(head: []const u8, start: u64, end: u64) !void {
+    const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
+    const status_line = head[0..status_end];
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 206")) return error.HttpStatus;
+    const cr = proto.headerGet(head, "Content-Range") orelse return error.MissingContentRange;
+    const r = proto.parseContentRange(cr) orelse return error.BadContentRange;
+    if (r.start != start or r.end < start or r.end > end) return error.RangeMismatch;
+}
+
+fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, start: u64, end: u64, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
+    var head_buf: [8192]u8 = undefined;
+    var head_len: usize = 0;
+    var total_read: usize = 0;
+    readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
+    try checkRangeReply(head_buf[0..head_len], start, end);
+    return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, dest, deadline_ms);
 }
 
 fn rangeBps(bytes: u64, dt_ns: i128) f64 {
@@ -1378,6 +1402,43 @@ test "readFlexBodyAlloc keeps the dest contract when Content-Length is absent" {
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         _ = try readFlexBodyAlloc(gpa, std.testing.io, pair[1], &.{});
+    }
+}
+
+test "range fetch binds the 206 body to the requested Content-Range" {
+    const gpa = std.testing.allocator;
+    // A same-sized window at offset 0 is the wrong piece: Content-Length
+    // matches, Content-Range does not. Marking it filled would poison the
+    // cache with prefix bytes for a later piece.
+    {
+        const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/32\r\nContent-Length: 8\r\nConnection: close\r\n\r\nABCDEFGH");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.RangeMismatch, readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 16, 23, null, null));
+    }
+    // A 200 of the right length is not a range reply.
+    {
+        const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nABCDEFGH");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.HttpStatus, readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 0, 7, null, null));
+    }
+    // Missing Content-Range on an otherwise well-formed 206 is the same
+    // unbound-window case as a mismatched one.
+    {
+        const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Length: 8\r\nConnection: close\r\n\r\nABCDEFGH");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.MissingContentRange, readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 0, 7, null, null));
+    }
+    // Matching range, including an EOF clamp of an over-long request end.
+    {
+        const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/8\r\nContent-Length: 8\r\nConnection: close\r\n\r\nABCDEFGH");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        const body = try readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 0, 999, null, null);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("ABCDEFGH", body);
     }
 }
 

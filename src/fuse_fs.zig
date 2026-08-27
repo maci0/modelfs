@@ -440,6 +440,14 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC | sys.c.O_NOFOLLOW, clientCreateMode(mode));
     if (fd < 0) return sys.negErrno();
     sys.close(fd);
+    // O_TRUNC replaced the origin bytes at this path. Cache identity is the
+    // path, so a leftover sidecar at the previous size would decode cleanly
+    // after a crash and a same-size rewrite -- the same resurrection
+    // unlink/rename already prevent via forget. Drop trust before warmup so
+    // an OOM on get cannot leave the old marks on disk. Pins and data stay:
+    // the path is still the operator's pin target, and unmarked pieces
+    // refill over the truncated origin.
+    st.store.distrust(rel);
     // The origin create above already landed: failing the syscall here (entry
     // warmup OOM) would tell the caller the create failed over a file that
     // exists and was possibly truncated. Warmup is best-effort; the next
@@ -740,6 +748,13 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
         if (file.cache_fd >= 0) _ = sys.ftruncate(file.cache_fd, new_size);
         file.mu.unlock(st.io);
         ob.deinit(st.gpa);
+    } else {
+        // No live entry: origin is already the new length, but a leftover
+        // sidecar at the previous size would decode cleanly if the file is
+        // later restored to that length. Same identity drop unlink/rename
+        // use via forget, and create uses via distrust: drop persisted
+        // marks, keep data/pins.
+        st.store.distrust(rel);
     }
     return 0;
 }

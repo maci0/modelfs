@@ -394,7 +394,19 @@ pub const Store = struct {
         if (f) |file| @memset(file.bits.bytes, 0);
     }
 
-    fn loadBits(self: *Store, rel: []const u8, file_size: u64) !piece.Bitfield {
+    /// Outcome of loading a sidecar: `bits` is always sized for the caller's
+    /// geometry. `discarded` is true when a sidecar was present but unusable
+    /// (wrong piece/file size, corrupt, unreadable). The in-memory field is
+    /// then empty; the caller must persist that wipe or a restart can decode
+    /// the old sidecar at the previous size and serve its marks over new
+    /// bytes. A missing sidecar is not discarded: first touch stays empty
+    /// on disk until a fill actually lands.
+    const LoadedBits = struct {
+        bits: piece.Bitfield,
+        discarded: bool,
+    };
+
+    fn loadBits(self: *Store, rel: []const u8, file_size: u64) !LoadedBits {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = try self.cacheMetaPath(&buf, rel);
         var open_errno: i32 = 0;
@@ -403,7 +415,13 @@ pub const Store = struct {
             error.OpenFailed => {
                 if (open_errno != c.ENOENT)
                     std.log.warn("cannot read piece sidecar for {s} (errno {d}); treating cache as empty", .{ rel, open_errno });
-                return piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+                // Non-ENOENT is a present sidecar we could not read: persist
+                // the empty field so a later open of the previous size cannot
+                // decode it. ENOENT is not a discard.
+                return .{
+                    .bits = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size)),
+                    .discarded = open_errno != c.ENOENT,
+                };
             },
             // Allocation failure propagates: callers turn it into EIO/500
             // instead of a cold entry pretending nothing was stored (the
@@ -415,7 +433,10 @@ pub const Store = struct {
             // always-cold cache.
             else => {
                 std.log.warn("cannot read piece sidecar for {s}: {t}; treating cache as empty", .{ rel, err });
-                return piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+                return .{
+                    .bits = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size)),
+                    .discarded = true,
+                };
             },
         };
         defer self.gpa.free(blob);
@@ -425,13 +446,34 @@ pub const Store = struct {
         // discarded and everything re-hydrates over origin/peers, which an
         // operator should be able to tell from the log instead of guessing why
         // the cache went cold.
-        return piece.Bitfield.decode(self.gpa, blob, self.piece_size, file_size) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
+        const bits = piece.Bitfield.decode(self.gpa, blob, self.piece_size, file_size) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
             error.BadBitfield => {
                 std.log.warn("corrupt piece sidecar for {s}; treating cache as empty", .{rel});
-                return piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+                return .{
+                    .bits = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size)),
+                    .discarded = true,
+                };
             },
         };
+        // decode() already returns an empty field on a geometry mismatch;
+        // that empty field is only in RAM until we persist it. A sidecar
+        // whose recorded size matches the loader's is kept as-is.
+        const stale = blob.len >= 16 and std.mem.eql(u8, blob[0..4], piece.magic) and
+            (std.mem.readInt(u32, blob[4..8], .little) != self.piece_size or
+                std.mem.readInt(u64, blob[8..16], .little) != file_size);
+        return .{ .bits = bits, .discarded = stale };
+    }
+
+    /// Persists the entry's current bits after a discarded sidecar load.
+    /// Caller must not hold file.mu. A forget that raced the insert has
+    /// already unlinked artifacts and stamped dead: saving then would
+    /// recreate a sidecar over a name that no longer exists.
+    fn persistDiscardedWipe(self: *Store, file: *Cached) void {
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        if (file.dead.load(.acquire)) return;
+        _ = self.saveBits(file, false);
     }
 
     /// Writes data at path under root/sub, creating the parent directory only
@@ -563,17 +605,19 @@ pub const Store = struct {
             // once f.* is assigned, f owns every field and all later cleanup
             // goes through f.deinit (double-free otherwise: an early error
             // return would fire both the errdefers and the deinit path).
+            var discarded = false;
             const f = blk: {
                 const raw = try self.gpa.create(Cached);
                 errdefer self.gpa.destroy(raw);
                 const rel_own = try self.gpa.dupe(u8, rel);
                 errdefer self.gpa.free(rel_own);
-                const bits = try self.loadBits(rel, file_size);
-                errdefer bits.deinit(self.gpa);
+                const loaded = try self.loadBits(rel, file_size);
+                errdefer loaded.bits.deinit(self.gpa);
+                discarded = loaded.discarded;
                 raw.* = .{
                     .rel = rel_own,
                     .size = file_size,
-                    .bits = bits,
+                    .bits = loaded.bits,
                     .filling = std.AutoHashMap(u32, void).init(self.gpa),
                     .last_access = .init(now_sec),
                 };
@@ -599,6 +643,12 @@ pub const Store = struct {
             // before the caller's use, so the entry must be born with refs=1.
             _ = f.refs.fetchAdd(1, .monotonic);
             self.mu.unlock(self.io);
+            // Same persist-the-wipe contract as reconcileSize on the hit
+            // path: a discarded sidecar left on disk would decode cleanly
+            // at its recorded size after a crash, serving pre-wipe marks
+            // over post-wipe content. First-touch (no sidecar) does not
+            // write one.
+            if (discarded) self.persistDiscardedWipe(f);
             return f;
         }
     }
@@ -1284,18 +1334,18 @@ pub const Store = struct {
         self.mu.lockUncancelable(self.io);
         const epoch0 = self.purge_epoch;
         self.mu.unlock(self.io);
-        var bits = self.loadBits(rel, size) catch return false;
-        defer bits.deinit(self.gpa);
-        const idx = bits.lastSet() orelse return self.punchDiskUnclaimed(rel, fd, size, bits, epoch0);
+        var loaded = self.loadBits(rel, size) catch return false;
+        defer loaded.bits.deinit(self.gpa);
+        const idx = loaded.bits.lastSet() orelse return self.punchDiskUnclaimed(rel, fd, size, loaded.bits, epoch0);
         const off = piece.offset(idx, self.piece_size);
         const ln = piece.len(size, idx, self.piece_size);
-        bits.clear(idx);
+        loaded.bits.clear(idx);
         // Encode and path resolution stay outside the lock; both failures
         // bail before anything is mutated, so no hole can outlive its
         // unpersisted mark.
         var blob: std.ArrayList(u8) = .empty;
         defer blob.deinit(self.gpa);
-        bits.encode(self.piece_size, size, &blob, self.gpa) catch {
+        loaded.bits.encode(self.piece_size, size, &blob, self.gpa) catch {
             std.log.warn("bitfield encode failed for {s}; piece {d} stays cached", .{ rel, idx });
             return false;
         };
@@ -1727,6 +1777,69 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
         var side = try piece.Bitfield.decode(gpa, blob, st.piece_size, 64);
         defer side.deinit(gpa);
         try std.testing.expectEqual(@as(u32, 0), side.filled());
+    }
+}
+
+test "cold get persists a stale-sidecar wipe so a restart cannot reload stale marks" {
+    // The live-entry shape is covered above (reconcileSize). After a
+    // restart there is no map hit: loadBits returns an empty field sized
+    // for the new length and used to leave the old sidecar on disk, so a
+    // crash plus a same-size restore decoded the pre-wipe marks over new
+    // bytes. The miss path must persist the same wipe the hit path does.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-coldwipe");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-coldwipe");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+        const f = try st.get("cold.bin", 64, sys.monoSec());
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        f.bits.set(0);
+        f.bits.set(3);
+        f.mu.unlock(std.testing.io);
+        _ = st.saveBits(f, false);
+        const mp = try st.cacheMetaPath(&mb, "cold.bin");
+        const blob = try sys.readFileAlloc(gpa, mp, 4096);
+        defer gpa.free(blob);
+        var side = try piece.Bitfield.decode(gpa, blob, st.piece_size, 64);
+        defer side.deinit(gpa);
+        try std.testing.expectEqual(@as(u32, 2), side.filled());
+    }
+
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        // Restart: no live entry. The create-truncate shape stats a
+        // zero-length origin through get.
+        const g = try st.get("cold.bin", 0, sys.monoSec());
+        defer st.releaseFile(g);
+        try std.testing.expectEqual(@as(u64, 0), g.size);
+        const mp = try st.cacheMetaPath(&mb, "cold.bin");
+        const blob = try sys.readFileAlloc(gpa, mp, 4096);
+        defer gpa.free(blob);
+        var side = try piece.Bitfield.decode(gpa, blob, st.piece_size, 64);
+        defer side.deinit(gpa);
+        try std.testing.expectEqual(@as(u32, 0), side.filled());
+    }
+
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        // File back at the old length: a leftover pre-wipe sidecar would
+        // decode as two filled pieces. The persisted wipe must still hold.
+        const h = try st.get("cold.bin", 64, sys.monoSec());
+        defer st.releaseFile(h);
+        h.mu.lockUncancelable(std.testing.io);
+        try std.testing.expectEqual(@as(u32, 0), h.bits.filled());
+        h.mu.unlock(std.testing.io);
     }
 }
 
