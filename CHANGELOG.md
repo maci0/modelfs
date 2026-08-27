@@ -6,6 +6,10 @@ Work since `v0.1.0`. A binary built from this tree still prints `0.1.0`
 until the next tag is cut (CONTRIBUTING.md, Cutting a release); pin a
 commit hash if you are not on the tag.
 
+- **Unauthenticated peer requests always get 401**: a POST (or any non-GET) without a valid bearer used to answer `405 Allow: GET` before the token was consulted, so a scanner learned the listener was a GET-only peer service. Auth now runs first; 405 is only for an authenticated client using the wrong method.
+- **A crashing daemon no longer dumps the cluster PSK**: mount sets `RLIMIT_CORE` to zero after loading the secret, wipes `MODELFS_PSK_VALUE` from the environment so the `auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown.
+- **Cache data files are owner-only (0600)**: they used to be created 0644, so a local user blocked by origin modes and FUSE `default_permissions` could still read cached weights from `/var/cache/modelfs/data`. New files are 0600, leftover 0644 files are tightened on the next open, and `data/`/`meta/`/`pin/` are created 0700.
+
 - **Python gate tooling no longer pulls matplotlib**: the lock installed numpy, pillow, fonttools, and the rest of that tree so mypy could type-check the benchmark plotter, and every CI job paid for it. Figures are SVG written with the stdlib; `requirements-dev.txt` is ruff and mypy only.
 - **Vendored libfuse3 hashes live in one file and are checked before unpack**: extract used to test only that the `.deb` files exist; `build.zig` and the README each copied the digests. `.deps/fuse3-arm64/SHA256SUMS` is the list extract verifies, `build.zig` reads, and `check.sh` checks. NOTICE and the Debian copyright file sit beside the debs.
 - **A CycloneDX inventory is generated from the lock and the vendored debs**: `scripts/sbom.py` writes `sbom.cdx.json`; `check.sh` fails if it drifted.

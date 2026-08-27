@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <netdb.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <poll.h>
 #include <ifaddrs.h>
 #include <net/if.h>

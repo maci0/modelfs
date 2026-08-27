@@ -985,7 +985,15 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
             std.log.err("load PSK: {t}", .{err});
         return 1;
     };
-    defer gpa.free(psk);
+    defer {
+        std.crypto.secureZero(u8, psk);
+        gpa.free(psk);
+    }
+    // The secret is in memory from here: refuse cores so a crash cannot
+    // spill it, and drop MODELFS_PSK_VALUE so fuse_main's auto_unmount
+    // helper cannot inherit it through the environment block.
+    sys.disableCoreDumps();
+    sys.scrubPskEnv();
 
     var id_buf: [256]u8 = undefined;
     const id = try gpa.dupe(u8, opts.id orelse discover.hostname(&id_buf));

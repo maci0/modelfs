@@ -156,6 +156,10 @@ pub const Store = struct {
     /// the file lock so a read/fill/transfer inside the window is never culled.
     const recency_secs: i64 = 10;
 
+    /// Cache data files hold origin bytes. 0600 so a local user who cannot
+    /// read the origin (FUSE default_permissions) cannot read the cache copy.
+    const cache_data_mode: c.mode_t = 0o600;
+
     gpa: std.mem.Allocator,
     io: std.Io,
     origin: []const u8,
@@ -322,7 +326,7 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
             const p = self.cacheSubPath(&buf, sub, "") catch return -sys.c.ENAMETOOLONG;
-            if (sys.mkdirAll(std.mem.span(p), 0o755) != 0) return sys.negErrno();
+            if (sys.mkdirAll(std.mem.span(p), 0o700) != 0) return sys.negErrno();
         }
         return 0;
     }
@@ -1245,12 +1249,15 @@ pub const Store = struct {
         // truncate/write primitive. The parent directory is created only when
         // the first open misses it (same shape as writeFileMakingParent): a
         // reopen after the reaper closed the fd pays no mkdir walk.
-        var fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, 0o644);
+        var fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, cache_data_mode);
         if (fd < 0 and sys.errno() == c.ENOENT) {
-            _ = sys.mkdirAll(parent, 0o755);
-            fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, 0o644);
+            _ = sys.mkdirAll(parent, 0o700);
+            fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, cache_data_mode);
         }
         if (fd < 0) return sys.negErrno();
+        // O_CREAT's mode is ignored when the name already exists, so a
+        // leftover 0644 data file from an older daemon is tightened here.
+        _ = c.fchmod(fd, cache_data_mode);
         if (sys.ftruncate(fd, file.size) != 0) {
             const e = sys.negErrno();
             sys.close(fd);
@@ -4007,6 +4014,47 @@ test "openCache refuses a symlink planted at the data path" {
 
     var rb: [8]u8 = undefined;
     try std.testing.expectEqualStrings("keepme", try sys.readFileBuf(&rb, try sys.toZ(&zb, target)));
+}
+
+test "openCache creates owner-only data files and tightens leftovers" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-mode");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-mode");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const data_dir = try st.cacheSubPath(&db, "data", "");
+    var dst: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(data_dir, &dst));
+    try std.testing.expectEqual(@as(c.mode_t, 0o700), dst.st_mode & 0o777);
+
+    const f = try st.get("weights.bin", 32, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expect(st.openCache(f) >= 0);
+
+    var dp: [sys.c.PATH_MAX]u8 = undefined;
+    const path = try st.cacheDataPath(&dp, "weights.bin");
+    var stbuf: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(path, &stbuf));
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), stbuf.st_mode & 0o777);
+
+    // A leftover world-readable data file is tightened on the next open,
+    // not left at the mode O_CREAT ignored because the name already existed.
+    f.mu.lockUncancelable(std.testing.io);
+    sys.close(f.cache_fd);
+    f.cache_fd = -1;
+    f.mu.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(i32, 0), c.chmod(path, 0o644));
+    try std.testing.expect(st.openCache(f) >= 0);
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(path, &stbuf));
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), stbuf.st_mode & 0o777);
 }
 
 test "origin access refuses a symlink planted at the model path" {

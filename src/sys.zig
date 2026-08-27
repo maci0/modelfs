@@ -176,6 +176,23 @@ pub fn close(fd: c_int) void {
     if (fd >= 0) _ = c.close(fd);
 }
 
+/// Refuse core dumps for this process. The cluster PSK lives in daemon
+/// memory for the mount lifetime; a crash would otherwise write it
+/// wherever kernel.core_pattern points (often a world-readable file).
+/// Both soft and hard limits go to zero so a later setrlimit in this
+/// process cannot raise them without CAP_SYS_RESOURCE.
+pub fn disableCoreDumps() void {
+    std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch {};
+}
+
+/// Drops MODELFS_PSK_VALUE from the process environment so the
+/// auto_unmount fusermount helper (spawned from fuse_main) and
+/// /proc/<pid>/environ cannot inherit the inline secret. The daemon
+/// already holds its own copy from loadPsk.
+pub fn scrubPskEnv() void {
+    _ = c.unsetenv("MODELFS_PSK_VALUE");
+}
+
 pub fn preadAll(fd: c_int, buf: []u8, off: u64) isize {
     var got: usize = 0;
     while (got < buf.len) {
@@ -553,6 +570,20 @@ test "parentOf" {
 fn fdIsCloexec(fd: c_int) bool {
     const flags = c.fcntl(fd, c.F_GETFD, @as(c_int, 0));
     return flags >= 0 and (flags & c.FD_CLOEXEC) != 0;
+}
+
+test "disableCoreDumps zeros RLIMIT_CORE" {
+    disableCoreDumps();
+    const lim = std.posix.getrlimit(.CORE) catch return error.SkipZigTest;
+    try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.cur);
+    try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.max);
+}
+
+test "scrubPskEnv removes MODELFS_PSK_VALUE" {
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv("MODELFS_PSK_VALUE", "inline-secret", 1));
+    try std.testing.expect(c.getenv("MODELFS_PSK_VALUE") != null);
+    scrubPskEnv();
+    try std.testing.expect(c.getenv("MODELFS_PSK_VALUE") == null);
 }
 
 test "open, socket, and accept are close-on-exec" {

@@ -332,25 +332,27 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
         return;
     };
-    if (!std.mem.eql(u8, method, "GET")) {
-        // RFC 9110 §15.5.5: a 405 must name the methods the resource
-        // supports, so a probing client can discover the shape of the API.
-        reply(fd, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        return;
-    }
     const auth = proto.headerGet(head, "Authorization") orelse "";
     if (!proto.bearerOk(auth, self.psk)) {
         // Security-relevant event: without this line a wrong-PSK node or an
         // unauthenticated prober is invisible to the operator, and without
         // the source address a probing campaign leaves nothing to
         // investigate after the fact. Bounded by the accept loop's inflight
-        // cap, so it cannot flood faster than 16/s.
+        // cap, so it cannot flood faster than 16/s. Auth runs before the
+        // method gate so an unauthenticated POST cannot learn that GET is
+        // the only verb this listener accepts.
         var abuf: [64]u8 = undefined;
         std.log.warn("peer http: rejected unauthorized request from {s}", .{peerAddrText(peer, &abuf)});
         _ = self.store.stats.http_unauthorized.fetchAdd(1, .monotonic);
         // RFC 9110 §15.5.2: a 401 must carry a challenge naming the scheme
         // a client should retry with; same empty-body framing as replyStatus.
         reply(fd, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+    if (!std.mem.eql(u8, method, "GET")) {
+        // RFC 9110 §15.5.5: a 405 must name the methods the resource
+        // supports, so a probing client can discover the shape of the API.
+        reply(fd, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
     const path = proto.pathOnly(target);
@@ -2297,7 +2299,9 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
     }
     // A missing bearer token is a 401 that names the scheme to retry with
     // (RFC 9110 §15.5.2). The expected rejection warning stays off the
-    // runner's stderr like sibling fault-tolerance tests.
+    // runner's stderr like sibling fault-tolerance tests. Auth is checked
+    // before the method gate, so an unauthenticated POST is the same 401
+    // (not a 405 that would advertise GET as the only verb).
     {
         const prev_log_level = std.testing.log_level;
         std.testing.log_level = .err;
@@ -2306,6 +2310,10 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 401 Unauthorized\r\n"));
         try std.testing.expect(std.mem.indexOf(u8, res.items, "WWW-Authenticate: Bearer\r\n") != null);
+        var post = try roundTrip(port, "POST /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        defer post.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, post.items, "HTTP/1.1 401 Unauthorized\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, post.items, "Allow: GET") == null);
     }
     // Unknown paths are 404 regardless of the query string behind them.
     // Regression: routing used to run after path-parameter decoding, so an
@@ -3252,13 +3260,14 @@ test "fuzz request head parsing pipeline gates auth paths and ranges" {
 // branch, an uncounted rejection, a reply missing its challenge header)
 // would leave both the handler and its mirror agreeing on the wrong thing.
 // This harness drives the real handleConn over a socketpair instead and
-// pins the published routing contract end to end: method gate before auth,
-// auth before routing, unknown routes 404 ahead of query validation,
+// pins the published routing contract end to end: auth before method gate,
+// method gate before routing, unknown routes 404 ahead of query validation,
 // traversal/control paths refused, ranges required on /data, and every
 // outcome landed in the counter status.json publishes.
 
 const seed_serve_ping_ok = fuzzcorpus.entry("GET /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_serve_post_ping = fuzzcorpus.entry("POST /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_post_unauthed = fuzzcorpus.entry("POST /ping HTTP/1.1\r\n\r\n");
 const seed_serve_no_target = fuzzcorpus.entry("HELP\r\n\r\n");
 const seed_serve_unterminated = fuzzcorpus.entry("GET /have?path=a HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n");
 const seed_serve_ping_unauthed = fuzzcorpus.entry("GET /ping HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n");
@@ -3280,6 +3289,7 @@ const fuzz_serve_corpus = [_][]const u8{
     &seed_req_no_path,
     &seed_serve_ping_ok,
     &seed_serve_post_ping,
+    &seed_serve_post_unauthed,
     &seed_serve_no_target,
     &seed_serve_unterminated,
     &seed_serve_ping_unauthed,
@@ -3305,9 +3315,9 @@ fn classifyServedHead(head: []const u8) ServeClass {
     var it = std.mem.splitScalar(u8, served[0..line_end], ' ');
     const method = it.next() orelse return .dropped;
     const target = it.next() orelse return .dropped;
-    if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
     const auth = proto.headerGet(served, "Authorization") orelse "";
     if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
+    if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
     const is_have = std.mem.eql(u8, path, "/have");
@@ -3514,9 +3524,9 @@ fn classifyDataHead(head: []const u8) DataClass {
     var it = std.mem.splitScalar(u8, served[0..line_end], ' ');
     const method = it.next().?;
     const target = it.next() orelse return .dropped;
-    if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
     const auth = proto.headerGet(served, "Authorization") orelse "";
     if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
+    if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
     const is_have = std.mem.eql(u8, path, "/have");
