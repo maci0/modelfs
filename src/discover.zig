@@ -1,5 +1,6 @@
-//! Cluster membership over origin-side lease files: publish/refresh/sweep,
-//! the /have probe cache, and path scoring (goodput, hops, inflight).
+//! Cluster membership over origin-side lease files: walkLeases, publish,
+//! refresh, sweep, the /have probe cache, and path scoring (goodput, hops,
+//! inflight).
 const std = @import("std");
 const proto = @import("proto.zig");
 const sys = @import("sys.zig");
@@ -159,7 +160,7 @@ pub fn displayName(name: []const u8) []const u8 {
 /// JSON string in that document, and is echoed into logs, so it must be
 /// printable ASCII without path separators (lease filename), quote or
 /// backslash (would corrupt the JSON for every peer's parser), or a leading
-/// dot (refresh skips dot files). An id failing this gate would otherwise
+/// dot (walkLeases skips dot files). An id failing this gate would otherwise
 /// partition its own node out of peer discovery while NFS fallback hides it.
 pub fn validId(s: []const u8) bool {
     if (s.len == 0) return false;
@@ -169,6 +170,63 @@ pub fn validId(s: []const u8) bool {
         if (ch == '/' or ch == '"' or ch == '\\') return false;
     }
     return true;
+}
+
+/// Outcome of opening origin/.cluster for a lease walk. Callers interpret
+/// missing_dir themselves: Catalog.refresh keeps the previous peer list;
+/// `modelfs peers` lists as empty.
+pub const LeaseWalk = enum { ok, path_too_long, missing_dir };
+
+/// Cap on a lease document read from origin/.cluster. formatLease writes
+/// into 2048 bytes; this is twice that so a slightly larger co-tenant
+/// document still parses, while a multi-megabyte plant is refused.
+const lease_file_max: usize = 4096;
+
+/// Walks origin/.cluster, invoking `visitor.visit(name, parsed)` for each
+/// `.json` lease that opened and parsed. `name` and `parsed` are valid only
+/// for that call: copy anything that outlives it. Dot-prefixed names are
+/// skipped (they cannot be a validId lease). Open/read/parse failures are
+/// skipped and named. Catalog.refresh and `modelfs peers` share this walk
+/// so the O_NOFOLLOW read, skip set, and corrupt-lease handling cannot drift.
+pub fn walkLeases(gpa: std.mem.Allocator, origin: []const u8, visitor: anytype) LeaseWalk {
+    var dbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const dirz = sys.joinZ(&dbuf, origin, cluster_dir) catch return .path_too_long;
+    const dir = c.opendir(dirz) orelse return .missing_dir;
+    defer _ = c.closedir(dir);
+
+    while (c.readdir(dir)) |ent| {
+        const name = sys.dirName(ent);
+        if (name.len == 0 or name[0] == '.') continue;
+        if (!std.mem.endsWith(u8, name, ".json")) continue;
+        var fbuf: [sys.c.PATH_MAX]u8 = undefined;
+        const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
+        var lease_buf: [lease_file_max]u8 = undefined;
+        // ENOENT is the normal race against expiry cleanup and stays
+        // unnamed; any other open failure (EACCES, ELOOP from a planted
+        // symlink) persists across ticks and, left silent, reads exactly
+        // like a dead cluster -- so it is named like the read failures
+        // below. O_NOFOLLOW: a co-tenant who can plant a .json name must
+        // not redirect this read onto a crafted lease outside .cluster.
+        var open_errno: i32 = 0;
+        const blob = sys.readFileBufNoFollowOpenErrno(&lease_buf, fp, &open_errno) catch |err| switch (err) {
+            error.OpenFailed => {
+                if (open_errno != c.ENOENT)
+                    std.log.warn("lease open failed for {s} (errno {d})", .{ displayName(name), open_errno });
+                continue;
+            },
+            else => {
+                std.log.warn("lease read failed for {s}: {t}", .{ displayName(name), err });
+                continue;
+            },
+        };
+        const parsed = proto.parseLease(gpa, blob) catch {
+            std.log.warn("skipping corrupt lease {s}", .{displayName(name)});
+            continue;
+        };
+        defer parsed.deinit();
+        visitor.visit(name, parsed);
+    }
+    return .ok;
 }
 
 pub const Catalog = struct {
@@ -463,54 +521,45 @@ pub const Catalog = struct {
     /// sample per tick: every expiry decision below sees the same instant
     /// instead of drifting across the directory walk.
     pub fn refresh(self: *Catalog, now_sec: i64) void {
-        var dbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const dirz = self.clusterDir(&dbuf) catch return;
-        const dir = c.opendir(dirz) orelse {
-            // Degrade to the previous peer list, but say why it went stale.
-            std.log.warn("cluster leases unreadable at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
-            return;
+        const Acc = struct {
+            cat: *Catalog,
+            now_sec: i64,
+            arena: std.mem.Allocator,
+            paths: *std.ArrayList(Path),
+
+            pub fn visit(acc: *@This(), name: []const u8, parsed: std.json.Parsed(proto.Lease)) void {
+                _ = name;
+                const lease = parsed.value;
+                if (lease.until < acc.now_sec) return;
+                if (std.mem.eql(u8, lease.id, acc.cat.self_id)) return;
+                for (lease.addrs) |a| {
+                    acc.cat.pushPath(acc.paths, acc.arena, lease.id, a);
+                }
+            }
         };
-        defer _ = c.closedir(dir);
 
         var new_arena = std.heap.ArenaAllocator.init(self.gpa);
         var new_paths: std.ArrayList(Path) = .empty;
-
-        while (c.readdir(dir)) |ent| {
-            const name = sys.dirName(ent);
-            if (name.len == 0 or name[0] == '.') continue;
-            if (!std.mem.endsWith(u8, name, ".json")) continue;
-            var fbuf: [sys.c.PATH_MAX]u8 = undefined;
-            const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
-            var lease_buf: [4096]u8 = undefined;
-            // ENOENT is the normal race against expiry cleanup and stays
-            // unnamed; any other open failure (EACCES, ELOOP from a planted
-            // symlink) persists across ticks and, left silent, reads exactly
-            // like a dead cluster -- so it is named like the read failures
-            // below. O_NOFOLLOW: a co-tenant who can plant a .json name must
-            // not redirect this read onto a crafted lease outside .cluster.
-            var open_errno: i32 = 0;
-            const blob = sys.readFileBufNoFollowOpenErrno(&lease_buf, fp, &open_errno) catch |err| switch (err) {
-                error.OpenFailed => {
-                    if (open_errno != c.ENOENT)
-                        std.log.warn("lease open failed for {s} (errno {d})", .{ displayName(name), open_errno });
-                    continue;
-                },
-                else => {
-                    std.log.warn("lease read failed for {s}: {t}", .{ displayName(name), err });
-                    continue;
-                },
-            };
-            const parsed = proto.parseLease(self.gpa, blob) catch {
-                std.log.warn("skipping corrupt lease {s}", .{displayName(name)});
-                continue;
-            };
-            defer parsed.deinit();
-            const lease = parsed.value;
-            if (lease.until < now_sec) continue;
-            if (std.mem.eql(u8, lease.id, self.self_id)) continue;
-            for (lease.addrs) |a| {
-                self.pushPath(&new_paths, new_arena.allocator(), lease.id, a);
-            }
+        var acc: Acc = .{
+            .cat = self,
+            .now_sec = now_sec,
+            .arena = new_arena.allocator(),
+            .paths = &new_paths,
+        };
+        switch (walkLeases(self.gpa, self.origin, &acc)) {
+            .ok => {},
+            .path_too_long => {
+                new_paths.deinit(self.gpa);
+                new_arena.deinit();
+                return;
+            },
+            .missing_dir => {
+                new_paths.deinit(self.gpa);
+                new_arena.deinit();
+                // Degrade to the previous peer list, but say why it went stale.
+                std.log.warn("cluster leases unreadable at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
+                return;
+            },
         }
 
         // Bootstrap: until any live lease shows up on the origin, dial the
@@ -1325,6 +1374,64 @@ test "publish unlinks the staging file when rename fails" {
     var tbuf: [192]u8 = undefined;
     const tmp_fp = try std.fmt.bufPrint(&tbuf, "{s}/me.json.tmp", .{cluster_d});
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
+}
+
+test "walkLeases visits parsed leases and skips hidden corrupt and missing" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-walk-leases");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    // No .cluster yet: missing_dir, not a walk of zero files.
+    {
+        const Empty = struct {
+            pub fn visit(_: *@This(), _: []const u8, _: std.json.Parsed(proto.Lease)) void {
+                unreachable;
+            }
+        };
+        var empty: Empty = .{};
+        try std.testing.expectEqual(LeaseWalk.missing_dir, walkLeases(gpa, origin_d, &empty));
+    }
+
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const live_fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, live_fp), "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[]}"));
+    // Leading-dot names cannot be a validId lease; Catalog.refresh already
+    // skipped them and `modelfs peers` now shares that skip.
+    const hidden_fp = try std.fmt.bufPrint(&pbuf, "{s}/.hidden.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, hidden_fp), "{\"id\":\"hidden\",\"until\":4102444800,\"addrs\":[]}"));
+    const corrupt_fp = try std.fmt.bufPrint(&pbuf, "{s}/corrupt.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, corrupt_fp), "{oops"));
+    const not_json_fp = try std.fmt.bufPrint(&pbuf, "{s}/notes.txt", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, not_json_fp), "x"));
+
+    const Acc = struct {
+        gpa: std.mem.Allocator,
+        names: std.ArrayList([]u8) = .empty,
+        pub fn visit(acc: *@This(), name: []const u8, parsed: std.json.Parsed(proto.Lease)) void {
+            _ = parsed;
+            const owned = acc.gpa.dupe(u8, name) catch return;
+            acc.names.append(acc.gpa, owned) catch acc.gpa.free(owned);
+        }
+        fn deinit(acc: *@This()) void {
+            for (acc.names.items) |n| acc.gpa.free(n);
+            acc.names.deinit(acc.gpa);
+        }
+    };
+    var acc: Acc = .{ .gpa = gpa };
+    defer acc.deinit();
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+    try std.testing.expectEqual(LeaseWalk.ok, walkLeases(gpa, origin_d, &acc));
+    try std.testing.expectEqual(@as(usize, 1), acc.names.items.len);
+    try std.testing.expectEqualStrings("spark9.json", acc.names.items[0]);
 }
 
 test "refresh skips self and expired leases" {

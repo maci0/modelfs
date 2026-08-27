@@ -1,5 +1,6 @@
-//! Local piece cache: per-file bitfields with persisted sidecars, hydration
-//! claims, pinning, and hole-punch culling (in-memory and disk-only victims).
+//! Local piece cache: the origin-relative path gate (`relOk`), per-file
+//! bitfields with persisted sidecars, hydration claims, pinning, and
+//! hole-punch culling (in-memory and disk-only victims).
 const std = @import("std");
 const piece = @import("piece.zig");
 const proto = @import("proto.zig");
@@ -11,6 +12,27 @@ const c = sys.c;
 /// Daemon liveness artifact at the cache root; the discovery tick writes it
 /// and `modelfs status` reads it. Not a piece sidecar (`data/`, `meta/`, `pin/`).
 pub const status_file = "status.json";
+
+/// True when rel is a safe origin-relative path at a trust boundary: not
+/// empty, not absolute, no "." or ".." component, no control character.
+/// Applied to every externally supplied path before it joins a root (FUSE,
+/// peer HTTP, CLI pin); without it a peer request can escape the origin/cache
+/// trees or forge multi-line entries in operator logs via \n in a path.
+/// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
+/// U+2028/U+2029), the same discover.printable applies before echoing a
+/// lease name. Non-control text above that set (NFC/NFD spellings, astral
+/// emoji, names that are not valid UTF-8 at all) passes byte-exact; identity
+/// is byte equality all the way down.
+pub fn relOk(rel: []const u8) bool {
+    if (rel.len == 0 or rel[0] == '/') return false;
+    if (proto.containsControl(rel)) return false;
+    var it = std.mem.splitScalar(u8, rel, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
+    }
+    return true;
+}
 
 /// Process-lifetime operation counters, published in status.json every
 /// discovery tick (plus one summary log line per tick while anything moved).
@@ -1620,27 +1642,6 @@ pub const Store = struct {
         return true;
     }
 };
-
-/// True when rel is a safe origin-relative path at a trust boundary: not
-/// empty, not absolute, no "." or ".." component, no control character.
-/// Applied to every externally supplied path before it joins a root (FUSE,
-/// peer HTTP, CLI pin); without it a peer request can escape the origin/cache
-/// trees or forge multi-line entries in operator logs via \n in a path.
-/// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
-/// U+2028/U+2029), the same discover.printable applies before echoing a
-/// lease name. Non-control text above that set (NFC/NFD spellings, astral
-/// emoji, names that are not valid UTF-8 at all) passes byte-exact; identity
-/// is byte equality all the way down.
-pub fn relOk(rel: []const u8) bool {
-    if (rel.len == 0 or rel[0] == '/') return false;
-    if (proto.containsControl(rel)) return false;
-    var it = std.mem.splitScalar(u8, rel, '/');
-    while (it.next()) |seg| {
-        if (seg.len == 0) continue;
-        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
-    }
-    return true;
-}
 
 test "noteOriginIo edge-triggers infrastructure origin failures" {
     const gpa = std.testing.allocator;

@@ -1258,106 +1258,117 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         if (!builtin.is_test) std.log.err("origin {s} is not a directory", .{origin});
         return 1;
     }
-    var dbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const dirz = sys.joinZ(&dbuf, origin, discover.cluster_dir) catch {
-        std.log.err("origin path too long to name {s}/{s}", .{ origin, discover.cluster_dir });
-        return 1;
+
+    // Collect before printing: readdir order is filesystem-dependent (and
+    // the origin is NFS), so sorting by lease file name keeps the listing a
+    // function of the directory's contents alone and run-to-run diffable.
+    // walkLeases's parsed value aliases a stack buffer, so every string
+    // printed below is copied here.
+    const Addr = struct {
+        ip: []u8,
+        port: u16,
+        mbps: u32,
     };
-    if (sys.c.opendir(dirz)) |dir| {
-        defer _ = sys.c.closedir(dir);
-        const now = sys.nowSec(io);
+    const Row = struct {
+        name: []u8,
+        id: []u8,
+        until: i64,
+        addrs: []Addr,
+    };
+    const Acc = struct {
+        gpa: std.mem.Allocator,
+        rows: *std.ArrayList(Row),
 
-        // Collect before printing: readdir order is filesystem-dependent (and
-        // the origin is NFS), so sorting by lease file name keeps the listing a
-        // function of the directory's contents alone and run-to-run diffable.
-        const Row = struct {
-            name: []const u8,
-            doc: std.json.Parsed(proto.Lease),
-        };
-        var rows: std.ArrayList(Row) = .empty;
-        // parseLease leaves unescaped strings pointing into the file blob
-        // (std.json's alloc_if_needed), so every blob must outlive the
-        // printing below, not just the loop iteration that read it.
-        var blobs: std.ArrayList([]u8) = .empty;
-        defer {
-            for (rows.items) |r| r.doc.deinit();
-            for (rows.items) |r| gpa.free(r.name);
-            rows.deinit(gpa);
-            for (blobs.items) |b| gpa.free(b);
-            blobs.deinit(gpa);
-        }
-        while (sys.c.readdir(dir)) |ent| {
-            const name = sys.dirName(ent);
-            if (!std.mem.endsWith(u8, name, ".json")) continue;
-            var fbuf: [sys.c.PATH_MAX]u8 = undefined;
-            const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
-            var open_errno: i32 = 0;
-            const blob = sys.readFileAllocNoFollowOpenErrno(gpa, fp, 64 * 1024, &open_errno) catch |err| {
-                // ENOENT is the normal race against expiry cleanup; any other
-                // failure persists across invocations and is named, matching
-                // the corrupt-lease warn below and Catalog.refresh's policy.
-                if (err == error.OpenFailed) {
-                    if (open_errno != sys.c.ENOENT)
-                        std.log.warn("peers: cannot open lease {s} (errno {d})", .{ discover.displayName(name), open_errno });
-                } else {
-                    std.log.warn("peers: cannot read lease {s}: {t}", .{ discover.displayName(name), err });
-                }
-                continue;
+        pub fn visit(acc: *@This(), name: []const u8, parsed: std.json.Parsed(proto.Lease)) void {
+            const lease = parsed.value;
+            const owned_name = acc.gpa.dupe(u8, name) catch return;
+            const owned_id = acc.gpa.dupe(u8, lease.id) catch {
+                acc.gpa.free(owned_name);
+                return;
             };
-            const parsed = proto.parseLease(gpa, blob) catch {
-                gpa.free(blob);
-                std.log.warn("peers: skipping corrupt lease {s}", .{discover.displayName(name)});
-                continue;
+            const addrs = acc.gpa.alloc(Addr, lease.addrs.len) catch {
+                acc.gpa.free(owned_name);
+                acc.gpa.free(owned_id);
+                return;
             };
-            blobs.append(gpa, blob) catch {
-                parsed.deinit();
-                gpa.free(blob);
-                continue;
-            };
-            const owned_name = gpa.dupe(u8, name) catch {
-                parsed.deinit();
-                _ = blobs.pop();
-                gpa.free(blob);
-                continue;
-            };
-            rows.append(gpa, .{ .name = owned_name, .doc = parsed }) catch {
-                gpa.free(owned_name);
-                parsed.deinit();
-                _ = blobs.pop();
-                gpa.free(blob);
-                continue;
-            };
-        }
-        std.mem.sort(Row, rows.items, {}, struct {
-            fn lessThan(_: void, a: Row, b: Row) bool {
-                return std.mem.order(u8, a.name, b.name) == .lt;
+            var n: usize = 0;
+            while (n < lease.addrs.len) : (n += 1) {
+                addrs[n] = .{
+                    .ip = acc.gpa.dupe(u8, lease.addrs[n].ip) catch {
+                        for (addrs[0..n]) |a| acc.gpa.free(a.ip);
+                        acc.gpa.free(addrs);
+                        acc.gpa.free(owned_name);
+                        acc.gpa.free(owned_id);
+                        return;
+                    },
+                    .port = lease.addrs[n].port,
+                    .mbps = lease.addrs[n].mbps,
+                };
             }
-        }.lessThan);
+            acc.rows.append(acc.gpa, .{
+                .name = owned_name,
+                .id = owned_id,
+                .until = lease.until,
+                .addrs = addrs,
+            }) catch {
+                for (addrs) |a| acc.gpa.free(a.ip);
+                acc.gpa.free(addrs);
+                acc.gpa.free(owned_name);
+                acc.gpa.free(owned_id);
+            };
+        }
+    };
 
-        var any = false;
+    var rows: std.ArrayList(Row) = .empty;
+    defer {
         for (rows.items) |r| {
-            const lease = r.doc.value;
-            const live = lease.until >= now;
-            const status_str = if (live) "live" else "expired";
-            // Lease ids and addresses come off shared storage as other nodes'
-            // JSON; echo them only when free of control bytes so `modelfs peers`
-            // cannot be turned into a terminal-injection vector.
-            const id_shown = if (discover.printable(lease.id)) lease.id else "<id withheld: control bytes>";
-            printOut(io, gpa, "{s} (until={d}, {s})\n", .{ id_shown, lease.until, status_str });
-            for (lease.addrs) |a| {
-                const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
-                printOut(io, gpa, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
-            }
-            any = true;
+            for (r.addrs) |a| gpa.free(a.ip);
+            gpa.free(r.addrs);
+            gpa.free(r.name);
+            gpa.free(r.id);
         }
-        if (!any) printOut(io, gpa, "no leases\n", .{});
-    } else {
-        // The origin itself was verified reachable above, so a missing or
-        // unreadable .cluster dir here is a fresh/empty cluster, not an
-        // error: same exit-0 empty output as below, with the reason on
-        // stdout next to where the listing would have been.
-        printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir });
+        rows.deinit(gpa);
     }
+    var acc: Acc = .{ .gpa = gpa, .rows = &rows };
+    switch (discover.walkLeases(gpa, origin, &acc)) {
+        .ok => {},
+        .path_too_long => {
+            std.log.err("origin path too long to name {s}/{s}", .{ origin, discover.cluster_dir });
+            return 1;
+        },
+        .missing_dir => {
+            // The origin itself was verified reachable above, so a missing or
+            // unreadable .cluster dir here is a fresh/empty cluster, not an
+            // error: same exit-0 empty output as below, with the reason on
+            // stdout next to where the listing would have been.
+            printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir });
+            return 0;
+        },
+    }
+
+    std.mem.sort(Row, rows.items, {}, struct {
+        fn lessThan(_: void, a: Row, b: Row) bool {
+            return std.mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lessThan);
+
+    const now = sys.nowSec(io);
+    var any = false;
+    for (rows.items) |r| {
+        const live = r.until >= now;
+        const status_str = if (live) "live" else "expired";
+        // Lease ids and addresses come off shared storage as other nodes'
+        // JSON; echo them only when free of control bytes so `modelfs peers`
+        // cannot be turned into a terminal-injection vector.
+        const id_shown = if (discover.printable(r.id)) r.id else "<id withheld: control bytes>";
+        printOut(io, gpa, "{s} (until={d}, {s})\n", .{ id_shown, r.until, status_str });
+        for (r.addrs) |a| {
+            const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
+            printOut(io, gpa, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
+        }
+        any = true;
+    }
+    if (!any) printOut(io, gpa, "no leases\n", .{});
     return 0;
 }
 
@@ -1929,6 +1940,10 @@ test "cmdPeers skips an unleasable lease entry instead of failing the listing" {
     // a dead node from a missing one. Sorted by filename, this row leads.
     const old_fp = try std.fmt.bufPrint(&pbuf, "{s}/old.json", .{cluster_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, old_fp), "{\"id\":\"old\",\"until\":1,\"addrs\":[]}"));
+    // Leading-dot names cannot be a validId lease; the shared walk skips them
+    // the way Catalog.refresh already did, so they must not appear here.
+    const hidden_fp = try std.fmt.bufPrint(&pbuf, "{s}/.hidden.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, hidden_fp), "{\"id\":\"hidden\",\"until\":4102444800,\"addrs\":[]}"));
 
     // Expected-path warning from the cannot-open branch; keep it off the
     // runner's stderr like sibling fault-tolerance tests.
