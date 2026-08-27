@@ -38,6 +38,14 @@ case "${MAX_AGE}" in
     *)
         ;;
 esac
+# Digit-only is not enough: bash [[ -gt ]] treats a leading 0 as octal
+# (MF_DRILL_LOG_MAX_AGE=08 aborts "value too great for base"; =010 means
+# 8 seconds). 10# forces decimal. 10 digits is ~317 years, above every
+# age knob here, and stays inside signed 64-bit $(( )).
+if [[ "${#MAX_AGE}" -gt 10 ]]; then
+    die "MF_DRILL_LOG_MAX_AGE must be a whole number of seconds, got '${MAX_AGE}'"
+fi
+MAX_AGE=$((10#${MAX_AGE}))
 
 if [[ ! -e "${LOG_FILE}" ]]; then
     die "drill log ${LOG_FILE} is missing: the monthly restore drill has never written an artifact (docs/recovery.md section 6)"

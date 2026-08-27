@@ -121,6 +121,13 @@ case "${MAX_SNAP_AGE}" in
     *)
         ;;
 esac
+# Digit-only is not enough: bash [[ -gt ]] treats a leading 0 as octal
+# (MF_DRILL_MAX_SNAP_AGE=08 aborts; =010 means 8 seconds). 10# forces
+# decimal. 10 digits is ~317 years and stays inside signed 64-bit $(( )).
+if [[ "${#MAX_SNAP_AGE}" -gt 10 ]]; then
+    die "MF_DRILL_MAX_SNAP_AGE must be a whole number of seconds, got '${MAX_SNAP_AGE}'"
+fi
+MAX_SNAP_AGE=$((10#${MAX_SNAP_AGE}))
 MAX_REPLICA_AGE="${MF_DRILL_MAX_REPLICA_AGE:-129600}"
 case "${MAX_REPLICA_AGE}" in
     '' | *[!0-9]*)
@@ -129,6 +136,10 @@ case "${MAX_REPLICA_AGE}" in
     *)
         ;;
 esac
+if [[ "${#MAX_REPLICA_AGE}" -gt 10 ]]; then
+    die "MF_DRILL_MAX_REPLICA_AGE must be a whole number of seconds, got '${MAX_REPLICA_AGE}'"
+fi
+MAX_REPLICA_AGE=$((10#${MAX_REPLICA_AGE}))
 # ZFS creation is an epoch second. A negative age is a snapshot from the
 # future of this host's clock (NTP stepped back, or the pool's clock was
 # ahead when the snap was taken): the RPO comparison cannot be trusted, and

@@ -1390,8 +1390,9 @@ test "rangeBps" {
     // Exact rate: 16 MiB over 8 ms.
     const b = rangeBps(16 * 1024 * 1024, 8_000_000);
     try std.testing.expectEqual(@as(f64, 16 * 1024 * 1024) / 0.008, b);
-    // A non-positive elapsed time must yield 0, not inf/NaN (it feeds
-    // updateGoodput's EWMA, which would poison the path score).
+    // A non-positive elapsed time must yield 0, not inf/NaN. Catalog.updateGoodput
+    // ignores that 0 rather than treating it as a real sample (which would
+    // pull the EWMA 30% toward zero on a same-ns clock tick).
     try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, 0));
     try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, -1));
 }

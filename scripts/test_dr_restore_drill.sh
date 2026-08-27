@@ -367,6 +367,17 @@ LOG3="${TEMP}/drill3.log"
 write_env tank/models "${LIVE3}" tank/models@old "${STALE}" "${SNAP3}"
 expect_fail "stale snapshot is an alarm" "past the" "${LIVE3}" "${LOG3}"
 
+# 200000s-old snap: octal 0300000 is 98304 (would still fail); decimal
+# 300000 is above the age, so a leading zero must not keep the alarm.
+LOG3A="${TEMP}/drill3a.log"
+write_env tank/models "${LIVE3}" tank/models@old "${STALE}" "${SNAP3}"
+expect_ok "padded MF_DRILL_MAX_SNAP_AGE=0300000 is decimal" "${LIVE3}" "${LOG3A}" \
+    MF_DRILL_MAX_SNAP_AGE=0300000
+LOG3A2="${TEMP}/drill3a2.log"
+write_env tank/models "${LIVE1}" tank/models@autosnap_test "${FRESH}" "${SNAP1}"
+expect_fail "padded MF_DRILL_MAX_SNAP_AGE=08 is decimal not an octal abort" "past the" "${LIVE1}" "${LOG3A2}" \
+    MF_DRILL_MAX_SNAP_AGE=08
+
 # --- 3b. snapshot creation in the future of date +%s
 LIVE3B="${TEMP}/live3b"
 SNAP3B="${TEMP}/snap3b"
@@ -566,6 +577,19 @@ expect_check "fresh drill log is ok" 0 "drill-log OK" \
 
 expect_check "bad MF_DRILL_LOG_MAX_AGE is an alarm" 1 "whole number of seconds" \
     MF_DRILL_LOG="${TEMP}/fresh-drill.log" MF_DRILL_LOG_MAX_AGE="30d"
+
+# Leading zeros are decimal seconds, not octal. 08 used to abort inside
+# [[ -gt ]] ("value too great for base"). 0120 octal is 80, so a 90s-old
+# log would fail that limit; decimal 120 keeps it fresh.
+NINETY_STAMP="$(date -u -d "-90 seconds" +%Y-%m-%dT%H:%M:%SZ)"
+echo "${NINETY_STAMP} tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+    >"${TEMP}/ninety-drill.log"
+expect_check "padded MF_DRILL_LOG_MAX_AGE=08 is decimal not an octal abort" 1 "has not succeeded recently" \
+    MF_DRILL_LOG="${TEMP}/ninety-drill.log" MF_DRILL_LOG_MAX_AGE="08"
+expect_check "padded MF_DRILL_LOG_MAX_AGE=0120 is 120 seconds, not octal 80" 0 "drill-log OK" \
+    MF_DRILL_LOG="${TEMP}/ninety-drill.log" MF_DRILL_LOG_MAX_AGE="0120"
+expect_check "overlong MF_DRILL_LOG_MAX_AGE is an alarm" 1 "whole number of seconds" \
+    MF_DRILL_LOG="${TEMP}/fresh-drill.log" MF_DRILL_LOG_MAX_AGE="12345678901"
 
 # --- install_nas_backup.sh: dry-run writes nothing; --install lands files under dest
 INSTALLER="${SCRIPTS_DIR}/install_nas_backup.sh"

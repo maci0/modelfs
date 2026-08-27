@@ -887,6 +887,12 @@ pub const Catalog = struct {
     }
 
     pub fn updateGoodput(self: *Catalog, ip: []const u8, port: u16, bps: f64) void {
+        // rangeBps returns 0 for a non-positive elapsed time (same-ns
+        // clock sample on a tiny piece). Applying that as a real 0 B/s
+        // sample pulls the EWMA 30% toward zero and after a handful of
+        // sub-resolution fetches the path looks dead. Inf/NaN would
+        // poison pickBest the same way. Skip; keep the prior.
+        if (!std.math.isFinite(bps) or bps <= 0) return;
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const p = self.pathByAddr(ip, port) orelse return;
@@ -895,6 +901,23 @@ pub const Catalog = struct {
         } else {
             p.ewma_bps = 0.3 * bps + 0.7 * p.ewma_bps;
         }
+    }
+
+    test "updateGoodput ignores non-positive and non-finite samples" {
+        const gpa = std.testing.allocator;
+        var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+        defer cat.deinit();
+        try cat.paths.append(gpa, .{ .peer_id = "a", .ip = "10.0.0.1", .port = 1, .ewma_bps = 1e8, .hops = 0 });
+
+        const prior = cat.paths.items[0].ewma_bps;
+        cat.updateGoodput("10.0.0.1", 1, 0);
+        cat.updateGoodput("10.0.0.1", 1, -1);
+        cat.updateGoodput("10.0.0.1", 1, std.math.inf(f64));
+        cat.updateGoodput("10.0.0.1", 1, std.math.nan(f64));
+        try std.testing.expectEqual(prior, cat.paths.items[0].ewma_bps);
+
+        cat.updateGoodput("10.0.0.1", 1, 5e9);
+        try std.testing.expectEqual(0.3 * 5e9 + 0.7 * prior, cat.paths.items[0].ewma_bps);
     }
 
     pub fn inflight(self: *Catalog, ip: []const u8, port: u16, delta: i32) u32 {
