@@ -1220,6 +1220,23 @@ pub const Store = struct {
         return 0;
     }
 
+    /// Origin mkdir with FUSE-retry semantics. A lost reply after a
+    /// successful mkdir is retried as EEXIST; if the name is already a
+    /// directory the second call is success, matching one mkdir. A
+    /// non-directory at that name (file, symlink) stays EEXIST, the
+    /// origin's own POSIX answer. Empty rel is the origin root: mkdir of
+    /// an existing directory still converges.
+    pub fn mkdirOrigin(self: Store, rel: []const u8, mode: c.mode_t) i32 {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const op = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
+        const rc = sys.mkdir(op, mode);
+        if (rc != -c.EEXIST) return rc;
+        var lst: c.struct_stat = undefined;
+        if (sys.lstatPath(op, &lst) != 0) return rc;
+        if ((lst.st_mode & c.S_IFMT) == c.S_IFDIR) return 0;
+        return rc;
+    }
+
     /// Copies bytes this node just wrote through the mount into the local
     /// cache and marks the pieces they fully span. The entry is grown with
     /// its piece marks preserved: an append is our own write, not an external
@@ -1273,9 +1290,12 @@ pub const Store = struct {
 
     /// Copies a landed origin write into the cache fd and marks the pieces it
     /// fully spans, so reads serve the copy instead of re-hydrating over NFS.
-    /// Returns false when the copy did not land or pieces could not be marked;
-    /// overlapping marks are then cleared so a warm read or `/have` cannot
-    /// serve pre-write cache bytes, and those pieces refill from origin.
+    /// A retry whose fully-covered pieces are already marked re-pwrites but
+    /// does not bump the write generation or rewrite the sidecar: the copy
+    /// is already applied. Returns false when the copy did not land or
+    /// pieces could not be marked; overlapping marks are then cleared so a
+    /// warm read or `/have` cannot serve pre-write cache bytes, and those
+    /// pieces refill from origin.
     /// The copy never truncates the cache fd: concurrent fills of one entry
     /// land overlapping appends outside any shared lock, and an absolute
     /// ftruncate here could shrink the shared descriptor below bytes another
@@ -1310,9 +1330,27 @@ pub const Store = struct {
         // write-through unlinked these artifacts; marking plus saving would
         // resurrect a sidecar claiming filled pieces over missing bytes.
         if (file.dead.load(.acquire)) return false;
-        file.writes += 1;
         if (copied) {
             const cov = piece.fullCover(off, data.len, self.piece_size);
+            // Already applied: every fully-covered piece is marked. A FUSE
+            // retry after a lost reply re-pwrites the same bytes; bumping
+            // writes again would drop in-flight fills of other pieces, and
+            // rewriting the sidecar is a mutation a punch round could observe.
+            // Partial writes (empty fullCover) still bump: they must invalidate
+            // an in-flight fill of the overlapping piece so it cannot overwrite
+            // the patch with stale whole-piece bytes.
+            if (cov.start < cov.end) {
+                var already = true;
+                var i = cov.start;
+                while (i < cov.end) : (i += 1) {
+                    if (!file.bits.get(i)) {
+                        already = false;
+                        break;
+                    }
+                }
+                if (already) return true;
+            }
+            file.writes += 1;
             var i = cov.start;
             while (i < cov.end) : (i += 1) file.bits.set(i);
         } else {
@@ -1320,6 +1358,7 @@ pub const Store = struct {
             // already forces peer fills onto origin, but a hit of an already
             // marked piece skips hydration and would serve the pre-write
             // cache copy -- and /have would advertise it to the fleet.
+            file.writes += 1;
             const cov = piece.cover(off, data.len, file.size, self.piece_size);
             var i = cov.start;
             while (i < cov.end) : (i += 1) file.bits.clear(i);
@@ -3238,6 +3277,16 @@ test "write-through copied twice marks the same pieces as one copy" {
     try std.testing.expect(twice.hasPiece(f2, 0, sys.monoSec(std.testing.io)));
     try std.testing.expect(!twice.hasPiece(f2, 1, sys.monoSec(std.testing.io)));
 
+    // Generation must match one copy: a retry must not bump writes again.
+    f1.mu.lockUncancelable(std.testing.io);
+    const w_once = f1.writes;
+    f1.mu.unlock(std.testing.io);
+    f2.mu.lockUncancelable(std.testing.io);
+    const w_twice = f2.writes;
+    f2.mu.unlock(std.testing.io);
+    try std.testing.expectEqual(w_once, w_twice);
+    try std.testing.expectEqual(@as(u64, 1), w_once);
+
     var mbuf1: [sys.c.PATH_MAX]u8 = undefined;
     var mbuf2: [sys.c.PATH_MAX]u8 = undefined;
     const meta1 = try once.cacheMetaPath(&mbuf1, "wt.bin");
@@ -3247,6 +3296,35 @@ test "write-through copied twice marks the same pieces as one copy" {
     const side1 = try sys.readFileBuf(&blob1, meta1);
     const side2 = try sys.readFileBuf(&blob2, meta2);
     try std.testing.expectEqualSlices(u8, side1, side2);
+}
+
+test "write-through overwrite of a marked piece still lands the new bytes" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-wt-ovw");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-wt-ovw");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var first: [16]u8 = undefined;
+    @memset(&first, 0xAA);
+    var next: [16]u8 = undefined;
+    @memset(&next, 0xBB);
+
+    const f = try st.get("ovw.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expect(st.copyIntoCache(f, 0, &first));
+    try std.testing.expect(st.copyIntoCache(f, 0, &next));
+    try std.testing.expect(st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+
+    var rd: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqualSlices(u8, &next, &rd);
 }
 
 // A destructive job run twice in quick succession must change nothing the
@@ -3482,6 +3560,33 @@ test "renameOrigin on a retry after origin-only rename still drops cache" {
     try std.testing.expect(sys.statPath(try st.originPath(&obuf, "d.bin"), &stbuf) == 0);
     try std.testing.expect(sys.statPath(try st.cacheMetaPath(&ma, "c.bin"), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try st.cacheMetaPath(&mb, "d.bin"), &stbuf) != 0);
+}
+
+test "mkdirOrigin twice matches once, and a file at that name stays EEXIST" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-mkdir-twice");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-mkdir-twice");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    try std.testing.expectEqual(@as(i32, 0), st.mkdirOrigin("sub", 0o755));
+    // FUSE retry after a lost reply: the directory exists, the second call
+    // must not fail EEXIST.
+    try std.testing.expectEqual(@as(i32, 0), st.mkdirOrigin("sub", 0o755));
+
+    var stbuf: c.struct_stat = undefined;
+    var pb: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.lstatPath(try st.originPath(&pb, "sub"), &stbuf));
+    try std.testing.expect((stbuf.st_mode & c.S_IFMT) == c.S_IFDIR);
+
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try st.originPath(&pb, "file.bin"), "x"));
+    try std.testing.expectEqual(@as(i32, -c.EEXIST), st.mkdirOrigin("file.bin", 0o755));
 }
 
 test "punchPiece refuses pinned and freshly accessed entries" {

@@ -118,6 +118,11 @@ pub fn appendExt(buf: []u8, src: [*:0]const u8, ext: []const u8) ![*:0]u8 {
     return buf[0 .. base.len + ext.len :0];
 }
 
+/// mkdir -p: create every component, treating an existing directory as
+/// success so a second run converges. EEXIST is not enough: a planted file
+/// or symlink at a component used to make this return 0 while callers
+/// believed the tree was in place. A file is ENOTDIR; a symlink is ELOOP
+/// (same fail-closed as the O_NOFOLLOW artifact opens).
 pub fn mkdirAll(path: []const u8, mode: c.mode_t) i32 {
     var tmp: [c.PATH_MAX]u8 = undefined;
     if (path.len == 0 or path.len >= tmp.len) return -c.ENAMETOOLONG;
@@ -134,6 +139,21 @@ pub fn mkdirAll(path: []const u8, mode: c.mode_t) i32 {
             if (e != c.EEXIST) {
                 tmp[i] = save;
                 return -e;
+            }
+            var st: c.struct_stat = undefined;
+            const lst = lstatPath(tmp[0..i :0], &st);
+            if (lst != 0) {
+                tmp[i] = save;
+                return lst;
+            }
+            const kind = st.st_mode & c.S_IFMT;
+            if (kind == c.S_IFLNK) {
+                tmp[i] = save;
+                return -c.ELOOP;
+            }
+            if (kind != c.S_IFDIR) {
+                tmp[i] = save;
+                return -c.ENOTDIR;
             }
         }
         tmp[i] = save;
@@ -623,6 +643,29 @@ pub fn scratchDir(buf: []u8, name: []const u8) ![]const u8 {
     const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSecRaw(), std.os.linux.getpid() });
     if (mkdirAll(p, 0o755) != 0) return error.MkdirFailed;
     return p;
+}
+
+test "mkdirAll twice converges and refuses a file or symlink at the name" {
+    var db: [128]u8 = undefined;
+    const scratch = try scratchDir(&db, "modelfs-mkdirall");
+    defer deleteTree(std.testing.io, scratch);
+
+    var zb: [192]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&zb, "{s}/a/b", .{scratch});
+    try std.testing.expectEqual(@as(i32, 0), mkdirAll(dir, 0o755));
+    try std.testing.expectEqual(@as(i32, 0), mkdirAll(dir, 0o755));
+
+    var fb: [192]u8 = undefined;
+    var fz: [192]u8 = undefined;
+    const file = try std.fmt.bufPrint(&fb, "{s}/a/b/file", .{scratch});
+    try std.testing.expectEqual(@as(i32, 0), writeFile(try toZ(&fz, file), "x"));
+    try std.testing.expectEqual(@as(i32, -c.ENOTDIR), mkdirAll(file, 0o755));
+
+    var lb: [192]u8 = undefined;
+    var lz: [192]u8 = undefined;
+    const link = try std.fmt.bufPrint(&lb, "{s}/planted", .{scratch});
+    try std.testing.expectEqual(@as(i32, 0), c.symlink("a", try toZ(&lz, link)));
+    try std.testing.expectEqual(@as(i32, -c.ELOOP), mkdirAll(link, 0o755));
 }
 
 test "closeWrite reports a bad fd and succeeds after a write" {
