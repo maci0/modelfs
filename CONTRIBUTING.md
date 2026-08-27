@@ -73,6 +73,8 @@ a PIE with full RELRO, BIND_NOW, and a non-executable stack.
 ./scripts/test_fault_tolerance.sh      # peer loss and lease expiry; some checks skip loudly without a live peer
 ./scripts/test_dr_restore_drill.sh     # restore drill against stub zfs; also run by check.sh
 ./scripts/check_drill_log.sh           # fail if the monthly drill log is missing or stale
+./scripts/dr_restore_drill.sh --age-only  # fail if newest snapshot is older than 25 h (NAS)
+./scripts/hold_monthlies.sh            # hold monthly snapshots on the replica (syncoid ExecStartPost)
 ./scripts/install_nas_backup.sh        # copy NAS snapshot/replica/drill units (dry-run; --install writes)
 ```
 

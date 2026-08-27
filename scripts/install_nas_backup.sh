@@ -13,10 +13,11 @@ print_usage() {
     cat <<'EOF'
 Usage: ./scripts/install_nas_backup.sh [--install]
 
-Copy sanoid.conf, OnFailure drop-ins, the replica pull timer, and the
-restore-drill timers from scripts/nas/ into MF_NAS_DEST (default /).
-Without --install, print the plan and exit 0. Does not enable or start
-any unit; run the printed systemctl lines on the NAS and replica host.
+Copy sanoid.conf, OnFailure drop-ins, the replica pull timer, the
+hourly snapshot-age alarm, and the restore-drill timers from
+scripts/nas/ into MF_NAS_DEST (default /). Without --install, print
+the plan and exit 0. Does not enable or start any unit; run the
+printed systemctl lines on the NAS and replica host.
 EOF
 }
 
@@ -74,16 +75,19 @@ copy_one "${NAS_DIR}/modelfs-drill.service" "etc/systemd/system/modelfs-drill.se
 copy_one "${NAS_DIR}/modelfs-drill.timer" "etc/systemd/system/modelfs-drill.timer"
 copy_one "${NAS_DIR}/modelfs-drill-log.service" "etc/systemd/system/modelfs-drill-log.service"
 copy_one "${NAS_DIR}/modelfs-drill-log.timer" "etc/systemd/system/modelfs-drill-log.timer"
+copy_one "${NAS_DIR}/modelfs-snap-age.service" "etc/systemd/system/modelfs-snap-age.service"
+copy_one "${NAS_DIR}/modelfs-snap-age.timer" "etc/systemd/system/modelfs-snap-age.timer"
 copy_one "${SCRIPTS_DIR}/dr_restore_drill.sh" "usr/local/sbin/modelfs-restore-drill"
 copy_one "${SCRIPTS_DIR}/check_drill_log.sh" "usr/local/sbin/modelfs-check-drill-log"
+copy_one "${SCRIPTS_DIR}/hold_monthlies.sh" "usr/local/sbin/modelfs-hold-monthlies"
 copy_one "${ROOT_DIR}/docs/recovery.md" "usr/local/share/doc/modelfs/recovery.md"
 
 echo
 echo "next, on the NAS (after dnf install sanoid and editing syncoid-models.service's SSH target on the replica host):"
 echo "  systemctl daemon-reload"
 echo "  systemctl enable --now sanoid.timer sanoid-prune.timer"
-echo "  systemctl enable --now modelfs-drill.timer modelfs-drill-log.timer"
+echo "  systemctl enable --now modelfs-drill.timer modelfs-drill-log.timer modelfs-snap-age.timer"
 echo "next, on the replica host:"
 echo "  systemctl enable --now syncoid-models.timer"
-echo "  systemctl enable --now modelfs-drill.timer   # with MF_DRILL_REPLICA set"
+echo "  systemctl enable --now modelfs-drill.timer modelfs-snap-age.timer   # with MF_DRILL_REPLICA set"
 echo "docs/recovery.md section 3 is the runbook; this script does not start units."

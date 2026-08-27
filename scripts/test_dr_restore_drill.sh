@@ -525,6 +525,295 @@ write_env tank/models "${LIVE14}" tank/models@ok "${FRESH}" "${SNAP14}" \
 expect_ok "replica 26h old is inside the daily slack" "${LIVE14}" "${LOG14}" \
     MF_DRILL_REPLICA="tank/models-backup"
 
+# --- --age-only: snapshot/replica freshness without clone or drill log
+expect_age_ok() {
+    local name="$1"
+    local live="$2"
+    local log="$3"
+    shift 3
+    local out rc
+    rc=0
+    out="$(env \
+        MF_DRILL_LIVE="${live}" \
+        MF_DRILL_LOG="${log}" \
+        MF_DRILL_KEEP="" \
+        "$@" \
+        "${DRILL}" --age-only tank/models 2>&1)" || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+        fail "${name}: expected success, rc=${rc}: ${out}"
+        return 0
+    fi
+    if ! grep -q "snap-age OK:" <<<"${out}"; then
+        fail "${name}: missing snap-age OK in: ${out}"
+        return 0
+    fi
+    if grep -q "drill OK:" <<<"${out}"; then
+        fail "${name}: --age-only ran the clone: ${out}"
+        return 0
+    fi
+    pass "${name}"
+}
+
+expect_age_fail() {
+    local name="$1"
+    local needle="$2"
+    local live="$3"
+    local log="$4"
+    shift 4
+    local out rc
+    rc=0
+    out="$(env \
+        MF_DRILL_LIVE="${live}" \
+        MF_DRILL_LOG="${log}" \
+        MF_DRILL_KEEP="" \
+        "$@" \
+        "${DRILL}" --age-only tank/models 2>&1)" || rc=$?
+    if [[ "${rc}" -eq 0 ]]; then
+        fail "${name}: expected failure, got success: ${out}"
+        return 0
+    fi
+    if ! grep -q "${needle}" <<<"${out}"; then
+        fail "${name}: expected '${needle}' in: ${out}"
+        return 0
+    fi
+    if grep -q "drill OK:" <<<"${out}"; then
+        fail "${name}: --age-only ran the clone: ${out}"
+        return 0
+    fi
+    pass "${name}"
+}
+
+LIVE15="${TEMP}/live15"
+SNAP15="${TEMP}/snap15"
+mkdir -p "${LIVE15}/gguf" "${SNAP15}/gguf"
+echo weight >"${SNAP15}/gguf/m.gguf"
+cp -a "${SNAP15}/gguf/m.gguf" "${LIVE15}/gguf/m.gguf"
+LOG15="${TEMP}/drill15.log"
+write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
+expect_age_ok "age-only succeeds on a fresh snapshot" "${LIVE15}" "${LOG15}"
+if [[ -f "${STUB_STATE}/clone" ]]; then
+    fail "age-only left a clone dataset behind"
+else
+    pass "age-only did not clone"
+fi
+if [[ -s "${LOG15}" ]]; then
+    fail "age-only appended the drill log: $(cat "${LOG15}" 2>/dev/null || true)"
+else
+    pass "age-only did not append the drill log"
+fi
+
+LOG15A="${TEMP}/drill15a.log"
+write_env tank/models "${LIVE15}" tank/models@old "${STALE}" "${SNAP15}"
+expect_age_fail "age-only stale snapshot is an alarm" "past the" "${LIVE15}" "${LOG15A}"
+
+LOG15B="${TEMP}/drill15b.log"
+write_env tank/models "${LIVE15}" "" "${FRESH}" "${TEMP}/nosnap-age"
+expect_age_fail "age-only no snapshots is an alarm" "no snapshots" "${LIVE15}" "${LOG15B}"
+
+LOG15C="${TEMP}/drill15c.log"
+write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
+expect_age_fail "age-only missing replica is an alarm" "replica dataset" \
+    "${LIVE15}" "${LOG15C}" MF_DRILL_REPLICA="tank/models-backup"
+
+LOG15D="${TEMP}/readonly-age.log"
+touch "${LOG15D}"
+chmod a-w "${LOG15D}"
+write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
+expect_age_ok "age-only does not need a writable drill log" "${LIVE15}" "${LOG15D}"
+chmod u+w "${LOG15D}"
+
+AGE_USAGE_RC=0
+AGE_USAGE_OUT="$("${DRILL}" --age-only tank/models extra 2>&1)" || AGE_USAGE_RC=$?
+if [[ "${AGE_USAGE_RC}" -ne 2 ]]; then
+    fail "age-only extra operand: expected rc=2, got ${AGE_USAGE_RC}: ${AGE_USAGE_OUT}"
+elif ! grep -q "Usage:" <<<"${AGE_USAGE_OUT}"; then
+    fail "age-only extra operand missing Usage: ${AGE_USAGE_OUT}"
+else
+    pass "age-only extra operand is a usage error"
+fi
+
+# --- hold_monthlies.sh: monthly snapshots get modelfs-dr; already-held is ok
+HOLD="${SCRIPTS_DIR}/hold_monthlies.sh"
+HOLD_BIN="${TEMP}/holdbin"
+HOLD_STATE="${TEMP}/holdstub"
+mkdir -p "${HOLD_BIN}" "${HOLD_STATE}"
+cat >"${HOLD_BIN}/zfs" <<'HOLDSTUB'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE="${HOLD_STATE:?}"
+read_state() {
+    # shellcheck source=/dev/null
+    source "${STATE}/env"
+}
+sub="$1"
+shift
+case "${sub}" in
+    list)
+        read_state
+        t=""
+        dataset=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -H | -p)
+                    shift
+                    ;;
+                -o | -s)
+                    shift 2
+                    ;;
+                -t)
+                    t="${2-}"
+                    shift 2
+                    ;;
+                *)
+                    dataset="$1"
+                    shift
+                    ;;
+            esac
+        done
+        if [[ "${t}" == "snapshot" ]]; then
+            if [[ "${dataset}" == "${ORIGIN}" && -f "${STATE}/snaps" ]]; then
+                cat "${STATE}/snaps"
+            fi
+            exit 0
+        fi
+        if [[ "${dataset}" == "${ORIGIN}" ]]; then
+            printf '%s\n' "${ORIGIN}"
+            exit 0
+        fi
+        exit 1
+        ;;
+    hold)
+        read_state
+        tag="${1-}"
+        snap="${2-}"
+        [[ -n "${tag}" && -n "${snap}" ]] || exit 1
+        mkdir -p "${STATE}/holds"
+        if [[ "${HOLD_DENY:-}" == "${snap}" ]]; then
+            echo "cannot hold snapshot '${snap}': permission denied" >&2
+            exit 1
+        fi
+        if [[ -f "${STATE}/holds/${snap//\//_}" ]]; then
+            echo "cannot hold snapshot '${snap}': tag already exists on this dataset" >&2
+            exit 1
+        fi
+        printf '%s\n' "${tag}" >"${STATE}/holds/${snap//\//_}"
+        exit 0
+        ;;
+    holds)
+        read_state
+        hflag=""
+        snap=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -H)
+                    hflag=1
+                    shift
+                    ;;
+                *)
+                    snap="$1"
+                    shift
+                    ;;
+            esac
+        done
+        [[ -n "${snap}" ]] || exit 1
+        holdf="${STATE}/holds/${snap//\//_}"
+        if [[ -f "${holdf}" ]]; then
+            tag="$(<"${holdf}")"
+            if [[ -n "${hflag}" ]]; then
+                printf '%s\t%s\t-\n' "${snap}" "${tag}"
+            else
+                printf '%s  %s  -\n' "${snap}" "${tag}"
+            fi
+        fi
+        exit 0
+        ;;
+    *)
+        echo "hold stub zfs: unsupported subcommand ${sub}" >&2
+        exit 1
+        ;;
+esac
+HOLDSTUB
+chmod +x "${HOLD_BIN}/zfs"
+
+write_hold_env() {
+    local origin="$1"
+    local deny="$2"
+    shift 2
+    printf 'ORIGIN=%q\nHOLD_DENY=%q\n' "${origin}" "${deny}" >"${HOLD_STATE}/env"
+    : >"${HOLD_STATE}/snaps"
+    local s
+    for s in "$@"; do
+        printf '%s\n' "${s}" >>"${HOLD_STATE}/snaps"
+    done
+}
+
+rm -rf "${HOLD_STATE}/holds"
+write_hold_env tank/models "" \
+    tank/models@autosnap_h_hourly tank/models@autosnap_m_monthly
+HOLD_OUT=""
+HOLD_RC=0
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+if [[ "${HOLD_RC}" -ne 0 ]]; then
+    fail "hold monthlies: expected success, rc=${HOLD_RC}: ${HOLD_OUT}"
+elif ! grep -q "hold OK: 1 monthly" <<<"${HOLD_OUT}"; then
+    fail "hold monthlies missing one-monthly OK: ${HOLD_OUT}"
+elif [[ ! -f "${HOLD_STATE}/holds/tank_models@autosnap_m_monthly" ]]; then
+    fail "hold monthlies did not tag the monthly"
+elif [[ -f "${HOLD_STATE}/holds/tank_models@autosnap_h_hourly" ]]; then
+    fail "hold monthlies tagged an hourly snapshot"
+else
+    pass "hold monthlies tags only *_monthly"
+fi
+
+HOLD_OUT=""
+HOLD_RC=0
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+if [[ "${HOLD_RC}" -ne 0 ]]; then
+    fail "hold already-held: expected success, rc=${HOLD_RC}: ${HOLD_OUT}"
+elif ! grep -q "already modelfs-dr" <<<"${HOLD_OUT}"; then
+    fail "hold already-held missing already line: ${HOLD_OUT}"
+else
+    pass "hold already-held is success"
+fi
+
+rm -rf "${HOLD_STATE}/holds"
+write_hold_env tank/models "" tank/models@autosnap_h_hourly
+HOLD_OUT=""
+HOLD_RC=0
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+if [[ "${HOLD_RC}" -ne 0 ]]; then
+    fail "hold no-monthlies: expected success, rc=${HOLD_RC}: ${HOLD_OUT}"
+elif ! grep -q "hold OK: 0 monthly" <<<"${HOLD_OUT}"; then
+    fail "hold no-monthlies missing zero OK: ${HOLD_OUT}"
+else
+    pass "hold no-monthlies is success"
+fi
+
+rm -rf "${HOLD_STATE}/holds"
+write_hold_env tank/models tank/models@autosnap_m_monthly \
+    tank/models@autosnap_m_monthly
+HOLD_OUT=""
+HOLD_RC=0
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+if [[ "${HOLD_RC}" -eq 0 ]]; then
+    fail "hold denied: expected failure: ${HOLD_OUT}"
+elif ! grep -q "cannot hold" <<<"${HOLD_OUT}"; then
+    fail "hold denied missing cannot hold: ${HOLD_OUT}"
+else
+    pass "hold denied is an alarm"
+fi
+
+HOLD_OUT=""
+HOLD_RC=0
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/missing 2>&1)" || HOLD_RC=$?
+if [[ "${HOLD_RC}" -eq 0 ]]; then
+    fail "hold missing dataset: expected failure: ${HOLD_OUT}"
+elif ! grep -q "does not exist" <<<"${HOLD_OUT}"; then
+    fail "hold missing dataset missing message: ${HOLD_OUT}"
+else
+    pass "hold missing dataset is an alarm"
+fi
+
 # --- check_drill_log.sh: the daily alarm for a missed monthly drill
 CHECK_LOG="${SCRIPTS_DIR}/check_drill_log.sh"
 expect_check() {
@@ -602,6 +891,10 @@ elif ! grep -q "would copy" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing 'would copy': ${DRY_OUT}"
 elif ! grep -q "etc/sanoid/sanoid.conf" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing sanoid.conf: ${DRY_OUT}"
+elif ! grep -q "modelfs-snap-age.timer" <<<"${DRY_OUT}"; then
+    fail "installer dry-run missing snap-age timer: ${DRY_OUT}"
+elif ! grep -q "modelfs-hold-monthlies" <<<"${DRY_OUT}"; then
+    fail "installer dry-run missing hold_monthlies: ${DRY_OUT}"
 else
     pass "installer dry-run lists the NAS units"
 fi
@@ -625,8 +918,11 @@ else
         etc/systemd/system/modelfs-drill.timer \
         etc/systemd/system/modelfs-drill-log.service \
         etc/systemd/system/modelfs-drill-log.timer \
+        etc/systemd/system/modelfs-snap-age.service \
+        etc/systemd/system/modelfs-snap-age.timer \
         usr/local/sbin/modelfs-restore-drill \
         usr/local/sbin/modelfs-check-drill-log \
+        usr/local/sbin/modelfs-hold-monthlies \
         usr/local/share/doc/modelfs/recovery.md; do
         if [[ ! -f "${INSTALL_DEST}/${rel}" ]]; then
             missing="${missing} ${rel}"
@@ -641,6 +937,21 @@ else
         fail "installer --install sanoid drop-in lost OnFailure"
     elif grep -q "OnFailure" "${INSTALL_DEST}/etc/systemd/system/modelfs-drill.timer"; then
         fail "installer --install put OnFailure on the drill timer (belongs on the service)"
+    elif grep -q "OnFailure" "${INSTALL_DEST}/etc/systemd/system/modelfs-snap-age.timer"; then
+        fail "installer --install put OnFailure on the snap-age timer (belongs on the service)"
+    elif ! grep -q "TimeoutStartSec=infinity" \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit lost TimeoutStartSec=infinity"
+    elif ! grep -q "modelfs-hold-monthlies" \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit lost hold ExecStartPost"
+    elif ! grep -q -- "--age-only" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-snap-age.service"; then
+        fail "installer --install snap-age unit lost --age-only"
+    elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-hold-monthlies" ]]; then
+        fail "installer --install hold wrapper is not executable"
+    elif ! grep -q "recursive = yes" "${INSTALL_DEST}/etc/sanoid/sanoid.conf"; then
+        fail "installer --install sanoid.conf lost recursive = yes"
     else
         pass "installer --install lands units, wrappers, and the service OnFailure"
     fi

@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly check that tank/models snapshots are inside the claimed RPO
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

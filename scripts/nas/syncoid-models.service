@@ -2,7 +2,7 @@
 Description=Pull tank/models from the NAS onto this replica host
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 OnFailure=notify-admin@%n.service
-After=zfs-import.target
+After=zfs-import.target network-online.target
 # Pull, not push: this unit runs on the replica host so NAS root cannot
 # destroy the pool-loss copy with the same credential that can destroy
 # tank/models. Replace nas:tank/models with the SSH target after a
@@ -10,7 +10,14 @@ After=zfs-import.target
 
 [Service]
 Type=oneshot
+# Initial pull and a large incremental are hours, not the 90 s some
+# systemd defaults give Type=oneshot. infinity is explicit so a Rocky
+# host whose DefaultTimeoutStartSec is still 90 s cannot kill the recv.
+TimeoutStartSec=infinity
 ExecStart=/usr/bin/syncoid --no-privilege-elevation nas:tank/models tank/models
-# Monthlies survive a recursive destroy only until `zfs release`. An
-# already-held snapshot makes `zfs hold` fail; that is success here.
-ExecStartPost=/bin/bash -c 'for s in $(zfs list -H -t snapshot -o name tank/models | grep "_monthly$" || true); do zfs hold modelfs-dr "$s" || true; done'
+# Monthlies survive a recursive destroy only until `zfs release`.
+# Already-held is success; any other hold failure fails this unit
+# (scripts/hold_monthlies.sh). The previous `|| true` swallowed a
+# missing hold as a green pull.
+ExecStartPost=/usr/local/sbin/modelfs-hold-monthlies tank/models
+

@@ -1,0 +1,15 @@
+[Unit]
+Description=Alarm if tank/models newest snapshot is older than the claimed RPO
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+OnFailure=notify-admin@%n.service
+After=zfs-import.target
+# Hourly, not the monthly clone: a disabled sanoid.timer never fails the
+# sanoid.service unit (OnFailure never fires), so snapshot age is the
+# alarm. --age-only does not append the drill log.
+
+[Service]
+Type=oneshot
+# Set MF_DRILL_REPLICA to the local replica dataset when this host holds
+# the pool-loss copy; leave unset on the NAS.
+# Environment=MF_DRILL_REPLICA=tank/models
+ExecStart=/usr/local/sbin/modelfs-restore-drill --age-only tank/models

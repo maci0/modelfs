@@ -47,11 +47,11 @@ systemctl enable --now smartd                         # disks complain before th
 
 Reads of cold weight files never surface silent bit rot; scrubs do.
 
-Snapshots, the replica, and the restore drill are not optional extras of
-this scrub: they are [recovery.md](recovery.md) section 3, installed from
-`scripts/nas/` via `scripts/install_nas_backup.sh`. Until those timers are
-enabled, a deleted or overwritten weight is gone. Scrub and smartd do not
-replace them.
+Snapshots, the replica, the hourly snapshot-age alarm, and the restore
+drill are not optional extras of this scrub: they are [recovery.md](recovery.md)
+section 3, installed from `scripts/nas/` via `scripts/install_nas_backup.sh`.
+Until those timers are enabled, a deleted or overwritten weight is gone.
+Scrub and smartd do not replace them.
 
 `*` on `showmount` is world-writable as root. The firewall rich rules are
 what actually limits NFS to `192.168.0.0/24` (`--add-service=nfs` would

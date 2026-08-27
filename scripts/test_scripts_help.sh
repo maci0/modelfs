@@ -38,6 +38,7 @@ scripts=(
     scripts/cross_aarch64.sh
     scripts/dr_restore_drill.sh
     scripts/extract_fuse3_arm64.sh
+    scripts/hold_monthlies.sh
     scripts/install_libfuse3_dev.sh
     scripts/install_nas_backup.sh
     scripts/peer_auth_probe.py

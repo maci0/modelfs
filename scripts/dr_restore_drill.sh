@@ -8,7 +8,9 @@
 # log line that proves the drill ran.
 #
 # Runs on the NAS (Rocky/RHEL, GNU coreutils), not on sparks or the desktop:
-#   ./scripts/dr_restore_drill.sh [DATASET]      # default: tank/models
+#   ./scripts/dr_restore_drill.sh [DATASET]             # default: tank/models
+#   ./scripts/dr_restore_drill.sh --age-only [DATASET]  # snapshot/replica
+#                                                       # freshness only
 #
 # Environment (deliberately not MODELFS_*: the daemon refuses any unknown
 # MODELFS_* variable as a typo'd knob, so an exported drill setting would
@@ -28,11 +30,15 @@
 #                       /var/tmp/modelfs-drill when this script is copied
 #                       out of the tree)
 #
-# Exit status is the drill verdict: 0 means the newest snapshot restored,
-# mounted off the live tree, and read back verified; anything else is an
-# alarm, including "no snapshots exist" and "newest snapshot older than the
-# age limit", which mean the backup schedule itself is dead or has silently
-# stopped keeping restore points inside the RPO the recovery doc claims.
+# --age-only stops after those age checks (no clone, no drill log). The
+# hourly modelfs-snap-age.timer runs that so a disabled sanoid.timer is
+# an alarm within the 25 h bound instead of waiting for the next monthly
+# clone. Exit status is the verdict: 0 means the newest snapshot restored
+# (or, with --age-only, is inside the age bound), mounted off the live
+# tree, and read back verified; anything else is an alarm, including "no
+# snapshots exist" and "newest snapshot older than the age limit", which
+# mean the backup schedule itself is dead or has silently stopped keeping
+# restore points inside the RPO the recovery doc claims.
 set -euo pipefail
 
 die() {
@@ -45,11 +51,13 @@ die() {
 # rather than a drill failure).
 print_usage() {
     cat <<'EOF'
-Usage: ./scripts/dr_restore_drill.sh [DATASET]
+Usage: ./scripts/dr_restore_drill.sh [--age-only] [DATASET]
 
 Monthly restore drill (docs/recovery.md section 6). Default DATASET is
 tank/models. Exit 0 means the newest snapshot restored, mounted off the
-live tree, and read back verified.
+live tree, and read back verified. --age-only checks snapshot (and
+optional replica) age only: no clone, no drill log. That is the hourly
+sanoid.timer-down alarm (modelfs-snap-age.timer).
 
 Environment: MF_DRILL_LOG, MF_DRILL_LIVE, MF_DRILL_CLONE_MP, MF_DRILL_KEEP,
 MF_DRILL_MAX_SNAP_AGE, MF_DRILL_REPLICA, MF_DRILL_MAX_REPLICA_AGE,
@@ -57,14 +65,41 @@ MF_DRILL_SCRATCH.
 EOF
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    print_usage
-    exit 0
-fi
-if [[ $# -gt 1 || ( $# -eq 1 && "$1" == -* ) ]]; then
+AGE_ONLY=0
+DATASET=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h | --help)
+            print_usage
+            exit 0
+            ;;
+        --age-only)
+            AGE_ONLY=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            print_usage >&2
+            exit 2
+            ;;
+        *)
+            if [[ -n "${DATASET}" ]]; then
+                print_usage >&2
+                exit 2
+            fi
+            DATASET="$1"
+            shift
+            ;;
+    esac
+done
+if [[ $# -gt 0 ]]; then
     print_usage >&2
     exit 2
 fi
+DATASET="${DATASET:-tank/models}"
 
 # Repo runs keep using .scratch via lib.sh. A copy at /usr/local/sbin
 # (scripts/install_nas_backup.sh) has no build.zig.zon above it, so
@@ -81,14 +116,17 @@ fi
 mkdir -p "${SCRATCH_DIR}" || die "cannot create scratch dir ${SCRATCH_DIR}"
 command -v zfs >/dev/null 2>&1 || die "zfs not found; this drill runs on the NAS"
 
-DATASET="${1:-tank/models}"
 LOG_FILE="${MF_DRILL_LOG:-/var/log/modelfs-drill.log}"
 # A restore with no writable artifact is not a drill. Fail before clone
 # so an unwritable /var/log does not spend minutes proving a snapshot
 # we then cannot record. `touch` is not enough: the owner can update
 # timestamps on a mode-000 file they own, and the append would then
 # fail after the clone. Opening for append is the write we need.
-: >>"${LOG_FILE}" || die "cannot write the drill log ${LOG_FILE}"
+# --age-only does not append the log (that would make check_drill_log.sh
+# treat a freshness check as a restore), so skip this gate there.
+if [[ "${AGE_ONLY}" -eq 0 ]]; then
+    : >>"${LOG_FILE}" || die "cannot write the drill log ${LOG_FILE}"
+fi
 
 zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
     || die "dataset ${DATASET} does not exist on this host"
@@ -181,6 +219,13 @@ if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
     fi
     REPLICA_STATUS="ok"
     echo "drill: replica ${MF_DRILL_REPLICA} newest ${REPLICA_SNAP} (age ${REPLICA_AGE}s)"
+fi
+
+# Hourly freshness alarm: the monthly clone is the restore proof, this
+# is the "sanoid.timer was disabled" alarm that cannot wait 30 days.
+if [[ "${AGE_ONLY}" -eq 1 ]]; then
+    echo "snap-age OK: ${SNAP} age ${SNAP_AGE}s replica=${REPLICA_STATUS}"
+    exit 0
 fi
 
 PARENT="${DATASET%/*}"

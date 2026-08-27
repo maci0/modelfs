@@ -4,7 +4,7 @@
 |---|---|
 | [architecture.md](architecture.md) | **Start here.** Shipped behavior: the three cache layers, discovery and leases, path scoring, auth, culling, write races |
 | [operations.md](operations.md) | The ZFS/NFS/FS-Cache layers underneath, per-host mount setup, Hugging Face downloads, failure modes |
-| [recovery.md](recovery.md) | Durability posture: state inventory, snapshot/replica schedule, per-disaster restore steps, RPO/RTO, monthly restore drill |
+| [recovery.md](recovery.md) | Durability posture: state inventory, snapshot/replica schedule, per-disaster restore steps, RPO/RTO, monthly restore drill, hourly snapshot-age alarm |
 | [benchmarks.md](benchmarks.md) | Measured latency and throughput, with the loopback caveat that qualifies them |
 | [audits.md](audits.md) | Findings from the review passes and how each was fixed |
 | [THREAT_MODEL.md](THREAT_MODEL.md) | Attack surface, trust boundaries, risk-ranked threats, and which controls exist versus which are missing |
