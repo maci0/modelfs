@@ -9,6 +9,7 @@ echo "=== 9-Node Cluster Performance & Block Exchange E2E Benchmark ==="
 echo "================================================================="
 
 cd "${ROOT_DIR}"
+require_fuse
 zig build
 
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"

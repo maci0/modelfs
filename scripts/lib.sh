@@ -5,12 +5,18 @@
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 while [[ ! -f "${ROOT_DIR}/build.zig.zon" ]]; do
-    if [[ "${ROOT_DIR}" == "/" ]]; then
+    if [[ "${ROOT_DIR}" == "/" || -z "${ROOT_DIR}" ]]; then
         echo "cannot find build.zig.zon above ${BASH_SOURCE[0]}" >&2
         exit 1
     fi
-    ROOT_DIR="$(dirname "${ROOT_DIR}")"
+    _mf_parent="$(dirname "${ROOT_DIR}")"
+    if [[ "${_mf_parent}" == "${ROOT_DIR}" ]]; then
+        echo "cannot find build.zig.zon above ${BASH_SOURCE[0]}" >&2
+        exit 1
+    fi
+    ROOT_DIR="${_mf_parent}"
 done
+unset _mf_parent
 
 # shellcheck disable=SC2034 # used by the scripts that source this file
 SCRIPTS_DIR="${ROOT_DIR}/scripts"
@@ -30,3 +36,24 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # ran. Current members: MF_TEST_HOST, MF_TEST_PORT (test_fault_tolerance.sh),
 # MF_DRILL_LOG, MF_DRILL_LIVE, MF_DRILL_KEEP, MF_DRILL_MAX_SNAP_AGE
 # (dr_restore_drill.sh).
+
+# FUSE-mounting harnesses call this before spawning daemons so a missing
+# /dev/fuse or helper fails with a named install hint instead of nine
+# "fusermount: mount failed" lines after the cluster is already half up.
+require_fuse() {
+    local problems=()
+    if [[ ! -e /dev/fuse ]]; then
+        problems+=("/dev/fuse is missing")
+    fi
+    if command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1; then
+        :
+    else
+        problems+=("no fusermount3/fusermount helper on PATH")
+    fi
+    if ((${#problems[@]} > 0)); then
+        local joined
+        joined="$(printf '%s; ' "${problems[@]}")"
+        echo "cannot run: ${joined%; } -- this suite mounts a live FUSE filesystem (install fuse3 / fuse; see CONTRIBUTING.md)" >&2
+        exit 1
+    fi
+}

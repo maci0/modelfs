@@ -9,17 +9,19 @@ what passes locally is what passes on push.
 Requirements: Linux, **Zig 0.16.0 or newer** (`minimum_zig_version` in
 [build.zig.zon](build.zig.zon) enforces this; CI builds with exactly
 0.16.0), libfuse3 headers
-(`libfuse3-dev` / `fuse3-devel`), and shellcheck. The Python tooling is pinned;
+(`libfuse3-dev` / `fuse3-devel`), shellcheck, and **uv**. Python tooling is
+pinned and type-checked against 3.12 ([.python-version](.python-version));
 install it with uv:
 
 ```bash
 uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
 ```
 
-`scripts/check.sh` puts `.venv/bin` on its PATH automatically when present, so
-you never need to activate the venv to run the checks. If `zig build` stops
-with "libfuse3 headers not found", install the package it names (or point
-`-Dfuse-include=<dir>` at a non-default location).
+`scripts/check.sh` requires `.venv` and puts it on PATH, so you never
+need to activate it. If `zig build` stops with "libfuse3 headers not found",
+install the package it names (or point `-Dfuse-include=<dir>` at a
+non-default location). `./scripts/check.sh --help` lists the contributor
+commands; so does `zig build --help`.
 
 ## The one command that matters
 
@@ -28,16 +30,26 @@ with "libfuse3 headers not found", install the package it names (or point
 ```
 
 Formatting, unit tests, shellcheck, ruff, and mypy: exactly what the `check`
-CI job runs. CI additionally cross-compiles for aarch64 against the vendored
-libfuse3 debs; reproduce it with `./scripts/extract_fuse3_arm64.sh` plus the
-build command in [.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md).
+CI job runs. Every CI job (that gate, the aarch64 cross-compile, and the
+reproducibility rebuild) as one local step:
+
+```bash
+./scripts/ci.sh
+```
 
 ## Edit-test loop
 
 ```bash
 zig build test --summary all           # full unit suite
-zig build test -Dtest-filter=store     # only tests whose name matches (substring)
+zig build test -Dtest-filter=relOk     # only tests whose names contain this substring
+zig build test --watch                 # rebuild and re-run on change
+zig build fmt                          # apply zig fmt (check.sh only --checks)
 ```
+
+Unit tests live next to the code they cover in `src/*.zig`. A new module's
+tests only run once that file is imported from [src/root.zig](src/root.zig).
+The filter matches test *names*, not file names: Zig collects tests from the
+whole import graph, so `-Dtest-filter=store` would miss most of `store.zig`.
 
 ## End-to-end suites
 
@@ -50,7 +62,8 @@ zig build test -Dtest-filter=store     # only tests whose name matches (substrin
 ## PR expectations
 
 The blocking requirement is green CI: `./scripts/check.sh`, the
-`cross-aarch64` compile job, and the `reproducibility` job. There are no
+`cross-aarch64` compile job, and the `reproducibility` job
+(`./scripts/ci.sh` runs all three). There are no
 sign-off or changelog-entry gates,
 but behavior changes belong in [CHANGELOG.md](CHANGELOG.md) as their own
 dated section under `[Unreleased]` (everything outside a version heading is

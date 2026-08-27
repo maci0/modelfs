@@ -1,4 +1,5 @@
 //! Test aggregator: pulls every module's tests into the test binary.
+//! A new src/*.zig file is invisible to `zig build test` until imported here.
 test {
     _ = @import("piece.zig");
     _ = @import("proto.zig");

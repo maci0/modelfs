@@ -81,6 +81,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Registered before the libfuse3 preflight so `zig build --help`,
+    // `zig build fmt`, and the check/ci wrappers still work on a machine
+    // that cannot compile yet.
+    const fmt_step = b.step("fmt", "Format Zig sources in place");
+    fmt_step.dependOn(&b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } }).step);
+
+    const check_cmd = b.addSystemCommand(&.{"./scripts/check.sh"});
+    check_cmd.setCwd(b.path("."));
+    const check_step = b.step("check", "Run the static gate (scripts/check.sh)");
+    check_step.dependOn(&check_cmd.step);
+
+    const ci_cmd = b.addSystemCommand(&.{"./scripts/ci.sh"});
+    ci_cmd.setCwd(b.path("."));
+    const ci_step = b.step("ci", "Run every CI job locally (scripts/ci.sh)");
+    ci_step.dependOn(&ci_cmd.step);
+
     const test_step = b.step("test", "Run unit tests");
     if (vendoredFuseMismatch(b)) |msg| {
         const fail = b.addFail(msg);
@@ -92,9 +108,10 @@ pub fn build(b: *std.Build) void {
     const fuse_inc = b.option([]const u8, "fuse-include", "libfuse3 headers") orelse "/usr/include/fuse3";
     const fuse_lib = b.option([]const u8, "fuse-lib", "libfuse3 library dir");
 
-    // Edit-test loop: substring match on test names, so a contributor working
-    // in one module pays for that module's tests, not all of them.
-    // zig build test -Dtest-filter=store
+    // Edit-test loop: substring match on test *names* (Zig collects tests
+    // from the whole import graph, so a file name is not a filter). A
+    // distinctive fragment like relOk or cacheFill keeps the loop short.
+    // zig build test -Dtest-filter=relOk
     const test_filter = b.option([]const u8, "test-filter", "only run unit tests whose name contains this substring");
 
     if (fuseHeadersMissing(b, fuse_inc)) |msg| {

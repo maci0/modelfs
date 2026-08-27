@@ -7,24 +7,45 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "${ROOT_DIR}"
 
-# CI installs the pinned Python tooling into .venv and puts it on PATH before
-# running this script; do the same locally so a created-but-not-activated
-# .venv is still what checks run with, matching CI exactly.
-if [[ -d "${ROOT_DIR}/.venv/bin" ]]; then
-    export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
-else
-    # CI always runs the requirements-dev.lock.txt versions; without .venv,
-    # PATH's ruff/mypy stand in and their rules can drift from the gate, so
-    # name the substitution instead of letting it surface as an after-push
-    # failure.
-    echo "WARN: .venv not found; running whatever ruff/mypy is on PATH, which may differ from the versions pinned in requirements-dev.lock.txt" >&2
-    echo "WARN: setup: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt" >&2
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    cat <<'EOF'
+Usage: ./scripts/check.sh
+
+The blocking static gate: zig fmt, unit tests, shellcheck, ruff, mypy.
+Same command the CI `check` job runs. Requires the pinned .venv from setup.
+
+Contributor commands (also listed by `zig build --help`):
+  zig build                                 build the binary
+  zig build fmt                             apply zig fmt
+  zig build test                            unit tests
+  zig build test -Dtest-filter=relOk        tests whose names contain this substring
+  zig build test --watch                    rebuild and re-run on change
+  zig build check                           this script
+  zig build ci / ./scripts/ci.sh            every CI job (this, aarch64, repro)
+  ./scripts/run_e2e_tests.sh                CLI and peer protocol; no FUSE
+  ./scripts/run_cluster_e2e_9nodes.sh       9 FUSE mounts (/dev/fuse + fusermount3)
+  ./scripts/test_fault_tolerance.sh         peer loss and lease expiry
+  ./scripts/repro_check.sh                  two ReleaseFast builds, compare bytes
+
+Setup, once per clone: see CONTRIBUTING.md.
+EOF
+    exit 0
 fi
 
 fail() {
     echo "FAIL: $1" >&2
     exit 1
 }
+
+# CI installs the pinned Python tooling into .venv and puts it on PATH
+# before running this script. Refuse to stand in with PATH's ruff/mypy:
+# those versions (and missing matplotlib stubs) disagree with the lock
+# and fail either here or only after push.
+if [[ -d "${ROOT_DIR}/.venv/bin" ]]; then
+    export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
+else
+    fail "pinned .venv not found; install it with: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+fi
 
 # Name every missing tool at once instead of dying mid-gate on a bare
 # "command not found"; CONTRIBUTING.md documents where each comes from.
@@ -36,8 +57,27 @@ if [[ -n "${missing}" ]]; then
     fail "required tools not found on PATH:${missing} -- see CONTRIBUTING.md (setup section)"
 fi
 
+# zig fmt does not consult build.zig.zon; catch an old toolchain here
+# rather than as a later, less obvious compile failure.
+min_zig="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
+[[ -n "${min_zig}" ]] || fail "cannot read minimum_zig_version from build.zig.zon"
+zig_ver="$(zig version)"
+if ! awk -v cur="${zig_ver}" -v min="${min_zig}" 'BEGIN {
+    ncur = split(cur, c, /[^0-9]+/)
+    nmin = split(min, t, /[^0-9]+/)
+    for (i = 1; i <= nmin; i++) {
+        ci = (i <= ncur) ? (c[i] + 0) : 0
+        ti = t[i] + 0
+        if (ci < ti) exit 1
+        if (ci > ti) exit 0
+    }
+    exit 0
+}'; then
+    fail "zig ${zig_ver} is older than minimum_zig_version ${min_zig} in build.zig.zon"
+fi
+
 echo "=== zig fmt --check ==="
-zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported unformatted files"
+zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported unformatted files; fix with: zig build fmt"
 
 echo "=== shellcheck ==="
 # Defect-oriented optional checks the tree already passes: every case
@@ -54,10 +94,10 @@ echo "=== shellcheck ==="
 shellcheck -o add-default-case,avoid-nullary-conditions,avoid-negated-conditions,deprecate-which,quote-safe-variables,check-set-e-suppressed,check-unassigned-uppercase,check-extra-masked-returns scripts/*.sh || fail "shellcheck reported violations"
 
 echo "=== ruff ==="
-ruff check scripts/ || fail "ruff reported violations"
+ruff check scripts/ || fail "ruff check reported violations"
 
 echo "=== ruff format --check ==="
-ruff format --check scripts/ || fail "ruff format reported unformatted files"
+ruff format --check scripts/ || fail "ruff format --check reported unformatted files; fix with: ruff format scripts/"
 
 echo "=== mypy ==="
 mypy scripts/ || fail "mypy reported errors"

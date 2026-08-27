@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+- **The contributor gate no longer pretends PATH ruff/mypy can stand in for the lock**: without `.venv`, `scripts/check.sh` warned and continued, then mypy died on a missing matplotlib stub (or, with a different ruff, only after push). It now fails immediately with the uv install line; `minimum_zig_version` is checked before `zig fmt` so an old toolchain is named rather than formatting under the wrong rules.
+- **Every CI job is one local command**: `./scripts/ci.sh` (also `zig build ci`) runs the check gate, the aarch64 cross-compile into `.scratch/cross-aarch64` so it does not replace a native `zig-out/bin/modelfs`, and `repro_check.sh`. `zig build fmt` applies the same paths `check.sh` verifies. `./scripts/check.sh --help` lists the rest.
+- **The documented `-Dtest-filter=store` loop was not a module filter**: Zig matches test *names*, so that example skipped most of `store.zig`. Docs now use a name fragment (`relOk`), and `src/root.zig` states that a new file's tests are invisible until imported there.
+- **The 9-node cluster harness names a missing FUSE device or helper** before spawning daemons, the same preflight the benchmark script already had.
+
 ## [Config pass] - 2026-08-26
 - **Harness and drill environment knobs no longer squat on the daemon's `MODELFS_` namespace**: `test_fault_tolerance.sh` read `MODELFS_TEST_HOST`/`MODELFS_TEST_PORT` and `dr_restore_drill.sh` read `MODELFS_DRILL_LOG/LIVE/KEEP`, but every `modelfs` invocation refuses any unknown `MODELFS_*` variable as a typo'd knob — so exporting one of these settings (the natural way to keep it for a session) made every command in that shell exit 2 with "unknown environment variable". They are renamed to `MF_TEST_*` and `MF_DRILL_*`; recovery.md's drill section matches.
 - **The log level is runtime configuration, not a compile-time constant**: verbosity was fixed at info inside `main.zig`, so quieting a cron'd `status` loop or debugging a misbehaving mount meant a rebuild. `MODELFS_LOG` (`err`, `warn`, `info` default, `debug`) moves the ceiling for every command; values outside that set are refused at startup like any other malformed knob, and an empty value counts as unset. Documented in `modelfs help`, README, docs/architecture.md, and docs/THREAT_MODEL.md.

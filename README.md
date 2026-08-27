@@ -110,8 +110,11 @@ The piece-size sweep is why the default piece is 16 MiB: past it the gain is sma
 ## Tests
 
 ```bash
-zig build test -Dtest-filter=store        # one module's unit tests only (substring match)
+zig build test -Dtest-filter=relOk        # only tests whose names contain this substring
+zig build test --watch                    # rebuild and re-run on change
+zig build fmt                             # apply zig fmt
 ./scripts/check.sh                        # fmt, unit tests, shellcheck, ruff, mypy
+./scripts/ci.sh                           # every CI job: check, aarch64 cross, repro
 ./scripts/repro_check.sh                  # build twice, require byte-identical output
 ./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end
 ./scripts/run_cluster_e2e_9nodes.sh       # 9-instance block exchange
