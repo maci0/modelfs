@@ -6,17 +6,31 @@ measure or assert, and both need the same policy: a fixed startup sleep is a
 guess nine concurrent FUSE mounts on a loaded host can outrun, an answered
 rejection (wrong PSK, 5xx) fails immediately because retrying cannot fix it,
 and only dial noise (nothing listening yet) is retried against one budget.
-One module here owns that policy so the two callers cannot drift apart.
+open_http is the one urlopen: http(s) only, so a file: URL cannot sneak
+through a probe. Callers share both so the policy cannot drift apart.
 """
 
 import sys
 import time
 import urllib.error
 import urllib.request
+from http.client import HTTPResponse
 
 PING_BODY = b"ok"
 REQUEST_TIMEOUT_S = 30.0
 RETRY_INTERVAL_S = 0.2
+
+
+def open_http(req: urllib.request.Request, timeout: float) -> HTTPResponse:
+    """urlopen restricted to http(s); file: and custom schemes are refused."""
+    url = req.full_url
+    if not url.startswith(("http://", "https://")):
+        sys.exit(f"refusing non-http URL {url!r}")
+    # Bandit S310 flags every urlopen; the scheme gate above is the audit.
+    resp = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
+    if not isinstance(resp, HTTPResponse):
+        sys.exit(f"expected HTTPResponse, got {type(resp).__name__}")
+    return resp
 
 
 def _ping_once(port: int, headers: dict[str, str]) -> bytes | None:
@@ -30,12 +44,8 @@ def _ping_once(port: int, headers: dict[str, str]) -> bytes | None:
     """
     req = urllib.request.Request(f"http://127.0.0.1:{port}/ping", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
-            # urllib's response object types read() as Any; narrow by check,
-            # not cast, so a non-bytes answer cannot ride into the comparison.
-            body = resp.read()
-            assert isinstance(body, bytes)
-            return body
+        with open_http(req, timeout=REQUEST_TIMEOUT_S) as resp:
+            return resp.read()
     except urllib.error.HTTPError as e:
         sys.exit(f"node on port {port}: /ping rejected with HTTP {e.code}")
     except OSError:
@@ -48,7 +58,8 @@ def wait_for_ping(port: int, headers: dict[str, str], timeout_s: float) -> None:
     while True:
         body = _ping_once(port, headers)
         if body is not None:
-            assert body == PING_BODY, f"Node on port {port} answered /ping with an unexpected body"
+            if body != PING_BODY:
+                sys.exit(f"node on port {port}: /ping answered with an unexpected body")
             return
         if time.monotonic() >= deadline:
             sys.exit(

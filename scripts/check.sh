@@ -95,12 +95,14 @@ echo "=== shellcheck ==="
 # currently safe, a suppressed `set -e` cannot silently downgrade error
 # handling, an uppercase-looking assignment is always set before use, and
 # a negated numeric comparison ([ ! "$x" -eq 1 ]) is written as its direct
-# operator (-ne) so the tested condition is the one a reader sees, and a
+# operator (-ne) so the tested condition is the one a reader sees, a
 # return value swallowed by command/process substitution must be either
-# propagated or explicitly dismissed with || true, like set -e suppression.
+# propagated or explicitly dismissed with || true, like set -e suppression,
+# and cat piped into a filter (which hides cat's exit status) is written as
+# a direct redirect so a missing file cannot look like an empty stream.
 # The style-only brace/double-bracket checks stay off: this tree does not
 # follow those conventions.
-shellcheck -o add-default-case,avoid-nullary-conditions,avoid-negated-conditions,deprecate-which,quote-safe-variables,check-set-e-suppressed,check-unassigned-uppercase,check-extra-masked-returns scripts/*.sh || fail "shellcheck reported violations"
+shellcheck -o add-default-case,avoid-nullary-conditions,avoid-negated-conditions,deprecate-which,quote-safe-variables,check-set-e-suppressed,check-unassigned-uppercase,check-extra-masked-returns,useless-use-of-cat scripts/*.sh || fail "shellcheck reported violations"
 
 # The NAS drill cannot run here (no zfs pool). The stub suite is what
 # keeps a clone-onto-live or empty-snapshot false pass from shipping.

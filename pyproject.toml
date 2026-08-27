@@ -31,14 +31,17 @@ required-version = ">=0.16,<0.17"
 # out by hand (ANN), stale FIXME/TBD/HACK comments (FIX), logging call
 # hygiene (G), logging setup anti-patterns (LOG), pytest conventions so any
 # Python tests added later start life under the same bar (PT), quote hygiene
-# beyond what the formatter normalizes, like avoidable escapes (Q), and
-# missing __slots__ on value classes (SLOT).
+# beyond what the formatter normalizes, like avoidable escapes (Q),
+# missing __slots__ on value classes (SLOT), bandit (S) so a pickle/eval/
+# bind-all/insecure-hash cannot merge while style rules run, postponed
+# annotation form (FA), and stub-file conventions (PYI) for any .pyi added
+# later.
 select = [
     "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
     "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
     "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE", "TRY", "EM",
     "EXE", "FBT", "I", "FLY", "ICN", "TD", "ANN", "FIX", "G", "LOG",
-    "PT", "Q", "SLOT",
+    "PT", "Q", "SLOT", "S", "FA", "PYI",
 ]
 
 [tool.ruff.format]
@@ -101,5 +104,9 @@ enable_error_code = [
     # a value narrowed to a type the declared annotation cannot hold is a
     # latent AttributeError/TypeError at runtime, not a style nit
     "narrowed-type-not-subtype",
+    # --strict already turns warn_unused_ignores on; listing the code keeps
+    # every default-off extra code in this one list so a later --strict
+    # reshape cannot drop it silently.
+    "unused-ignore",
 ]
 

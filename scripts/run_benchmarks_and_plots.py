@@ -59,7 +59,11 @@ _SCRATCH = _ROOT / ".scratch"
 def reexec_under_venv() -> None:
     if not _VENV_PYTHON.is_file() or Path(sys.executable).samefile(_VENV_PYTHON):
         return
-    os.execv(os.fspath(_VENV_PYTHON), [os.fspath(_VENV_PYTHON), _SCRIPT, *sys.argv[1:]])
+    # Absolute path of this tree's pinned interpreter; argv is that path plus
+    # this script. os.execv is the no-shell form (S605 would be the risk).
+    os.execv(  # noqa: S606
+        os.fspath(_VENV_PYTHON), [os.fspath(_VENV_PYTHON), _SCRIPT, *sys.argv[1:]]
+    )
 
 
 def require_fuse() -> None:
@@ -79,9 +83,11 @@ def require_fuse() -> None:
 
 def unmount(mount_dir: str) -> None:
     """Best-effort unmount via whichever FUSE helper exists (libfuse3 first)."""
-    helper = shutil.which("fusermount3") or shutil.which("fusermount")
-    cmd = [helper, "-u", mount_dir] if helper else ["umount", mount_dir]
-    subprocess.run(cmd, capture_output=True, check=False)
+    helper = shutil.which("fusermount3") or shutil.which("fusermount") or shutil.which("umount")
+    if helper is None:
+        return
+    # argv is a resolved helper plus fixed -u; no shell, no user input.
+    subprocess.run([helper, "-u", mount_dir], capture_output=True, check=False)  # noqa: S603
 
 
 def stop_mount(p: subprocess.Popen[bytes], mount_dir: str) -> None:
@@ -89,7 +95,7 @@ def stop_mount(p: subprocess.Popen[bytes], mount_dir: str) -> None:
 
     terminate() without wait() would leave an unreaped child holding its peer
     port and FUSE mount until interpreter exit; a skipped teardown (benchmark
-    assertion or HTTP failure) would orphan the daemon across runs.
+    mismatch or HTTP failure) would orphan the daemon across runs.
     """
     if p.poll() is None:
         p.terminate()
@@ -108,8 +114,12 @@ def build_modelfs() -> str:
     # and no optimization, inflating per-request fixed cost and understating
     # sendfile throughput; the piece-size sweep's shape depends on exactly
     # that fixed cost.
-    res = subprocess.run(
-        ["zig", "build", "-Doptimize=ReleaseFast"],
+    zig = shutil.which("zig")
+    if zig is None:
+        sys.exit("zig not found on PATH -- see CONTRIBUTING.md")
+    # argv is the resolved zig binary plus fixed build flags; no shell.
+    res = subprocess.run(  # noqa: S603
+        [zig, "build", "-Doptimize=ReleaseFast"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -161,7 +171,8 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
                 os.makedirs(mount_dir, exist_ok=True)
                 port = 19100 + i
 
-                p = subprocess.Popen(
+                # argv is this tree's zig-out binary plus fixed mount flags.
+                p = subprocess.Popen(  # noqa: S603
                     [
                         bin_path,
                         "mount",
@@ -195,8 +206,10 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
                     port = 19100 + i
                     url = f"http://127.0.0.1:{port}/ping"
                     req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=30) as resp:
-                        assert resp.read() == b"ok"
+                    with peer_ping.open_http(req, timeout=30) as resp:
+                        body = resp.read()
+                    if body != b"ok":
+                        sys.exit(f"node on port {port}: /ping answered with an unexpected body")
                 t1 = time.monotonic()
                 elapsed_ms = round((t1 - t0) * 1000.0, 2)
                 latencies_ms.append(elapsed_ms)
@@ -248,7 +261,8 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
             os.makedirs(mount_dir, exist_ok=True)
             port = 19600 + idx
 
-            p = subprocess.Popen(
+            # argv is this tree's zig-out binary plus fixed mount flags.
+            p = subprocess.Popen(  # noqa: S603
                 [
                     bin_path,
                     "mount",
@@ -286,11 +300,14 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
                 )
 
                 t0 = time.monotonic()
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with peer_ping.open_http(req, timeout=30) as resp:
                     got_data = resp.read()
                 t1 = time.monotonic()
 
-                assert len(got_data) == len(data), f"Data size mismatch for {label}"
+                if len(got_data) != len(data):
+                    sys.exit(
+                        f"Data size mismatch for {label}: got {len(got_data)}, want {len(data)}"
+                    )
                 elapsed_sec = t1 - t0
                 size_mb = bytes_len / (1024.0 * 1024.0)
                 mbps = round(size_mb / max(elapsed_sec, 0.0001), 2)

@@ -10,6 +10,8 @@ import sys
 import urllib.error
 import urllib.request
 
+import peer_ping
+
 HTTP_UNAUTHORIZED = 401
 ARGC = 3  # prog + HOST PORT
 
@@ -29,7 +31,8 @@ def main(argv: list[str]) -> int:
     try:
         # Same 30s budget as the other script probes: a peer that accepts but
         # never answers must fail the probe, not hang the suite.
-        urllib.request.urlopen(req, timeout=30)
+        with peer_ping.open_http(req, timeout=30):
+            pass
     except urllib.error.HTTPError as e:
         if e.code != HTTP_UNAUTHORIZED:
             print(f"Error: Expected 401, got {e.code}", file=sys.stderr)

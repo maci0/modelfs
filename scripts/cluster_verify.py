@@ -84,16 +84,19 @@ def main(argv: list[str]) -> int:
 
         have_url = f"http://127.0.0.1:{port}/have?path={path_enc}"
         have_req = urllib.request.Request(have_url, headers=headers)
-        with urllib.request.urlopen(have_req, timeout=30) as resp:
+        with peer_ping.open_http(have_req, timeout=30) as resp:
             bits = resp.read()
             # /have body is the raw cache bitfield: one bit per piece, packed
             # (nbits+7)//8 bytes. A non-empty but short blob would still look
             # like a pass under a mere len>0 check, then hide missing pieces.
             want_len = (total_pieces + 7) // 8
-            assert len(bits) == want_len, (
-                f"Node {target_node} bitfield length {len(bits)} != {want_len} "
-                f"for {total_pieces} pieces"
-            )
+            if len(bits) != want_len:
+                print(
+                    f"Node {target_node} bitfield length {len(bits)} != {want_len} "
+                    f"for {total_pieces} pieces",
+                    file=sys.stderr,
+                )
+                return 1
 
     t1 = time.monotonic()
     elapsed = t1 - t0
