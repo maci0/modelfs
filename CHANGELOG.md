@@ -31,6 +31,7 @@ below.
 
 ### Changes
 
+- **Origin writes fail when `close` fails after a successful pwrite**: NFS reports delayed write errors on close. `originPwrite`, `writeFile*` (lease/status/sidecar staging), and FUSE create/truncate now return that errno instead of reporting success over missing bytes. Linux `EINTR` on close is treated as success (the descriptor is already gone).
 - **SECURITY.md names GitHub private vulnerability reporting as intended, not enabled**: that feature is off on the repository, so there is no private inbox. docs/THREAT_MODEL.md matches, and records the local-user surface (cache dirs 0700, origin statvfs/chmod/readdir lstat+ELOOP, disk-cull of dot-prefixed names, leftover world-readable `status.json`).
 - **Origin stat, pread, and pwrite raise `origin_down`**: FUSE getattr/open/read/write already called `noteOriginIo`; a fill or peer `/have`/`/data` hydration that hit EIO/ESTALE/ETIMEDOUT after a successful stat (or with no local FUSE traffic) left `status.json` at 0. `statOrigin`/`originPread`/`originPwrite` now share `noteOriginIo`, so an NFS outage on any origin data path is visible without a later getattr.
 - **Peer fetch warns name a timed-out dial as `ConnectTimeout`**: a spent or elapsed connect budget used to surface as `error.Connect`, so a blackholed peer looked like a refused port. Same split `readHeadFull` already makes for `HeadTimeout`.

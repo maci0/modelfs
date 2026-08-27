@@ -1144,9 +1144,12 @@ pub const Store = struct {
             self.noteOriginIo(rel, rc, "write");
             return rc;
         }
-        defer sys.close(fd);
         const n = sys.pwriteAll(fd, buf, off);
-        self.noteOriginIo(rel, if (n < 0) @intCast(n) else 0, "write");
+        const cr = sys.closeWrite(fd);
+        const rc: i32 = if (n < 0) @intCast(n) else if (cr != 0) cr else 0;
+        self.noteOriginIo(rel, rc, "write");
+        if (n < 0) return n;
+        if (cr != 0) return @intCast(cr);
         return n;
     }
 

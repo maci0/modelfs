@@ -176,6 +176,19 @@ pub fn close(fd: c_int) void {
     if (fd >= 0) _ = c.close(fd);
 }
 
+/// Close a write fd and return whether deallocation succeeded. NFS reports
+/// delayed write errors here; ignoring them would turn a failed ingest into
+/// a successful FUSE write over missing bytes. Linux still closes the
+/// descriptor when close reports EINTR, so that result is success (retrying
+/// would close a different fd).
+pub fn closeWrite(fd: c_int) i32 {
+    if (fd < 0) return 0;
+    if (c.close(fd) == 0) return 0;
+    const e = errno();
+    if (e == c.EINTR) return 0;
+    return if (e == 0) -1 else -e;
+}
+
 /// Refuse core dumps for this process. The cluster PSK lives in daemon
 /// memory for the mount lifetime; a crash would otherwise write it
 /// wherever kernel.core_pattern points (often a world-readable file).
@@ -364,9 +377,11 @@ pub fn readOnce(fd: c_int, buf: []u8) !usize {
 fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, durable: bool) i32 {
     const fd = open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | extra_flags, 0o644);
     if (fd < 0) return negErrno();
-    defer close(fd);
     const n = writeAll(fd, data);
-    if (n < 0) return @intCast(n);
+    if (n < 0) {
+        _ = closeWrite(fd);
+        return @intCast(n);
+    }
     if (durable) {
         while (true) {
             // libc fsync: a raw linux.fsync return is a usize with -errno
@@ -375,10 +390,13 @@ fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, dura
             // skip in ReleaseFast).
             if (c.fsync(fd) == 0) break;
             const e = errno();
-            if (e != c.EINTR) return -e;
+            if (e != c.EINTR) {
+                _ = closeWrite(fd);
+                return -e;
+            }
         }
     }
-    return 0;
+    return closeWrite(fd);
 }
 
 pub fn writeFile(path: [*:0]const u8, data: []const u8) i32 {
@@ -605,6 +623,22 @@ pub fn scratchDir(buf: []u8, name: []const u8) ![]const u8 {
     const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSecRaw(), std.os.linux.getpid() });
     if (mkdirAll(p, 0o755) != 0) return error.MkdirFailed;
     return p;
+}
+
+test "closeWrite reports a bad fd and succeeds after a write" {
+    try std.testing.expectEqual(@as(i32, -c.EBADF), closeWrite(0x4000_0000));
+
+    var path_buf: [128]u8 = undefined;
+    var z_buf: [128]u8 = undefined;
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/cw-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const z = try toZ(&z_buf, p);
+    const fd = open(z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, 0o644);
+    try std.testing.expect(fd >= 0);
+    defer _ = c.unlink(z);
+    const n = writeAll(fd, "ok");
+    const cr = closeWrite(fd);
+    try std.testing.expect(n >= 0);
+    try std.testing.expectEqual(@as(i32, 0), cr);
 }
 
 test "sizeFromStat rejects a signed overflow" {

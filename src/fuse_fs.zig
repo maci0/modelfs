@@ -455,15 +455,18 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     // turn the create's O_TRUNC into a truncate of the link's target.
     const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC | sys.c.O_NOFOLLOW, clientCreateMode(mode));
     if (fd < 0) return sys.negErrno();
-    sys.close(fd);
+    const cr = sys.closeWrite(fd);
     // O_TRUNC replaced the origin bytes at this path. Cache identity is the
     // path, so a leftover sidecar at the previous size would decode cleanly
     // after a crash and a same-size rewrite -- the same resurrection
     // unlink/rename already prevent via forget. Drop trust before warmup so
     // an OOM on get cannot leave the old marks on disk. Pins and data stay:
     // the path is still the operator's pin target, and unmarked pieces
-    // refill over the truncated origin.
+    // refill over the truncated origin. Distrust even when close failed:
+    // the truncate already landed, and a leftover sidecar would resurrect
+    // pre-create marks over the new inode.
     st.store.distrust(rel);
+    if (cr != 0) return cr;
     // The origin create above already landed: failing the syscall here (entry
     // warmup OOM) would tell the caller the create failed over a file that
     // exists and was possibly truncated. Warmup is best-effort; the next
@@ -783,8 +786,10 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
     // never on a planted symlink's target (arbitrary daemon-writable file).
     const fd = sys.open(op, sys.c.O_WRONLY | sys.c.O_NOFOLLOW, 0);
     if (fd < 0) return sys.negErrno();
-    defer sys.close(fd);
-    if (sys.ftruncate(fd, new_size) != 0) return sys.negErrno();
+    const origin_tr = sys.ftruncate(fd, new_size);
+    const cr = sys.closeWrite(fd);
+    if (origin_tr != 0) return origin_tr;
+    if (cr != 0) return cr;
     // Map lookup must take store.mu; lookupRef also pins the entry against
     // eviction for the duration of the truncate.
     const live = st.store.lookupRef(rel);
