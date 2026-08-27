@@ -599,7 +599,10 @@ pub const Store = struct {
             return false;
         };
         var path_buf: [sys.c.PATH_MAX]u8 = undefined;
-        const p = self.cacheMetaPath(&path_buf, file.rel) catch return false;
+        const p = self.cacheMetaPath(&path_buf, file.rel) catch {
+            std.log.warn("bitfield save failed for {s}; cache path does not fit; cache state resets on restart", .{file.rel});
+            return false;
+        };
         const w = writeFileMakingParent(p, blob, durable);
         if (w != 0) {
             std.log.warn("bitfield save failed for {s} (errno {d}); cache state resets on restart", .{ file.rel, -w });
@@ -628,7 +631,11 @@ pub const Store = struct {
         var ob = f.bits;
         f.bits = nb;
         f.size = file_size;
-        if (f.cache_fd >= 0) _ = sys.ftruncate(f.cache_fd, file_size);
+        if (f.cache_fd >= 0) {
+            const tr = sys.ftruncate(f.cache_fd, file_size);
+            if (tr != 0)
+                std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ f.rel, -tr });
+        }
         // Same best-effort save mf_truncate pairs with its own swap: the
         // reset must outlive the process to count as an invalidation.
         _ = self.saveBits(f, false);
@@ -1223,9 +1230,11 @@ pub const Store = struct {
             _ = self.saveBits(file, false);
             return false;
         }
-        if (sys.punchHole(fd, off, ln) != 0) {
+        const punched = sys.punchHole(fd, off, ln);
+        if (punched != 0) {
             // Bytes stay: restore the mark in memory and on disk so reads
             // keep serving the cached copy and LRU state stays truthful.
+            std.log.warn("piece punch failed for {s} piece {d} (errno {d}); mark restored", .{ file.rel, idx, -punched });
             file.bits.set(idx);
             _ = self.saveBits(file, false);
             return false;
@@ -1458,7 +1467,10 @@ pub const Store = struct {
         self.mu.lockUncancelable(self.io);
         const epoch0 = self.purge_epoch;
         self.mu.unlock(self.io);
-        var loaded = self.loadBits(rel, size) catch return false;
+        var loaded = self.loadBits(rel, size) catch |err| {
+            std.log.warn("cannot load piece sidecar for {s} ({t}); piece stays cached", .{ rel, err });
+            return false;
+        };
         defer loaded.bits.deinit(self.gpa);
         const idx = loaded.bits.lastSet() orelse return self.punchDiskUnclaimed(rel, fd, size, loaded.bits, epoch0);
         const off = piece.offset(idx, self.piece_size);
@@ -1474,7 +1486,10 @@ pub const Store = struct {
             return false;
         };
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const mp = self.cacheMetaPath(&mbuf, rel) catch return false;
+        const mp = self.cacheMetaPath(&mbuf, rel) catch {
+            std.log.warn("bitfield save skipped for {s}; cache path does not fit; piece {d} stays cached", .{ rel, idx });
+            return false;
+        };
         // One store.mu window covers the liveness recheck, the durable
         // sidecar save, the punch, and the builder-invalidation bump -- the
         // same shape as forget/reapIdle purges. The save sits inside the
@@ -1504,7 +1519,14 @@ pub const Store = struct {
             std.log.warn("bitfield save failed for {s} (errno {d}); piece {d} stays cached", .{ rel, -w, idx });
             return false;
         }
-        if (sys.punchHole(fd, off, ln) != 0) return false;
+        const punched = sys.punchHole(fd, off, ln);
+        if (punched != 0) {
+            // Write-ahead already cleared the sidecar: reads refill over the
+            // intact bytes. Without this line a cache fs that cannot hole-punch
+            // fills up with only culled=0 on the tick line.
+            std.log.warn("piece punch failed for {s} piece {d} (errno {d}); bytes stay until the next round", .{ rel, idx, -punched });
+            return false;
+        }
         self.purge_epoch += 1;
         _ = self.stats.pieces_culled.fetchAdd(1, .monotonic);
         return true;
@@ -1532,7 +1554,10 @@ pub const Store = struct {
             return false;
         };
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const mp = self.cacheMetaPath(&mbuf, rel) catch return false;
+        const mp = self.cacheMetaPath(&mbuf, rel) catch {
+            std.log.warn("bitfield save skipped for {s}; cache path does not fit; unclaimed bytes stay cached", .{rel});
+            return false;
+        };
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         if (self.files.contains(rel)) return false;

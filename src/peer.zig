@@ -435,6 +435,8 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
     defer self.gpa.free(snap);
     var hdr: [192]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Piece-Size: {d}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ self.store.piece_size, snap.len }) catch {
+        std.log.warn("have header format failed for {s}; replying 500", .{rel});
+        replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
     if (sys.writeAll(fd, h) < 0) return;
@@ -524,9 +526,14 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                         // read is an upstream (origin) failure. Reporting 404 here
                         // would make peers believe the path is gone. Log it too:
                         // the 502 alone leaves the local operator no trace of why
-                        // hydration failed.
+                        // hydration failed. A negative result is an errno; a
+                        // non-negative short count is not -- same split the FUSE
+                        // originFillBuf path already uses.
                         _ = self.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
-                        std.log.warn("origin pread failed for {s} piece {d} (rc {d}); replying 502", .{ file.rel, pi, -got });
+                        if (got < 0)
+                            std.log.warn("origin pread failed for {s} piece {d} (errno {d}); replying 502", .{ file.rel, pi, -got })
+                        else
+                            std.log.warn("origin pread short for {s} piece {d} ({d}/{d} bytes); replying 502", .{ file.rel, pi, got, ln });
                         replyStatus(self, fd, "502 Bad Gateway");
                         return false;
                     }
@@ -701,7 +708,11 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     var hdr: [220]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {d}-{d}/{d}\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
         rg.start, rg_end, size, want,
-    }) catch return;
+    }) catch {
+        std.log.warn("data header format failed for {s}; replying 500", .{rel});
+        replyStatus(self, fd, "500 Internal Server Error");
+        return;
+    };
     if (sys.writeAll(fd, h) < 0) return;
     // Same as serveHave: the 206 going out is the success this node's
     // http_ok / bytes_to_peer must see, or a busy serving node looks idle
@@ -768,7 +779,7 @@ fn fetchHaveDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
+    try readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms);
     return haveFromHeadDeadline(gpa, io, fd, &head_buf, head_len, total_read, deadline_ms);
 }
 
@@ -875,7 +886,7 @@ fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
+    try readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms);
     try checkRangeReply(head_buf[0..head_len], start, end);
     return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, dest, deadline_ms);
 }
@@ -936,7 +947,7 @@ fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.f
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms) catch return error.Head;
+    try readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms);
     return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, dest, deadline_ms);
 }
 
@@ -1530,6 +1541,30 @@ test "readFlexBodyAllocDeadline aborts a dribbled body at the deadline" {
     const err = readFlexBodyAllocDeadline(std.testing.allocator, std.testing.io, pair[1], null, t0 + 150);
     try std.testing.expectError(error.BodyTimeout, err);
     try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
+}
+
+test "readFlexBodyAllocDeadline and readRangeBodyAllocDeadline keep HeadTimeout" {
+    // A spent head budget used to become error.Head at these wrappers, so a
+    // piece-fetch warn named a truncated request instead of the deadline that
+    // actually fired. The inner reader already distinguishes the two; the
+    // wrappers must not collapse them.
+    const gpa = std.testing.allocator;
+    {
+        const pair = try responsePair("");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        const t0 = sys.monoMs(std.testing.io);
+        try std.testing.expectError(error.HeadTimeout, readFlexBodyAllocDeadline(gpa, std.testing.io, pair[1], null, t0 - 1));
+        try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
+    }
+    {
+        const pair = try responsePair("");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        const t0 = sys.monoMs(std.testing.io);
+        try std.testing.expectError(error.HeadTimeout, readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 0, 15, null, t0 - 1));
+        try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
+    }
 }
 
 test "readHeadFullAt expires an injected budget without waiting real time" {

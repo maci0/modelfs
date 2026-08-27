@@ -419,10 +419,16 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     const rc = st.store.statOrigin(rel, &ost);
     if (rc != 0) return rc;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
-        const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch return -sys.c.ENOMEM;
+        const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch |err| {
+            std.log.warn("cache entry open failed for {s} ({t}); failing open", .{ rel, err });
+            return -sys.c.ENOMEM;
+        };
         defer st.store.releaseFile(file);
         const fd = st.store.openCache(file);
-        if (fd < 0) return fd;
+        if (fd < 0) {
+            std.log.warn("cache open failed for {s} (errno {d}); failing open", .{ rel, -fd });
+            return fd;
+        }
     }
     return 0;
 }
@@ -495,7 +501,10 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     var ln: u32 = 0;
     while (true) {
         if (file.dead.load(.acquire)) return 0;
-        const cl = st.store.beginFill(file, idx, sys.monoSec(st.io)) catch return -sys.c.ENOMEM;
+        const cl = st.store.beginFill(file, idx, sys.monoSec(st.io)) catch |err| {
+            std.log.warn("fill claim failed for {s} piece {d} ({t}); failing read", .{ file.rel, idx, err });
+            return -sys.c.ENOMEM;
+        };
         ln = switch (cl) {
             // Filled by someone else, or a truncate shrank the file below the
             // piece between claim and sample (the claim was dropped unmarked):
@@ -727,11 +736,13 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
         _ = st.store.copyIntoCache(file, uoff, buf[0..@intCast(n)]);
         return @intCast(n);
     }
-    // Neither size observation landed: the entry's bits can no longer be
-    // proven to describe this inode's post-write contents, so drop them
-    // instead of silently serving pre-write bytes as current. The write
-    // itself already succeeded, so the syscall still reports n.
-    std.log.warn("post-write stat failed for {s}; cache marks dropped, pieces refill", .{rel});
+    // Neither a matching size observation nor a live cache entry landed:
+    // the entry's bits can no longer be proven to describe this inode's
+    // post-write contents, so drop them instead of silently serving
+    // pre-write bytes as current. The write itself already succeeded, so
+    // the syscall still reports n. This path is also get() OOM after a
+    // successful stat (size mismatch), not only a failed GETATTR.
+    std.log.warn("post-write cache could not be updated for {s}; cache marks dropped, pieces refill", .{rel});
     st.store.distrust(rel);
     return @intCast(n);
 }
@@ -764,12 +775,30 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
             // Already applied: a FUSE retry after a lost reply, or a no-op
             // truncate to the current size. Re-wiping bits would discard
             // pieces re-hydrated after the first truncate to this size.
-            if (file.cache_fd >= 0) _ = sys.ftruncate(file.cache_fd, new_size);
+            if (file.cache_fd >= 0) {
+                const tr = sys.ftruncate(file.cache_fd, new_size);
+                if (tr != 0)
+                    std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ rel, -tr });
+            }
             file.mu.unlock(st.io);
             return 0;
         }
         const nb = piece.Bitfield.init(st.gpa, piece.count(new_size, st.store.piece_size)) catch {
+            // Origin is already the new length. Leaving filled bits at the
+            // old size would let a concurrent read serve pre-truncate cache
+            // bytes past the new EOF. Wipe marks now; shrink the recorded
+            // size when we can do that without growing an undersized field.
+            @memset(file.bits.bytes, 0);
+            file.writes += 1;
+            if (new_size < file.size) file.size = new_size;
+            _ = st.store.saveBits(file, false);
+            if (file.cache_fd >= 0) {
+                const tr = sys.ftruncate(file.cache_fd, file.size);
+                if (tr != 0)
+                    std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ rel, -tr });
+            }
             file.mu.unlock(st.io);
+            std.log.warn("bitfield alloc failed for {s} after truncate; cache marks dropped, pieces refill", .{rel});
             return -sys.c.ENOMEM;
         };
         var ob = file.bits;
@@ -782,7 +811,11 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
         // cache_fd cannot be closed between check and use. Best-effort save:
         // a lost sidecar here only costs refill, never stale bytes.
         _ = st.store.saveBits(file, false);
-        if (file.cache_fd >= 0) _ = sys.ftruncate(file.cache_fd, new_size);
+        if (file.cache_fd >= 0) {
+            const tr = sys.ftruncate(file.cache_fd, new_size);
+            if (tr != 0)
+                std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ rel, -tr });
+        }
         file.mu.unlock(st.io);
         ob.deinit(st.gpa);
     } else {
