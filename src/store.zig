@@ -237,12 +237,14 @@ pub const Store = struct {
         filling: std.AutoHashMap(u32, u64),
         cache_fd: c_int = -1,
         last_access: std.atomic.Value(i64) = .init(0),
-        /// Serializes write-through pwrite+mark with completeFill pwrite+mark
-        /// and with punchPiece. Without it the two pwrites race on the cache
+        /// Serializes write-through pwrite+mark with completeFill pwrite+mark,
+        /// punchPiece, and size-changing ftruncate (reconcileSize, mf_truncate,
+        /// cacheFill shrink). Without it the two pwrites race on the cache
         /// fd: a fill that claimed before the write can overwrite the
-        /// write-through bytes and then mark them filled. punchPiece taking
-        /// only file.mu could hole a piece between copyIntoCache's pwrite
-        /// and mark, then the mark would publish hole zeros as cached data.
+        /// write-through bytes and then mark them filled. punchPiece or
+        /// ftruncate taking only file.mu could hole a piece between
+        /// copyIntoCache's pwrite and mark, then the mark would publish hole
+        /// zeros as cached data. Lock order is content_mu then file.mu.
         content_mu: std.Io.Mutex = .init,
         /// Count of local origin mutations observed on this entry (write-through,
         /// distrust, truncate wipe). Nonzero means peer bytes for this path
@@ -678,7 +680,7 @@ pub const Store = struct {
     /// cleanly, so an unsaved wipe let a crash here reload the pre-reset
     /// marks as soon as the file was back at the last-saved length, serving
     /// old bytes or hole zeros as current. Must be called WITHOUT store.mu
-    /// held (it takes file.mu internally).
+    /// held (it takes content_mu then file.mu internally).
     fn reconcileSize(self: *Store, f: *Cached, file_size: u64) !*Cached {
         // Size is mutated under file.mu; an unlocked compare races a
         // concurrent truncate and can skip a needed wipe, or two getters
@@ -691,10 +693,15 @@ pub const Store = struct {
         }
         f.mu.unlock(self.io);
         var nb = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
-        // Swap under the file lock, as mf_truncate does: readers read
-        // size/bits/cache_fd while holding it, and the ftruncate must sit in
-        // the same window so cache_fd cannot be closed (entry destroyed by
-        // the last releaser) between capture and use.
+        // content_mu first, then file.mu: the same order copyIntoCache,
+        // completeFill, and punchPiece use. Taking only file.mu let a
+        // concurrent pwrite land, then this ftruncate cut those bytes,
+        // then the filler's mark published the hole as cached data.
+        // Readers read size/bits/cache_fd while holding file.mu, and the
+        // ftruncate sits in the same window so cache_fd cannot be closed
+        // (entry destroyed by the last releaser) between capture and use.
+        f.content_mu.lockUncancelable(self.io);
+        defer f.content_mu.unlock(self.io);
         f.mu.lockUncancelable(self.io);
         if (f.size == file_size) {
             f.mu.unlock(self.io);
@@ -1268,34 +1275,48 @@ pub const Store = struct {
         };
         defer self.releaseFile(file);
 
-        file.mu.lockUncancelable(self.io);
-        if (end > file.size) {
-            // Our own append: earlier piece marks stay valid.
-            file.bits.resize(self.gpa, piece.count(end, self.piece_size)) catch {
-                // OOM leaves the field undersized: appended pieces stay
-                // unmarked and re-hydrate instead of serving hole zeros.
-                std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
-            };
-            file.size = end;
-        } else if (end < file.size) {
-            // Entry is longer than the observed origin: someone truncated
-            // externally. Reset like reconcileSize instead of keeping marks
-            // for bytes past the new end, and persist the reset like it does:
-            // the old sidecar's recorded size decodes cleanly again once the
-            // file is back at that length, which would resurrect pre-shrink
-            // marks over new content after a crash.
-            if (piece.Bitfield.init(self.gpa, piece.count(end, self.piece_size))) |nb| {
-                var ob = file.bits;
-                file.bits = nb;
+        // Size mutation takes content_mu then file.mu, matching reconcileSize
+        // and mf_truncate, then drops both before copyIntoCache (which takes
+        // the same pair). A shrink that took only file.mu let completeFill
+        // pwrite between the bit swap and the copy, then mark pre-shrink
+        // bytes on the new field because writes was not bumped.
+        var dropped: ?piece.Bitfield = null;
+        defer if (dropped) |*ob| ob.deinit(self.gpa);
+        {
+            file.content_mu.lockUncancelable(self.io);
+            defer file.content_mu.unlock(self.io);
+            file.mu.lockUncancelable(self.io);
+            defer file.mu.unlock(self.io);
+            if (end > file.size) {
+                // Our own append: earlier piece marks stay valid.
+                file.bits.resize(self.gpa, piece.count(end, self.piece_size)) catch {
+                    // OOM leaves the field undersized: appended pieces stay
+                    // unmarked and re-hydrate instead of serving hole zeros.
+                    std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
+                };
                 file.size = end;
-                ob.deinit(self.gpa);
-                _ = self.saveBits(file, false);
-            } else |_| {
-                std.log.warn("bitfield shrink failed for {s}; stale tail pieces refill", .{rel});
+            } else if (end < file.size) {
+                // Entry is longer than the observed origin: someone truncated
+                // externally. Reset like reconcileSize instead of keeping marks
+                // for bytes past the new end, and persist the reset like it does:
+                // the old sidecar's recorded size decodes cleanly again once the
+                // file is back at that length, which would resurrect pre-shrink
+                // marks over new content after a crash. writes++ invalidates a
+                // fill claimed against the old generation; truncateCacheFd
+                // cuts the tail the same way reconcileSize does.
+                if (piece.Bitfield.init(self.gpa, piece.count(end, self.piece_size))) |nb| {
+                    dropped = file.bits;
+                    file.bits = nb;
+                    file.size = end;
+                    file.writes += 1;
+                    truncateCacheFd(file, end);
+                    _ = self.saveBits(file, false);
+                } else |_| {
+                    std.log.warn("bitfield shrink failed for {s}; stale tail pieces refill", .{rel});
+                }
             }
+            file.last_access.store(now_sec, .monotonic);
         }
-        file.last_access.store(now_sec, .monotonic);
-        file.mu.unlock(self.io);
 
         _ = self.copyIntoCache(file, off, data);
     }
@@ -2087,6 +2108,12 @@ test "cacheFill resets every mark when an external truncate shrinks the file" {
         try std.testing.expect(f.bits.get(1));
         try std.testing.expectEqual(@as(u32, 1), f.bits.filled());
         f.mu.unlock(std.testing.io);
+        // Same fd cut reconcileSize makes: the tail the truncator removed
+        // must not remain readable on the live cache descriptor.
+        var post: c.struct_stat = undefined;
+        try std.testing.expect(f.cache_fd >= 0);
+        try std.testing.expectEqual(@as(i32, 0), sys.fstat(f.cache_fd, &post));
+        try std.testing.expectEqual(@as(u64, 32), @as(u64, @intCast(post.st_size)));
     }
 
     // The persisted sidecar names exactly this state, so a restart cannot
@@ -2437,6 +2464,76 @@ test "size reconciliation does not cut a cache fd under an in-flight peer send" 
     try std.testing.expectEqual(@as(i32, 0), sys.fstat(f.cache_fd, &post));
     try std.testing.expectEqual(@as(u64, 64), @as(u64, @intCast(post.st_size)));
     _ = f.xfer.fetchSub(1, .monotonic);
+}
+
+test "cacheFill shrink drops an in-flight fill of a surviving piece" {
+    // beginFill samples writes, then completeFill pwrites without file.mu.
+    // A shrink that did not bump writes left that claim valid against the
+    // new (empty) field, so the filler marked pre-shrink bytes as current
+    // on a piece the post-shrink write did not cover.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-cfshrink-race");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-cfshrink-race");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("race.bin", 64, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expect(st.openCache(f) >= 0);
+
+    var stale: [16]u8 = undefined;
+    @memset(&stale, 0xBB);
+    var fresh: [16]u8 = undefined;
+    @memset(&fresh, 0xAA);
+
+    var round: usize = 0;
+    while (round < 50) : (round += 1) {
+        {
+            f.content_mu.lockUncancelable(std.testing.io);
+            defer f.content_mu.unlock(std.testing.io);
+            f.mu.lockUncancelable(std.testing.io);
+            defer f.mu.unlock(std.testing.io);
+            if (f.size != 64) {
+                try f.bits.resize(gpa, piece.count(64, st.piece_size));
+                f.size = 64;
+            }
+            @memset(f.bits.bytes, 0);
+            f.filling.clearRetainingCapacity();
+        }
+
+        var claimed = std.atomic.Value(bool).init(false);
+        const filler = try std.Thread.spawn(.{}, struct {
+            fn run(s: *Store, file: *Store.Cached, buf: []const u8, ready: *std.atomic.Value(bool)) void {
+                const cl = s.beginFill(file, 0, sys.monoSec(std.testing.io)) catch {
+                    ready.store(true, .release);
+                    return;
+                };
+                if (cl != .len) {
+                    ready.store(true, .release);
+                    return;
+                }
+                ready.store(true, .release);
+                _ = s.completeFill(file, 0, buf, sys.monoSec(std.testing.io));
+            }
+        }.run, .{ &st, f, stale[0..], &claimed });
+
+        while (!claimed.load(.acquire))
+            std.Thread.yield() catch {};
+        st.cacheFill("race.bin", 32, 16, &fresh, sys.monoSec(std.testing.io));
+        filler.join();
+
+        f.mu.lockUncancelable(std.testing.io);
+        try std.testing.expectEqual(@as(u64, 32), f.size);
+        try std.testing.expect(!f.bits.get(0));
+        try std.testing.expect(f.bits.get(1));
+        f.mu.unlock(std.testing.io);
+    }
 }
 
 test "completeFill does not overwrite a racing write-through" {

@@ -798,13 +798,19 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
     const live = st.store.lookupRef(rel);
     if (live) |file| {
         defer st.store.releaseFile(file);
+        // content_mu first, then file.mu: the same order copyIntoCache,
+        // completeFill, and punchPiece use. Taking only file.mu let a
+        // concurrent write-through pwrite land, then this ftruncate cut
+        // those bytes, then the mark published the hole as cached data.
+        file.content_mu.lockUncancelable(st.io);
+        defer file.content_mu.unlock(st.io);
         file.mu.lockUncancelable(st.io);
+        defer file.mu.unlock(st.io);
         if (file.size == new_size) {
             // Already applied: a FUSE retry after a lost reply, or a no-op
             // truncate to the current size. Re-wiping bits would discard
             // pieces re-hydrated after the first truncate to this size.
             store_mod.Store.truncateCacheFd(file, new_size);
-            file.mu.unlock(st.io);
             return 0;
         }
         const nb = piece.Bitfield.init(st.gpa, piece.count(new_size, st.store.piece_size)) catch {
@@ -812,16 +818,13 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
             // old size would let a concurrent read serve pre-truncate cache
             // bytes past the new EOF. Wipe marks now; shrink the recorded
             // size when we can do that without growing an undersized field.
+            // truncateCacheFd, not a raw ftruncate: a peer /data sendfile
+            // holds xfer and is reading this fd without file.mu.
             @memset(file.bits.bytes, 0);
             file.writes += 1;
             if (new_size < file.size) file.size = new_size;
             _ = st.store.saveBits(file, false);
-            if (file.cache_fd >= 0) {
-                const tr = sys.ftruncate(file.cache_fd, file.size);
-                if (tr != 0)
-                    std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ rel, -tr });
-            }
-            file.mu.unlock(st.io);
+            store_mod.Store.truncateCacheFd(file, file.size);
             std.log.warn("bitfield alloc failed for {s} after truncate; cache marks dropped, pieces refill", .{rel});
             return -sys.c.ENOMEM;
         };
@@ -836,7 +839,6 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
         // a lost sidecar here only costs refill, never stale bytes.
         _ = st.store.saveBits(file, false);
         store_mod.Store.truncateCacheFd(file, new_size);
-        file.mu.unlock(st.io);
         ob.deinit(st.gpa);
     } else {
         // No live entry: origin is already the new length, but a leftover
