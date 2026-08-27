@@ -235,10 +235,12 @@ pub const Store = struct {
         filling: std.AutoHashMap(u32, u64),
         cache_fd: c_int = -1,
         last_access: std.atomic.Value(i64) = .init(0),
-        /// Serializes write-through pwrite+mark with completeFill pwrite+mark.
-        /// Without it the two pwrites race on the cache fd: a fill that claimed
-        /// before the write can overwrite the write-through bytes and then
-        /// mark them filled.
+        /// Serializes write-through pwrite+mark with completeFill pwrite+mark
+        /// and with punchPiece. Without it the two pwrites race on the cache
+        /// fd: a fill that claimed before the write can overwrite the
+        /// write-through bytes and then mark them filled. punchPiece taking
+        /// only file.mu could hole a piece between copyIntoCache's pwrite
+        /// and mark, then the mark would publish hole zeros as cached data.
         content_mu: std.Io.Mutex = .init,
         /// Count of local origin mutations observed on this entry (write-through,
         /// distrust, truncate wipe). Nonzero means peer bytes for this path
@@ -1272,7 +1274,8 @@ pub const Store = struct {
     /// Copies a landed origin write into the cache fd and marks the pieces it
     /// fully spans, so reads serve the copy instead of re-hydrating over NFS.
     /// Returns false when the copy did not land or pieces could not be marked;
-    /// reads then fall back to origin rather than serve hole zeros.
+    /// overlapping marks are then cleared so a warm read or `/have` cannot
+    /// serve pre-write cache bytes, and those pieces refill from origin.
     /// The copy never truncates the cache fd: concurrent fills of one entry
     /// land overlapping appends outside any shared lock, and an absolute
     /// ftruncate here could shrink the shared descriptor below bytes another
@@ -1296,7 +1299,6 @@ pub const Store = struct {
                 copied = true;
             }
         }
-        const cov = piece.fullCover(off, data.len, self.piece_size);
         // Marking, the write generation, and the sidecar save share file.mu:
         // saveBits encodes size/bits, and a concurrent truncate may swap and
         // free them. Bump writes even when the cache copy failed: the origin
@@ -1310,10 +1312,19 @@ pub const Store = struct {
         if (file.dead.load(.acquire)) return false;
         file.writes += 1;
         if (copied) {
+            const cov = piece.fullCover(off, data.len, self.piece_size);
             var i = cov.start;
             while (i < cov.end) : (i += 1) file.bits.set(i);
-            _ = self.saveBits(file, false);
+        } else {
+            // Origin has the new bytes; this node's cache does not. writes
+            // already forces peer fills onto origin, but a hit of an already
+            // marked piece skips hydration and would serve the pre-write
+            // cache copy -- and /have would advertise it to the fleet.
+            const cov = piece.cover(off, data.len, file.size, self.piece_size);
+            var i = cov.start;
+            while (i < cov.end) : (i += 1) file.bits.clear(i);
         }
+        _ = self.saveBits(file, false);
         return copied;
     }
 
@@ -1330,8 +1341,15 @@ pub const Store = struct {
     /// Punches piece idx when it may be culled at instant `now_sec`. The
     /// caller's monotonic instant keeps the decision a pure function of
     /// entry state plus time, drivable virtually in tests; cull drivers
-    /// sample sys.monoSec(io) once per round.
+    /// sample sys.monoSec(io) once per round. Holds content_mu across the
+    /// hole so a concurrent copyIntoCache cannot mark bytes this punch cut.
     pub fn punchPiece(self: *Store, file: *Cached, idx: u32, now_sec: i64) bool {
+        // content_mu first, then file.mu: the same order copyIntoCache and
+        // completeFill use. Taking only file.mu let a punch hole a piece
+        // between copyIntoCache's pwrite and mark, after which the mark
+        // published hole zeros as cached model data.
+        file.content_mu.lockUncancelable(self.io);
+        defer file.content_mu.unlock(self.io);
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
         // Revalidate recency under the file lock: cullOne picked this file on
@@ -1459,10 +1477,11 @@ pub const Store = struct {
         defer for (cands.items) |cd| self.releaseFile(cd.f);
 
         // Phase 2 runs outside every lock, LRU first: punchPiece revalidates
-        // recency, pin, mid-fill, and bit state under file.mu, so a stale
-        // sample only wastes one attempt before the next candidate. Equal-
-        // recency ties break by rel bytes: map iteration order must not
-        // decide which of several equally idle files is culled first.
+        // recency, pin, mid-fill, and bit state under content_mu then
+        // file.mu, so a stale sample only wastes one attempt before the next
+        // candidate. Equal-recency ties break by rel bytes: map iteration
+        // order must not decide which of several equally idle files is
+        // culled first.
         std.mem.sort(Cand, cands.items, {}, struct {
             fn lessThan(_: void, a: Cand, b: Cand) bool {
                 if (a.at != b.at) return a.at < b.at;
@@ -2431,6 +2450,73 @@ test "completeFill drops a stale peer buffer after a partial write-through" {
     try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
     try std.testing.expectEqualSlices(u8, &patch, rd[0..4]);
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 12), rd[4..]);
+}
+
+test "copyIntoCache unmarks overlapping pieces when the cache write fails" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-wt-fail");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-wt-fail");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Expected-path warning from the refused pwrite; keep it off stderr.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var old: [32]u8 = undefined;
+    @memset(&old, 0xAA);
+    var patch: [8]u8 = undefined;
+    @memset(&patch, 0xBB);
+
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+        const f = try st.get("fail.bin", 32, sys.monoSec(std.testing.io));
+        defer st.releaseFile(f);
+        try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
+        try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, old[0..16], sys.monoSec(std.testing.io)));
+        try std.testing.expect((try st.beginFill(f, 1, sys.monoSec(std.testing.io))) == .len);
+        try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 1, old[16..32], sys.monoSec(std.testing.io)));
+        try std.testing.expect(st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+        try std.testing.expect(st.hasPiece(f, 1, sys.monoSec(std.testing.io)));
+
+        // Plant a read-only cache fd so the write-through pwrite fails while
+        // both pieces stay marked. A 8-byte overwrite at offset 12 overlaps
+        // both; leaving those bits set used to serve the 0xAA cache copy
+        // after origin already held 0xBB, and /have advertised the stale
+        // pieces to peers.
+        try std.testing.expect(st.openCache(f) >= 0);
+        var dbuf: [sys.c.PATH_MAX]u8 = undefined;
+        const dp = try st.cacheDataPath(&dbuf, "fail.bin");
+        f.mu.lockUncancelable(std.testing.io);
+        sys.close(f.cache_fd);
+        const ro = sys.open(dp, c.O_RDONLY | c.O_NOFOLLOW, 0);
+        f.cache_fd = ro;
+        f.mu.unlock(std.testing.io);
+        try std.testing.expect(ro >= 0);
+
+        try std.testing.expect(!st.copyIntoCache(f, 12, &patch));
+        try std.testing.expect(st.wroteLocally(f));
+        try std.testing.expect(!st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+        try std.testing.expect(!st.hasPiece(f, 1, sys.monoSec(std.testing.io)));
+    }
+
+    // The wipe reached the sidecar: a restart must not reload the pre-write
+    // marks over the bytes the refused pwrite never replaced.
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        const f = try st.get("fail.bin", 32, sys.monoSec(std.testing.io));
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+        f.mu.unlock(std.testing.io);
+    }
 }
 
 test "relOk rejects traversal and absolute paths" {
