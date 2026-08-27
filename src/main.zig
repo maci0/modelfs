@@ -53,7 +53,7 @@ const usage =
     \\mount options:
     \\  --origin PATH         Existing NFS/dir origin (required). Writes go here.
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
-    \\  --id NAME             Override node id (default: hostname)
+    \\  --id NAME             Override node id (default: short hostname)
     \\  --listen [IP:]PORT    Peer HTTP port (default 18080); binds all interfaces
     \\  --advertise ADDRS     Extra addresses IP[:PORT], comma separated
     \\                        (default: every local IPv4 except loopback and 169.254)

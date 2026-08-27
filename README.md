@@ -72,7 +72,7 @@ sudo mkdir -p /models /var/cache/modelfs
 sudo chown "$(id -u):$(id -g)" /models /var/cache/modelfs
 umask 077; openssl rand -hex 32 | sudo tee /etc/modelfs.psk   # same file on every node
 
-# same command on every node (id defaults to the hostname)
+# same command on every node (id defaults to the short hostname)
 modelfs mount /models --origin /net/192.168.0.100/models
 ```
 
@@ -80,7 +80,7 @@ modelfs mount /models --origin /net/192.168.0.100/models
 
 ```bash
 modelfs status                                    # liveness, peers, and lifetime counters (reads, fills by source, errors)
-modelfs peers --origin /net/192.168.0.100/models  # live cluster leases
+modelfs peers --origin /net/192.168.0.100/models  # cluster leases, each marked live or expired
 modelfs pin gguf/foo.gguf                         # keep a file out of the cull
 modelfs unpin gguf/foo.gguf
 ```

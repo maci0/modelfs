@@ -388,7 +388,7 @@ flowchart TB
   q3 -->|yes, this repo| build["Build ModelFS"]
 ```
 
-When a ZFS box can export NFS, use that path first. Full compose: [operations.md](operations.md). No S3, no Postgres, no Redis, no bind mounts. Origin is the NAS. GPU nodes mount it at `/models` with `fsc`. Writes into `/models` are the replicate-back.
+When a ZFS box can export NFS, use that path first. Full compose: [operations.md](operations.md). No S3, no Postgres, no Redis, no bind mounts. Origin is the NAS. Desktop mounts NFS at `/models` with `fsc`; sparks mount the origin without `fsc` and run FUSE at `/models`. Writes into `/models` are the replicate-back.
 
 ### 6.1 Strategy A: buy / configure a product
 

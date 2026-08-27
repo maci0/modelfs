@@ -51,7 +51,7 @@ One piece, one source. Misses block the read until that hole is filled. No full-
 
 Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run `modelfs` there.
 
-`stat` / `readdir` / `mkdir` / `unlink` / `rename` → origin. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `create` (`O_TRUNC`) and `truncate` with no live cache entry drop persisted marks via `Store.distrust` for the same reason; a cold `Store.get` whose sidecar geometry does not match the origin size persists that wipe so a restart cannot reload the old marks. `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`.
+`stat` / `readdir` / `mkdir` / `rmdir` / `chmod` / `statfs` / `unlink` / `rename` → origin. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `create` (`O_TRUNC`) and `truncate` with no live cache entry drop persisted marks via `Store.distrust` for the same reason; a cold `Store.get` whose sidecar geometry does not match the origin size persists that wipe so a restart cannot reload the old marks. `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`, lookup (`ENOENT`), and mutation (`EPERM`).
 
 Origin is **required**. It can be any POSIX dir both nodes see, not only NFS. Two-node with no shared store is not implemented.
 
@@ -190,7 +190,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 
 A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. The fetching peer requires `206` plus a `Content-Range` whose start matches the request and whose end is at most the request end (EOF clamp); a same-length window at a different offset is refused rather than cached. Errors carry no body: both peers of a conversation parse only the status line.
 
-Every endpoint requires the bearer token, including `/ping`. Listen `0.0.0.0:18080`; `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status. Listen sockets, accepted connections, and files are opened close-on-exec (`sys.socket`, `sys.accept`, `sys.open`) so the `auto_unmount` fusermount helper spawned at mount cannot inherit them: a helper still holding the listen fd would keep the port bound after `Server.stop`, and the next start would fail to bind.
+Every endpoint requires the bearer token, including `/ping`. Listen `0.0.0.0` on each unique advertised port (default 18080); `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status. Listen sockets, accepted connections, and files are opened close-on-exec (`sys.socket`, `sys.accept`, `sys.open`) so the `auto_unmount` fusermount helper spawned at mount cannot inherit them: a helper still holding the listen fd would keep the port bound after `Server.stop`, and the next start would fail to bind.
 
 ---
 
@@ -204,7 +204,7 @@ Like cachefilesd, on **percent free** of the filesystem that holds `/var/cache/m
 | `--bcull` | 7 | start culling |
 | `--bstop` | 3 | cull harder |
 
-Culling punches 16 MiB holes (`FALLOC_FL_PUNCH_HOLE`), clears that bit, leaves the sparse file. LRU by last read. Skip `pin`, files read in the last 10s, and entries with a peer transfer in flight (punching mid-send would ship hole zeros the fetching peer cannot tell from real data). Next read hydrates that piece again.
+Culling punches piece-sized holes (default 16 MiB, `FALLOC_FL_PUNCH_HOLE`), clears that bit, leaves the sparse file. LRU by last read. Skip `pin`, files read in the last 10s, and entries with a peer transfer in flight (punching mid-send would ship hole zeros the fetching peer cannot tell from real data). Next read hydrates that piece again.
 
 `pin` is a marker under `pin/`. Nothing else is deleted as a whole file.
 

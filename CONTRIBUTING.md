@@ -21,7 +21,7 @@ uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
 need to activate it. If `zig build` stops with "libfuse3 headers not found",
 install the package it names (or point `-Dfuse-include=<dir>` at a
 non-default location). `./scripts/check.sh --help` lists the contributor
-commands; so does `zig build --help`.
+commands. `zig build --help` lists the `check`/`ci`/`fmt`/`test` steps.
 
 ## The one command that matters
 
