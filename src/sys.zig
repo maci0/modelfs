@@ -400,19 +400,14 @@ fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, e
 }
 
 pub fn readFileBuf(buf: []u8, path: [*:0]const u8) ![]u8 {
-    return readFileBufOpenErrno(buf, path, null);
+    return readFileBufFlags(buf, path, 0, null);
 }
 
-/// readFileBuf plus the failing open's errno written through open_errno_out
-/// (when non-null), so callers can stay silent for the expected ENOENT race
-/// while naming every other open failure, like readFileAllocOpenErrno does.
-/// Follows a final symlink; daemon-owned artifacts use the NoFollow form.
-pub fn readFileBufOpenErrno(buf: []u8, path: [*:0]const u8, open_errno_out: ?*i32) ![]u8 {
-    return readFileBufFlags(buf, path, 0, open_errno_out);
-}
-
-/// readFileBufOpenErrno with O_NOFOLLOW: origin lease files live on shared
-/// NFS where a co-tenant can plant a symlink at a .json name.
+/// readFileBuf with O_NOFOLLOW: origin lease files live on shared NFS where
+/// a co-tenant can plant a symlink at a .json name. The failing open's
+/// errno is written through open_errno_out (when non-null) so callers can
+/// stay silent for the expected ENOENT race while naming every other open
+/// failure, like readFileAllocOpenErrno does.
 pub fn readFileBufNoFollowOpenErrno(buf: []u8, path: [*:0]const u8, open_errno_out: ?*i32) ![]u8 {
     return readFileBufFlags(buf, path, c.O_NOFOLLOW, open_errno_out);
 }

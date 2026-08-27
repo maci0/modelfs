@@ -98,18 +98,12 @@ fn cPath(p: [*c]const u8) []const u8 {
 }
 
 /// "" and "/" name the mount root itself; everything else must be a clean
-/// relative path once the leading slash is stripped.
-fn fuseRelOk(path: []const u8) bool {
-    if (path.len == 0 or std.mem.eql(u8, path, "/")) return true;
-    const rel = if (path[0] == '/') path[1..] else path;
-    return store_mod.relOk(rel);
-}
-
+/// relative path once the leading slash is stripped. Null when the path
+/// fails store.relOk after that strip.
 fn relFromFuse(path: []const u8) ?[]const u8 {
-    if (!fuseRelOk(path)) return null;
     if (path.len == 0 or std.mem.eql(u8, path, "/")) return "";
-    if (path[0] == '/') return path[1..];
-    return path;
+    const rel = if (path[0] == '/') path[1..] else path;
+    return if (store_mod.relOk(rel)) rel else null;
 }
 
 fn isCluster(path: []const u8) bool {
@@ -200,8 +194,7 @@ const fuzz_path_corpus = [_][]const u8{
 
 /// Every FUSE operation hands this gate a path any local process chose, so
 /// the harness treats it as untrusted wire input. Asserts the gate's
-/// published contract end to end: the boolean pre-check and extracting
-/// wrapper agree on every input; cluster control paths are denied under
+/// published contract end to end: cluster control paths are denied under
 /// both handler shapes (lookup ENOENT, mutation EPERM) whatever rides
 /// behind them; results are deterministic across repeated calls; and the
 /// one invariant every downstream handler leans on holds -- an accepted rel
@@ -212,7 +205,6 @@ fn fuzzPathGateOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const p = buf[0..smith.slice(&buf)];
 
     const gated = relFromFuse(p);
-    try std.testing.expectEqual(fuseRelOk(p), gated != null);
 
     if (isCluster(p)) {
         var rel: []const u8 = "";

@@ -768,21 +768,13 @@ fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) 
 /// malformed header fails the probe like any other bad reply so failures
 /// stay uncached and retried.
 fn fetchHave(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !proto.HaveBits {
-    return fetchHaveDeadline(gpa, io, psk, ip, port, rel, null);
-}
-
-/// fetchHave with an injectable budget (see readHeadFullAt): a non-null
-/// deadline bounds the dial, the head stage, and the bitmap body as one
-/// span, so tests expire the probe virtually instead of waiting out
-/// connect(2) or SO_RCVTIMEO.
-fn fetchHaveDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, deadline_ms: ?i64) !proto.HaveBits {
-    const fd = try sendRequest(io, psk, ip, port, rel, null, deadline_ms);
+    const fd = try sendRequest(io, psk, ip, port, rel, null);
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    try readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms);
-    return haveFromHeadDeadline(gpa, io, fd, &head_buf, head_len, total_read, deadline_ms);
+    try readHeadFull(io, fd, &head_buf, &head_len, &total_read);
+    return haveFromHead(gpa, io, fd, &head_buf, head_len, total_read);
 }
 
 /// Parses one /have response head (already read, body bytes possibly
@@ -822,11 +814,8 @@ fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, 
 /// Dials and sends one GET (/have, or /data when range is set); returns the
 /// connected socket with the request already on the wire. One builder for
 /// both shapes so URL encoding, bearer auth, and Connection framing cannot
-/// drift between them. `deadline_ms` (see readHeadFullAt) also bounds the
-/// dial: the connect wait clamps to the budget's remainder, so an injected
-/// deadline spans the whole wire round trip instead of starting only after
-/// connect(2) returned on its own.
-fn sendRequest(io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, range: ?proto.Range, deadline_ms: ?i64) !c_int {
+/// drift between them.
+fn sendRequest(io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, range: ?proto.Range) !c_int {
     var qbuf: [4096 * 3]u8 = undefined;
     const enc = try proto.urlEncode(&qbuf, rel);
     var req: [max_head_bytes]u8 = undefined;
@@ -838,37 +827,25 @@ fn sendRequest(io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []co
         try std.fmt.bufPrint(&req, "GET /have?path={s} HTTP/1.1\r\nHost: {s}:{d}\r\nAuthorization: Bearer {s}\r\nConnection: close\r\n\r\n", .{
             enc, ip, port, psk,
         });
-    const fd = try dial(io, ip, port, deadline_ms);
+    const fd = try dial(io, ip, port, null);
     errdefer sys.close(fd);
     if (sys.writeAll(fd, s) < 0) return error.Write;
     return fd;
 }
 
 fn fetchRange(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64) ![]u8 {
-    return fetchRangeDeadline(gpa, io, psk, ip, port, rel, start, end, null);
-}
-
-/// Fetch variants with an injectable budget (see readHeadFullAt): a non-null
-/// deadline bounds the dial plus head and body stages as one span, so a test
-/// expires the transfer virtually instead of holding real connect waits or
-/// socket timeouts open.
-fn fetchRangeDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, deadline_ms: ?i64) ![]u8 {
-    const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
+    const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end });
     defer sys.close(fd);
-    return readRangeBodyAllocDeadline(gpa, io, fd, start, end, null, deadline_ms);
+    return readRangeBodyAllocDeadline(gpa, io, fd, start, end, null, null);
 }
 
 /// Like fetchRange, but streams the body directly into `out` (whose length
 /// must match the peer's Content-Length): one fewer piece-sized allocation
 /// and copy per fetched piece.
 fn fetchRangeInto(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8) !void {
-    return fetchRangeIntoDeadline(gpa, io, psk, ip, port, rel, start, end, out, null);
-}
-
-fn fetchRangeIntoDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8, deadline_ms: ?i64) !void {
-    const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end }, deadline_ms);
+    const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end });
     defer sys.close(fd);
-    _ = try readRangeBodyAllocDeadline(gpa, io, fd, start, end, out, deadline_ms);
+    _ = try readRangeBodyAllocDeadline(gpa, io, fd, start, end, out, null);
 }
 
 /// Binds a 206 body to the range we asked for. Content-Length alone cannot
@@ -2109,10 +2086,9 @@ test "fault tolerance: dial unreachable peer fails gracefully" {
 
 test "dial expires an injected budget that is already spent" {
     // A spent budget must refuse at the dial stage itself, before the socket
-    // even exists: fetchHaveDeadline and the fetchRange* variants span dial,
-    // head, and body as one budget, so a test (or any simulator driving
-    // virtual deadlines) can expire a wire round trip without connect(2)
-    // ever running against a real address.
+    // even exists, so a test (or any simulator driving virtual deadlines)
+    // can expire a connect without connect(2) ever running against a real
+    // address.
     const t0 = sys.monoMs(std.testing.io);
     const err = dial(std.testing.io, "10.255.255.255", 18080, t0 - 1);
     try std.testing.expectError(error.Connect, err);
@@ -2494,7 +2470,7 @@ test "serveData replies 500 when the cache refuses hydrated bytes" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
-    const fd = try sendRequest(std.testing.io, "secret", "127.0.0.1", port, "ro.bin", .{ .start = 0, .end = 15 }, null);
+    const fd = try sendRequest(std.testing.io, "secret", "127.0.0.1", port, "ro.bin", .{ .start = 0, .end = 15 });
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
