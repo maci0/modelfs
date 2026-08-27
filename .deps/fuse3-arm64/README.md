@@ -19,9 +19,9 @@ zig build -Dtarget=aarch64-linux-gnu.2.39 -Dfuse-include=<repo>/.deps/fuse3-arm6
 [scripts/extract_fuse3_arm64.sh](../../scripts/extract_fuse3_arm64.sh) handles
 this itself: a `.deb` is an `ar` archive whose `data.tar.zst` holds the
 filesystem, so where `dpkg-deb` is absent the script unpacks each `.deb` with
-binutils `ar` plus a zstd-capable `tar` into `root/`, then recreates the
-`lib/` symlinks. The only requirements are `ar` and `tar --zstd`; there is no
-manual recipe to follow.
+binutils `ar` plus `zstd` (or a zstd-capable `tar`) into `root/`, then recreates
+the `lib/` symlinks. The only requirements are `ar` and `zstd` or `tar --zstd`;
+there is no manual recipe to follow.
 
 ## Provenance
 

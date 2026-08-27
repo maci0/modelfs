@@ -16,4 +16,5 @@
 #include <errno.h>
 #include <poll.h>
 #include <ifaddrs.h>
+#include <net/if.h>
 #include <limits.h>

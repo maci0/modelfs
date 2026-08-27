@@ -712,16 +712,13 @@ pub fn localIpv4(gpa: std.mem.Allocator) ![][]const u8 {
         list.deinit(gpa);
     }
     var p = ifa;
-    // net/if.h flag bits (c.h does not pull the header in).
-    const IFF_UP: u32 = 0x1;
-    const IFF_LOOPBACK: u32 = 0x8;
     while (p) |node| {
         defer p = node.ifa_next;
         const addr = node.ifa_addr orelse continue;
         if (addr.*.sa_family != c.AF_INET) continue;
         const flags = node.ifa_flags;
-        if (flags & IFF_LOOPBACK != 0) continue;
-        if (flags & IFF_UP == 0) continue;
+        if ((flags & @as(@TypeOf(flags), @intCast(c.IFF_LOOPBACK))) != 0) continue;
+        if ((flags & @as(@TypeOf(flags), @intCast(c.IFF_UP))) == 0) continue;
         const sin: *c.struct_sockaddr_in = @ptrCast(@alignCast(addr));
         var buf: [c.INET_ADDRSTRLEN]u8 = undefined;
         const s = c.inet_ntop(c.AF_INET, &sin.sin_addr, &buf, buf.len) orelse continue;

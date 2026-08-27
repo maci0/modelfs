@@ -39,10 +39,22 @@ extract_one() {
         # this reproduces what dpkg-deb -x does on non-Debian hosts.
         local data_tar="data.tar.zst"
         ar x "$1" "${data_tar}"
-        tar --zstd -xf "${data_tar}" -C root/
-        rm "${data_tar}"
+        # GNU tar 1.31+ understands --zstd; older tar still works when the
+        # zstd binary is on PATH (Arch, Rocky, and similar without dpkg).
+        if command -v zstd >/dev/null 2>&1; then
+            zstd -dc "${data_tar}" | tar -xf - -C root/
+        else
+            local tar_help
+            tar_help="$(tar --help 2>/dev/null || true)"
+            if [[ "${tar_help}" == *--zstd* ]]; then
+                tar --zstd -xf "${data_tar}" -C root/
+            else
+                fail "need dpkg-deb, or binutils ar plus zstd (or tar --zstd), to extract $1"
+            fi
+        fi
+        rm -f "${data_tar}"
     else
-        fail "need dpkg-deb, or binutils ar plus a zstd-capable tar, to extract $1"
+        fail "need dpkg-deb, or binutils ar plus zstd (or tar --zstd), to extract $1"
     fi
 }
 

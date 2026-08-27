@@ -178,11 +178,8 @@ pub fn fadviseDontneed(fd: c_int, off: u64, len: u64) void {
     _ = c.posix_fadvise(fd, @intCast(off), @intCast(len), c.POSIX_FADV_DONTNEED);
 }
 
-const FALLOC_FL_KEEP_SIZE: c_int = 0x01;
-const FALLOC_FL_PUNCH_HOLE: c_int = 0x02;
-
 pub fn punchHole(fd: c_int, off: u64, len: u64) i32 {
-    const rc = c.fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, @intCast(off), @intCast(len));
+    const rc = c.fallocate(fd, c.FALLOC_FL_PUNCH_HOLE | c.FALLOC_FL_KEEP_SIZE, @intCast(off), @intCast(len));
     if (rc != 0) return negErrno();
     return 0;
 }
@@ -286,12 +283,12 @@ fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, dura
     if (n < 0) return @intCast(n);
     if (durable) {
         while (true) {
-            const rc = std.os.linux.fsync(fd);
-            if (rc == 0) break;
-            // EINTR is retried like every other interruptible syscall here;
-            // any other failure means the durability guarantee does not hold
-            // and must surface as "not saved".
-            const e: i32 = @intCast(rc);
+            // libc fsync: a raw linux.fsync return is a usize with -errno
+            // in the high bits, which does not fit i32 and so cannot be
+            // compared to EINTR (the retry would panic in safe builds and
+            // skip in ReleaseFast).
+            if (c.fsync(fd) == 0) break;
+            const e = errno();
             if (e != c.EINTR) return -e;
         }
     }
@@ -421,18 +418,48 @@ pub fn setSockBuffers(fd: c_int, size_bytes: c_int) void {
     _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_SNDBUF, &size_bytes, @sizeOf(c_int));
 }
 
+fn dottedQuad(out_ip: []u8, s_addr_be: u32) ?[]const u8 {
+    const raw = std.mem.bigToNative(u32, s_addr_be);
+    return std.fmt.bufPrint(out_ip, "{d}.{d}.{d}.{d}", .{
+        @as(u8, @truncate(raw >> 24)),
+        @as(u8, @truncate(raw >> 16)),
+        @as(u8, @truncate(raw >> 8)),
+        @as(u8, @truncate(raw)),
+    }) catch null;
+}
+
+fn numericIpv4Host(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |ch| {
+        if (ch != '.' and (ch < '0' or ch > '9')) return false;
+    }
+    return true;
+}
+
 /// Resolves a host name to its first IPv4 address, writing the dotted quad
-/// into out_ip. Numeric dotted quads resolve through getaddrinfo without a
-/// DNS trip. Null when resolution fails or yields no IPv4 address; the
-/// peer dial path only accepts dotted quads (inet_pton), so callers that
-/// accept host names must convert here or the address dies silently later.
+/// into out_ip. Numeric dotted quads go through inet_pton (no DNS, no
+/// AI_ADDRCONFIG). Null when resolution fails or yields no IPv4 address;
+/// the peer dial path only accepts dotted quads (inet_pton), so callers
+/// that accept host names must convert here or the address dies silently
+/// later.
 pub fn resolveIpv4(host: []const u8, out_ip: []u8) ?[]const u8 {
     var hz: [256]u8 = undefined;
     const h = toZ(&hz, host) catch return null;
+    var addr: c.struct_in_addr = undefined;
+    if (c.inet_pton(c.AF_INET, h, &addr) == 1) {
+        return dottedQuad(out_ip, addr.s_addr);
+    }
+    // Digits-and-dots that inet_pton refused (leading zeros, 256, ...)
+    // must not fall through to getaddrinfo: glibc may accept spellings
+    // the dialer's inet_pton later rejects.
+    if (numericIpv4Host(host)) return null;
+
     var hints: c.struct_addrinfo = std.mem.zeroes(c.struct_addrinfo);
     hints.ai_family = c.AF_INET;
     hints.ai_socktype = c.SOCK_STREAM;
-    hints.ai_flags = c.AI_ADDRCONFIG;
+    // No AI_ADDRCONFIG: that flag skips IPv4 when the only configured
+    // address is loopback, so --seed HOST would fail on a loopback-only
+    // or IPv6-first host. AF_INET already restricts the family.
     var res: [*c]c.struct_addrinfo = null;
     if (c.getaddrinfo(h, null, &hints, &res) != 0) return null;
     defer c.freeaddrinfo(res);
@@ -441,13 +468,7 @@ pub fn resolveIpv4(host: []const u8, out_ip: []u8) ?[]const u8 {
         if (it.*.ai_family != c.AF_INET) continue;
         if (it.*.ai_addrlen < @sizeOf(c.struct_sockaddr_in)) continue;
         const sin: *const c.struct_sockaddr_in = @ptrCast(@alignCast(it.*.ai_addr));
-        const raw = std.mem.bigToNative(u32, sin.sin_addr.s_addr);
-        return std.fmt.bufPrint(out_ip, "{d}.{d}.{d}.{d}", .{
-            @as(u8, @truncate(raw >> 24)),
-            @as(u8, @truncate(raw >> 16)),
-            @as(u8, @truncate(raw >> 8)),
-            @as(u8, @truncate(raw)),
-        }) catch null;
+        return dottedQuad(out_ip, sin.sin_addr.s_addr);
     }
     return null;
 }
@@ -555,6 +576,10 @@ test "resolveIpv4 passes numeric quads and resolves localhost" {
     // Numeric form: what every existing seed uses; must not change.
     try std.testing.expectEqualStrings("127.0.0.1", resolveIpv4("127.0.0.1", &out).?);
     try std.testing.expectEqualStrings("192.168.0.100", resolveIpv4("192.168.0.100", &out).?);
+    // Leading zeros are a numeric miss, not a getaddrinfo-accepted spelling
+    // the dialer would later refuse.
+    try std.testing.expect(resolveIpv4("192.168.000.001", &out) == null);
+    try std.testing.expect(resolveIpv4("127.0.0.256", &out) == null);
     // Name form: documented "--seed HOST[:PORT]" (here via /etc/hosts, so
     // the assertion holds without network access).
     const resolved = resolveIpv4("localhost", &out).?;
