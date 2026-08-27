@@ -319,8 +319,13 @@ test "bitfield set get persist" {
     var bf = try Bitfield.init(gpa, 10);
     defer bf.deinit(gpa);
     try std.testing.expect(!bf.get(3));
+    try std.testing.expect(bf.lastSet() == null);
     bf.set(3);
     bf.set(9);
+    // Past nbits is a no-op: neither get nor set may wrap into byte 0.
+    try std.testing.expect(!bf.get(10));
+    bf.set(10);
+    try std.testing.expect(!bf.get(10));
     try std.testing.expect(bf.get(3));
     try std.testing.expect(bf.get(9));
     try std.testing.expectEqual(@as(u32, 2), bf.filled());

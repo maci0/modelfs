@@ -1458,7 +1458,8 @@ test "readFlexBodyAlloc keeps the dest contract when Content-Length is absent" {
         const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        _ = try readFlexBodyAlloc(gpa, std.testing.io, pair[1], &.{});
+        const body = try readFlexBodyAlloc(gpa, std.testing.io, pair[1], &.{});
+        try std.testing.expectEqual(@as(usize, 0), body.len);
     }
 }
 
@@ -1752,6 +1753,14 @@ test "server start and stop" {
     const bound_port = boundPort(server.listen_fds.items[0]);
     try std.testing.expect(bound_port > 0);
     server.stop();
+    try std.testing.expectEqual(@as(usize, 0), server.listen_fds.items.len);
+    // stop() must release the port so a restart can bind it; a leaked
+    // listener would still occupy the address.
+    try server.bindOne("127.0.0.1", bound_port);
+    try std.testing.expectEqual(@as(usize, 1), server.listen_fds.items.len);
+    try std.testing.expectEqual(bound_port, boundPort(server.listen_fds.items[0]));
+    server.stop();
+    try std.testing.expectEqual(@as(usize, 0), server.listen_fds.items.len);
 }
 
 test "duplicate bind of a live port fails instead of sharing it" {

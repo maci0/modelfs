@@ -2294,6 +2294,8 @@ test "relOk rejects traversal and absolute paths" {
     // traversal in every position
     try std.testing.expect(!relOk("../etc/passwd"));
     try std.testing.expect(!relOk("gguf/../../etc/passwd"));
+    try std.testing.expect(!relOk("a/../b"));
+    try std.testing.expect(!relOk("a/./b"));
     try std.testing.expect(!relOk("a/.."));
     try std.testing.expect(!relOk(".."));
     try std.testing.expect(!relOk("./a.bin"));

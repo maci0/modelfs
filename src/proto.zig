@@ -334,6 +334,11 @@ test "range and query" {
     try std.testing.expectEqual(@as(u64, 16777215), r.end);
     try std.testing.expect(parseRange("bytes=10-1") == null);
     try std.testing.expect(parseRange("bytes=-5") == null);
+    // A one-byte window is legal; trailing garbage after the end is not.
+    const one = parseRange("bytes=0-0").?;
+    try std.testing.expectEqual(@as(u64, 0), one.start);
+    try std.testing.expectEqual(@as(u64, 0), one.end);
+    try std.testing.expect(parseRange("bytes=0-5foo") == null);
     // the open-ended form names everything through EOF; the suffix form
     // (last N bytes) stays unsupported and rejected
     const open = parseRange("bytes=10-").?;
@@ -386,6 +391,9 @@ test "range and query" {
     try std.testing.expectEqualStrings("foo%2Fbar", q);
     // key must match whole token, not a suffix
     try std.testing.expect(queryGet("/have?xpath=1", "path") == null);
+    // An empty value is present (the caller URL-decodes it); a missing key is not.
+    try std.testing.expectEqualStrings("", queryGet("/have?path=", "path").?);
+    try std.testing.expect(queryGet("/have?x=1", "path") == null);
     try std.testing.expectEqualStrings("/have", pathOnly("/have?path=x"));
     try std.testing.expectEqualStrings("/data", pathOnly("/data"));
 }
@@ -404,6 +412,8 @@ test "HaveBits.hasPiece respects advertised grid" {
     const aligned = HaveBits{ .bits = &bits, .piece_size = 4096 };
     try std.testing.expect(aligned.hasPiece(0, 4096));
     try std.testing.expect(!aligned.hasPiece(1, 4096));
+    // Past the advertised bitmap is no-answer, not a wrap into byte 0.
+    try std.testing.expect(!aligned.hasPiece(8, 4096));
     try std.testing.expect(!aligned.hasPiece(0, 8192));
     // Absent X-Piece-Size (piece_size 0) is assumed aligned, so a fetcher
     // talking to an older peer still reads the bits it advertised.
@@ -459,6 +469,7 @@ test "lease json roundtrip" {
     // a peer publishing such a document must fail closed here, never read
     // downstream as an empty-address (unreachable) or empty-cluster node.
     try std.testing.expectError(error.MissingField, parseLease(std.testing.allocator, "{\"id\":\"n1\",\"until\":5}"));
+    try std.testing.expectError(error.MissingField, parseLease(std.testing.allocator, "{\"until\":5,\"addrs\":[]}"));
 
     // The writer refuses an undersized buffer instead of truncating: publish
     // ships this document verbatim to every peer, so a torn tail would look

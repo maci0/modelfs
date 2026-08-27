@@ -53,11 +53,16 @@ test "phase matches cachefilesd watermarks" {
     const w = Water{};
     try std.testing.expectEqual(Phase.run, phase(50, w, false));
     try std.testing.expectEqual(Phase.run, phase(10, w, false));
+    // Not currently culling: the open band (bcull, brun) stays run so free
+    // space sitting at 8% does not flap into cull on the next tick.
+    try std.testing.expectEqual(Phase.run, phase(8, w, false));
     try std.testing.expectEqual(Phase.cull, phase(7, w, false));
     try std.testing.expectEqual(Phase.cull, phase(5, w, false));
     try std.testing.expectEqual(Phase.stop, phase(3, w, false));
     try std.testing.expectEqual(Phase.stop, phase(0, w, true));
     try std.testing.expectEqual(Phase.cull, phase(8, w, true));
+    // Currently culling: still below brun, so 9% keeps punching.
+    try std.testing.expectEqual(Phase.cull, phase(9, w, true));
     try std.testing.expectEqual(Phase.run, phase(10, w, true));
 }
 

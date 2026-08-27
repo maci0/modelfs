@@ -2054,6 +2054,7 @@ test "parseArgs mount flags" {
     try std.testing.expectEqualStrings("mount", parsed.cmd);
     try std.testing.expectEqualStrings("/mnt/models", parsed.rest[0]);
     try std.testing.expectEqualStrings("/srv/origin", parsed.opts.origin.?);
+    try std.testing.expectEqualStrings("/etc/modelfs.psk", parsed.opts.psk_file);
     try std.testing.expectEqual(@as(u32, 4 * 1024 * 1024), parsed.opts.piece);
     // --listen is fully parsed at the flag boundary; only the port survives
     try std.testing.expectEqual(@as(u16, 19090), parsed.opts.listen_port.?);

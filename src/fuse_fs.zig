@@ -147,6 +147,9 @@ test "resolveRel denies cluster and traversal paths" {
     var rel: []const u8 = "";
     try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), resolveRel("/.cluster", -sys.c.ENOENT, &rel));
     try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), resolveRel("/.cluster/spark1.json", -sys.c.ENOENT, &rel));
+    // Prefix, not substring: a model named .clusterfoo is not the lease dir.
+    try std.testing.expectEqual(@as(c_int, 0), resolveRel("/.clusterfoo", -sys.c.ENOENT, &rel));
+    try std.testing.expectEqualStrings(".clusterfoo", rel);
     try std.testing.expectEqual(@as(c_int, 0), resolveRel("/gguf/a.gguf", -sys.c.ENOENT, &rel));
     try std.testing.expectEqualStrings("gguf/a.gguf", rel);
     try std.testing.expectEqual(@as(c_int, -sys.c.EPERM), resolveRel("/../etc", -sys.c.ENOENT, &rel));
@@ -156,7 +159,12 @@ test "relFromFuse rejects .." {
     try std.testing.expectEqualStrings("gguf/a.gguf", relFromFuse("/gguf/a.gguf").?);
     try std.testing.expect(relFromFuse("/../etc/passwd") == null);
     try std.testing.expectEqualStrings("", relFromFuse("/").?);
+    try std.testing.expect(isCluster("/.cluster"));
     try std.testing.expect(isCluster("/.cluster/spark1.json"));
+    // The trailing slash in the prefix match is the boundary: without it a
+    // model named .clusterfoo would vanish as a control path.
+    try std.testing.expect(!isCluster("/.clusterfoo"));
+    try std.testing.expect(!isCluster("/foo/.cluster"));
     try std.testing.expect(!isCluster("/gguf/a.gguf"));
 }
 
@@ -1250,22 +1258,23 @@ test "fuse operations wire every supported handler" {
     const o = ops();
     // A null entry makes libfuse answer that operation with a default
     // behavior instead of going through the store: e.g. a dropped truncate
-    // wiring would silently corrupt cache/origin size agreement.
-    try std.testing.expect(o.getattr != null);
-    try std.testing.expect(o.open != null);
-    try std.testing.expect(o.create != null);
-    try std.testing.expect(o.read != null);
-    try std.testing.expect(o.write != null);
-    try std.testing.expect(o.truncate != null);
-    try std.testing.expect(o.unlink != null);
-    try std.testing.expect(o.mkdir != null);
-    try std.testing.expect(o.rmdir != null);
-    try std.testing.expect(o.rename != null);
-    try std.testing.expect(o.chmod != null);
-    try std.testing.expect(o.readdir != null);
-    try std.testing.expect(o.statfs != null);
-    try std.testing.expect(o.init != null);
-    try std.testing.expect(o.destroy != null);
+    // wiring would silently corrupt cache/origin size agreement. Identity,
+    // not mere non-null: swapping two handlers would still pass a null check.
+    try std.testing.expectEqual(&mf_getattr, o.getattr);
+    try std.testing.expectEqual(&mf_open, o.open);
+    try std.testing.expectEqual(&mf_create, o.create);
+    try std.testing.expectEqual(&mf_read, o.read);
+    try std.testing.expectEqual(&mf_write, o.write);
+    try std.testing.expectEqual(&mf_truncate, o.truncate);
+    try std.testing.expectEqual(&mf_unlink, o.unlink);
+    try std.testing.expectEqual(&mf_mkdir, o.mkdir);
+    try std.testing.expectEqual(&mf_rmdir, o.rmdir);
+    try std.testing.expectEqual(&mf_rename, o.rename);
+    try std.testing.expectEqual(&mf_chmod, o.chmod);
+    try std.testing.expectEqual(&mf_readdir, o.readdir);
+    try std.testing.expectEqual(&mf_statfs, o.statfs);
+    try std.testing.expectEqual(&mf_init, o.init);
+    try std.testing.expectEqual(&mf_destroy, o.destroy);
 }
 
 test "statusJson publishes parseable liveness atomically and replaces in place" {

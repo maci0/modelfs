@@ -1097,9 +1097,20 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
 
 test "hostname copies into buf" {
     var buf: [256]u8 = undefined;
+    @memset(&buf, 0xaa);
     const name = hostname(&buf);
     try std.testing.expect(name.len > 0);
     try std.testing.expect(std.mem.findScalar(u8, name, '.') == null);
+    if (name.ptr == buf[0..].ptr) {
+        // Copied into the caller buffer: the returned slice is that prefix,
+        // not a view of gethostname's stack storage.
+        try std.testing.expect(name.len < buf.len);
+        try std.testing.expectEqualSlices(u8, name, buf[0..name.len]);
+    } else {
+        // Documented fallback when gethostname fails or the short name is
+        // unusable as a cluster id. A static string, never an alias of buf.
+        try std.testing.expectEqualStrings("node", name);
+    }
 }
 
 test "shouldAdvertise skips loopback and link-local" {
