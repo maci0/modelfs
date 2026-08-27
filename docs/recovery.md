@@ -78,7 +78,14 @@ Failure visibility: a green exit code proves nothing. Give the timers teeth:
 OnFailure=notify-admin@%n.service
 ```
 
-and treat these as alarms, not log noise: no new snapshot in the last hour, replica dataset size frozen on a day with known downloads, drill log (section 6) stale.
+and treat these as alarms, not log noise: no new snapshot in the last hour
+(the monthly drill enforces a coarser 25 h bound in section 6, so a dead
+timer surfaces within one drill cycle at the latest), replica dataset size
+frozen on a day with known downloads, drill log (section 6) stale.
+
+The same drop-in belongs on whichever timer runs the `syncoid` replica above:
+a replica that dies silently leaves section 5's pool-loss row depending on a
+copy nobody knows stopped updating.
 
 Before risky bulk work (`rm -rf` of an old model, big re-download with overwrite, moving datasets), take a named snapshot; it is the pre-run safety net POSIX does not give you:
 
@@ -155,7 +162,7 @@ A backup never restored is a hypothesis. Monthly, on the NAS:
 ./scripts/dr_restore_drill.sh tank/models
 ```
 
-The script ([scripts/dr_restore_drill.sh](../scripts/dr_restore_drill.sh)) picks the newest snapshot by creation time (not name order, where hourly/daily/monthly suffixes would decide), clones it timed, diffs the restored tree against the live dataset, and checksums one size-stable file on both sides before appending the log line that proves the drill ran. Drift inside the RPO window is counted, never failed; a size-stable file that hashes differently fails the drill, and so does an empty snapshot or a missing snapshot schedule: the "no snapshots" exit is the sanoid.timer alarm. Exit status is the verdict; `MF_DRILL_KEEP=1` leaves the clone mounted for inspection and `MF_DRILL_LOG` relocates the artifact log from `/var/log/modelfs-drill.log`.
+The script ([scripts/dr_restore_drill.sh](../scripts/dr_restore_drill.sh)) picks the newest snapshot by creation time (not name order, where hourly/daily/monthly suffixes would decide), clones it timed, diffs the restored tree against the live dataset, and checksums one size-stable file on both sides before appending the log line that proves the drill ran. Drift inside the RPO window is counted, never failed; a size-stable file that hashes differently fails the drill, and so does an empty snapshot or a missing snapshot schedule: the "no snapshots" exit is the sanoid.timer alarm. The drill also fails when the newest snapshot is older than `MF_DRILL_MAX_SNAP_AGE` (default 25 h): snapshots that exist but stopped refreshing mean sanoid died after the last green drill, and restoring them would miss the RPO table claims. That age rides the log line as `snap_age_s`, so the RPO column above stays a measured number rather than an assumption. Exit status is the verdict; `MF_DRILL_KEEP=1` leaves the clone mounted for inspection and `MF_DRILL_LOG` relocates the artifact log from `/var/log/modelfs-drill.log`.
 
 The timed clone is the measured restore rate that keeps the RTO row honest; the log line is the artifact proving the drill ran. Alert when the newest entry ages past 35 days.
 
