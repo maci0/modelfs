@@ -487,7 +487,7 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
 /// actually lacks its bit: fully-cached ranges skip the allocation.
 /// Sends the error reply itself; false means streaming cannot proceed.
 fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, size: u64) bool {
-    const cov = piece.cover(start, want, size, self.store.piece_size);
+    const cov = piece.cover(.{ .off = start, .len = want }, size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
     const piece_size = self.store.piece_size;
     var pbuf: ?[]u8 = null;
@@ -601,7 +601,7 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     // fetching peer would mark them filled. file_size is the origin sample
     // this 206 advertised: reading file.size unlocked races a concurrent
     // truncate and can treat an untracked tail as cacheable.
-    const cache_ok = piece.rangeTracked(start, want, file_size, self.store.piece_size);
+    const cache_ok = piece.rangeTracked(.{ .off = start, .len = want }, file_size, self.store.piece_size);
     const cfd = if (cache_ok) self.store.openCache(file) else @as(c_int, -1);
     if (cfd >= 0) {
         var done: u64 = 0;

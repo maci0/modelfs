@@ -75,18 +75,21 @@ fn nowSecRaw() i64 {
     return ts.sec;
 }
 
-pub fn joinZ(buf: []u8, a: []const u8, b: []const u8) ![*:0]u8 {
-    if (a.len + b.len + 2 > buf.len) return error.NameTooLong;
-    @memcpy(buf[0..a.len], a);
-    var n = a.len;
-    const b_start: []const u8 = if (b.len > 0 and b[0] == '/') b[1..] else b;
-    if (b_start.len > 0) {
+/// Joins `root` and `rel` into a NUL-terminated path in `buf`. A leading
+/// slash on `rel` is stripped so an origin-relative name can sit on either
+/// a trailing-slash or a bare root.
+pub fn joinZ(buf: []u8, root: []const u8, rel: []const u8) ![*:0]u8 {
+    if (root.len + rel.len + 2 > buf.len) return error.NameTooLong;
+    @memcpy(buf[0..root.len], root);
+    var n = root.len;
+    const rel_body: []const u8 = if (rel.len > 0 and rel[0] == '/') rel[1..] else rel;
+    if (rel_body.len > 0) {
         if (n == 0 or buf[n - 1] != '/') {
             buf[n] = '/';
             n += 1;
         }
-        @memcpy(buf[n..][0..b_start.len], b_start);
-        n += b_start.len;
+        @memcpy(buf[n..][0..rel_body.len], rel_body);
+        n += rel_body.len;
     }
     // collapse trailing slash except root
     if (n > 1 and buf[n - 1] == '/') n -= 1;

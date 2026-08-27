@@ -6,17 +6,24 @@ const fuzzcorpus = @import("fuzzcorpus.zig");
 pub const default_size: u32 = 16 * 1024 * 1024;
 pub const magic = "MFS1";
 
+/// Saturating ceil(n / d). `d` must be nonzero. The add saturates so a
+/// maxInt(u64) numerator cannot wrap before the divide (which would
+/// under-count pieces and leave a tail the bitfield cannot name).
+fn divCeilSat(n: u64, d: u64) u64 {
+    std.debug.assert(d != 0);
+    return @divFloor(n +| (d - 1), d);
+}
+
 /// Piece count for a file, clamped at u32 max. piece_size 0 or an empty
 /// file is 0; a sparse truncate near i64 max must not panic or wrap the
 /// bitfield to a size too small to name the file.
 pub fn count(file_size: u64, piece_size: u32) u32 {
     if (file_size == 0 or piece_size == 0) return 0;
-    const ps: u64 = piece_size;
     // file_size can approach i64 max (a sparse truncate through the mount),
     // so the quotient can exceed u32: clamp like indexAt instead of letting
     // the cast panic (safe builds) or wrap (release builds) into a bitfield
     // too small for the file, whose bits then persist via saveBits.
-    return @intCast(@min((file_size +| (ps - 1)) / ps, @as(u64, std.math.maxInt(u32))));
+    return @intCast(@min(divCeilSat(file_size, @as(u64, piece_size)), @as(u64, std.math.maxInt(u32))));
 }
 
 /// The pwrite address of piece idx. A u64 product of two u32 values cannot
@@ -37,7 +44,7 @@ fn indexAt(file_off: u64, piece_size: u32) u32 {
     const idx = if (@popCount(piece_size) == 1)
         file_off >> @intCast(@ctz(piece_size))
     else
-        file_off / piece_size;
+        @divFloor(file_off, @as(u64, piece_size));
     return @intCast(@min(idx, std.math.maxInt(u32)));
 }
 
@@ -65,33 +72,40 @@ pub fn trackedEnd(file_size: u64, piece_size: u32) u64 {
     return offset(last, piece_size) + @as(u64, len(file_size, last, piece_size));
 }
 
-/// True when [off, off+n) against file_size lies entirely inside trackedEnd.
+/// Byte window [off, off+len). Named fields so cover/fullCover/rangeTracked
+/// cannot swap the offset, length, and file size at the call site.
+pub const Span = struct {
+    off: u64,
+    len: u64,
+};
+
+/// True when span against file_size lies entirely inside trackedEnd.
 /// Empty and past-EOF ranges are vacuously tracked: there are no bytes to
 /// serve from either tier.
-pub fn rangeTracked(off: u64, n: u64, file_size: u64, piece_size: u32) bool {
-    if (n == 0 or off >= file_size) return true;
-    const end = @min(off +| n, file_size);
+pub fn rangeTracked(span: Span, file_size: u64, piece_size: u32) bool {
+    if (span.len == 0 or span.off >= file_size) return true;
+    const end = @min(span.off +| span.len, file_size);
     return end <= trackedEnd(file_size, piece_size);
 }
 
-/// Inclusive start, exclusive end of pieces overlapping [file_off, file_off+n).
-pub fn cover(file_off: u64, n: u64, file_size: u64, piece_size: u32) struct { start: u32, end: u32 } {
-    if (n == 0 or piece_size == 0 or file_off >= file_size) return .{ .start = 0, .end = 0 };
-    const last_byte = @min(file_off +| n, file_size) -| 1;
-    const start = indexAt(file_off, piece_size);
+/// Inclusive start, exclusive end of pieces overlapping span.
+pub fn cover(span: Span, file_size: u64, piece_size: u32) struct { start: u32, end: u32 } {
+    if (span.len == 0 or piece_size == 0 or span.off >= file_size) return .{ .start = 0, .end = 0 };
+    const last_byte = @min(span.off +| span.len, file_size) -| 1;
+    const start = indexAt(span.off, piece_size);
     const last = indexAt(last_byte, piece_size);
     return .{ .start = start, .end = last +| 1 };
 }
 
-/// Inclusive start, exclusive end of pieces FULLY contained in [off, off+n).
+/// Inclusive start, exclusive end of pieces FULLY contained in span.
 /// Unlike cover, boundary pieces the range only partially covers are excluded:
 /// marking such a piece filled would let later reads serve hole zeros for the
 /// bytes the write never touched.
-pub fn fullCover(off: u64, n: u64, piece_size: u32) struct { start: u32, end: u32 } {
-    if (n == 0 or piece_size == 0) return .{ .start = 0, .end = 0 };
+pub fn fullCover(span: Span, piece_size: u32) struct { start: u32, end: u32 } {
+    if (span.len == 0 or piece_size == 0) return .{ .start = 0, .end = 0 };
     const ps: u64 = piece_size;
-    const first: u64 = (off +| (ps - 1)) / ps;
-    const stop: u64 = (off +| n) / ps;
+    const first = divCeilSat(span.off, ps);
+    const stop = @divFloor(span.off +| span.len, ps);
     if (first >= stop) return .{ .start = 0, .end = 0 };
     return .{
         .start = @intCast(@min(first, std.math.maxInt(u32))),
@@ -104,7 +118,8 @@ pub const Bitfield = struct {
     nbits: u32,
 
     pub fn bytesLen(nbits: u32) usize {
-        return (@as(usize, nbits) + 7) / 8;
+        // ceil(nbits / 8)
+        return @divFloor(@as(usize, nbits) + 7, 8);
     }
 
     /// Clears pad bits above nbits in the final byte so phantom pieces can
@@ -298,11 +313,11 @@ test "piece count and cover" {
     try std.testing.expectEqual(@as(u32, ps), len(ps + 100, 0, ps));
     try std.testing.expectEqual(@as(u32, 100), len(ps + 100, 1, ps));
 
-    const c1 = cover(0, 100, 70 * 1024 * 1024 * 1024, ps);
+    const c1 = cover(.{ .off = 0, .len = 100 }, 70 * 1024 * 1024 * 1024, ps);
     try std.testing.expectEqual(@as(u32, 0), c1.start);
     try std.testing.expectEqual(@as(u32, 1), c1.end);
 
-    const c2 = cover(ps - 10, 20, 3 * ps, ps);
+    const c2 = cover(.{ .off = ps - 10, .len = 20 }, 3 * ps, ps);
     try std.testing.expectEqual(@as(u32, 0), c2.start);
     try std.testing.expectEqual(@as(u32, 2), c2.end);
 
@@ -448,7 +463,7 @@ test "resize preserves prefix bits and clears grown capacity" {
 test "zero piece_size edge cases" {
     try std.testing.expectEqual(@as(u32, 0), count(100, 0));
     try std.testing.expectEqual(@as(u32, 0), indexAt(100, 0));
-    const c = cover(10, 20, 100, 0);
+    const c = cover(.{ .off = 10, .len = 20 }, 100, 0);
     try std.testing.expectEqual(@as(u32, 0), c.start);
     try std.testing.expectEqual(@as(u32, 0), c.end);
 }
@@ -456,25 +471,25 @@ test "zero piece_size edge cases" {
 test "fullCover only claims pieces the range fully spans" {
     const ps: u32 = 16 * 1024 * 1024;
     // write of one exact piece at piece boundary fills exactly that piece
-    var fc = fullCover(0, ps, ps);
+    var fc = fullCover(.{ .off = 0, .len = ps }, ps);
     try std.testing.expectEqual(@as(u32, 0), fc.start);
     try std.testing.expectEqual(@as(u32, 1), fc.end);
     // two aligned pieces
-    fc = fullCover(ps, 2 * ps, ps);
+    fc = fullCover(.{ .off = ps, .len = 2 * ps }, ps);
     try std.testing.expectEqual(@as(u32, 1), fc.start);
     try std.testing.expectEqual(@as(u32, 3), fc.end);
     // partial write inside one piece fills nothing (regression: cover() was
     // used here and marked the whole boundary piece, serving hole zeros for
     // the untouched tail)
-    fc = fullCover(100, 200, ps);
+    fc = fullCover(.{ .off = 100, .len = 200 }, ps);
     try std.testing.expectEqual(@as(u32, 0), fc.start);
     try std.testing.expectEqual(@as(u32, 0), fc.end);
     // straddling a boundary: middle piece is full, both edges are not
-    fc = fullCover(ps - 10, ps + 20, ps);
+    fc = fullCover(.{ .off = ps - 10, .len = ps + 20 }, ps);
     try std.testing.expectEqual(@as(u32, 1), fc.start);
     try std.testing.expectEqual(@as(u32, 2), fc.end);
     // empty range
-    fc = fullCover(0, 0, ps);
+    fc = fullCover(.{ .off = 0, .len = 0 }, ps);
     try std.testing.expectEqual(@as(u32, 0), fc.start);
     try std.testing.expectEqual(@as(u32, 0), fc.end);
 }
@@ -482,11 +497,11 @@ test "fullCover only claims pieces the range fully spans" {
 test "cover saturation near max int" {
     const max = std.math.maxInt(u64);
     // indexAt clamps huge offsets to maxInt(u32); +| keeps end inside u32
-    const c = cover(max - 5, 100, max, 1024);
+    const c = cover(.{ .off = max - 5, .len = 100 }, max, 1024);
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), c.start);
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), c.end);
     // read fully past eof yields empty range
-    const past = cover(max - 2049, 10, 100, 1024);
+    const past = cover(.{ .off = max - 2049, .len = 10 }, 100, 1024);
     try std.testing.expectEqual(@as(u32, 0), past.start);
     try std.testing.expectEqual(@as(u32, 0), past.end);
 }
@@ -497,9 +512,9 @@ test "trackedEnd matches file_size until the u32 piece count clamps" {
     try std.testing.expectEqual(@as(u64, 100), trackedEnd(100, ps));
     try std.testing.expectEqual(@as(u64, ps), trackedEnd(ps, ps));
     try std.testing.expectEqual(@as(u64, ps + 100), trackedEnd(ps + 100, ps));
-    try std.testing.expect(rangeTracked(0, 100, 100, ps));
-    try std.testing.expect(rangeTracked(100, 8, 100, ps));
-    try std.testing.expect(rangeTracked(50, 0, 100, ps));
+    try std.testing.expect(rangeTracked(.{ .off = 0, .len = 100 }, 100, ps));
+    try std.testing.expect(rangeTracked(.{ .off = 100, .len = 8 }, 100, ps));
+    try std.testing.expect(rangeTracked(.{ .off = 50, .len = 0 }, 100, ps));
 
     // piece size 1: the bitfield names bytes 0..maxInt(u32)-1; a 5 GiB
     // sparse file's tail has no piece index that fits u32. Concrete miss:
@@ -509,18 +524,18 @@ test "trackedEnd matches file_size until the u32 piece count clamps" {
     const tail_off: u64 = std.math.maxInt(u32);
     const huge: u64 = tail_off + 100;
     try std.testing.expectEqual(tail_off, trackedEnd(huge, ps1));
-    try std.testing.expect(rangeTracked(tail_off - 1, 1, huge, ps1));
-    try std.testing.expect(!rangeTracked(tail_off, 1, huge, ps1));
-    try std.testing.expect(!rangeTracked(tail_off - 10, 20, huge, ps1));
-    const empty = cover(tail_off, 8, huge, ps1);
+    try std.testing.expect(rangeTracked(.{ .off = tail_off - 1, .len = 1 }, huge, ps1));
+    try std.testing.expect(!rangeTracked(.{ .off = tail_off, .len = 1 }, huge, ps1));
+    try std.testing.expect(!rangeTracked(.{ .off = tail_off - 10, .len = 20 }, huge, ps1));
+    const empty = cover(.{ .off = tail_off, .len = 8 }, huge, ps1);
     try std.testing.expectEqual(empty.start, empty.end);
 
     // Default 16 MiB pieces clamp at 64 PiB, well below i64 max; a read in
     // the untracked tail must not look filled.
     const clamp_off = offset(std.math.maxInt(u32), ps);
     try std.testing.expect(clamp_off < std.math.maxInt(i64));
-    try std.testing.expect(!rangeTracked(clamp_off, 1, std.math.maxInt(i64), ps));
-    try std.testing.expect(rangeTracked(0, ps, std.math.maxInt(i64), ps));
+    try std.testing.expect(!rangeTracked(.{ .off = clamp_off, .len = 1 }, std.math.maxInt(i64), ps));
+    try std.testing.expect(rangeTracked(.{ .off = 0, .len = ps }, std.math.maxInt(i64), ps));
 }
 
 /// One sidecar blob as it lands on shared storage, wrapped in the corpus

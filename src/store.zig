@@ -342,37 +342,37 @@ pub const Store = struct {
         self.files.deinit();
     }
 
-    pub fn originPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+    pub fn originPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
         return sys.joinZ(buf, self.origin, rel);
     }
 
     /// Joins cache/<sub>/<rel> (rel empty names the subdir itself): one
     /// policy for every artifact path under the cache root.
-    fn cacheSubPath(self: Store, buf: []u8, sub: []const u8, rel: []const u8) ![*:0]u8 {
+    fn cacheSubPath(self: *const Store, buf: []u8, sub: []const u8, rel: []const u8) ![*:0]u8 {
         var mid: [sys.c.PATH_MAX]u8 = undefined;
         const d = try sys.joinZ(&mid, self.cache, sub);
         return sys.joinZ(buf, std.mem.span(d), rel);
     }
 
-    pub fn cacheDataPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+    pub fn cacheDataPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
         return self.cacheSubPath(buf, "data", rel);
     }
 
-    pub fn cacheMetaPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+    pub fn cacheMetaPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
         var mid: [sys.c.PATH_MAX]u8 = undefined;
         const n = try self.cacheSubPath(&mid, "meta", rel);
         return sys.appendExt(buf, n, ".pieces");
     }
 
-    pub fn cachePinPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+    pub fn cachePinPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
         return self.cacheSubPath(buf, "pin", rel);
     }
 
-    pub fn cacheStatusPath(self: Store, buf: []u8) ![*:0]u8 {
+    pub fn cacheStatusPath(self: *const Store, buf: []u8) ![*:0]u8 {
         return sys.joinZ(buf, self.cache, status_file);
     }
 
-    pub fn ensureLayout(self: Store) i32 {
+    pub fn ensureLayout(self: *const Store) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
             const p = self.cacheSubPath(&buf, sub, "") catch return -sys.c.ENAMETOOLONG;
@@ -395,14 +395,14 @@ pub const Store = struct {
         return rc;
     }
 
-    fn pinExists(self: Store, rel: []const u8) bool {
+    fn pinExists(self: *const Store, rel: []const u8) bool {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cachePinPath(&buf, rel) catch return false;
         var st: c.struct_stat = undefined;
         return sys.statPath(p, &st) == 0;
     }
 
-    pub fn setPin(self: Store, rel: []const u8, on: bool) i32 {
+    pub fn setPin(self: *const Store, rel: []const u8, on: bool) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cachePinPath(&buf, rel) catch return -c.ENAMETOOLONG;
         if (on) {
@@ -1065,9 +1065,9 @@ pub const Store = struct {
     /// name (piece index past u32, after count() clamps) is never filled:
     /// cover() of that tail is empty, which would otherwise look like a hit
     /// and serve hole zeros.
-    pub fn rangeFilled(file: *Cached, fsize: u64, off: u64, n: u64, piece_size: u32) bool {
-        if (!piece.rangeTracked(off, n, fsize, piece_size)) return false;
-        const cov = piece.cover(off, n, fsize, piece_size);
+    pub fn rangeFilled(file: *Cached, file_size: u64, span: piece.Span, piece_size: u32) bool {
+        if (!piece.rangeTracked(span, file_size, piece_size)) return false;
+        const cov = piece.cover(span, file_size, piece_size);
         var i = cov.start;
         while (i < cov.end) : (i += 1) {
             if (!file.bits.get(i)) return false;
@@ -1109,7 +1109,7 @@ pub const Store = struct {
         file.mu.lockUncancelable(self.io);
         const fsize = file.size;
         file.mu.unlock(self.io);
-        if (!piece.rangeTracked(off, buf.len, fsize, self.piece_size))
+        if (!piece.rangeTracked(.{ .off = off, .len = buf.len }, fsize, self.piece_size))
             return self.originPread(file.rel, buf, off);
         const n = self.readCache(file, buf, off, now_sec);
         if (n >= 0) return n;
@@ -1161,7 +1161,7 @@ pub const Store = struct {
     /// otherwise make statvfs(2) report the target's filesystem (df of a
     /// link to `/` leaks the host root's size/free through the mount).
     /// ELOOP matches originPread/originPwrite and the FUSE lstat gates.
-    pub fn originStatvfs(self: Store, rel: []const u8, vs: *c.struct_statvfs) i32 {
+    pub fn originStatvfs(self: *const Store, rel: []const u8, vs: *c.struct_statvfs) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
         var lst: c.struct_stat = undefined;
@@ -1333,7 +1333,7 @@ pub const Store = struct {
         // resurrect a sidecar claiming filled pieces over missing bytes.
         if (file.dead.load(.acquire)) return false;
         if (copied) {
-            const cov = piece.fullCover(off, data.len, self.piece_size);
+            const cov = piece.fullCover(.{ .off = off, .len = data.len }, self.piece_size);
             // Already applied: every fully-covered piece is marked. A FUSE
             // retry after a lost reply re-pwrites the same bytes; bumping
             // writes again would drop in-flight fills of other pieces, and
@@ -1361,7 +1361,7 @@ pub const Store = struct {
             // marked piece skips hydration and would serve the pre-write
             // cache copy -- and /have would advertise it to the fleet.
             file.writes += 1;
-            const cov = piece.cover(off, data.len, file.size, self.piece_size);
+            const cov = piece.cover(.{ .off = off, .len = data.len }, file.size, self.piece_size);
             var i = cov.start;
             while (i < cov.end) : (i += 1) file.bits.clear(i);
         }
@@ -1371,7 +1371,7 @@ pub const Store = struct {
 
     /// Null when the cache filesystem cannot be stat'ed; callers must not
     /// read that as "plenty free" without saying so.
-    pub fn freePercentChecked(self: Store) ?u32 {
+    pub fn freePercentChecked(self: *const Store) ?u32 {
         var vs: c.struct_statvfs = undefined;
         var z: [sys.c.PATH_MAX]u8 = undefined;
         const p = sys.toZ(&z, self.cache) catch return null;
@@ -1915,16 +1915,16 @@ test "rangeFilled is true only when every covered piece is marked" {
         .filling = filling,
     };
     const ps: u32 = 16;
-    try std.testing.expect(Store.rangeFilled(&file, 64, 0, 16, ps));
-    try std.testing.expect(Store.rangeFilled(&file, 64, 0, 32, ps));
-    try std.testing.expect(!Store.rangeFilled(&file, 64, 0, 33, ps));
-    try std.testing.expect(!Store.rangeFilled(&file, 64, 32, 16, ps));
-    try std.testing.expect(Store.rangeFilled(&file, 64, 100, 8, ps));
+    try std.testing.expect(Store.rangeFilled(&file, 64, .{ .off = 0, .len = 16 }, ps));
+    try std.testing.expect(Store.rangeFilled(&file, 64, .{ .off = 0, .len = 32 }, ps));
+    try std.testing.expect(!Store.rangeFilled(&file, 64, .{ .off = 0, .len = 33 }, ps));
+    try std.testing.expect(!Store.rangeFilled(&file, 64, .{ .off = 32, .len = 16 }, ps));
+    try std.testing.expect(Store.rangeFilled(&file, 64, .{ .off = 100, .len = 8 }, ps));
     // Piece-size 1 past 4 GiB: cover() of the tail is empty (indexAt
     // clamps), which used to look filled.
     const tail_off: u64 = std.math.maxInt(u32);
-    try std.testing.expect(!Store.rangeFilled(&file, tail_off + 100, tail_off, 8, 1));
-    try std.testing.expect(!Store.rangeFilled(&file, tail_off + 100, tail_off - 10, 20, 1));
+    try std.testing.expect(!Store.rangeFilled(&file, tail_off + 100, .{ .off = tail_off, .len = 8 }, 1));
+    try std.testing.expect(!Store.rangeFilled(&file, tail_off + 100, .{ .off = tail_off - 10, .len = 20 }, 1));
 }
 
 test "cacheFill grows entry preserving earlier piece marks" {

@@ -45,7 +45,7 @@ pub fn phase(free_pct: u32, w: Water, culling: bool) Phase {
 pub fn freePercent(bavail: u64, blocks: u64) u32 {
     if (blocks == 0) return 100;
     // bavail * 100 can exceed u64 on huge filesystems; widen before dividing.
-    const pct: u128 = @as(u128, bavail) * 100 / blocks;
+    const pct: u128 = @divFloor(@as(u128, bavail) * 100, blocks);
     return @intCast(@min(pct, 100));
 }
 

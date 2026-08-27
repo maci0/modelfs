@@ -526,16 +526,15 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
             .filled, .raced => return 0,
             .len => |n| n,
         };
+        std.debug.assert(ln <= scratch.len);
         const buf = scratch[0..ln];
-        if (!prefer_origin) {
-            from_peer = true;
+        from_peer = !prefer_origin;
+        if (from_peer) {
             peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
                 from_peer = false;
-                const oe = originFillBuf(st, file, idx, buf);
-                if (oe != 0) return oe;
             };
-        } else {
-            from_peer = false;
+        }
+        if (!from_peer) {
             const oe = originFillBuf(st, file, idx, buf);
             if (oe != 0) return oe;
         }
@@ -580,7 +579,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
 /// sample that bounded n): cover() then agrees with the bounds check instead
 /// of racing a concurrent truncate on an unlocked file.size read.
 fn ensureRange(st: *State, file: *store_mod.Store.Cached, fsize: u64, off: u64, n: u64) i32 {
-    const cov = piece.cover(off, n, fsize, st.store.piece_size);
+    const cov = piece.cover(.{ .off = off, .len = n }, fsize, st.store.piece_size);
     if (cov.start >= cov.end) return 0;
     // One reusable buffer for every hydrated piece in the range, allocated
     // only when some covered piece actually lacks its bit: warm reads (every
@@ -662,7 +661,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         return 0;
     }
     const n = @min(want, @as(usize, @intCast(fsize - uoff)));
-    const ready = store_mod.Store.rangeFilled(file, fsize, uoff, n, st.store.piece_size);
+    const ready = store_mod.Store.rangeFilled(file, fsize, .{ .off = uoff, .len = @as(u64, n) }, st.store.piece_size);
     file.mu.unlock(st.io);
     const rc = if (ready) 0 else ensureRange(st, file, fsize, uoff, n);
     if (rc != 0) {

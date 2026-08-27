@@ -523,7 +523,7 @@ pub const Catalog = struct {
         }) catch return;
     }
 
-    fn clusterDir(self: Catalog, buf: []u8) ![*:0]u8 {
+    fn clusterDir(self: *const Catalog, buf: []u8) ![*:0]u8 {
         return sys.joinZ(buf, self.origin, cluster_dir);
     }
 
