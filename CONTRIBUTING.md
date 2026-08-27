@@ -29,9 +29,10 @@ commands. `zig build --help` lists the `check`/`ci`/`fmt`/`test` steps.
 ./scripts/check.sh
 ```
 
-Formatting, unit tests, the restore-drill stub suite, vendored libfuse3
-digest and extract checks, shellcheck, ruff, mypy, and the CycloneDX
-inventory: exactly what the `check` CI job runs. Every CI job (that gate, the
+Formatting, CHANGELOG headings versus `build.zig.zon`, unit tests, the
+restore-drill stub suite, vendored libfuse3 digest and extract checks,
+shellcheck, ruff, mypy, and the CycloneDX inventory: exactly what the
+`check` CI job runs. Every CI job (that gate, the
 aarch64 cross-compile, and the reproducibility rebuild) as one local step:
 
 ```bash

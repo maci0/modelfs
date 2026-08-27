@@ -16,11 +16,12 @@ and an NFS origin as the write authority. Linux only.
 
 ## Gates
 
-`./scripts/check.sh` is the blocking gate: `zig fmt --check`, changelog `##`
+`./scripts/check.sh` is the blocking gate: `zig fmt --check`, CHANGELOG `##`
 headings (`[Unreleased]` and semver matching `build.zig.zon`; dated notes are
 `###`), `zig build test`, shellcheck (`-o` extras on `scripts/*.sh`),
 `test_dr_restore_drill.sh`, vendored libfuse3 digest and extract checks,
 `ruff check scripts/`, `ruff format --check scripts/`, `mypy scripts/`, and
+
 `scripts/sbom.py --check`. CI runs that plus the aarch64 cross-compile
 and the reproducibility rebuild.
 Never loosen a gate to pass it.
