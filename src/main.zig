@@ -58,7 +58,8 @@ const usage =
     \\  --advertise ADDRS     Lease addresses IP[:PORT], comma separated
     \\                        (replaces auto-detect; a defaulted port follows
     \\                        --listen; default: every local IPv4 except
-    \\                        loopback and 169.254; none -> 127.0.0.1)
+    \\                        loopback and 169.254; none -> 127.0.0.1;
+    \\                        0.0.0.0 and 255.255.255.255 are refused)
     \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
     \\  --seed HOST[:PORT]    Peer seed while origin/.cluster has no live lease; repeatable
     \\  --piece SIZE          Piece size (default 16M)
@@ -81,6 +82,7 @@ const usage =
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID set the same values as their flags; an explicit flag wins.
     \\MODELFS_PSK_VALUE cannot be combined with --psk or MODELFS_PSK on mount.
+    \\A PSK file or MODELFS_PSK_VALUE is trimmed of surrounding whitespace.
     \\MODELFS_LOG sets the log ceiling: err, warn, info (default), or debug.
     \\An empty environment value counts as unset (defaults apply).
     \\
@@ -248,6 +250,16 @@ fn parseHostPort(s: []const u8) !proto.LeaseAddr {
     }
     if (s.len == 0) return error.BadHostPort;
     return .{ .ip = s, .port = proto.default_port, .mbps = 0 };
+}
+
+/// True when a dotted-quad host is 0.0.0.0 or 255.255.255.255: parseV4
+/// admits both (they match inet_pton) but neither is a unicast address a
+/// peer can dial. --advertise would publish them in the lease; --seed would
+/// burn a timeout on every miss. Names are left to buildSeeds.
+fn undialablePeerIp(ip: []const u8) bool {
+    var quad: [4]u8 = undefined;
+    if (!discover.parseV4(ip, &quad)) return false;
+    return !discover.isDialableHost(&quad);
 }
 
 /// "--listen [IP:]PORT": only the port is consumed (binding is always
@@ -692,6 +704,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                     if (!builtin.is_test) std.debug.print("--advertise {s}: {s} is not an IPv4 address (peers dial dotted quads only)\n", .{ v, hp.ip });
                     return error.BadAdvertiseIp;
                 }
+                if (!discover.isDialableHost(&quad)) {
+                    if (!builtin.is_test) std.debug.print("--advertise {s}: {s} is not a dialable peer address\n", .{ v, hp.ip });
+                    return error.UndialableIp;
+                }
                 try opts.advertise.append(gpa, hp);
             }
         } else if (std.mem.eql(u8, flag, "--seed")) {
@@ -699,7 +715,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             const s = try takeValue(args, flag, &i, inline_val);
             // Validate now with a named message instead of failing later in
             // mount setup with a bare parseInt error.
-            _ = parseHostPort(s) catch |err| {
+            const hp = parseHostPort(s) catch |err| {
                 if (!builtin.is_test) {
                     if (err == error.ZeroPort)
                         std.debug.print("--seed {s}: port 0 is not a peer port (want 1-65535)\n", .{s})
@@ -708,6 +724,12 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 }
                 return error.BadHostPort;
             };
+            // Numeric form is gated here; a hostname that resolves to
+            // 0.0.0.0 is refused in buildSeeds after DNS, same message.
+            if (undialablePeerIp(hp.ip)) {
+                if (!builtin.is_test) std.debug.print("--seed {s}: {s} is not a dialable peer address\n", .{ s, hp.ip });
+                return error.UndialableIp;
+            }
             try opts.seed.append(gpa, s);
         } else if (flag.len > 0 and flag[0] == '-') {
             // Plain print, like every other usage error in this loop; the
@@ -762,6 +784,18 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             std.debug.print("MODELFS_PSK_VALUE cannot be combined with --psk or MODELFS_PSK; pick one\n", .{});
         return error.ConflictingPsk;
     }
+    // Empty positional after flags (`mount ""`) is the same missing
+    // directory as omitting the argument; refuse it here so cmdMount never
+    // sees a zero-length path that would fail later as "not reachable".
+    if (std.mem.eql(u8, cmd, "mount")) {
+        for (rest.items) |r| {
+            if (r.len == 0) {
+                if (!builtin.is_test)
+                    std.debug.print("mount takes exactly one directory argument (see 'modelfs help')\n", .{});
+                return error.MissingValue;
+            }
+        }
+    }
     return .{ .cmd = cmd, .opts = opts, .rest = try rest.toOwnedSlice(gpa) };
 }
 
@@ -769,19 +803,24 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     // An empty shared secret would authenticate every "Bearer " request;
     // refuse it before any socket is bound.
     if (opts.psk_value) |v| {
-        if (v.len == 0) {
+        // Same surrounding-whitespace trim as the file form: openssl-rand
+        // files and systemd EnvironmentFile lines carry a trailing newline,
+        // and a leading/trailing space would start the daemon then 401 every
+        // peer (bearerOk trims the received token but hashes `want`
+        // verbatim, so "secret " never equals the wire form "secret").
+        const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (trimmed.len == 0) {
             if (!builtin.is_test) std.log.err("MODELFS_PSK_VALUE is empty; refusing to serve unauthenticated", .{});
             return error.EmptyPsk;
         }
-        // The file form is capped by the read (proto.max_psk_bytes); the
-        // inline form must match or a huge env value would start the
-        // daemon and then fail every peer request as a truncated head.
-        if (v.len > proto.max_psk_bytes) {
+        // Cap the token that actually rides the wire, after trim: a
+        // max-size secret plus a trailing newline is still one legal token.
+        if (trimmed.len > proto.max_psk_bytes) {
             if (!builtin.is_test)
                 std.log.err("MODELFS_PSK_VALUE is longer than {d} bytes; refusing", .{proto.max_psk_bytes});
             return error.PskTooLarge;
         }
-        return dupeHeaderSafePsk(gpa, v);
+        return dupeHeaderSafePsk(gpa, trimmed);
     }
     var z: [sys.c.PATH_MAX]u8 = undefined;
     const p = try sys.toZ(&z, opts.psk_file);
@@ -850,17 +889,26 @@ fn dupeHeaderSafePsk(gpa: std.mem.Allocator, secret: []const u8) ![]u8 {
 /// realpath of path, creating the directory first when missing. label names
 /// the directory ("mountpoint", "cache") in failure messages.
 fn ensureDirReal(gpa: std.mem.Allocator, path: []const u8, label: []const u8) ![]u8 {
-    return sys.realpathAlloc(gpa, path) catch {
+    const abs = sys.realpathAlloc(gpa, path) catch blk: {
         const rc = sys.mkdirAll(path, 0o755);
         if (rc != 0) {
             std.log.err("cannot create {s} {s} (errno {d})", .{ label, path, -rc });
             return error.MkdirFailed;
         }
-        return sys.realpathAlloc(gpa, path) catch {
+        break :blk sys.realpathAlloc(gpa, path) catch {
             std.log.err("{s} {s} is not reachable", .{ label, path });
             return error.BadPath;
         };
     };
+    // realpath succeeds for a regular file; mkdir under it then fails as
+    // a bare ENOTDIR from ensureLayout. Same named refusal origin uses.
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    if (!if (sys.toZ(&zbuf, abs)) |z| pathIsDir(z) else |_| false) {
+        if (!builtin.is_test) std.log.err("{s} {s} is not a directory", .{ label, path });
+        gpa.free(abs);
+        return error.NotDir;
+    }
+    return abs;
 }
 
 /// Addresses published in this node's lease: explicit --advertise entries
@@ -915,6 +963,10 @@ fn buildSeeds(gpa: std.mem.Allocator, specs: []const []const u8) !SeedList {
         const hp = try parseHostPort(s);
         var quad: [4]u8 = undefined;
         if (discover.parseV4(hp.ip, &quad)) {
+            if (!discover.isDialableHost(&quad)) {
+                if (!builtin.is_test) std.log.err("--seed {s}: {s} is not a dialable peer address", .{ s, hp.ip });
+                return error.SeedUndialable;
+            }
             try out.addrs.append(gpa, hp);
             continue;
         }
@@ -923,6 +975,11 @@ fn buildSeeds(gpa: std.mem.Allocator, specs: []const []const u8) !SeedList {
             if (!builtin.is_test) std.log.err("--seed {s}: host {s} does not resolve to an IPv4 address", .{ s, hp.ip });
             return error.SeedUnresolved;
         };
+        var resolved: [4]u8 = undefined;
+        if (!discover.parseV4(rip, &resolved) or !discover.isDialableHost(&resolved)) {
+            if (!builtin.is_test) std.log.err("--seed {s}: host {s} resolved to {s}, which is not a dialable peer address", .{ s, hp.ip, rip });
+            return error.SeedUndialable;
+        }
         const owned = try gpa.dupe(u8, rip);
         try out.owned_ips.append(gpa, owned);
         try out.addrs.append(gpa, .{ .ip = owned, .port = hp.port, .mbps = 0 });
@@ -1020,7 +1077,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
 
     var seed_list = buildSeeds(gpa, opts.seed.items) catch |err| switch (err) {
         // Already reported with the offending flag inside buildSeeds.
-        error.SeedUnresolved => return 1,
+        error.SeedUnresolved, error.SeedUndialable => return 1,
         else => {
             std.log.err("build seeds: {t}", .{err});
             return 1;
@@ -1896,6 +1953,29 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     }
 }
 
+test "ensureDirReal creates a missing dir and refuses a file" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const d = try sys.scratchDir(&cb, "modelfs-ensuredir");
+    defer sys.deleteTree(std.testing.io, d);
+
+    var zb: [256]u8 = undefined;
+    var fb: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fb, "{s}/regular", .{d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "x"));
+    try std.testing.expectError(error.NotDir, ensureDirReal(gpa, fp, "cache"));
+
+    const existing = try ensureDirReal(gpa, d, "cache");
+    defer gpa.free(existing);
+    try std.testing.expect(pathIsDir(try sys.toZ(&zb, existing)));
+
+    var nb: [160]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&nb, "{s}/new-cache", .{d});
+    const created = try ensureDirReal(gpa, missing, "cache");
+    defer gpa.free(created);
+    try std.testing.expect(pathIsDir(try sys.toZ(&zb, created)));
+}
+
 test "pathIsDir separates directories from files and absent paths" {
     var cb: [128]u8 = undefined;
     const d = try sys.scratchDir(&cb, "modelfs-isdir");
@@ -2141,6 +2221,21 @@ test "parseArgs rejects bad values" {
     try std.testing.expectError(error.BadAdvertiseIp, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "spark1" }));
     try std.testing.expectError(error.BadAdvertiseIp, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "10.0.0.1:19091,host.example" }));
     try std.testing.expectError(error.BadAdvertiseIp, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "::1" }));
+    // Unspecified and limited-broadcast are dotted quads inet_pton accepts
+    // but no peer can dial: --advertise would publish them, --seed would
+    // wait out a connect timeout on every miss. Loopback stays legal
+    // (single-node / the no-NIC fallback).
+    try std.testing.expectError(error.UndialableIp, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "0.0.0.0" }));
+    try std.testing.expectError(error.UndialableIp, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "255.255.255.255:19091" }));
+    try std.testing.expectError(error.UndialableIp, parseArgs(gpa, &environ, &.{ "mount", "--seed", "0.0.0.0" }));
+    try std.testing.expectError(error.UndialableIp, parseArgs(gpa, &environ, &.{ "mount", "--seed", "255.255.255.255:18080" }));
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--advertise", "127.0.0.1" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("127.0.0.1", parsed.opts.advertise.items[0].ip);
+    }
+    // Empty mount directory is the same missing positional as omitting it.
+    try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "mount", "" }));
     // watermarks are percentages of free space (freePercent clamps to 100):
     // values above 100 would pin the cull phase permanently
     try std.testing.expectError(error.BadWatermark, parseArgs(gpa, &environ, &.{ "mount", "--brun", "101" }));
@@ -2511,20 +2606,37 @@ test "loadPsk refuses empty secrets and trims file contents" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
-    // Inline value passes through...
+    // Inline value passes through interior spaces...
     {
         const psk = try loadPsk(gpa, .{ .psk_value = "inline secret" });
         defer gpa.free(psk);
         try std.testing.expectEqualStrings("inline secret", psk);
     }
-    // ...but an empty one would authenticate every "Bearer " request.
+    // ...and surrounding whitespace/newlines, matching the file form, so
+    // EnvironmentFile lines and `$(cat psk)`-shaped copies of a file secret
+    // produce the same token. bearerOk trims only the received token.
+    {
+        const psk = try loadPsk(gpa, .{ .psk_value = "  topsecret \r\n" });
+        defer gpa.free(psk);
+        try std.testing.expectEqualStrings("topsecret", psk);
+    }
+    // ...but an empty or whitespace-only one would authenticate every
+    // "Bearer " request (or 401 forever against a trimmed wire token).
     try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, .{ .psk_value = "" }));
+    try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, .{ .psk_value = " \t\n" }));
     // The file form is capped at proto.max_psk_bytes; the inline form must
     // match or a huge env value would start the daemon and then fail the
     // peer request head.
     try std.testing.expectError(error.PskTooLarge, loadPsk(gpa, .{ .psk_value = "k" ** (proto.max_psk_bytes + 1) }));
     {
         const psk = try loadPsk(gpa, .{ .psk_value = "k" ** proto.max_psk_bytes });
+        defer gpa.free(psk);
+        try std.testing.expectEqual(@as(usize, proto.max_psk_bytes), psk.len);
+    }
+    // Cap is the trimmed token: a max-size secret plus a trailing newline
+    // (EnvironmentFile, a copied psk file) is still one legal token.
+    {
+        const psk = try loadPsk(gpa, .{ .psk_value = ("k" ** proto.max_psk_bytes) ++ "\n" });
         defer gpa.free(psk);
         try std.testing.expectEqual(@as(usize, proto.max_psk_bytes), psk.len);
     }
@@ -2633,6 +2745,10 @@ test "buildSeeds passes numeric ips through and resolves names" {
     // surfaces as the underlying parse error, as parseHostPort has always
     // propagated it).
     try std.testing.expectError(error.Overflow, buildSeeds(gpa, &.{"h:70000"}));
+    // parseArgs already refuses these; buildSeeds is the mount-time backstop
+    // for a hostname that resolved to the unspecified address.
+    try std.testing.expectError(error.SeedUndialable, buildSeeds(gpa, &.{"0.0.0.0"}));
+    try std.testing.expectError(error.SeedUndialable, buildSeeds(gpa, &.{"255.255.255.255:19099"}));
 }
 
 test "leaseAddrs follows --listen and falls back to loopback" {

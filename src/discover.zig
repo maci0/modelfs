@@ -880,9 +880,21 @@ pub fn localIpv4(gpa: std.mem.Allocator) ![][]const u8 {
     return list.toOwnedSlice(gpa);
 }
 
+/// True when `oct` is a unicast host address a peer can dial. parseV4
+/// admits 0.0.0.0 and 255.255.255.255 (they match inet_pton) but neither
+/// is a destination: the unspecified address and limited broadcast.
+/// Loopback and link-local stay dialable so `--advertise 127.0.0.1` still
+/// works; auto-detect filters those separately in shouldAdvertise.
+pub fn isDialableHost(oct: *const [4]u8) bool {
+    if (oct[0] == 0 and oct[1] == 0 and oct[2] == 0 and oct[3] == 0) return false;
+    if (oct[0] == 255 and oct[1] == 255 and oct[2] == 255 and oct[3] == 255) return false;
+    return true;
+}
+
 fn shouldAdvertise(ip: []const u8) bool {
     var oct: [4]u8 = undefined;
     if (!parseV4(ip, &oct)) return false;
+    if (!isDialableHost(&oct)) return false;
     if (oct[0] == 127) return false;
     if (oct[0] == 169 and oct[1] == 254) return false;
     return true;
@@ -1334,10 +1346,20 @@ test "shouldAdvertise skips loopback and link-local" {
     try std.testing.expect(!shouldAdvertise("127.0.0.2"));
     try std.testing.expect(!shouldAdvertise("169.254.1.1"));
     try std.testing.expect(!shouldAdvertise("169.254.0.1"));
+    try std.testing.expect(!shouldAdvertise("0.0.0.0"));
+    try std.testing.expect(!shouldAdvertise("255.255.255.255"));
     // parseV4 miss: a hostname or truncated quad must not be published.
     try std.testing.expect(!shouldAdvertise("spark1"));
     try std.testing.expect(!shouldAdvertise("10.0.1"));
     try std.testing.expect(!shouldAdvertise(""));
+}
+
+test "isDialableHost refuses unspecified and limited broadcast" {
+    try std.testing.expect(isDialableHost(&.{ 10, 0, 0, 1 }));
+    try std.testing.expect(isDialableHost(&.{ 127, 0, 0, 1 }));
+    try std.testing.expect(isDialableHost(&.{ 169, 254, 1, 1 }));
+    try std.testing.expect(!isDialableHost(&.{ 0, 0, 0, 0 }));
+    try std.testing.expect(!isDialableHost(&.{ 255, 255, 255, 255 }));
 }
 
 test "parseV4 validation" {
