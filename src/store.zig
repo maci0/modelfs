@@ -621,21 +621,32 @@ pub const Store = struct {
     /// old bytes or hole zeros as current. Must be called WITHOUT store.mu
     /// held (it takes file.mu internally).
     fn reconcileSize(self: *Store, f: *Cached, file_size: u64) !*Cached {
-        if (f.size == file_size) return f;
-        const nb = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
+        // Size is mutated under file.mu; an unlocked compare races a
+        // concurrent truncate and can skip a needed wipe, or two getters
+        // that both sampled a mismatch can each swap in an empty field,
+        // the second wiping a fill that landed between them.
+        f.mu.lockUncancelable(self.io);
+        if (f.size == file_size) {
+            f.mu.unlock(self.io);
+            return f;
+        }
+        f.mu.unlock(self.io);
+        var nb = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size));
         // Swap under the file lock, as mf_truncate does: readers read
         // size/bits/cache_fd while holding it, and the ftruncate must sit in
         // the same window so cache_fd cannot be closed (entry destroyed by
         // the last releaser) between capture and use.
         f.mu.lockUncancelable(self.io);
+        if (f.size == file_size) {
+            f.mu.unlock(self.io);
+            nb.deinit(self.gpa);
+            return f;
+        }
         var ob = f.bits;
         f.bits = nb;
         f.size = file_size;
-        if (f.cache_fd >= 0) {
-            const tr = sys.ftruncate(f.cache_fd, file_size);
-            if (tr != 0)
-                std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ f.rel, -tr });
-        }
+        f.writes += 1;
+        truncateCacheFd(f, file_size);
         // Same best-effort save mf_truncate pairs with its own swap: the
         // reset must outlive the process to count as an invalidation.
         _ = self.saveBits(f, false);
@@ -827,14 +838,24 @@ pub const Store = struct {
             _ = file.filling.remove(idx);
             return;
         }
+        const gen = file.filling.get(idx);
         _ = file.filling.remove(idx);
         if (ok) {
-            file.bits.set(idx);
-            // Landing bytes is access. The claim's stamp predates the fill,
-            // so a fill slower than recency_secs would leave this fresh piece
-            // punchable the moment the filling claim cleared, before the
-            // reader's readCache gets its own stamp in.
-            file.last_access.store(now_sec, .monotonic);
+            // completeFill's pre-I/O skip samples writes under this lock,
+            // then drops it for the pwrite. A truncate, distrust, or
+            // size reconcile that lands in that window bumps writes (and
+            // may have swapped bits). Marking the fill's bytes would
+            // publish pre-mutation content over the new inode.
+            if (gen) |g| {
+                if (g == file.writes) {
+                    file.bits.set(idx);
+                    // Landing bytes is access. The claim's stamp predates the fill,
+                    // so a fill slower than recency_secs would leave this fresh piece
+                    // punchable the moment the filling claim cleared, before the
+                    // reader's readCache gets its own stamp in.
+                    file.last_access.store(now_sec, .monotonic);
+                }
+            }
         }
         _ = self.saveBits(file, false);
     }
@@ -997,7 +1018,10 @@ pub const Store = struct {
     /// returns hole zeros as a successful read, so those ranges go to origin
     /// without touching the cache fd.
     pub fn readServed(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64) isize {
-        if (!piece.rangeTracked(off, buf.len, file.size, self.piece_size))
+        file.mu.lockUncancelable(self.io);
+        const fsize = file.size;
+        file.mu.unlock(self.io);
+        if (!piece.rangeTracked(off, buf.len, fsize, self.piece_size))
             return self.originPread(file.rel, buf, off);
         const n = self.readCache(file, buf, off, now_sec);
         if (n >= 0) return n;
@@ -1244,6 +1268,19 @@ pub const Store = struct {
         // status.json and the discovery tick's summary instead.
         _ = self.stats.pieces_culled.fetchAdd(1, .monotonic);
         return true;
+    }
+
+    /// Caller holds file.mu. Cuts the live cache descriptor to `new_size`
+    /// unless a peer /data send is streaming from it: ftruncate would punch
+    /// holes under sendfile and the fetching peer would mark those zeros
+    /// filled. xfer is held across that send (serveData); a later truncate
+    /// or a reopen after reapIdle closed the fd still applies the cut.
+    pub fn truncateCacheFd(file: *Cached, new_size: u64) void {
+        if (file.cache_fd >= 0 and file.xfer.load(.monotonic) == 0) {
+            const tr = sys.ftruncate(file.cache_fd, new_size);
+            if (tr != 0)
+                std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ file.rel, -tr });
+        }
     }
 
     /// Caller must hold file.mu.
@@ -2064,6 +2101,102 @@ test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
         try std.testing.expectEqualSlices(u8, &w1, rd[0..16]);
         try std.testing.expectEqualSlices(u8, &w2, rd[16..40]);
     }
+}
+
+test "finishPiece does not mark a fill whose write generation raced" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-fingen");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-fingen");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("gen.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+
+    // completeFill samples writes, drops file.mu for the pwrite, then
+    // finishPiece marks. A truncate/distrust that bumps writes in that
+    // window used to publish the fill's pre-mutation bytes as current.
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
+    f.mu.lockUncancelable(std.testing.io);
+    f.writes += 1;
+    f.mu.unlock(std.testing.io);
+    st.finishPiece(f, 0, true, sys.monoSec(std.testing.io));
+    try std.testing.expect(!st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+}
+
+test "size reconciliation does not wipe marks already matching the observed size" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-recon");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-recon");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Grow 16 -> 32 wipes; a fill at 32 must survive a second get(32).
+    // Without a locked re-check, two getters that both sampled a mismatch
+    // each swap in an empty field and the later swap drops the fill.
+    {
+        const cold = try st.get("rc2.bin", 16, sys.monoSec(std.testing.io));
+        st.releaseFile(cold);
+    }
+    const f = try st.get("rc2.bin", 32, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, sys.monoSec(std.testing.io))).len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", sys.monoSec(std.testing.io)));
+    try std.testing.expect(st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+
+    const f2 = try st.get("rc2.bin", 32, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f2);
+    try std.testing.expectEqual(f, f2);
+    try std.testing.expect(st.hasPiece(f2, 0, sys.monoSec(std.testing.io)));
+}
+
+test "size reconciliation does not cut a cache fd under an in-flight peer send" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-xferfd");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-xferfd");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("xferfd.bin", 64, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expect(st.openCache(f) >= 0);
+    var pre: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.fstat(f.cache_fd, &pre));
+    try std.testing.expectEqual(@as(u64, 64), @as(u64, @intCast(pre.st_size)));
+
+    // serveData holds xfer across hydration plus sendfile. A concurrent
+    // get() that observes a smaller origin must wipe marks but must not
+    // ftruncate the descriptor sendfile is copying from -- that would
+    // ship hole zeros the fetching peer marks filled.
+    _ = f.xfer.fetchAdd(1, .monotonic);
+    const f2 = try st.get("xferfd.bin", 32, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f2);
+    f.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 32), f.size);
+    try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+    f.mu.unlock(std.testing.io);
+    var post: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.fstat(f.cache_fd, &post));
+    try std.testing.expectEqual(@as(u64, 64), @as(u64, @intCast(post.st_size)));
+    _ = f.xfer.fetchSub(1, .monotonic);
 }
 
 test "completeFill does not overwrite a racing write-through" {

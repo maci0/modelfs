@@ -571,11 +571,13 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
 /// bodyDeadlineFor): SO_SNDTIMEO resets on every drained byte, so the
 /// per-chunk clamp to its remainder is what keeps a dribbling receiver from
 /// holding an inflight slot forever.
-fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, deadline_ms: i64) void {
+fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, file_size: u64, deadline_ms: i64) void {
     // Sendfile copies the cache fd, including sparse holes. A range the
     // bitfield cannot name would ship those zeros as a 206 body and the
-    // fetching peer would mark them filled.
-    const cache_ok = piece.rangeTracked(start, want, file.size, self.store.piece_size);
+    // fetching peer would mark them filled. file_size is the origin sample
+    // this 206 advertised: reading file.size unlocked races a concurrent
+    // truncate and can treat an untracked tail as cacheable.
+    const cache_ok = piece.rangeTracked(start, want, file_size, self.store.piece_size);
     const cfd = if (cache_ok) self.store.openCache(file) else @as(c_int, -1);
     if (cfd >= 0) {
         var done: u64 = 0;
@@ -721,7 +723,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
     _ = self.store.stats.bytes_to_peer.fetchAdd(want, .monotonic);
 
-    streamRange(self, fd, file, rg.start, want, bodyDeadlineFor(self.io, want));
+    streamRange(self, fd, file, rg.start, want, size, bodyDeadlineFor(self.io, want));
 }
 
 fn reply(fd: std.posix.fd_t, s: []const u8) void {
@@ -1669,7 +1671,7 @@ test "streamRange honors the response body budget in both directions" {
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         const t0 = sys.monoMs(std.testing.io);
-        streamRange(&srv.server, pair[1], f, 0, pattern.len, t0 - 1);
+        streamRange(&srv.server, pair[1], f, 0, pattern.len, pattern.len, t0 - 1);
         try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
         var probe: [1]u8 = undefined;
         try std.testing.expect(c.recv(pair[0], &probe, probe.len, c.MSG_PEEK | c.MSG_DONTWAIT) < 0);
@@ -1679,7 +1681,7 @@ test "streamRange honors the response body budget in both directions" {
         const pair = try responsePair("");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        streamRange(&srv.server, pair[1], f, 0, pattern.len, sys.monoMs(std.testing.io) + 60_000);
+        streamRange(&srv.server, pair[1], f, 0, pattern.len, pattern.len, sys.monoMs(std.testing.io) + 60_000);
         var got: [pattern.len]u8 = undefined;
         const n = sys.readOnce(pair[0], &got) catch 0;
         try std.testing.expectEqual(@as(usize, got.len), n);

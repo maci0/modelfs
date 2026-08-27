@@ -775,11 +775,7 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
             // Already applied: a FUSE retry after a lost reply, or a no-op
             // truncate to the current size. Re-wiping bits would discard
             // pieces re-hydrated after the first truncate to this size.
-            if (file.cache_fd >= 0) {
-                const tr = sys.ftruncate(file.cache_fd, new_size);
-                if (tr != 0)
-                    std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ rel, -tr });
-            }
+            store_mod.Store.truncateCacheFd(file, new_size);
             file.mu.unlock(st.io);
             return 0;
         }
@@ -811,11 +807,7 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
         // cache_fd cannot be closed between check and use. Best-effort save:
         // a lost sidecar here only costs refill, never stale bytes.
         _ = st.store.saveBits(file, false);
-        if (file.cache_fd >= 0) {
-            const tr = sys.ftruncate(file.cache_fd, new_size);
-            if (tr != 0)
-                std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ rel, -tr });
-        }
+        store_mod.Store.truncateCacheFd(file, new_size);
         file.mu.unlock(st.io);
         ob.deinit(st.gpa);
     } else {
