@@ -357,6 +357,17 @@ LOG3="${TEMP}/drill3.log"
 write_env tank/models "${LIVE3}" tank/models@old "${STALE}" "${SNAP3}"
 expect_fail "stale snapshot is an alarm" "past the" "${LIVE3}" "${LOG3}"
 
+# --- 3b. snapshot creation in the future of date +%s
+LIVE3B="${TEMP}/live3b"
+SNAP3B="${TEMP}/snap3b"
+mkdir -p "${LIVE3B}/gguf" "${SNAP3B}/gguf"
+echo weight >"${SNAP3B}/gguf/m.gguf"
+cp -a "${SNAP3B}/gguf/m.gguf" "${LIVE3B}/gguf/m.gguf"
+LOG3B="${TEMP}/drill3b.log"
+FUTURE=$((NOW + 3600))
+write_env tank/models "${LIVE3B}" tank/models@future "${FUTURE}" "${SNAP3B}"
+expect_fail "future snapshot creation is an alarm" "in the future" "${LIVE3B}" "${LOG3B}"
+
 # --- 4. empty snapshot (no files at all)
 LIVE4="${TEMP}/live4"
 SNAP4="${TEMP}/snap4"

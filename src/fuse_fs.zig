@@ -1091,9 +1091,11 @@ fn discLoop(st: *State) void {
     // what happened since daemon start.
     var last_stats = st.store.stats.snap();
     while (st.running.load(.acquire)) {
-        // One wall-clock instant per tick: publish, refresh's expiry filter,
-        // and the sweep cutoff all decide against the same sample instead of
-        // three reads drifting across the tick.
+        // One wall-clock instant per tick: publish and refresh's expiry
+        // filter decide against the same sample instead of two reads
+        // drifting across the tick. Sweep prefers this node's own lease
+        // mtime on the origin (NAS clock) and uses `now` only when that
+        // file is missing.
         const now = sys.nowSec(st.io);
         st.catalog.publish(now);
         st.catalog.refresh(now);

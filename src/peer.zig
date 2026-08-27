@@ -516,7 +516,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                             replyStatus(self, fd, "500 Internal Server Error");
                             return false;
                         }
-                        const fill_dt: u64 = @intCast(sys.monoNs(self.io) - fill_t0);
+                        const fill_dt: u64 = @intCast(@max(sys.monoNs(self.io) - fill_t0, 0));
                         _ = self.store.stats.fills_origin.fetchAdd(1, .monotonic);
                         _ = self.store.stats.bytes_from_origin.fetchAdd(ln, .monotonic);
                         _ = self.store.stats.fill_origin_nanos.fetchAdd(fill_dt, .monotonic);

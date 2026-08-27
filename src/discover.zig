@@ -373,7 +373,10 @@ pub const Catalog = struct {
     /// Lease files are claims on shared NFS storage; without a teardown path
     /// one file per node id ever seen accumulates there forever. Nodes
     /// republish every discovery tick, so mtime age identifies dead claimants
-    /// without parsing untrusted JSON or comparing clocks across hosts.
+    /// without parsing untrusted JSON. Age is measured against this node's
+    /// own lease mtime on that filesystem (the origin/NAS clock), not against
+    /// CLOCK_REALTIME on the spark: a NAS minutes behind the nodes would
+    /// otherwise make every live peer look idle and unlink their leases.
     const sweep_min_age_secs: i64 = 300;
 
     pub fn init(
@@ -603,18 +606,19 @@ pub const Catalog = struct {
     }
 
     /// Removes stale external claims from origin/.cluster: lease files whose
-    /// mtime is older than sweep_min_age_secs at `now_sec` (a live node
-    /// rewrites its lease every publish tick) and abandoned .tmp staging
-    /// files from crashed publishes. Our own lease is never swept even when
-    /// our own writes are failing; that state must stay visible in the log,
-    /// not vanish quietly. The caller's instant keeps the cutoff virtual,
-    /// like refresh's expiry filter.
+    /// mtime is older than sweep_min_age_secs relative to this node's own
+    /// lease mtime on that filesystem (a live node rewrites its lease every
+    /// publish tick) and abandoned .tmp staging files from crashed publishes.
+    /// Our own lease is never swept even when our own writes are failing;
+    /// that state must stay visible in the log, not vanish quietly. `now_sec`
+    /// is the fallback cutoff clock when we have no lease file yet (tests,
+    /// or a tick whose publish never landed).
     pub fn sweepLeases(self: *Catalog, now_sec: i64) void {
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
         const dirz = self.clusterDir(&dbuf) catch return;
         const dir = c.opendir(dirz) orelse return;
         defer _ = c.closedir(dir);
-        const cutoff = now_sec -| sweep_min_age_secs;
+        const cutoff = self.sweepCutoff(dirz, now_sec);
         while (c.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
             if (name.len == 0 or name[0] == '.') continue;
@@ -643,6 +647,23 @@ pub const Catalog = struct {
             }
             std.log.info("swept stale cluster lease {s}", .{displayName(name)});
         }
+    }
+
+    /// Cutoff instant for sweepLeases: this node's own lease mtime on the
+    /// origin filesystem minus sweep_min_age_secs, so NAS/spark clock skew
+    /// cannot make live peers look idle. `now_sec` is used only when that
+    /// file is missing.
+    fn sweepCutoff(self: *const Catalog, dirz: [*:0]const u8, now_sec: i64) i64 {
+        const ref_sec = blk: {
+            var ibuf: [sys.c.PATH_MAX]u8 = undefined;
+            const ipath = sys.joinZ(&ibuf, std.mem.span(dirz), self.self_id) catch break :blk now_sec;
+            var ebuf: [sys.c.PATH_MAX]u8 = undefined;
+            const zown = sys.appendExt(&ebuf, ipath, ".json") catch break :blk now_sec;
+            var ost: c.struct_stat = undefined;
+            if (sys.statPath(zown, &ost) != 0) break :blk now_sec;
+            break :blk ost.st_mtim.tv_sec;
+        };
+        return ref_sec -| sweep_min_age_secs;
     }
 
     pub fn snapshot(self: *Catalog, gpa: std.mem.Allocator) ![]Path {
@@ -1052,21 +1073,24 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     var tmpf_buf: [192]u8 = undefined;
     const tmp_fp = try std.fmt.bufPrint(&tmpf_buf, "{s}/crashed.json.tmp", .{cluster_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, tmp_fp), "half"));
-    // own lease with stale mtime: kept (our publish failures must stay visible)
+    // own lease: kept (self-id skip). Left at write mtime so it is the
+    // origin-clock sample the cutoff uses; aged after the first sweep.
     var me_buf: [192]u8 = undefined;
     const me_fp = try std.fmt.bufPrint(&me_buf, "{s}/me.json", .{cluster_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, me_fp), lease_json));
 
-    // Age dead.json, crashed.json.tmp and me.json beyond the sweep cutoff.
-    // One edge instant drives both the mtime stamps and the sweep call, so
-    // every file sits exactly sweep_min_age_secs outside the cutoff no
+    // Age dead.json and crashed.json.tmp beyond the sweep cutoff. me.json
+    // stays at its write mtime: production publishes then sweeps, so the
+    // own-lease stamp is the origin-filesystem clock the cutoff uses. One
+    // edge instant drives the mtime stamps and the sweep call, so every
+    // aged file sits exactly sweep_min_age_secs outside that clock no
     // matter how long the test takes between those steps.
     const sweep_now = sys.nowSec(std.testing.io);
     const past = [2]std.os.linux.timespec{
         .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
         .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
     };
-    for ([_][]const u8{ old_fp, tmp_fp, me_fp }) |fp| {
+    for ([_][]const u8{ old_fp, tmp_fp }) |fp| {
         var zb: [192]u8 = undefined;
         const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, fp), &past, 0);
         try std.testing.expectEqual(@as(usize, 0), rc);
@@ -1083,6 +1107,19 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
 
+    // Own lease with stale mtime: still kept (publish failures must stay
+    // visible). Cutoff then follows that stale stamp, so a second pass
+    // must not start deleting survivors.
+    const own_past = [2]std.os.linux.timespec{
+        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
+        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
+    };
+    {
+        var zb: [192]u8 = undefined;
+        const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, me_fp), &own_past, 0);
+        try std.testing.expectEqual(@as(usize, 0), rc);
+    }
+
     // Re-execution is the sweep's normal shape: every node runs one per
     // discovery tick, so the same stale directory is swept repeatedly and
     // concurrently. A second pass over the already-swept tree must converge
@@ -1091,6 +1128,63 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     cat.sweepLeases(sweep_now);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
+}
+
+test "sweepLeases ages origin mtimes against our own lease, not CLOCK_REALTIME" {
+    // NAS five-plus minutes behind the spark: every live mtime looks older
+    // than sweep_min_age_secs on the node's wall clock. Comparing to
+    // now_sec would unlink alive.json; comparing to me.json's mtime keeps
+    // the live peer and still sweeps the one that actually went idle.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-sweep-skew");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    const lease_json = "{\"id\":\"x\",\"until\":1,\"addrs\":[]}";
+    var zbuf: [192]u8 = undefined;
+    var me_buf: [192]u8 = undefined;
+    const me_fp = try std.fmt.bufPrint(&me_buf, "{s}/me.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, me_fp), lease_json));
+    var new_buf: [192]u8 = undefined;
+    const new_fp = try std.fmt.bufPrint(&new_buf, "{s}/alive.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, new_fp), lease_json));
+    var old_buf: [192]u8 = undefined;
+    const old_fp = try std.fmt.bufPrint(&old_buf, "{s}/dead.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, old_fp), lease_json));
+
+    const sweep_now = sys.nowSec(std.testing.io);
+    const nas_lag: i64 = Catalog.sweep_min_age_secs + 100;
+    const own_ts = [2]std.os.linux.timespec{
+        .{ .sec = sweep_now - nas_lag, .nsec = 0 },
+        .{ .sec = sweep_now - nas_lag, .nsec = 0 },
+    };
+    const live_ts = [2]std.os.linux.timespec{
+        .{ .sec = sweep_now - nas_lag + 10, .nsec = 0 },
+        .{ .sec = sweep_now - nas_lag + 10, .nsec = 0 },
+    };
+    const dead_ts = [2]std.os.linux.timespec{
+        .{ .sec = sweep_now - nas_lag - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
+        .{ .sec = sweep_now - nas_lag - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
+    };
+    {
+        var zb: [192]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, me_fp), &own_ts, 0));
+        try std.testing.expectEqual(@as(usize, 0), std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, new_fp), &live_ts, 0));
+        try std.testing.expectEqual(@as(usize, 0), std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, old_fp), &dead_ts, 0));
+    }
+
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+    cat.sweepLeases(sweep_now);
+
+    var stbuf: c.struct_stat = undefined;
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
 }

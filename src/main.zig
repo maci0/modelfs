@@ -1173,9 +1173,16 @@ const max_status_age_secs: i64 = 120;
 /// clock set cannot make a wedged daemon look fresh or a healthy one look
 /// dead. Fall back to wall-clock `now_s` for artifacts from older builds.
 /// Saturating subtract so a hostile i64-min stamp cannot overflow the
-/// subtraction in safe builds.
+/// subtraction in safe builds. A `mono_s` ahead of now is a previous-boot
+/// leftover or a hostile future stamp: CLOCK_MONOTONIC resets on reboot,
+/// and `now -| stamp` would read as age 0, so the gap is taken the other
+/// way. Wall-clock `now_s` still treats a backward step as fresh (NTP noise
+/// on older artifacts).
 fn statusAgeSecs(io: std.Io, doc: StatusLiveness) ?i64 {
-    if (doc.mono_s) |stamp| return sys.monoSec(io) -| stamp;
+    if (doc.mono_s) |stamp| {
+        const now = sys.monoSec(io);
+        return if (stamp > now) stamp -| now else now -| stamp;
+    }
     if (doc.now_s) |stamp| return sys.nowSec(io) -| stamp;
     return null;
 }
@@ -1225,7 +1232,9 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // would report a mount that cannot serve reads as healthy to every
     // monitor keying on this command's exit code. Age is monotonic when the
     // document carries mono_s, so a wall-clock step no longer flips the
-    // verdict; the now_s fallback still treats a backward step as fresh.
+    // verdict; a leftover from the previous boot (CLOCK_MONOTONIC reset,
+    // stamp ahead of now) is stale even when pid reuse keeps pidAlive true.
+    // The now_s fallback still treats a backward step as fresh.
     if (statusAgeSecs(io, doc.value)) |age| {
         if (age > max_status_age_secs) {
             if (!builtin.is_test)
@@ -1819,6 +1828,30 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
             sys.monoSec(std.testing.io) - 121,
         });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), ntp_dead));
+        try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+    }
+
+    // CLOCK_MONOTONIC resets on reboot. A leftover stamp from the previous
+    // boot is larger than now; saturating now-stamp used to read as age 0,
+    // so pid reuse (common in the first seconds after boot) served a crash
+    // leftover as live. A hostile/future mono_s has the same shape.
+    {
+        var reboot_buf: [192]u8 = undefined;
+        const reboot_doc = try std.fmt.bufPrint(&reboot_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
+            std.os.linux.getpid(),
+            sys.nowSec(std.testing.io),
+            sys.monoSec(std.testing.io) + 1000,
+        });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), reboot_doc));
+        try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+
+        var max_buf: [192]u8 = undefined;
+        const max_doc = try std.fmt.bufPrint(&max_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
+            std.os.linux.getpid(),
+            sys.nowSec(std.testing.io),
+            std.math.maxInt(i64),
+        });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), max_doc));
         try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
     }
 

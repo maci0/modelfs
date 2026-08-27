@@ -80,6 +80,13 @@ case "${MAX_SNAP_AGE}" in
     *)
         ;;
 esac
+# ZFS creation is an epoch second. A negative age is a snapshot from the
+# future of this host's clock (NTP stepped back, or the pool's clock was
+# ahead when the snap was taken): the RPO comparison cannot be trusted, and
+# bash `[[ negative -gt MAX ]]` would pass it as fresh.
+if [[ "${SNAP_AGE}" -lt 0 ]]; then
+    die "newest snapshot ${SNAP} has creation ${SNAP_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"
+fi
 if [[ "${SNAP_AGE}" -gt "${MAX_SNAP_AGE}" ]]; then
     die "newest snapshot ${SNAP} is ${SNAP_AGE}s old, past the ${MAX_SNAP_AGE}s limit: the autosnap schedule stopped keeping restore points inside the claimed RPO (docs/recovery.md sections 3 and 5)"
 fi
@@ -99,6 +106,9 @@ if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
     fi
     REPLICA_CTIME="${REPLICA_LINE##*$'\t'}"
     REPLICA_AGE=$((NOW - REPLICA_CTIME))
+    if [[ "${REPLICA_AGE}" -lt 0 ]]; then
+        die "replica newest snapshot ${REPLICA_SNAP} has creation ${REPLICA_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"
+    fi
     if [[ "${REPLICA_AGE}" -gt "${MAX_SNAP_AGE}" ]]; then
         die "replica newest snapshot ${REPLICA_SNAP} is ${REPLICA_AGE}s old, past the ${MAX_SNAP_AGE}s limit: the replica schedule stopped keeping restore points inside the claimed RPO (docs/recovery.md sections 3 and 5)"
     fi
