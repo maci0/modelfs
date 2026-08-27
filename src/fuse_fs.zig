@@ -442,8 +442,12 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
         defer st.store.releaseFile(file);
         const fd = st.store.openCache(file);
         if (fd < 0) {
-            std.log.warn("cache open failed for {s} (errno {d}); failing open", .{ rel, -fd });
-            return fd;
+            // Same best-effort warmup mf_create already uses: the origin
+            // file is there, and mf_read falls back to origin when the
+            // cache cannot land a fill. Failing open here turned a full or
+            // broken cache disk into a total outage -- engines never reach
+            // the read path that already degrades.
+            std.log.warn("cache open failed for {s} (errno {d}); reads will use origin until the cache recovers", .{ rel, -fd });
         }
     }
     return 0;
@@ -564,7 +568,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
             // branch. Failed fills keep their error counts and no time (and no
             // fill or byte totals): the tick line's averages stay miss-only.
             _ = st.store.stats.fill_err_cache.fetchAdd(1, .monotonic);
-            std.log.warn("cache write refused {s} piece {d} (errno {d}); failing read", .{ file.rel, idx, -rc });
+            std.log.warn("cache write refused {s} piece {d} (errno {d}); piece unmarked", .{ file.rel, idx, -rc });
             return rc;
         }
         if (st.store.hasPiece(file, idx, sys.monoSec(st.io))) break;
@@ -574,7 +578,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
         // bumping the generation, and returning 0 unmarked would serve hole
         // zeros. Fail the read so the client retries.
         if (discard_retries >= fill_discard_retries_max) {
-            std.log.warn("fill discarded for {s} piece {d} after origin retry; failing read", .{ file.rel, idx });
+            std.log.warn("fill discarded for {s} piece {d} after origin retry; piece unmarked", .{ file.rel, idx });
             return -sys.c.EIO;
         }
         discard_retries += 1;
@@ -627,6 +631,33 @@ fn ensureRange(st: *State, file: *store_mod.Store.Cached, fsize: u64, off: u64, 
         if (rc != 0) return rc;
     }
     return 0;
+}
+
+/// Serve `buf` at `off` after hydrating any missing pieces. A failed fill
+/// (dead/full cache, discarded claim) must not black-hole a healthy origin:
+/// `readServed` already degrades a failed cache pread, and this is the
+/// matching miss-path policy. Returning the hydration errno without the
+/// origin read turned a cache-disk failure into a total read outage.
+/// Origin-down fails here too: `originPread` returns the same class of
+/// error, and the caller publishes the hydration errno so the first
+/// failure stays named.
+fn serveHydrated(
+    st: *State,
+    file: *store_mod.Store.Cached,
+    rel: []const u8,
+    buf: []u8,
+    off: u64,
+    fsize: u64,
+    ready: bool,
+) isize {
+    const rc = if (ready) 0 else ensureRange(st, file, fsize, off, buf.len);
+    if (rc == 0) return st.store.readServed(file, buf, off, sys.monoSec(st.io));
+    const got = st.store.originPread(rel, buf, off);
+    if (got >= 0) {
+        std.log.warn("hydration failed for {s} (errno {d}); serving this read from origin", .{ rel, -rc });
+        return got;
+    }
+    return rc;
 }
 
 export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
@@ -689,16 +720,11 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     const n = @min(want, @as(usize, @intCast(fsize - uoff)));
     const ready = store_mod.Store.rangeFilled(file, fsize, .{ .off = uoff, .len = @as(u64, n) }, st.store.piece_size);
     file.mu.unlock(st.io);
-    const rc = if (ready) 0 else ensureRange(st, file, fsize, uoff, n);
-    if (rc != 0) {
+    const got = serveHydrated(st, file, rel, buf[0..n], uoff, fsize, ready);
+    if (got < 0) {
         // The failing tier kept its own fill_err_* count; the op-level
         // counter must still see the read fail, or error-rate alerts keying
         // on reads_err miss exactly the EIO storms users feel.
-        _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
-        return rc;
-    }
-    const got = st.store.readServed(file, buf[0..n], uoff, sys.monoSec(st.io));
-    if (got < 0) {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
     } else {
         _ = st.store.stats.reads_ok.fetchAdd(1, .monotonic);
@@ -1619,5 +1645,50 @@ test "hydratePiece fails closed when write generation keeps discarding fills" {
         }
     }
     try std.testing.expectEqual(@as(i32, -sys.c.EIO), rc);
+    try std.testing.expect(!st.store.hasPiece(file, 0, sys.monoSec(st.io)));
+}
+
+test "serveHydrated falls back to origin when the cache cannot land a fill" {
+    // A directory planted at the cache data path refuses openCache (EISDIR),
+    // so hydratePiece cannot pwrite the piece. The FUSE read must still
+    // return origin bytes: failing that read was a total outage while the
+    // origin stayed healthy, the miss-path twin of readServed's warm
+    // fallback. Regression: ensureRange's errno used to be the syscall
+    // result, so engines saw EIO over a perfectly readable origin file.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-serve-hydrated");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-serve-hydrated");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.store.deinit();
+    defer st.catalog.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+
+    const pattern = "0123456789abcdef";
+    var tb: [192]u8 = undefined;
+    var zb: [192]u8 = undefined;
+    const origin_z = try sys.toZ(&zb, try std.fmt.bufPrint(&tb, "{s}/fb.bin", .{origin_d}));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, pattern));
+
+    const file = try st.store.get("fb.bin", pattern.len, sys.monoSec(st.io));
+    defer st.store.releaseFile(file);
+
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try st.store.cacheDataPath(&db, "fb.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(dp), 0o755));
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var rb: [16]u8 = undefined;
+    const n = serveHydrated(&st, file, "fb.bin", &rb, 0, pattern.len, false);
+    try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
+    try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
     try std.testing.expect(!st.store.hasPiece(file, 0, sys.monoSec(st.io)));
 }

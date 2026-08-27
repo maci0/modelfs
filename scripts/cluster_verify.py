@@ -3,7 +3,9 @@
 
 Pings every node, then reads /have bitfields round-robin across the nodes
 (one per piece, cycling pieces over nodes) while timing the sweep for the
-benchmark log. Exits nonzero on the first failure.
+benchmark log. Each answer must advertise a nonzero X-Piece-Size, a
+bitmap long enough to name TOTAL_PIECES, and have bit i set for the
+piece that node is asked about. Exits nonzero on the first failure.
 """
 
 import os
@@ -95,12 +97,18 @@ def main(argv: list[str]) -> int:
             # like a pass under a mere len>0 check, then hide missing pieces.
             want_len = (total_pieces + 7) // 8
             ps_ok = ps is not None and ps.isascii() and ps.isdigit() and int(ps) != 0
-            if not ps_ok or len(bits) != want_len:
-                why = (
-                    f"X-Piece-Size {ps!r}"
-                    if not ps_ok
-                    else f"bitfield length {len(bits)} != {want_len} for {total_pieces} pieces"
-                )
+            # LSB-first, same packing HaveBits.hasPiece uses: bit i names
+            # piece i. Length-only used to pass an all-zero field, which is
+            # the empty cache the 9-node script used to ship as "exchange".
+            # Length is checked first so a short blob cannot IndexError.
+            bit_set = len(bits) == want_len and (bits[p_idx // 8] & (1 << (p_idx % 8))) != 0
+            if not ps_ok or len(bits) != want_len or not bit_set:
+                if not ps_ok:
+                    why = f"X-Piece-Size {ps!r}"
+                elif len(bits) != want_len:
+                    why = f"bitfield length {len(bits)} != {want_len} for {total_pieces} pieces"
+                else:
+                    why = f"missing piece {p_idx}"
                 print(f"Node {target_node} /have {why}", file=sys.stderr)
                 return 1
 

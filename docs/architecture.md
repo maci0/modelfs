@@ -35,7 +35,7 @@ sequenceDiagram
   end
 ```
 
-One piece, one source. Misses block the read until that hole is filled. No full-file background stripe (that OOMed UMA).
+One piece, one source. Misses block the read until that hole is filled. If the local cache cannot land the fill (full or broken cache disk), that one read is served from the origin rather than failing EIO over a healthy origin (`serveHydrated` in src/fuse_fs.zig); the piece stays unmarked and the next miss retries the cache. Peer `/data` still answers 500 when this node's cache layer fails, so the fetching peer tries its next path. No full-file background stripe (that OOMed UMA).
 
 ---
 

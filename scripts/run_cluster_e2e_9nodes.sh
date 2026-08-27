@@ -107,6 +107,45 @@ echo "=== Step 4: Inspecting active cluster peers ==="
 "${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}" --psk "${PSK_FILE}"
 
 echo "=== Step 5: multi-peer piece exchange ==="
+# Pin first so a tight watermark cannot punch the just-filled bits before
+# /have is asked. A FUSE read is what hydrates: /have snapshots live bits
+# and does not fill, so listing leases plus probing empty bitmaps used to
+# count as exchange.
+for i in $(seq 1 "${NUM_NODES}"); do
+    "${MODELFS_BIN}" pin "${TEST_FILE}" --cache "${TEMP_DIR}/node_${i}_cache"
+done
+# Node 1 fills from origin; node 2 should then take pieces from node 1.
+# Remaining mounts read the same file so every node the verifier asks has
+# bit i set, not an all-zero field of the right length.
+for i in $(seq 1 "${NUM_NODES}"); do
+    if ! cmp -s "${ORIGIN_DIR}/${TEST_FILE}" "${TEMP_DIR}/mount_${i}/${TEST_FILE}"; then
+        echo "Error: mount_${i} read of ${TEST_FILE} does not match origin"
+        exit 1
+    fi
+done
+echo "✓ All ${NUM_NODES} mounts served ${TEST_FILE} matching origin"
+
+# fills_peer rides status.json, rewritten each discovery tick (10s). Poll
+# so a just-finished read is visible; 0 after that window means spark_2
+# filled only from origin and P2P never ran.
+PEER_FILL_DEADLINE=$((SECONDS + 15))
+while :; do
+    STATUS_OUT="$("${MODELFS_BIN}" status --cache "${TEMP_DIR}/node_2_cache" 2>/dev/null)" && STATUS_RC=0 || STATUS_RC=$?
+    FILLS=0
+    if [[ "${STATUS_RC}" -eq 0 ]]; then
+        FILLS="$(python3 -c 'import json,sys; print(int(json.load(sys.stdin)["stats"]["fills_peer"]))' <<<"${STATUS_OUT}" 2>/dev/null || echo 0)"
+    fi
+    if [[ "${FILLS}" -gt 0 ]]; then
+        echo "✓ Node spark_2 filled ${FILLS} piece(s) from peers"
+        break
+    fi
+    if ((SECONDS >= PEER_FILL_DEADLINE)); then
+        echo "Error: node spark_2 reported no peer fills; piece exchange did not happen"
+        exit 1
+    fi
+    sleep 0.5
+done
+
 python3 "${SCRIPTS_DIR}/cluster_verify.py" \
     "${TEST_FILE}" \
     "${PSK_FILE}" \
