@@ -57,11 +57,10 @@ zig build -Doptimize=ReleaseFast          # ./zig-out/bin/modelfs
 zig build test --summary all              # unit tests
 ```
 
-Non-default libfuse3 locations, e.g. when cross-compiling: the vendored arm64 tree ships as `.deb` files only (`root/` and `lib/` are gitignored), so extract it first with the one extractor script CI's cross-aarch64 job runs too ([.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md) holds the provenance; the script falls back to `ar` plus `zstd` or `tar --zstd` on hosts without dpkg):
+Non-default libfuse3 locations, e.g. when cross-compiling: the vendored arm64 tree ships as `.deb` files only. `./scripts/cross_aarch64.sh` extracts them into `.scratch/fuse3-arm64/` (hash-checked against [.deps/fuse3-arm64/SHA256SUMS](.deps/fuse3-arm64/SHA256SUMS); provenance is [.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md)) and builds ReleaseFast aarch64, the same recipe CI runs. On hosts without dpkg the extractor falls back to `ar` plus `zstd` or `tar --zstd`:
 
 ```bash
-./scripts/extract_fuse3_arm64.sh
-./scripts/cross_aarch64.sh                # ReleaseFast aarch64; same recipe CI runs
+./scripts/cross_aarch64.sh                # extract + ReleaseFast aarch64
 ```
 
 ## Quickstart
@@ -110,7 +109,7 @@ The piece-size sweep is why the default piece is 16 MiB: past it the gain is sma
 zig build test -Dtest-filter=relOk        # only tests whose names contain this substring
 zig build test --watch                    # rebuild and re-run on change
 zig build fmt                             # apply zig fmt
-./scripts/check.sh                        # fmt, unit tests, shellcheck, ruff, mypy
+./scripts/check.sh                        # fmt, unit tests, vendored fuse extract, shellcheck, ruff, mypy
 ./scripts/ci.sh                           # every CI job: check, aarch64 cross, repro
 ./scripts/repro_check.sh                  # build twice, require byte-identical output
 ./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end

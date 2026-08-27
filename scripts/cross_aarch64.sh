@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Cross-compile the spark-node binary the way CI's cross-aarch64 job does:
-# aarch64-linux-gnu.2.39, ReleaseFast, vendored arm64 libfuse3. Both
+# aarch64-linux-gnu.2.39, ReleaseFast, vendored arm64 libfuse3. Extracts the
+# committed .deb files first (scripts/extract_fuse3_arm64.sh). Both
 # .github/workflows/ci.yml and scripts/ci.sh run this, so the flags cannot
 # drift apart the way the old inlined extract recipe used to.
 set -euo pipefail
@@ -19,9 +20,10 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 Usage: ./scripts/cross_aarch64.sh [--prefix DIR]
 
 Cross-compile ReleaseFast aarch64 against the vendored arm64 libfuse3.
-Run ./scripts/extract_fuse3_arm64.sh first. Without --prefix the binary
-lands at zig-out/bin/modelfs; --prefix DIR installs to DIR/bin/modelfs
-(used by scripts/ci.sh so a native zig-out/ is not replaced).
+Extracts the committed .deb files into .scratch/fuse3-arm64 first.
+Without --prefix the binary lands at zig-out/bin/modelfs; --prefix DIR
+installs to DIR/bin/modelfs (used by scripts/ci.sh so a native zig-out/
+is not replaced).
 EOF
     exit 0
 fi
@@ -38,10 +40,11 @@ fi
 command -v file >/dev/null 2>&1 || fail "file not found on PATH (used to assert the aarch64 ELF machine type)"
 command -v zig >/dev/null 2>&1 || fail "zig not found on PATH -- see CONTRIBUTING.md (setup section)"
 
-FUSE_INC=".deps/fuse3-arm64/root/usr/include/fuse3"
-FUSE_LIB=".deps/fuse3-arm64/lib"
-[[ -d "${FUSE_INC}" ]] || fail "missing ${FUSE_INC}; run ./scripts/extract_fuse3_arm64.sh first"
-[[ -d "${FUSE_LIB}" ]] || fail "missing ${FUSE_LIB}; run ./scripts/extract_fuse3_arm64.sh first"
+"${SCRIPTS_DIR}/extract_fuse3_arm64.sh"
+FUSE_INC="${SCRATCH_DIR}/fuse3-arm64/root/usr/include/fuse3"
+FUSE_LIB="${SCRATCH_DIR}/fuse3-arm64/lib"
+[[ -d "${FUSE_INC}" ]] || fail "missing ${FUSE_INC} after extract"
+[[ -d "${FUSE_LIB}" ]] || fail "missing ${FUSE_LIB} after extract"
 
 build_args=(
     zig build

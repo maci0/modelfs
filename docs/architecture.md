@@ -94,7 +94,6 @@ Build:
 zig build -Doptimize=ReleaseFast
 
 # sparks (aarch64, Ubuntu 24.04 fuse 3.14): same recipe CI runs
-./scripts/extract_fuse3_arm64.sh
 ./scripts/cross_aarch64.sh
 ```
 

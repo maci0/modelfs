@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Single blocking gate for all static analysis: formatting, compile+unit tests,
-# shell lint, Python lint, Python type check.
+# vendored libfuse3 digests and extract, shell lint, Python lint, Python type
+# check.
 set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
@@ -11,8 +12,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<'EOF'
 Usage: ./scripts/check.sh
 
-The blocking static gate: zig fmt, unit tests, shellcheck, ruff, mypy.
-Same command the CI `check` job runs. Requires the pinned .venv from setup.
+The blocking static gate: zig fmt, unit tests, vendored libfuse3
+digests and extract, shellcheck, ruff, mypy. Same command the CI
+`check` job runs. Requires the pinned .venv from setup.
 
 Contributor commands (also listed by `zig build --help`):
   zig build                                 build the binary
@@ -22,7 +24,7 @@ Contributor commands (also listed by `zig build --help`):
   zig build test --watch                    rebuild and re-run on change
   zig build check                           this script
   zig build ci / ./scripts/ci.sh            every CI job (this, aarch64, repro)
-  ./scripts/cross_aarch64.sh                aarch64 ReleaseFast (vendored libfuse3)
+  ./scripts/cross_aarch64.sh                aarch64 ReleaseFast (extracts vendored libfuse3)
   ./scripts/run_e2e_tests.sh                CLI and peer protocol; no FUSE
   ./scripts/run_cluster_e2e_9nodes.sh       9 FUSE mounts (/dev/fuse + fusermount3)
   ./scripts/test_fault_tolerance.sh         peer loss and lease expiry
@@ -51,7 +53,7 @@ fi
 # Name every missing tool at once instead of dying mid-gate on a bare
 # "command not found"; CONTRIBUTING.md documents where each comes from.
 missing=""
-for tool in zig shellcheck ruff mypy; do
+for tool in zig shellcheck ruff mypy sha256sum; do
     command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
 done
 if [[ -n "${missing}" ]]; then
@@ -98,6 +100,17 @@ shellcheck -o add-default-case,avoid-nullary-conditions,avoid-negated-conditions
 # keeps a clone-onto-live or empty-snapshot false pass from shipping.
 echo "=== restore drill (stub zfs) ==="
 "${SCRIPTS_DIR}/test_dr_restore_drill.sh" || fail "restore drill stub tests failed"
+
+# Digests first (coreutils only), then a full extract so a stale-tree or
+# unpack-tool regression fails this gate instead of only the aarch64 job.
+echo "=== vendored libfuse3 digests ==="
+(
+    cd "${ROOT_DIR}/.deps/fuse3-arm64"
+    sha256sum -c SHA256SUMS
+) || fail "vendored libfuse3 integrity check failed; refresh per .deps/fuse3-arm64/README.md"
+
+echo "=== vendored libfuse3 extract ==="
+"${SCRIPTS_DIR}/test_extract_fuse3_arm64.sh" || fail "vendored libfuse3 extract tests failed"
 
 echo "=== ruff ==="
 ruff check scripts/ || fail "ruff check reported violations"

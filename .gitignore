@@ -9,14 +9,15 @@ __pycache__/
 .ruff_cache/
 
 # Vendored/downloaded dependencies: the arm64 libfuse3 provenance (.deb
-# files + README with digests) ships so the documented aarch64 cross-build
-# works from a fresh clone. The extracted root/ and lib/ trees are build
-# inputs recreated from the .deb files (see .deps/fuse3-arm64/README.md).
+# files + SHA256SUMS + README) ships so the documented aarch64 cross-build
+# works from a fresh clone. Extraction writes under .scratch/fuse3-arm64/
+# (see .deps/fuse3-arm64/README.md). Keep ignoring the old in-tree root/
+# and lib/ plus ar-fallback members so a leftover extract cannot be
+# committed.
 .deps/*
 !.deps/fuse3-arm64/
 .deps/fuse3-arm64/root/
 .deps/fuse3-arm64/lib/
-# ar-fallback members if extract_fuse3_arm64.sh is killed mid-unpack
 .deps/fuse3-arm64/data.tar.zst
 .deps/fuse3-arm64/control.tar.zst
 .deps/fuse3-arm64/debian-binary

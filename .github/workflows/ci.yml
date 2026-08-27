@@ -108,18 +108,13 @@ jobs:
       # the host build's.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
 
-      # The extracted root/ and lib/ trees are gitignored build inputs;
-      # recreate them from the committed .deb files with the same extractor
-      # script local builds run (one recipe, not two to keep in sync).
-      # build.zig verifies both sha256 digests before any compilation, so
-      # drifted vendored input fails this job rather than producing an
-      # unchecked binary.
-      - name: Extract vendored arm64 libfuse3 from the committed debs
-        run: ./scripts/extract_fuse3_arm64.sh
-
       # ReleaseFast: the deployment build README documents, not Debug, so the
       # gate exercises the codegen that actually ships. Same script
       # scripts/ci.sh runs, so the flags cannot drift from a local pre-push.
+      # The script extracts the committed .deb files (hash-checked against
+      # .deps/fuse3-arm64/SHA256SUMS) before compiling; build.zig re-verifies
+      # those digests, so drifted vendored input fails rather than producing
+      # an unchecked binary.
       - name: Cross-compile the spark-node binary
         run: ./scripts/cross_aarch64.sh
 

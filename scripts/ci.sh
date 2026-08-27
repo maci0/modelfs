@@ -31,7 +31,6 @@ echo "=== CI job: check ==="
 "${SCRIPTS_DIR}/check.sh"
 
 echo "=== CI job: cross-aarch64 ==="
-"${SCRIPTS_DIR}/extract_fuse3_arm64.sh"
 CROSS_PREFIX="${SCRATCH_DIR}/cross-aarch64"
 rm -rf "${CROSS_PREFIX}"
 mkdir -p "${SCRATCH_DIR}"
