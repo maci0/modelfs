@@ -2,9 +2,17 @@
 
 ## [Unreleased]
 
-Work since `v0.1.0`. A binary built from this tree still prints `0.1.0`
-until the next tag is cut (CONTRIBUTING.md, Cutting a release); pin a
-commit hash if you are not on the tag.
+## [0.2.0] - 2026-08-27
+
+Second tagged release. Recovery gets fail-closed alarms (hourly snapshot
+age, held monthly replicas, a daily drill-log check), the FUSE layer falls
+back to the origin when the local cache cannot store a piece, origin
+symlink races are closed with `O_NOFOLLOW`, and the CLI grows `--log` plus
+usage errors that name what is missing. Upgrading from `v0.1.0`: start at
+**Upgrade from v0.1.0** below.
+
+### Hydrate-discard test raced its own hydrator - 2026-08-27
+- **`hydratePiece fails closed when write generation keeps discarding fills` failed about two runs in three.** It read `rc` before joining the hydrator thread, so an unfinished fill read as a successful one, and it waited on "piece 0 is claimed" instead of the generation stamped on the claim, which cannot tell the first claim from the retry's. The wait now matches the claim generation and reacquires `content_mu` around a parked hydrator, and the assertions run after the join.
 
 ### Hourly snapshot-age alarm and replica hold fail-closed - 2026-08-27
 - **A disabled `sanoid.timer` is an hourly alarm, not a 30-day wait.** `OnFailure=` on `sanoid.service` never fires if the timer is stopped, so the monthly restore drill was the only check that the newest snapshot was still inside the 25 h RPO bound. `modelfs-restore-drill --age-only` stops after that check (no clone, no drill log), `modelfs-snap-age.timer` runs it hourly, and `scripts/test_dr_restore_drill.sh` pins stale/missing/replica-missing failures plus "did not clone or append the log".
@@ -372,5 +380,6 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/maci0/modelfs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/maci0/modelfs/releases/tag/v0.1.0
