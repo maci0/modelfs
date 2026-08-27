@@ -393,10 +393,6 @@ export fn mf_getattr(path: [*c]const u8, stbuf: ?*fuse.struct_stat, fi: ?*fuse.f
     if (rerr != 0) return rerr;
     var ost: sys.c.struct_stat = undefined;
     const rc = st.store.statOrigin(rel, &ost);
-    // Lookup is the first origin hit on every open/stat. Without this, an
-    // NFS outage during ls/stat never raises origin_down and never logs
-    // until a read or write also fails.
-    st.store.noteOriginIo(rel, rc, "stat");
     if (rc != 0) return rc;
     // Same translated C type; a whole-struct assign keeps every stat field.
     if (stbuf) |out| out.* = ost;
@@ -422,7 +418,6 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     // Return the captured errno, like getattr/read do: re-reading errno here
     // would report whatever ran between the failed stat and this return.
     const rc = st.store.statOrigin(rel, &ost);
-    st.store.noteOriginIo(rel, rc, "stat");
     if (rc != 0) return rc;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
@@ -619,11 +614,9 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     // into EISDIR would send readers hunting for a directory that is not there.
     var ost: sys.c.struct_stat = undefined;
     const rc_stat = st.store.statOrigin(rel, &ost);
-    // Edge-triggered: the first EIO/ESTALE/ETIMEDOUT logs path+errno, later
-    // ones ride reads_err and the tick line. Path-level answers (ENOENT,
-    // ELOOP, ...) stay counted but do not raise the origin-down flag
+    // Edge-triggered origin_down lives in statOrigin: path-level answers
+    // (ENOENT, ELOOP, ...) stay counted here but do not raise the flag
     // (see Store.originIoOutage).
-    st.store.noteOriginIo(rel, rc_stat, "stat");
     if (rc_stat != 0) {
         // An origin outage fails every uncached read here before any tier
         // runs; without this count reads_err stays flat while clients see
@@ -702,7 +695,6 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     if (off < 0) return -sys.c.EINVAL;
     const uoff: u64 = @intCast(off);
     const n = st.store.originPwrite(rel, buf[0..want], uoff);
-    st.store.noteOriginIo(rel, if (n < 0) @intCast(n) else 0, "write");
     if (n < 0) {
         _ = st.store.stats.writes_err.fetchAdd(1, .monotonic);
         return @intCast(n);

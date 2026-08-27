@@ -182,7 +182,9 @@ pub fn close(fd: c_int) void {
 /// Both soft and hard limits go to zero so a later setrlimit in this
 /// process cannot raise them without CAP_SYS_RESOURCE.
 pub fn disableCoreDumps() void {
-    std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch {};
+    std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch |err| {
+        std.log.err("cannot disable core dumps ({t}); a crash may write the cluster PSK", .{err});
+    };
 }
 
 /// Drops MODELFS_PSK_VALUE from the process environment so the

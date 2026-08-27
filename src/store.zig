@@ -202,12 +202,14 @@ pub const Store = struct {
     water: cull.Water = .{},
     stats: Stats = .{},
     /// Edge-triggered origin I/O outage flag. FUSE getattr/open/read/write
-    /// share this so an NFS outage logs once (path + errno) instead of once
-    /// per syscall, and recovery logs once too, the same shape as cullLoop's
-    /// statvfs suspension. status.json publishes it as origin_down (0/1) so
-    /// `modelfs status` answers whether NFS is currently failing. Peer HTTP
-    /// keeps its per-request origin-stat warns: that path is already bounded
-    /// by the inflight cap.
+    /// and originPread/originPwrite share this so an NFS outage logs once
+    /// (path + errno) instead of once per syscall, and recovery logs once
+    /// too, the same shape as cullLoop's statvfs suspension. status.json
+    /// publishes it as origin_down (0/1) so `modelfs status` answers whether
+    /// NFS is currently failing. Peer HTTP keeps its per-request origin-stat
+    /// warns: that path is already bounded by the inflight cap. Origin
+    /// pread/pwrite still raise this flag, so a fill or peer /data hydration
+    /// that hits EIO after a successful stat is not silent in status.json.
     origin_io_down: std.atomic.Value(bool) = .init(false),
     mu: std.Io.Mutex = .init,
     files: std.StringHashMap(*Cached),
@@ -380,10 +382,12 @@ pub const Store = struct {
     /// then rejects it fail-closed instead of stat'ing the link's target.
     /// Paired with the O_NOFOLLOW opens in originPread/originPwrite, which
     /// close the window between this sample and any later open.
-    pub fn statOrigin(self: Store, rel: []const u8, st: *c.struct_stat) i32 {
+    pub fn statOrigin(self: *Store, rel: []const u8, st: *c.struct_stat) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
-        return sys.lstatPath(p, st);
+        const rc = sys.lstatPath(p, st);
+        self.noteOriginIo(rel, rc, "stat");
+        return rc;
     }
 
     fn pinExists(self: Store, rel: []const u8) bool {
@@ -486,7 +490,14 @@ pub const Store = struct {
     /// file.mu where finishPiece and copyIntoCache save.
     pub fn distrust(self: *Store, rel: []const u8) void {
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const mp = self.cacheMetaPath(&mbuf, rel) catch return;
+        // A sidecar path that does not fit cannot name an on-disk artifact,
+        // but live marks still have to drop: returning here used to leave
+        // a map entry's bits set after a write whose size could not be
+        // observed, so the next read served pre-write cache bytes as current.
+        const mp: ?[*:0]u8 = self.cacheMetaPath(&mbuf, rel) catch blk: {
+            std.log.warn("cannot name piece sidecar for {s}; dropping live cache marks", .{rel});
+            break :blk null;
+        };
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         // Sidecar unlink and mark wipe share one file.mu window (same shape
@@ -500,7 +511,7 @@ pub const Store = struct {
         const f = self.files.get(rel);
         if (f) |file| file.mu.lockUncancelable(self.io);
         defer if (f) |file| file.mu.unlock(self.io);
-        unlinkOrWarn(mp, "meta", rel);
+        if (mp) |p| unlinkOrWarn(p, "meta", rel);
         // Same builder-invalidation contract as forget: a builder whose
         // sidecar read raced this unlink must not publish its stale bits.
         self.purge_epoch += 1;
@@ -1101,19 +1112,25 @@ pub const Store = struct {
         return self.originPread(file.rel, buf, off);
     }
 
-    pub fn originPread(self: Store, rel: []const u8, buf: []u8, off: u64) isize {
+    pub fn originPread(self: *Store, rel: []const u8, buf: []u8, off: u64) isize {
         var path: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&path, rel) catch return -c.ENAMETOOLONG;
         // O_NOFOLLOW: a symlink planted at this name on the shared origin
         // would otherwise have the daemon read the link's target (resolved
         // client-side) and serve those bytes to peers. ELOOP fails closed.
         const fd = sys.open(p, c.O_RDONLY | c.O_NOFOLLOW, 0);
-        if (fd < 0) return sys.negErrno();
+        if (fd < 0) {
+            const rc = sys.negErrno();
+            self.noteOriginIo(rel, rc, "read");
+            return rc;
+        }
         defer sys.close(fd);
-        return sys.preadAll(fd, buf, off);
+        const n = sys.preadAll(fd, buf, off);
+        self.noteOriginIo(rel, if (n < 0) @intCast(n) else 0, "read");
+        return n;
     }
 
-    pub fn originPwrite(self: Store, rel: []const u8, buf: []const u8, off: u64) isize {
+    pub fn originPwrite(self: *Store, rel: []const u8, buf: []const u8, off: u64) isize {
         var path: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&path, rel) catch return -c.ENAMETOOLONG;
         // Same O_NOFOLLOW contract as every other daemon write into a tree
@@ -1121,9 +1138,15 @@ pub const Store = struct {
         // planted symlink must not redirect this truncate-and-write onto an
         // arbitrary daemon-writable file.
         const fd = sys.open(p, c.O_WRONLY | c.O_NOFOLLOW, 0);
-        if (fd < 0) return sys.negErrno();
+        if (fd < 0) {
+            const rc = sys.negErrno();
+            self.noteOriginIo(rel, rc, "write");
+            return rc;
+        }
         defer sys.close(fd);
-        return sys.pwriteAll(fd, buf, off);
+        const n = sys.pwriteAll(fd, buf, off);
+        self.noteOriginIo(rel, if (n < 0) @intCast(n) else 0, "write");
+        return n;
     }
 
     /// Filesystem stats for the origin name. A planted final symlink would
@@ -1324,7 +1347,10 @@ pub const Store = struct {
         if (file.xfer.load(.monotonic) != 0) return false;
         if (!file.bits.get(idx)) return false;
         const fd = if (file.cache_fd >= 0) file.cache_fd else self.openCacheUnlocked(file);
-        if (fd < 0) return false;
+        if (fd < 0) {
+            std.log.warn("piece punch skipped for {s} piece {d} (cache open errno {d}); piece stays cached", .{ file.rel, idx, -fd });
+            return false;
+        }
         const off = piece.offset(idx, self.piece_size);
         const ln = piece.len(file.size, idx, self.piece_size);
         // Write-ahead order: the cleared mark must be durable before the hole
@@ -1588,7 +1614,12 @@ pub const Store = struct {
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
         const dp = self.cacheDataPath(&dbuf, rel) catch return false;
         const fd = sys.open(dp, c.O_RDWR | c.O_NOFOLLOW, 0);
-        if (fd < 0) return false;
+        if (fd < 0) {
+            const e = sys.errno();
+            if (e != c.ENOENT)
+                std.log.warn("disk punch skipped for {s} (errno {d}); bytes stay cached", .{ rel, e });
+            return false;
+        }
         defer sys.close(fd);
         var st: c.struct_stat = undefined;
         if (sys.fstat(fd, &st) != 0) return false;
@@ -1755,6 +1786,52 @@ test "noteOriginIo edge-triggers infrastructure origin failures" {
 
     // The next success is the recovery edge: one info line, flag cleared.
     st.noteOriginIo("a.bin", 0, "stat");
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+}
+
+test "originPread and originPwrite raise and clear origin_io_down" {
+    // Fill, peer /have stat, and write-through I/O used to skip noteOriginIo:
+    // getattr/open could succeed (or never run) while an EIO pread left
+    // origin_down at 0. Success must also clear a prior outage.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-origio");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-origio");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var tb: [192]u8 = undefined;
+    var zb: [192]u8 = undefined;
+    const real_z = try sys.toZ(&zb, try std.fmt.bufPrint(&tb, "{s}/real.bin", .{origin_d}));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(real_z, "model"));
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var rbuf: [8]u8 = undefined;
+    var stbuf: c.struct_stat = undefined;
+    // Path-level miss is not an outage: ENOENT must not raise the flag.
+    try std.testing.expectEqual(-c.ENOENT, st.statOrigin("gone.bin", &stbuf));
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    try std.testing.expectEqual(-c.ENOENT, st.originPread("gone.bin", &rbuf, 0));
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    try std.testing.expectEqual(-c.ENOENT, st.originPwrite("gone.bin", rbuf[0..5], 0));
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+
+    st.origin_io_down.store(true, .monotonic);
+    try std.testing.expectEqual(@as(i32, 0), st.statOrigin("real.bin", &stbuf));
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    st.origin_io_down.store(true, .monotonic);
+    try std.testing.expectEqual(@as(isize, 5), st.originPread("real.bin", rbuf[0..5], 0));
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    st.origin_io_down.store(true, .monotonic);
+    try std.testing.expectEqual(@as(isize, 5), st.originPwrite("real.bin", rbuf[0..5], 0));
     try std.testing.expect(!st.origin_io_down.load(.monotonic));
 }
 

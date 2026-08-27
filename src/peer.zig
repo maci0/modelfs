@@ -941,7 +941,7 @@ fn dial(io: std.Io, ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     var addr: c.struct_sockaddr_in = undefined;
     try sockaddrV4(ip, port, &addr);
     const budget_ms = dialBudgetMs(io, deadline_ms);
-    if (budget_ms == 0) return error.Connect;
+    if (budget_ms == 0) return error.ConnectTimeout;
     const fd = sys.socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (fd < 0) return error.Socket;
     sys.setSockTimeout(fd, budget_ms);
@@ -949,9 +949,13 @@ fn dial(io: std.Io, ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     sys.setSockBuffers(fd, sock_buf_bytes);
     // Bounded connect: SO_RCVTIMEO does not cover the dial itself, and a
     // blocking connect to a dead address stalls the fill path for minutes.
-    if (sys.connectIn(fd, &addr, budget_ms) != 0) {
+    const rc = sys.connectIn(fd, &addr, budget_ms);
+    if (rc != 0) {
         sys.close(fd);
-        return error.Connect;
+        // Same split as readHeadFullDeadline: a spent or elapsed budget is
+        // ConnectTimeout, not Connect, so a piece-fetch warn names the
+        // deadline instead of a refused or unreachable address.
+        return if (rc == -c.ETIMEDOUT) error.ConnectTimeout else error.Connect;
     }
     return fd;
 }
@@ -2201,10 +2205,11 @@ test "dial expires an injected budget that is already spent" {
     // A spent budget must refuse at the dial stage itself, before the socket
     // even exists, so a test (or any simulator driving virtual deadlines)
     // can expire a connect without connect(2) ever running against a real
-    // address.
+    // address. Named ConnectTimeout like HeadTimeout, not Connect: the
+    // fetch warn must say the budget fired, not that the peer refused.
     const t0 = sys.monoMs(std.testing.io);
     const err = dial(std.testing.io, "10.255.255.255", 18080, t0 - 1);
-    try std.testing.expectError(error.Connect, err);
+    try std.testing.expectError(error.ConnectTimeout, err);
     try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }
 
@@ -2216,7 +2221,11 @@ test "dial clamps the connect wait to an injected budget's remainder" {
     // deadline instead of after the steady-state window.
     const t0 = sys.monoMs(std.testing.io);
     const err = dial(std.testing.io, "10.255.255.255", 18080, t0 + 250);
-    try std.testing.expectError(error.Connect, err);
+    if (err) |_| {
+        try std.testing.expect(false);
+    } else |e| {
+        try std.testing.expect(e == error.Connect or e == error.ConnectTimeout);
+    }
     try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }
 
