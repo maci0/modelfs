@@ -125,20 +125,10 @@ echo "=== vendored fuse3 hashes ==="
 ) || fail "vendored libfuse3 sha256 mismatch; refresh per .deps/fuse3-arm64/README.md"
 
 echo "=== shellcheck ==="
-# Defect-oriented optional checks the tree already passes: every case
-# statement must handle an unmatched input, bare [ $x ] conditions are
-# ambiguous, which(1) is not portable, variables stay quoted even where
-# currently safe, a suppressed `set -e` cannot silently downgrade error
-# handling, an uppercase-looking assignment is always set before use, and
-# a negated numeric comparison ([ ! "$x" -eq 1 ]) is written as its direct
-# operator (-ne) so the tested condition is the one a reader sees, a
-# return value swallowed by command/process substitution must be either
-# propagated or explicitly dismissed with || true, like set -e suppression,
-# and cat piped into a filter (which hides cat's exit status) is written as
-# a direct redirect so a missing file cannot look like an empty stream.
-# The style-only brace/double-bracket checks stay off: this tree does not
-# follow those conventions.
-shellcheck -o add-default-case,avoid-nullary-conditions,avoid-negated-conditions,deprecate-which,quote-safe-variables,check-set-e-suppressed,check-unassigned-uppercase,check-extra-masked-returns,useless-use-of-cat scripts/*.sh || fail "shellcheck reported violations"
+# Optional checks live in .shellcheckrc so a bare `shellcheck scripts/*.sh`
+# from the repo root matches this gate. The style-only brace/double-bracket
+# checks stay off: this tree does not follow those conventions.
+shellcheck scripts/*.sh || fail "shellcheck reported violations"
 
 # The NAS drill cannot run here (no zfs pool). The stub suite is what
 # keeps a clone-onto-live or empty-snapshot false pass from shipping.

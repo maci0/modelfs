@@ -45,6 +45,9 @@ cat >"${STUB_BIN}/zfs" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 STATE="${STUB_STATE:?}"
+# "${STATE}/env" and "${STATE}/clone" are written at runtime by this stub
+# (and the test harness). They are not files in the repo, so the source
+# directives below cannot be followed at lint time.
 read_state() {
     # shellcheck source=/dev/null
     source "${STATE}/env"

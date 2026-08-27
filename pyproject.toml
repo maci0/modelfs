@@ -18,38 +18,31 @@ target-version = "py312"
 required-version = ">=0.16,<0.17"
 
 [tool.ruff.lint]
-# pycodestyle errors/warnings, pyflakes, bugbear, pyupgrade, simplify,
-# pylint's defect-oriented subset, and ruff-specific hygiene.
-# Plus defect-oriented groups: builtin shadowing (A), unused arguments
-# (ARG), comprehension pitfalls (C4), naive datetimes (DTZ),
-# private-member access (SLF), committed debuggers (T10), correctness
-# around yields (YTT) and implicit string concatenation (ISC),
-# suppression hygiene (PGH), performance anti-patterns (PERF),
-# refactoring/modernization (FURB), redundant constructs (PIE),
-# return simplification (RET), dead commented-out code (ERA),
-# import hygiene (TID), implicit namespace packages (INP), naming
-# conventions (N), typing-only imports left at runtime (TC), function
-# complexity (C90), blocking calls inside asyncio loops (ASYNC),
-# blind exception catches (BLE), redundant raise parens (RSE),
-# exception-handling anti-patterns (TRY), exception messages that hide
-# context in inline literals (EM), executable-bit vs shebang mismatches
-# (EXE), boolean-trap positional flags (FBT), import sorting/ordering (I),
-# join-to-f-string simplification (FLY), conventional import aliases (ICN),
-# TODO-comment hygiene (TD), annotation completeness including Any spelled
-# out by hand (ANN), stale FIXME/TBD/HACK comments (FIX), logging call
-# hygiene (G), logging setup anti-patterns (LOG), pytest conventions so any
-# Python tests added later start life under the same bar (PT), quote hygiene
-# beyond what the formatter normalizes, like avoidable escapes (Q),
-# missing __slots__ on value classes (SLOT), bandit (S) so a pickle/eval/
-# bind-all/insecure-hash cannot merge while style rules run, postponed
-# annotation form (FA), and stub-file conventions (PYI) for any .pyi added
-# later.
-select = [
-    "E", "F", "W", "B", "UP", "SIM", "PL", "RUF", "A", "ARG", "C4", "DTZ",
-    "SLF", "T10", "YTT", "ISC", "PGH", "PERF", "FURB", "PIE", "RET", "ERA",
-    "TID", "INP", "N", "TC", "C90", "ASYNC", "BLE", "RSE", "TRY", "EM",
-    "EXE", "FBT", "I", "FLY", "ICN", "TD", "ANN", "FIX", "G", "LOG",
-    "PT", "Q", "SLOT", "S", "FA", "PYI",
+# Every stable group. A new prefix that lands in the pinned 0.16 line
+# starts failing this gate instead of staying off by not being listed.
+# Ignores are only the exceptions this tree does not pass, each named.
+select = ["ALL"]
+ignore = [
+    # CLI harnesses print to stdout/stderr as their interface.
+    "T201",
+    # Conflicts with ruff format (the formatter owns trailing commas).
+    "COM812",
+    # Internal scripts, not a published library: no pydocstyle or
+    # copyright-header convention.
+    "D",
+    "CPY",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Remaining os.path join/makedirs/open/chmod/exists in the benchmark
+# driver. Other scripts already use pathlib; these codes stay on
+# everywhere else so a new harness cannot add os.path.join unnoticed.
+"scripts/run_benchmarks_and_plots.py" = [
+    "PTH101",
+    "PTH103",
+    "PTH110",
+    "PTH118",
+    "PTH123",
 ]
 
 [tool.ruff.format]
@@ -70,6 +63,13 @@ files = ["scripts"]
 # (today overlapping the explicit error codes below; tomorrow it also picks
 # up new opt-in checks in the 2.x line instead of leaving them off).
 extra_checks = true
+# A partial type assigned in one branch must be completed in the same
+# scope; a later use cannot silently see an incomplete annotation.
+local_partial_types = true
+# Incomplete features this tree already passes: tuple types keep their
+# length and element precision across operations, and inline TypedDict
+# shapes are checked instead of degrading to dict[str, Any].
+enable_incomplete_feature = ["PreciseTupleTypes", "InlineTypedDict"]
 # Beyond the strict bundle: flag unreachable code and redundant/truthiness
 # mistakes, require code-scoped ignores, catch possibly-undefined names,
 # overriding methods that widen mutable base attributes, use of APIs

@@ -1,0 +1,25 @@
+# Optional checks the gate enables. A bare `shellcheck scripts/*.sh` from
+# the repo root must match scripts/check.sh; without this file it would
+# skip every optional check and pass scripts the gate rejects.
+#
+# Defect-oriented extras this tree already passes: every case statement
+# must handle an unmatched input, bare [ $x ] conditions are ambiguous,
+# which(1) is not portable, variables stay quoted even where currently
+# safe, a suppressed `set -e` cannot silently downgrade error handling,
+# an uppercase-looking assignment is always set before use, a negated
+# numeric comparison ([ ! "$x" -eq 1 ]) is written as its direct operator
+# (-ne), a return value swallowed by command/process substitution must be
+# propagated or explicitly dismissed with || true, and cat piped into a
+# filter (which hides cat's exit status) is written as a direct redirect.
+#
+# Style-only brace/double-bracket checks stay off: this tree does not
+# follow those conventions (require-double-brackets / require-variable-braces).
+enable=add-default-case
+enable=avoid-nullary-conditions
+enable=avoid-negated-conditions
+enable=deprecate-which
+enable=quote-safe-variables
+enable=check-set-e-suppressed
+enable=check-unassigned-uppercase
+enable=check-extra-masked-returns
+enable=useless-use-of-cat
