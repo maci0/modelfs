@@ -938,22 +938,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     defer seed_list.deinit(gpa);
 
     const st = try gpa.create(fuse_fs.State);
-    st.* = .{
-        .gpa = gpa,
-        .io = init.io,
-        .store = store_mod.Store.init(gpa, init.io, origin, cache, opts.piece),
-        .catalog = discover.Catalog.init(gpa, init.io, origin, id, addrs.items, local_ips, seed_list.addrs.items),
-        .server = .{
-            .gpa = gpa,
-            .io = init.io,
-            .psk = psk,
-            .store = undefined,
-        },
-        .direct_io = opts.direct_io,
-        .start_secs = sys.monoSec(init.io),
-    };
-    st.server.store = &st.store;
-    st.store.water = opts.water;
+    st.init(gpa, init.io, origin, cache, opts.piece, opts.water, id, addrs.items, local_ips, seed_list.addrs.items, psk, opts.direct_io);
     // From here every error return owns st. Without this, an allocation
     // failure while building the fuse argv escaped without teardown,
     // leaking the bound listen fds and skipping the shutdown path that
@@ -1094,10 +1079,10 @@ const max_status_age_secs: i64 = 120;
 
 fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
-    const p = sys.joinZ(&z, opts.cache, fuse_fs.status_file) catch {
+    const p = sys.joinZ(&z, opts.cache, store_mod.status_file) catch {
         // Same audience as the "not running" prints below: a bare exit 1
         // would leave the operator guessing which path was refused.
-        std.debug.print("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, fuse_fs.status_file });
+        std.debug.print("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, store_mod.status_file });
         return 1;
     };
     var open_errno: i32 = 0;
@@ -1109,9 +1094,9 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         // loadPsk draws for its PSK file.
         if (!builtin.is_test) {
             if (err == error.OpenFailed and open_errno != sys.c.ENOENT)
-                std.debug.print("modelfs: cannot read {s}/{s} (errno {d}); cannot tell whether the daemon is running\n", .{ opts.cache, fuse_fs.status_file, open_errno })
+                std.debug.print("modelfs: cannot read {s}/{s} (errno {d}); cannot tell whether the daemon is running\n", .{ opts.cache, store_mod.status_file, open_errno })
             else
-                std.debug.print("modelfs: not running (no {s}/{s})\n", .{ opts.cache, fuse_fs.status_file });
+                std.debug.print("modelfs: not running (no {s}/{s})\n", .{ opts.cache, store_mod.status_file });
         }
         return 1;
     };
@@ -1123,7 +1108,7 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // writer exits; pid reuse can only ever false-positive, never hide a
     // genuinely running daemon behind a stale report.
     const doc = std.json.parseFromSlice(StatusLiveness, gpa, blob, .{ .ignore_unknown_fields = true }) catch {
-        if (!builtin.is_test) std.debug.print("modelfs: not running ({s}/{s} is unreadable)\n", .{ opts.cache, fuse_fs.status_file });
+        if (!builtin.is_test) std.debug.print("modelfs: not running ({s}/{s} is unreadable)\n", .{ opts.cache, store_mod.status_file });
         return 1;
     };
     defer doc.deinit();
@@ -1141,7 +1126,7 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         const age = sys.nowSec(io) - stamp;
         if (age > max_status_age_secs) {
             if (!builtin.is_test)
-                std.debug.print("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ opts.cache, fuse_fs.status_file, age });
+                std.debug.print("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ opts.cache, store_mod.status_file, age });
             return 1;
         }
     }
@@ -1628,7 +1613,7 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
 
     var zbuf: [192]u8 = undefined;
     var pbuf: [160]u8 = undefined;
-    const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ cache_d, fuse_fs.status_file });
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ cache_d, store_mod.status_file });
 
     // A live writer's document is served verbatim with success.
     var live_buf: [160]u8 = undefined;

@@ -1,5 +1,6 @@
-//! Peer wire helpers: range/header parsing, URL codec, bearer auth, and
-//! the cluster lease JSON document. Shared by the HTTP server and client.
+//! Peer wire helpers: range/header parsing, URL codec, bearer auth, the
+//! /have bitmap document, and the cluster lease JSON document. Shared by
+//! the HTTP server and client.
 const std = @import("std");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 
@@ -136,6 +137,23 @@ pub fn bearerOk(got: []const u8, want: []const u8) bool {
     return std.crypto.timing_safe.eql([32]u8, ha, hb);
 }
 
+/// A successful /have answer: the peer's cached-piece bitmap plus the piece
+/// size its bits are indexed against. piece_size 0 means the peer did not
+/// advertise one (an older build); consumers assume alignment for those.
+pub const HaveBits = struct {
+    bits: []u8,
+    piece_size: u32,
+
+    /// True when bit `idx` is set on a grid compatible with `local_piece_size`.
+    /// A mismatched advertised grid is treated as no-answer at this index
+    /// (the fetch falls through) rather than reading bits that cover
+    /// different byte ranges than ours.
+    pub fn hasPiece(self: HaveBits, idx: u32, local_piece_size: u32) bool {
+        if (self.piece_size != 0 and self.piece_size != local_piece_size) return false;
+        return idx / 8 < self.bits.len and (self.bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
+    }
+};
+
 /// Upper bound on a bearer token in bytes: main.zig's loadPsk reads at most
 /// this much and trims it, so it is also the token budget every request
 /// builder and request-head buffer must reserve beyond the encoded path.
@@ -263,6 +281,18 @@ test "headerGet is case-insensitive and trims" {
     try std.testing.expectEqualStrings("node1:18080", headerGet(head, "Host").?);
     try std.testing.expectEqualStrings("bytes=0-9", headerGet(head, "range").?);
     try std.testing.expect(headerGet(head, "Content-Length") == null);
+}
+
+test "HaveBits.hasPiece respects advertised grid" {
+    var bits = [_]u8{0b0000_0001};
+    const aligned = HaveBits{ .bits = &bits, .piece_size = 4096 };
+    try std.testing.expect(aligned.hasPiece(0, 4096));
+    try std.testing.expect(!aligned.hasPiece(1, 4096));
+    try std.testing.expect(!aligned.hasPiece(0, 8192));
+    // Absent X-Piece-Size (piece_size 0) is assumed aligned, so a fetcher
+    // talking to an older peer still reads the bits it advertised.
+    const unknown = HaveBits{ .bits = &bits, .piece_size = 0 };
+    try std.testing.expect(unknown.hasPiece(0, 8192));
 }
 
 test "bearer compare is length-independent" {

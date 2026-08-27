@@ -98,6 +98,25 @@ zig build -Dtarget=aarch64-linux-gnu.2.39 -Doptimize=ReleaseFast \
   -Dfuse-include=.../fuse3 -Dfuse-lib=.../libfuse3
 ```
 
+Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are no cycles. New code goes in the module that already owns that concern.
+
+| File | Role |
+|---|---|
+| `c.h`, `c.zig` | Sole door to libfuse3 and libc |
+| `sys.zig` | Syscall wrappers; no policy beyond EINTR retry |
+| `piece.zig` | Piece arithmetic and the persisted bitfield codec |
+| `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON) |
+| `cull.zig` | Free-space watermark policy |
+| `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
+| `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names |
+| `discover.zig` | Cluster leases, `/have` probe cache, path scoring |
+| `peer.zig` | Peer HTTP server and fetch client |
+| `fuse_fs.zig` | FUSE handlers, daemon `State`, discovery/cull loops |
+| `main.zig` | CLI and mount wiring into `State.init` |
+| `root.zig` | Test aggregator for `zig build test` |
+
+`main` → `fuse_fs` → `peer` → (`store`, `discover`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
+
 ---
 
 ## Discovery
@@ -137,7 +156,7 @@ score = ewma_goodput_bps / (1 + hops) / (1 + inflight)
 
 On miss: among paths whose `/have` bit is set, max score. GET fails: next path, then NFS. Never two sources for one piece.
 
-Probe answers are cached per (path, file) for 2 s (`Catalog.have_ttl_ms`), so a sequential fill of one large model sends `/have` once per peer per TTL window instead of once per peer per piece. Sequential fills consult that line through `Catalog.haveHas` (one bit, no bitmap copy); `haveGet` still returns an owned copy for callers that need the whole field. Only hits are cached: a stale bitmap can at worst route a fetch to a peer that no longer has the piece, which the next-path fallback already handles; failed probes are never cached, so a down peer is retried on the next piece.
+Probe answers are cached per (path, file) for 2 s (`Catalog.have_ttl_ms`), so a sequential fill of one large model sends `/have` once per peer per TTL window instead of once per peer per piece. Sequential fills consult that line through `Catalog.haveHas` (one bit, no bitmap copy); `haveGet` still returns an owned `proto.HaveBits` for callers that need the whole field. Only hits are cached: a stale bitmap can at worst route a fetch to a peer that no longer has the piece, which the next-path fallback already handles; failed probes are never cached, so a down peer is retried on the next piece.
 
 ---
 

@@ -151,23 +151,6 @@ pub fn printable(s: []const u8) bool {
     return true;
 }
 
-/// A successful /have answer: the peer's cached-piece bitmap plus the piece
-/// size its bits are indexed against. piece_size 0 means the peer did not
-/// advertise one (an older build); consumers assume alignment for those.
-pub const HaveBits = struct {
-    bits: []u8,
-    piece_size: u32,
-
-    /// True when bit `idx` is set on a grid compatible with `local_piece_size`.
-    /// A mismatched advertised grid is treated as no-answer at this index
-    /// (the fetch falls through) rather than reading bits that cover
-    /// different byte ranges than ours.
-    pub fn hasPiece(self: HaveBits, idx: u32, local_piece_size: u32) bool {
-        if (self.piece_size != 0 and self.piece_size != local_piece_size) return false;
-        return idx / 8 < self.bits.len and (self.bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
-    }
-};
-
 /// Name safe to echo into a log line: the input when printable, else a fixed
 /// placeholder. Lease file names come off shared NFS storage anyone with
 /// origin write access can craft, so every site that logs one goes through
@@ -255,7 +238,7 @@ pub const Catalog = struct {
     /// instant, so tests drive expiry virtually instead of sleeping.
     /// Copies under the lock so the entry cannot be replaced or freed
     /// between lookup and use by a concurrent filler.
-    pub fn haveGet(self: *Catalog, gpa: std.mem.Allocator, rel: []const u8, ip: []const u8, port: u16, now_ms: i64) ?HaveBits {
+    pub fn haveGet(self: *Catalog, gpa: std.mem.Allocator, rel: []const u8, ip: []const u8, port: u16, now_ms: i64) ?proto.HaveBits {
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
         const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
@@ -274,7 +257,7 @@ pub const Catalog = struct {
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
         const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
-        return (HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
+        return (proto.HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
     }
 
     /// Caches a successful probe result; failures are never cached so a

@@ -717,7 +717,7 @@ fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) 
 /// reads as 0, meaning unknown; consumers assume alignment for those. A
 /// malformed header fails the probe like any other bad reply so failures
 /// stay uncached and retried.
-fn fetchHave(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !discover.HaveBits {
+fn fetchHave(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !proto.HaveBits {
     return fetchHaveDeadline(gpa, io, psk, ip, port, rel, null);
 }
 
@@ -725,7 +725,7 @@ fn fetchHave(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8
 /// deadline bounds the dial, the head stage, and the bitmap body as one
 /// span, so tests expire the probe virtually instead of waiting out
 /// connect(2) or SO_RCVTIMEO.
-fn fetchHaveDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, deadline_ms: ?i64) !discover.HaveBits {
+fn fetchHaveDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, deadline_ms: ?i64) !proto.HaveBits {
     const fd = try sendRequest(io, psk, ip, port, rel, null, deadline_ms);
     defer sys.close(fd);
     var head_buf: [8192]u8 = undefined;
@@ -738,11 +738,11 @@ fn fetchHaveDeadline(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []
 /// Parses one /have response head (already read, body bytes possibly
 /// pipelined behind it in head_buf) and completes the bitmap body. The
 /// seam between dialing and parsing so tests can drive replies directly.
-fn haveFromHead(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize) !discover.HaveBits {
+fn haveFromHead(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize) !proto.HaveBits {
     return haveFromHeadDeadline(gpa, io, fd, head_buf, head_len, total_read, null);
 }
 
-fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, deadline_ms: ?i64) !discover.HaveBits {
+fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, deadline_ms: ?i64) !proto.HaveBits {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 200")) {

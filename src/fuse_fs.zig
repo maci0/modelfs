@@ -3,15 +3,13 @@
 const std = @import("std");
 const fuse = sys.c;
 const piece = @import("piece.zig");
+const proto = @import("proto.zig");
 const sys = @import("sys.zig");
 const store_mod = @import("store.zig");
 const discover = @import("discover.zig");
 const peer = @import("peer.zig");
 const cull = @import("cull.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
-
-/// Daemon liveness artifact in the cache dir; `modelfs status` reads it.
-pub const status_file = "status.json";
 
 pub const State = struct {
     gpa: std.mem.Allocator,
@@ -28,6 +26,42 @@ pub const State = struct {
     /// spawned earlier dies with the parent and a detached mount would
     /// silently lose its peer server, discovery, and culling.
     workers: std.ArrayList(std.Thread) = .empty,
+
+    /// One constructor for the daemon composition: cache, membership, and
+    /// peer HTTP share this object, and Server.store must alias the Store
+    /// field rather than a copy. Callers (mount wiring, tests) never poke
+    /// that pointer themselves.
+    pub fn init(
+        self: *State,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        origin: []const u8,
+        cache: []const u8,
+        piece_size: u32,
+        water: cull.Water,
+        id: []const u8,
+        addrs: []const proto.LeaseAddr,
+        local_ips: []const []const u8,
+        seeds: []const proto.LeaseAddr,
+        psk: []const u8,
+        direct_io: bool,
+    ) void {
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .store = store_mod.Store.init(gpa, io, origin, cache, piece_size),
+            .catalog = discover.Catalog.init(gpa, io, origin, id, addrs, local_ips, seeds),
+            .server = .{
+                .gpa = gpa,
+                .io = io,
+                .psk = psk,
+                .store = &self.store,
+            },
+            .direct_io = direct_io,
+            .start_secs = sys.monoSec(io),
+        };
+        self.store.water = water;
+    }
 
     pub fn spawnWorkers(self: *State) void {
         // Reserve before spawning: an append failure after a spawn used to
@@ -1091,7 +1125,7 @@ fn statusJson(st: *State) !void {
     try w.writeAll("}}\n");
     const json = w.buffered();
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const p = try sys.joinZ(&pbuf, st.store.cache, status_file);
+    const p = try st.store.cacheStatusPath(&pbuf);
     var tbuf: [sys.c.PATH_MAX]u8 = undefined;
     const tp = try sys.appendExt(&tbuf, p, ".tmp");
     // Atomic swap: a torn half-written status.json would make `modelfs status`
@@ -1149,20 +1183,11 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     const cache_d = try sys.scratchDir(&cb, "modelfs-status");
     defer sys.deleteTree(std.testing.io, cache_d);
 
-    var st = State{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .store = store_mod.Store.init(gpa, std.testing.io, "/unused", cache_d, 4096),
-        .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
-        .server = undefined,
-        .direct_io = true,
-        .start_secs = sys.monoSec(std.testing.io),
-    };
-    // statusJson reads server.http_inflight; give the test a real Server so
-    // it does not sample undefined memory.
-    st.server = .{ .gpa = gpa, .io = std.testing.io, .psk = "", .store = &st.store };
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, "/unused", cache_d, 4096, .{}, "me", &.{}, &.{}, &.{}, "", true);
     defer st.store.deinit();
     defer st.catalog.deinit();
+    try std.testing.expectEqual(&st.store, st.server.store);
     // Two paths sharing one peer id plus one distinct peer: the published
     // count must be unique peers (2), not raw paths (3).
     try st.catalog.paths.append(gpa, .{ .peer_id = "dup", .ip = "10.0.0.1", .port = 18080, .ewma_bps = 1e8, .hops = 0 });
@@ -1172,7 +1197,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try statusJson(&st);
 
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const fp = try sys.joinZ(&pbuf, cache_d, status_file);
+    const fp = try st.store.cacheStatusPath(&pbuf);
     var zbuf: [sys.c.PATH_MAX]u8 = undefined;
     const tmp_fp = try sys.appendExt(&zbuf, fp, ".tmp");
     var stbuf: sys.c.struct_stat = undefined;
@@ -1237,15 +1262,8 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
     const cache_d = try sys.scratchDir(&cb, "modelfs-tick");
     defer sys.deleteTree(std.testing.io, cache_d);
 
-    var st = State{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .store = store_mod.Store.init(gpa, std.testing.io, "/unused", cache_d, 4096),
-        .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
-        .server = undefined,
-        .direct_io = true,
-        .start_secs = sys.monoSec(std.testing.io),
-    };
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, "/unused", cache_d, 4096, .{}, "me", &.{}, &.{}, &.{}, "", true);
     defer st.store.deinit();
     defer st.catalog.deinit();
 

@@ -6,6 +6,10 @@ const cull = @import("cull.zig");
 const sys = @import("sys.zig");
 const c = sys.c;
 
+/// Daemon liveness artifact at the cache root; the discovery tick writes it
+/// and `modelfs status` reads it. Not a piece sidecar (`data/`, `meta/`, `pin/`).
+pub const status_file = "status.json";
+
 /// Process-lifetime operation counters, published in status.json every
 /// discovery tick (plus one summary log line per tick while anything moved).
 /// This is the daemon's metrics surface: per-event logs would flood the
@@ -242,6 +246,10 @@ pub const Store = struct {
 
     pub fn cachePinPath(self: Store, buf: []u8, rel: []const u8) ![*:0]u8 {
         return self.cacheSubPath(buf, "pin", rel);
+    }
+
+    pub fn cacheStatusPath(self: Store, buf: []u8) ![*:0]u8 {
+        return sys.joinZ(buf, self.cache, status_file);
     }
 
     pub fn ensureLayout(self: Store) i32 {
