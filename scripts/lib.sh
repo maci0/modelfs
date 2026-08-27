@@ -86,3 +86,26 @@ require_fuse() {
         exit 1
     fi
 }
+
+# True when path is a 64-bit little-endian ELF with e_machine EM_AARCH64.
+# Reads header bytes (POSIX od) instead of file(1) text, which changes
+# across GNU file versions, locales, and busybox. Does not rely on set -e
+# (callers use the status in &&/||).
+assert_aarch64_elf() {
+    local bin="$1" ident machine
+    ident="$(od -An -t x1 -N 6 "${bin}")" || return 1
+    ident="${ident//[[:space:]]/}"
+    ident="${ident,,}"
+    machine="$(od -An -t x1 -N 2 -j 18 "${bin}")" || return 1
+    machine="${machine//[[:space:]]/}"
+    machine="${machine,,}"
+    if [[ "${ident}" != "7f454c460201" ]]; then
+        echo "not a 64-bit little-endian ELF: ${bin} (e_ident ${ident})" >&2
+        return 1
+    fi
+    if [[ "${machine}" != "b700" ]]; then
+        echo "not ARM aarch64 (e_machine ${machine}, want b700): ${bin}" >&2
+        return 1
+    fi
+    return 0
+}

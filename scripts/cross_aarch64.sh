@@ -37,7 +37,7 @@ if [[ $# -gt 0 ]]; then
     PREFIX="$2"
 fi
 
-command -v file >/dev/null 2>&1 || fail "file not found on PATH (used to assert the aarch64 ELF machine type)"
+command -v od >/dev/null 2>&1 || fail "od not found on PATH (used to assert the aarch64 ELF machine type)"
 require_zig
 
 "${SCRIPTS_DIR}/extract_fuse3_arm64.sh"
@@ -62,9 +62,7 @@ fi
 
 "${build_args[@]}"
 [[ -f "${bin}" ]] || fail "cross-aarch64 produced no binary at ${bin}"
-desc="$(file "${bin}")" || fail "file(1) failed on ${bin}"
-case "${desc}" in
-    *ARM\ aarch64*) ;;
-    *) fail "cross-aarch64 produced a binary that is not ARM aarch64: ${desc}" ;;
-esac
-echo "cross-aarch64: ${desc}"
+# shellcheck disable=SC2310 # assert_aarch64_elf returns explicitly, never relies on set -e
+assert_aarch64_elf "${bin}" && elf_rc=0 || elf_rc=$?
+[[ "${elf_rc}" -eq 0 ]] || fail "cross-aarch64 produced a binary that is not ARM aarch64: ${bin}"
+echo "cross-aarch64: ELF 64-bit LSB aarch64 ${bin}"

@@ -3,3 +3,7 @@
 * text=auto eol=lf
 
 *.png binary
+# Vendored Ubuntu arm64 debs: git's text=auto heuristic can mis-tag a
+# binary ar archive that happens not to contain a NUL in the first 8 KiB,
+# and a CRLF conversion would invalidate SHA256SUMS.
+*.deb binary

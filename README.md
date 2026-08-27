@@ -46,7 +46,7 @@ Releases: `v0.1.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since
 
 ## Requirements
 
-* Linux with `/dev/fuse` and **libfuse3** (headers to build: `libfuse3-dev` / `fuse3-devel`)
+* Linux (x86_64 or aarch64) with `/dev/fuse` and **libfuse3** (headers to build: `libfuse3-dev` / `fuse3-devel`). Sparks deploy `aarch64-linux-gnu.2.39` (Ubuntu 24.04 glibc); CI tests the x86_64 build on ubuntu-24.04 and cross-compiles that aarch64 ABI.
 * **Zig 0.16.0** or newer
 * A shared POSIX directory every node can see (NFS or anything else) to act as the origin
 

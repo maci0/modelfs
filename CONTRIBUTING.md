@@ -6,7 +6,7 @@ what passes locally is what passes on push.
 
 ## Setup, once per clone
 
-Requirements: Linux, **Zig 0.16.0 or newer** from
+Requirements: Linux (x86_64 or aarch64), **Zig 0.16.0 or newer** from
 https://ziglang.org/download/ (`minimum_zig_version` in
 [build.zig.zon](build.zig.zon) is the floor and the version CI installs;
 setup-zig reads that field so a bump updates every job), libfuse3 headers

@@ -174,6 +174,18 @@ pub fn build(b: *std.Build) void {
     // zig build test -Dtest-filter=relOk
     const test_filter = b.option([]const u8, "test-filter", "only run unit tests whose name contains this substring");
 
+    // Options are registered above so `zig build --help` still lists them
+    // when this early-return fires. Linux is the only claimed OS: FUSE3,
+    // sendfile, fallocate hole-punch, and accept4. A non-Linux target used
+    // to proceed into translate-c / std.os.linux and die on missing headers
+    // or glibc-only sockaddr unions.
+    if (target.result.os.tag != .linux) {
+        const fail = b.addFail("modelfs is Linux-only (libfuse3, sendfile, FUSE)");
+        b.getInstallStep().dependOn(&fail.step);
+        test_step.dependOn(&fail.step);
+        return;
+    }
+
     if (fuseHeadersMissing(b, fuse_inc)) |msg| {
         const fail = b.addFail(msg);
         b.getInstallStep().dependOn(&fail.step);

@@ -4,7 +4,10 @@ const std = @import("std");
 pub const c = @import("c.zig").c;
 
 pub fn errno() i32 {
-    return c.__errno_location().*;
+    // std.c._errno is the libc thread-local errno pointer on every Linux
+    // ABI Zig ships (glibc __errno_location, musl the same name, Android
+    // __errno). translate-c of errno.h only exports the glibc spelling.
+    return std.c._errno().*;
 }
 
 /// Borrowed name of a readdir entry; valid until the next readdir on its DIR.
@@ -666,6 +669,11 @@ test "mkdirAll twice converges and refuses a file or symlink at the name" {
     const link = try std.fmt.bufPrint(&lb, "{s}/planted", .{scratch});
     try std.testing.expectEqual(@as(i32, 0), c.symlink("a", try toZ(&lz, link)));
     try std.testing.expectEqual(@as(i32, -c.ELOOP), mkdirAll(link, 0o755));
+}
+
+test "errno follows a failed libc call" {
+    try std.testing.expectEqual(@as(c_int, -1), c.close(-1));
+    try std.testing.expectEqual(@as(i32, c.EBADF), errno());
 }
 
 test "closeWrite reports a bad fd and succeeds after a write" {

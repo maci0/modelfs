@@ -34,3 +34,24 @@ echo stale >"${OUT}/root/leftover-from-previous-extract/STALE"
 [[ -L "${OUT}/lib/libfuse3.so.3" ]] || fail "missing libfuse3.so.3 soname symlink"
 
 echo "=== extract_fuse3_arm64 hermetic extract ok ==="
+
+# Same ELF-machine gate scripts/cross_aarch64.sh runs after the link, so a
+# wording change in file(1) cannot silently replace the byte check.
+echo "=== aarch64 ELF header check ==="
+elf_ok="${OUT}/fake-aarch64"
+elf_x86="${OUT}/fake-x86_64"
+elf_be="${OUT}/fake-be"
+# 20-byte ELF prefix: magic, EI_CLASS, EI_DATA, pad to e_machine at 18.
+printf '\177ELF\002\001\000\000\000\000\000\000\000\000\000\000\000\000\267\000' >"${elf_ok}"
+printf '\177ELF\002\001\000\000\000\000\000\000\000\000\000\000\000\000\076\000' >"${elf_x86}"
+printf '\177ELF\002\002\000\000\000\000\000\000\000\000\000\000\000\000\000\267' >"${elf_be}"
+# shellcheck disable=SC2310 # assert_aarch64_elf returns explicitly, never relies on set -e
+assert_aarch64_elf "${elf_ok}" && ok_rc=0 || ok_rc=$?
+[[ "${ok_rc}" -eq 0 ]] || fail "assert_aarch64_elf rejected a 64-bit LE aarch64 header"
+# shellcheck disable=SC2310 # assert_aarch64_elf returns explicitly, never relies on set -e
+assert_aarch64_elf "${elf_x86}" 2>/dev/null && x86_rc=0 || x86_rc=$?
+[[ "${x86_rc}" -ne 0 ]] || fail "assert_aarch64_elf accepted an x86_64 e_machine"
+# shellcheck disable=SC2310 # assert_aarch64_elf returns explicitly, never relies on set -e
+assert_aarch64_elf "${elf_be}" 2>/dev/null && be_rc=0 || be_rc=$?
+[[ "${be_rc}" -ne 0 ]] || fail "assert_aarch64_elf accepted a big-endian ELF ident"
+echo "=== aarch64 ELF header check ok ==="
