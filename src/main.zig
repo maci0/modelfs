@@ -54,7 +54,7 @@ const usage =
     \\  --origin PATH         Existing NFS/dir origin (required). Writes go here.
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
     \\  --id NAME             Override node id (default: short hostname)
-    \\  --listen [IP:]PORT    Peer HTTP port (default 18080); binds all interfaces
+    \\  --listen [IP:]PORT    Peer HTTP port (default 18080, 1-65535); binds all interfaces
     \\  --advertise ADDRS     Extra addresses IP[:PORT], comma separated
     \\                        (default: every local IPv4 except loopback and 169.254)
     \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
@@ -78,6 +78,7 @@ const usage =
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID set the same values as their flags; an explicit flag wins.
+    \\MODELFS_PSK_VALUE cannot be combined with --psk or MODELFS_PSK on mount.
     \\MODELFS_LOG sets the log ceiling: err, warn, info (default), or debug.
     \\An empty environment value counts as unset (defaults apply).
     \\
@@ -230,6 +231,10 @@ fn parseHostPort(s: []const u8) !proto.LeaseAddr {
     if (std.mem.findScalarLast(u8, s, ':')) |i| {
         if (i == 0) return error.BadHostPort;
         const port = try std.fmt.parseInt(u16, s[i + 1 ..], 10);
+        // Port 0 is a kernel ephemeral bind, not a dialable address: a lease
+        // or seed that advertises it is silently unreachable. Refuse it at
+        // the flag, like an empty host.
+        if (port == 0) return error.ZeroPort;
         return .{ .ip = s[0..i], .port = port, .mbps = 0 };
     }
     if (s.len == 0) return error.BadHostPort;
@@ -241,12 +246,16 @@ fn parseHostPort(s: []const u8) !proto.LeaseAddr {
 /// honored for its explicit port. A bare word or empty value names no port
 /// at all; defaulting it would silently mount on 18080 while the caller
 /// believes their spec took effect, so it is refused where the flag is
-/// parsed, like every other malformed flag value.
+/// parsed, like every other malformed flag value. Port 0 would bind an
+/// ephemeral kernel port while the lease still advertised 0, so peers
+/// could never dial this node: refused here instead of at first fetch.
 fn listenPort(spec: []const u8) !u16 {
-    if (std.mem.findScalarLast(u8, spec, ':')) |i| {
-        return std.fmt.parseInt(u16, spec[i + 1 ..], 10);
-    }
-    return std.fmt.parseInt(u16, spec, 10);
+    const port = if (std.mem.findScalarLast(u8, spec, ':')) |i|
+        try std.fmt.parseInt(u16, spec[i + 1 ..], 10)
+    else
+        try std.fmt.parseInt(u16, spec, 10);
+    if (port == 0) return error.ZeroPort;
+    return port;
 }
 
 /// CLI size values ("16M", "512", "3 MB") for --piece: plain byte counts or
@@ -305,6 +314,16 @@ fn takeValue(args: []const []const u8, flag: []const u8, i: *usize, inline_val: 
         return error.MissingValue;
     }
     return args[i.*];
+}
+
+/// Empty --origin/--cache/--psk would otherwise surface later as a confusing
+/// "not reachable" or open-failed path. Same named missing-value refusal as
+/// a flag with no argument at all.
+fn refuseEmpty(flag: []const u8, value: []const u8) !void {
+    if (value.len == 0) {
+        if (!builtin.is_test) std.debug.print("{s} needs a value (see 'modelfs help')\n", .{flag});
+        return error.MissingValue;
+    }
 }
 
 fn isHelpTok(s: []const u8) bool {
@@ -500,7 +519,14 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // process.Init; the map is threaded in instead of reading global environ.
     if (envValue(environ, "MODELFS_ORIGIN")) |v| opts.origin = v;
     if (envValue(environ, "MODELFS_CACHE")) |v| opts.cache = v;
-    if (envValue(environ, "MODELFS_PSK")) |v| opts.psk_file = v;
+    // An explicit file source (env or --psk) plus MODELFS_PSK_VALUE would
+    // otherwise silently prefer the inline secret in loadPsk; tracked so
+    // mount can refuse the pair instead of picking one.
+    var psk_file_set = false;
+    if (envValue(environ, "MODELFS_PSK")) |v| {
+        opts.psk_file = v;
+        psk_file_set = true;
+    }
     // The only inline-secret spelling: no flag carries the secret, because
     // argv is world-readable through /proc/<pid>/cmdline while the
     // environment block is readable only by the process owner and root.
@@ -568,6 +594,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             opts.id = try takeValue(args, flag, &i, inline_val);
         } else if (std.mem.eql(u8, flag, "--psk")) {
             opts.psk_file = try takeValue(args, flag, &i, inline_val);
+            psk_file_set = true;
         } else if (std.mem.eql(u8, flag, "--piece")) {
             try rejectOutsideMount(cmd, flag);
             const raw = try takeValue(args, flag, &i, inline_val);
@@ -618,8 +645,13 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         } else if (std.mem.eql(u8, flag, "--listen")) {
             try rejectOutsideMount(cmd, flag);
             const raw = try takeValue(args, flag, &i, inline_val);
-            opts.listen_port = listenPort(raw) catch {
-                if (!builtin.is_test) std.debug.print("--listen {s}: bad endpoint (want [IP:]PORT)\n", .{raw});
+            opts.listen_port = listenPort(raw) catch |err| {
+                if (!builtin.is_test) {
+                    if (err == error.ZeroPort)
+                        std.debug.print("--listen {s}: port 0 is not a listen port (want 1-65535)\n", .{raw})
+                    else
+                        std.debug.print("--listen {s}: bad endpoint (want [IP:]PORT)\n", .{raw});
+                }
                 return error.BadListen;
             };
         } else if (std.mem.eql(u8, flag, "--advertise")) {
@@ -631,8 +663,13 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 // after each comma; a leading/trailing space is not part of
                 // the address and would fail parseV4 as a host name.
                 const tok = std.mem.trim(u8, one, " \t");
-                const hp = parseHostPort(tok) catch {
-                    if (!builtin.is_test) std.debug.print("--advertise {s}: bad address (want IP[:PORT])\n", .{v});
+                const hp = parseHostPort(tok) catch |err| {
+                    if (!builtin.is_test) {
+                        if (err == error.ZeroPort)
+                            std.debug.print("--advertise {s}: port 0 is not a peer port (want 1-65535)\n", .{v})
+                        else
+                            std.debug.print("--advertise {s}: bad address (want IP[:PORT])\n", .{v});
+                    }
                     return error.BadHostPort;
                 };
                 // Same contract --seed resolves for: every lease consumer
@@ -653,8 +690,13 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             const s = try takeValue(args, flag, &i, inline_val);
             // Validate now with a named message instead of failing later in
             // mount setup with a bare parseInt error.
-            _ = parseHostPort(s) catch {
-                if (!builtin.is_test) std.debug.print("--seed {s}: bad address (want HOST[:PORT])\n", .{s});
+            _ = parseHostPort(s) catch |err| {
+                if (!builtin.is_test) {
+                    if (err == error.ZeroPort)
+                        std.debug.print("--seed {s}: port 0 is not a peer port (want 1-65535)\n", .{s})
+                    else
+                        std.debug.print("--seed {s}: bad address (want HOST[:PORT])\n", .{s});
+                }
                 return error.BadHostPort;
             };
             try opts.seed.append(gpa, s);
@@ -694,6 +736,23 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             std.debug.print("watermarks out of order (brun {d}, bcull {d}, bstop {d}): need brun > bcull > bstop\n", .{ opts.water.brun, opts.water.bcull, opts.water.bstop });
         return error.BadWatermarks;
     }
+    // Empty path flags would fail later as "not reachable" / missing PSK
+    // with no mention of the flag; refuse them at parse like a missing
+    // argument. Empty env values already count as unset (defaults apply).
+    if (opts.origin) |o| try refuseEmpty("--origin", o);
+    try refuseEmpty("--cache", opts.cache);
+    try refuseEmpty("--psk", opts.psk_file);
+    // loadPsk prefers MODELFS_PSK_VALUE over the file. Both set on mount
+    // would start with the env secret while the operator believed --psk
+    // (or MODELFS_PSK) won, matching the documented "explicit flag wins"
+    // for every other pair. status/peers/pin never load the secret, so a
+    // shell-wide inline value must not fail those commands the way the
+    // e2e suites pass --psk to them.
+    if (std.mem.eql(u8, cmd, "mount") and opts.psk_value != null and psk_file_set) {
+        if (!builtin.is_test)
+            std.debug.print("MODELFS_PSK_VALUE cannot be combined with --psk or MODELFS_PSK; pick one\n", .{});
+        return error.ConflictingPsk;
+    }
     return .{ .cmd = cmd, .opts = opts, .rest = try rest.toOwnedSlice(gpa) };
 }
 
@@ -704,6 +763,14 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
         if (v.len == 0) {
             if (!builtin.is_test) std.log.err("MODELFS_PSK_VALUE is empty; refusing to serve unauthenticated", .{});
             return error.EmptyPsk;
+        }
+        // The file form is capped by the read (proto.max_psk_bytes); the
+        // inline form must match or a huge env value would start the
+        // daemon and then fail every peer request as a truncated head.
+        if (v.len > proto.max_psk_bytes) {
+            if (!builtin.is_test)
+                std.log.err("MODELFS_PSK_VALUE is longer than {d} bytes; refusing", .{proto.max_psk_bytes});
+            return error.PskTooLarge;
         }
         return dupeHeaderSafePsk(gpa, v);
     }
@@ -884,14 +951,21 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     // Dependent-path gate: the kernel routes by mount, so origin preads or
     // cache piece writes under the mountpoint would come back through this
     // daemon's own FUSE handlers, each nesting another request until the
-    // handler threads exhaust and the mount wedges. Both sides are already
-    // realpaths, so symlinks cannot smuggle the overlap past this check.
+    // handler threads exhaust and the mount wedges. Origin overlapping the
+    // cache would write piece files onto the shared store (every node's
+    // data/meta/pin landing in the origin, stomping each other). Both
+    // sides are already realpaths, so symlinks cannot smuggle the overlap
+    // past this check.
     if (pathsOverlap(origin, mount_abs)) {
         std.log.err("mountpoint {s} equals or contains origin {s}; mount outside the origin", .{ mount_abs, origin });
         return 1;
     }
     if (pathsOverlap(cache, mount_abs)) {
         std.log.err("mountpoint {s} equals or contains cache {s}; keep the cache outside the mountpoint", .{ mount_abs, cache });
+        return 1;
+    }
+    if (pathsOverlap(origin, cache)) {
+        std.log.err("origin {s} equals or overlaps cache {s}; keep the cache off the origin", .{ origin, cache });
         return 1;
     }
 
@@ -1365,6 +1439,9 @@ test "parseHostPort splits and defaults" {
     // at the flag boundary instead.
     try std.testing.expectError(error.BadHostPort, parseHostPort(""));
     try std.testing.expectError(error.BadHostPort, parseHostPort(":19081"));
+    // Port 0 would publish an undialable lease / seed.
+    try std.testing.expectError(error.ZeroPort, parseHostPort("10.0.0.9:0"));
+    try std.testing.expectError(error.ZeroPort, parseHostPort("spark1:0"));
 }
 
 test "listenPort accepts bare port per --listen [IP:]PORT" {
@@ -1383,6 +1460,10 @@ test "listenPort accepts bare port per --listen [IP:]PORT" {
     // numeric garbage must fail loudly, not silently become the default
     try std.testing.expectError(error.Overflow, listenPort("70000"));
     try std.testing.expectError(error.Overflow, listenPort("h:70000"));
+    // Port 0 binds an ephemeral kernel port but the lease would still say 0.
+    try std.testing.expectError(error.ZeroPort, listenPort("0"));
+    try std.testing.expectError(error.ZeroPort, listenPort("127.0.0.1:0"));
+    try std.testing.expectError(error.ZeroPort, listenPort(":0"));
 }
 
 test "parseSize overflow and invalid" {
@@ -1526,7 +1607,11 @@ fn fuzzFlagValuesOne(_: void, smith: *std.testing.Smith) anyerror!void {
         } else {
             try std.testing.expectEqualStrings(s, a.ip);
             try std.testing.expectEqual(@as(u16, proto.default_port), a.port);
-            try std.testing.expectEqual(std.fmt.parseInt(u16, s, 10) catch null, lp);
+            // Bare numeric "0" is a --seed host (defaults to 18080) but not
+            // a --listen port (port 0 is refused).
+            const parsed_port: ?u16 = std.fmt.parseInt(u16, s, 10) catch null;
+            const want_lp: ?u16 = if (parsed_port) |p| (if (p == 0) null else p) else null;
+            try std.testing.expectEqual(want_lp, lp);
         }
     }
 }
@@ -1563,6 +1648,9 @@ test "pathsOverlap matches equality and whole-component containment" {
     // The root contains everything: mounting with origin "/" would shadow
     // the whole filesystem.
     try std.testing.expect(pathsOverlap("/x", "/"));
+    // Cache under origin would publish piece files through the shared store.
+    try std.testing.expect(pathsOverlap("/net/nas/models", "/net/nas/models/cache"));
+    try std.testing.expect(pathsOverlap("/var/cache/modelfs", "/var/cache/modelfs"));
     // A bare string prefix is not containment: /models2 is a sibling of
     // /models, and refusing it would break legitimate layouts.
     try std.testing.expect(!pathsOverlap("/models2/c", "/models"));
@@ -1899,6 +1987,16 @@ test "parseArgs rejects bad values" {
     try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "" }));
     try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "abc:def" }));
     try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "70000" }));
+    try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "0" }));
+    try std.testing.expectError(error.BadListen, parseArgs(gpa, &environ, &.{ "mount", "--listen", "127.0.0.1:0" }));
+    try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "10.0.0.1:0" }));
+    try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--seed", "10.0.0.9:0" }));
+    // Empty path flags name no configuration: fail at parse, not later as
+    // "not reachable" / missing PSK with no mention of the flag.
+    try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "mount", "--origin", "" }));
+    try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "mount", "--cache", "" }));
+    try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "status", "--psk", "" }));
+    try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "mount", "--origin=" }));
     // an empty address (bare comma split) is refused at the flag, not at bind
     try std.testing.expectError(error.BadHostPort, parseArgs(gpa, &environ, &.{ "mount", "--advertise", "," }));
     // host names in --advertise would publish addresses no peer can dial
@@ -1969,19 +2067,29 @@ test "empty environment variables read as unset" {
 
     // Non-empty values still apply, and an explicitly empty flag keeps its
     // stricter meaning where one exists (--id "" is refused by the BadId
-    // gate above).
+    // gate above). The two PSK sources are exclusive on mount, so the
+    // file form and the inline form are applied in separate parses.
     try environ.put("MODELFS_ORIGIN", "/env/origin");
     try environ.put("MODELFS_CACHE", "/env/cache");
     try environ.put("MODELFS_PSK", "/env/psk");
-    try environ.put("MODELFS_PSK_VALUE", "env-secret");
     try environ.put("MODELFS_ID", "spark-env");
-    const parsed2 = try parseArgs(gpa, &environ, &.{"mount"});
-    defer freeParsed(parsed2, gpa);
-    try std.testing.expectEqualStrings("/env/origin", parsed2.opts.origin.?);
-    try std.testing.expectEqualStrings("/env/cache", parsed2.opts.cache);
-    try std.testing.expectEqualStrings("/env/psk", parsed2.opts.psk_file);
-    try std.testing.expectEqualStrings("env-secret", parsed2.opts.psk_value.?);
-    try std.testing.expectEqualStrings("spark-env", parsed2.opts.id.?);
+    {
+        const parsed2 = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed2, gpa);
+        try std.testing.expectEqualStrings("/env/origin", parsed2.opts.origin.?);
+        try std.testing.expectEqualStrings("/env/cache", parsed2.opts.cache);
+        try std.testing.expectEqualStrings("/env/psk", parsed2.opts.psk_file);
+        try std.testing.expect(parsed2.opts.psk_value == null);
+        try std.testing.expectEqualStrings("spark-env", parsed2.opts.id.?);
+    }
+    _ = environ.orderedRemove("MODELFS_PSK");
+    try environ.put("MODELFS_PSK_VALUE", "env-secret");
+    {
+        const parsed3 = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed3, gpa);
+        try std.testing.expectEqualStrings("env-secret", parsed3.opts.psk_value.?);
+        try std.testing.expectEqualStrings("/etc/modelfs.psk", parsed3.opts.psk_file);
+    }
 }
 
 test "parseLogLevel accepts the documented names only" {
@@ -2184,6 +2292,37 @@ test "the inline secret comes from MODELFS_PSK_VALUE and has no flag" {
         error.UnknownFlag,
         parseArgs(gpa, &environ, &.{ "mount", "--psk-value", "flag-secret" }),
     );
+    // Combined with an explicit file source on mount, loadPsk would silently
+    // prefer the env secret while the operator believed --psk won.
+    try std.testing.expectError(
+        error.ConflictingPsk,
+        parseArgs(gpa, &environ, &.{ "mount", "--psk", "/etc/modelfs.psk" }),
+    );
+    // status/peers/pin never load the secret; a shell-wide inline value
+    // must not fail them the way the e2e suites pass --psk.
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "status", "--psk", "/etc/modelfs.psk" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("env-secret", parsed.opts.psk_value.?);
+        try std.testing.expectEqualStrings("/etc/modelfs.psk", parsed.opts.psk_file);
+    }
+}
+
+test "MODELFS_PSK and MODELFS_PSK_VALUE conflict on mount" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("MODELFS_PSK", "/env/psk");
+    try environ.put("MODELFS_PSK_VALUE", "env-secret");
+    try std.testing.expectError(error.ConflictingPsk, parseArgs(gpa, &environ, &.{"mount"}));
+    // Either source alone still applies.
+    _ = environ.orderedRemove("MODELFS_PSK_VALUE");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/env/psk", parsed.opts.psk_file);
+        try std.testing.expect(parsed.opts.psk_value == null);
+    }
 }
 
 test "parseArgs defaults come from the environ map" {
@@ -2242,6 +2381,15 @@ test "loadPsk refuses empty secrets and trims file contents" {
     }
     // ...but an empty one would authenticate every "Bearer " request.
     try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, .{ .psk_value = "" }));
+    // The file form is capped at proto.max_psk_bytes; the inline form must
+    // match or a huge env value would start the daemon and then fail the
+    // peer request head.
+    try std.testing.expectError(error.PskTooLarge, loadPsk(gpa, .{ .psk_value = "k" ** (proto.max_psk_bytes + 1) }));
+    {
+        const psk = try loadPsk(gpa, .{ .psk_value = "k" ** proto.max_psk_bytes });
+        defer gpa.free(psk);
+        try std.testing.expectEqual(@as(usize, proto.max_psk_bytes), psk.len);
+    }
 
     var zb: [192]u8 = undefined;
     // Missing file: the named error the CLI turns into remediation output.
