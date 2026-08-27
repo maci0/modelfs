@@ -107,8 +107,8 @@ fn relFromFuse(path: []const u8) ?[]const u8 {
 }
 
 fn isCluster(path: []const u8) bool {
-    return std.mem.eql(u8, path, "/" ++ discover.cluster_dir) or
-        std.mem.startsWith(u8, path, "/" ++ discover.cluster_dir ++ "/");
+    const rel = if (path.len > 0 and path[0] == '/') path[1..] else path;
+    return discover.relIsCluster(rel);
 }
 
 /// One path policy for every handler: cluster control files are invisible
@@ -1264,7 +1264,7 @@ fn statusJson(st: *State) !void {
     // Atomic swap: a torn half-written status.json would make `modelfs status`
     // print garbage; readers see either the old or the new file. O_NOFOLLOW
     // on the staging write keeps a planted symlink from redirecting it.
-    if (sys.writeFileNoFollow(tp, json) != 0) {
+    if (sys.writeFileOwnerOnly(tp, json) != 0) {
         // Staging file may exist from a partial write; leave none behind.
         // A retry every tick would refresh mtime, so no sweeper ages it out.
         _ = sys.c.unlink(tp);
@@ -1346,6 +1346,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // The rename must leave no staging file behind: a leftover .tmp next to
     // the live artifact means readers raced a torn write.
     try std.testing.expect(sys.statPath(fp, &stbuf) == 0);
+    try std.testing.expectEqual(@as(sys.c.mode_t, 0o600), stbuf.st_mode & 0o777);
     try std.testing.expect(sys.statPath(tmp_fp, &stbuf) != 0);
 
     const blob = try sys.readFileAlloc(gpa, fp, 4096);
@@ -1407,6 +1408,15 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expectEqual(@as(u64, 1), doc2.value.stats.fills_peer);
     try std.testing.expectEqual(@as(u64, 4096), doc2.value.stats.bytes_from_peer);
     try std.testing.expectEqual(@as(i32, 1), doc2.value.origin_down);
+
+    // A leftover world-readable status.json (older daemon, or a 0644 tmp
+    // that was renamed in) is tightened on the next publish: O_CREAT's
+    // mode is ignored when the name exists, so writeFileOwnerOnly fchmods
+    // the staging fd before the rename.
+    try std.testing.expectEqual(@as(i32, 0), sys.c.chmod(fp, 0o644));
+    try statusJson(&st);
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(fp, &stbuf));
+    try std.testing.expectEqual(@as(sys.c.mode_t, 0o600), stbuf.st_mode & 0o777);
 }
 
 test "statusJson unlinks the staging file when rename fails" {

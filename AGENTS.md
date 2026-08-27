@@ -43,7 +43,7 @@ stand-in (stub `zfs`).
   `MODELFS_*` as typo'd knobs.
 - **Every external path is untrusted.** Request heads, lease JSON, and encoded
   paths have fuzzed parsers. FUSE handlers go through `resolveRel`; peer and
-  CLI paths pass `relOk` before origin or cache.
+  CLI paths pass `relOk` (and `relIsCluster`) before origin or cache.
 - **No hot-path allocation.** Piece hydration and request parsing use stack
   buffers or one reusable piece-sized buffer; allocating functions take an
   explicit `gpa`.

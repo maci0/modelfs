@@ -128,9 +128,21 @@ pub fn pickBest(cands: []const PathCand) ?usize {
 }
 
 /// Name of the origin-side control directory holding cluster leases
-/// (<origin>/.cluster/<id>.json). Hidden from the FUSE mount and read by
-/// `modelfs peers`; every module referencing the path must use this constant.
+/// (<origin>/.cluster/<id>.json). Hidden from the FUSE mount, peer `/have`
+/// and `/data`, and `modelfs pin`; read by `modelfs peers`. Every module
+/// referencing the path must use this constant.
 pub const cluster_dir = ".cluster";
+
+/// True when an origin-relative path names the lease directory or a file
+/// under it. Prefix, not substring: a model named `.clusterfoo` is not the
+/// control plane. Applied at every external path boundary after `relOk`
+/// (FUSE `resolveRel`, peer `handleConn`, CLI `cmdPin`) so a PSK holder
+/// cannot hydrate lease JSON as a piece and a local pin cannot mark the
+/// control dir uncullable.
+pub fn relIsCluster(rel: []const u8) bool {
+    return std.mem.eql(u8, rel, cluster_dir) or
+        std.mem.startsWith(u8, rel, cluster_dir ++ "/");
+}
 
 /// True when s carries no control character in its terminal-visible form
 /// (proto.containsControl's set). Lease file names come off shared NFS
@@ -1095,6 +1107,17 @@ test "displayName echoes printable names and withholds the rest" {
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("\x7f"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{2028}ERROR forged"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{202e}gnp"));
+}
+
+test "relIsCluster matches the lease dir by prefix, not substring" {
+    try std.testing.expect(relIsCluster(cluster_dir));
+    try std.testing.expect(relIsCluster(cluster_dir ++ "/spark1.json"));
+    try std.testing.expect(relIsCluster(cluster_dir ++ "/a/b.json"));
+    // Prefix, not substring: a model named .clusterfoo is not the lease dir.
+    try std.testing.expect(!relIsCluster(cluster_dir ++ "foo"));
+    try std.testing.expect(!relIsCluster("foo/" ++ cluster_dir));
+    try std.testing.expect(!relIsCluster("gguf/a.gguf"));
+    try std.testing.expect(!relIsCluster(""));
 }
 
 test "validId gates the lease file name and JSON document" {

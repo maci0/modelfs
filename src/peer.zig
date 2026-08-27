@@ -387,6 +387,14 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         replyStatus(self, fd, "400 Bad Request");
         return;
     }
+    // `.cluster` is the discovery control plane, not a model: FUSE hides it
+    // (ENOENT lookup) and a GET here would hydrate lease JSON into the piece
+    // cache and advertise it via `/have`. Same 404 as an unknown route so
+    // the data plane does not confirm the control dir's existence.
+    if (discover.relIsCluster(rel)) {
+        replyStatus(self, fd, "404 Not Found");
+        return;
+    }
     if (std.mem.eql(u8, path, "/have")) {
         const t0 = sys.monoNs(self.io);
         defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
@@ -1965,6 +1973,54 @@ test "fault tolerance: traversal path is rejected with 400" {
     try std.testing.expectError(error.PeerMiss, fetchHave(gpa, std.testing.io, "correct_secret", "127.0.0.1", port, "%2e%2e/secret.txt"));
     // Absolute paths are refused too, not silently re-rooted into the origin.
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "correct_secret", "127.0.0.1", port, "/etc/passwd"));
+}
+
+test "peer /have and /data hide .cluster the way FUSE does" {
+    // A PSK holder used to fetch origin/.cluster/<id>.json through the piece
+    // protocol (relOk admits a leading-dot component), hydrating lease JSON
+    // into the cache and advertising it via /have. FUSE lookup is ENOENT;
+    // the data plane must match, even when the lease file is a regular file
+    // the origin would otherwise serve.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-cluster");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-cluster");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var cbuf: [192]u8 = undefined;
+    const cluster_dir = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_dir, 0o755));
+    var lbuf: [224]u8 = undefined;
+    var lz: [224]u8 = undefined;
+    const lease_fp = try std.fmt.bufPrint(&lbuf, "{s}/spark1.json", .{cluster_dir});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&lz, lease_fp), "{\"id\":\"spark1\",\"until\":4102444800,\"addrs\":[]}"));
+    // Prefix, not substring: a model named .clusterfoo is a regular origin
+    // file and must still be reachable through /have.
+    const model_fp = try std.fmt.bufPrint(&lbuf, "{s}/.clusterfoo", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&lz, model_fp), "weights"));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+    const port = srv.port();
+
+    var res = try roundTrip(port, "GET /have?path=.cluster%2Fspark1.json HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+    defer res.deinit(gpa);
+    try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
+
+    var data = try roundTrip(port, "GET /data?path=.cluster%2Fspark1.json HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-15\r\nConnection: close\r\n\r\n");
+    defer data.deinit(gpa);
+    try std.testing.expect(std.mem.startsWith(u8, data.items, "HTTP/1.1 404 Not Found\r\n"));
+    // Missing Range on a cluster path is still 404, not 400: the resource
+    // is not a piece, so the Range gate never runs.
+    var norange = try roundTrip(port, "GET /data?path=.cluster HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+    defer norange.deinit(gpa);
+    try std.testing.expect(std.mem.startsWith(u8, norange.items, "HTTP/1.1 404 Not Found\r\n"));
+    var model = try roundTrip(port, "GET /have?path=.clusterfoo HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+    defer model.deinit(gpa);
+    try std.testing.expect(std.mem.startsWith(u8, model.items, "HTTP/1.1 200 OK\r\n"));
 }
 
 test "origin stat failures answer 502 while true misses stay healthy 404s" {
@@ -3552,6 +3608,7 @@ const seed_serve_data_no_range = fuzzcorpus.entry("GET /data?path=a.bin HTTP/1.1
 const seed_serve_data_bad_range = fuzzcorpus.entry("GET /data?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=x-\r\n\r\n");
 const seed_serve_data_no_path = fuzzcorpus.entry("GET /data HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-0\r\n\r\n");
 const seed_serve_empty_path = fuzzcorpus.entry("GET /have?path= HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_cluster_path = fuzzcorpus.entry("GET /have?path=.cluster%2Fspark1.json HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 
 const fuzz_serve_corpus = [_][]const u8{
     &seed_req_have_ok,
@@ -3576,6 +3633,7 @@ const fuzz_serve_corpus = [_][]const u8{
     &seed_serve_data_bad_range,
     &seed_serve_data_no_path,
     &seed_serve_empty_path,
+    &seed_serve_cluster_path,
 };
 
 /// Every outcome handleConn's published order can produce for a head whose
@@ -3605,6 +3663,7 @@ fn classifyServedHead(head: []const u8) ServeClass {
     const q = proto.queryGet(target, "path") orelse return .bad_path;
     const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
     if (!store_mod.relOk(rel)) return .bad_path;
+    if (discover.relIsCluster(rel)) return .miss;
     if (!is_have) {
         const rh = proto.headerGet(served, "Range") orelse return .bad_range;
         _ = proto.parseRange(rh) orelse return .bad_range;
@@ -3814,6 +3873,7 @@ fn classifyDataHead(head: []const u8) DataClass {
     const q = proto.queryGet(target, "path") orelse return .bad_path;
     const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
     if (!store_mod.relOk(rel)) return .bad_path;
+    if (discover.relIsCluster(rel)) return .not_found;
     switch (dataKindOf(rel)) {
         .dir, .absent => return .not_found,
         .file48 => {},
@@ -4047,6 +4107,7 @@ const fuzz_data_corpus = [_][]const u8{
     &seed_serve_unterminated,
     &seed_serve_ping_unauthed,
     &seed_serve_unknown_route,
+    &seed_serve_cluster_path,
 };
 
 fn fuzzServeDataOne(fixture: *DataFixture, smith: *std.testing.Smith) anyerror!void {

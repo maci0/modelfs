@@ -1467,6 +1467,14 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
         }
         return 1;
     }
+    // Same control-plane hide FUSE and peer HTTP apply: a pin of `.cluster`
+    // would mark lease files uncullable if they ever landed in the cache.
+    // Gate before ensureLayout so a refused path cannot create cache dirs.
+    if (discover.relIsCluster(rel)) {
+        if (!builtin.is_test)
+            std.debug.print("{s}: refusing cluster control path\n", .{if (on) "pin" else "unpin"});
+        return 1;
+    }
     var dummy_io = std.Io.Threaded.init(gpa, .{});
     defer dummy_io.deinit();
     var store = store_mod.Store.init(gpa, dummy_io.io(), opts.origin orelse "", opts.cache, opts.piece);
@@ -2142,6 +2150,16 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     // after the convenience strip, same exit-1 refusal as an escape.
     try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "/models/", true));
 
+    // `.cluster` is the discovery control plane: FUSE and peer HTTP hide it,
+    // so pin must not mark those names either. Prefix, not substring.
+    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, ".cluster/spark1.json", true));
+    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "/models/.cluster", true));
+    const cluster_pin = try std.fmt.bufPrint(&pbuf, "{s}/pin/.cluster/spark1.json", .{cache_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zb, cluster_pin), &stbuf) != 0);
+    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, ".clusterfoo", true));
+    const clusterfoo_pin = try std.fmt.bufPrint(&pbuf, "{s}/pin/.clusterfoo", .{cache_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zb, clusterfoo_pin), &stbuf) == 0);
+
     // A refused path must not create cache layout.
     {
         var nb: [128]u8 = undefined;
@@ -2149,6 +2167,8 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
         defer sys.deleteTree(std.testing.io, cache2);
         try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache2 }, "../escape.bin", true));
         const pin_dir = try std.fmt.bufPrint(&pbuf, "{s}/pin", .{cache2});
+        try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_dir), &stbuf) != 0);
+        try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache2 }, ".cluster/spark1.json", true));
         try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_dir), &stbuf) != 0);
     }
 

@@ -18,6 +18,8 @@ pub const status_file = "status.json";
 /// Applied to every externally supplied path before it joins a root (FUSE,
 /// peer HTTP, CLI pin); without it a peer request can escape the origin/cache
 /// trees or forge multi-line entries in operator logs via \n in a path.
+/// `.cluster` is a sibling policy (`discover.relIsCluster`), not part of
+/// this gate: a leading-dot component is a legal model name.
 /// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
 /// Unicode line separators, and bidi format controls), the same
 /// discover.printable applies before echoing a lease name. Non-control text

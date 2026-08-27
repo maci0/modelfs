@@ -46,12 +46,12 @@ One piece, one source. Misses block the read until that hole is filled. No full-
 | `192.168.0.100:/export/models` | ZFS NFS export |
 | `/net/192.168.0.100/models` | NFS origin on sparks, **no `fsc`** |
 | `/models` | FUSE (sparks). Empty local dir, uid 1000 |
-| `/var/cache/modelfs` | pieces (`data/` 0600 files under 0700 dirs, `meta/*.pieces`, `pin/`) |
+| `/var/cache/modelfs` | pieces (`data/` 0600 files under 0700 dirs, `meta/*.pieces`, `pin/`, `status.json` 0600) |
 | `:18080` | peer HTTP, bound on all interfaces; non-loopback IPv4 advertised in the lease (127.0.0.1 if none) |
 
 Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run `modelfs` there.
 
-`stat` / `readdir` / `mkdir` / `rmdir` / `chmod` / `statfs` / `unlink` / `rename` → origin. `mkdir` (`Store.mkdirOrigin`) of a path that already exists as a directory is success, so a FUSE retry after a lost reply does not fail `EEXIST`; a non-directory at that name is still `EEXIST`. `rmdir` returns the origin errno as-is. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `create` (`O_TRUNC`) and `truncate` with no live cache entry drop persisted marks via `Store.distrust` for the same reason; a cold `Store.get` whose sidecar geometry does not match the origin size persists that wipe so a restart cannot reload the old marks. `open` / `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`, lookup (`ENOENT`), and mutation (`EPERM`).
+`stat` / `readdir` / `mkdir` / `rmdir` / `chmod` / `statfs` / `unlink` / `rename` → origin. `mkdir` (`Store.mkdirOrigin`) of a path that already exists as a directory is success, so a FUSE retry after a lost reply does not fail `EEXIST`; a non-directory at that name is still `EEXIST`. `rmdir` returns the origin errno as-is. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `create` (`O_TRUNC`) and `truncate` with no live cache entry drop persisted marks via `Store.distrust` for the same reason; a cold `Store.get` whose sidecar geometry does not match the origin size persists that wipe so a restart cannot reload the old marks. `open` / `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`, lookup (`ENOENT`), and mutation (`EPERM`), and from peer `/have`/`/data` (404) and `modelfs pin` (`relIsCluster` in src/discover.zig).
 
 Origin is **required**. It can be any POSIX dir both nodes see, not only NFS. Two-node with no shared store is not implemented. The mountpoint must not overlap the origin or the cache (FUSE reentrancy: origin preads or cache writes under the mount nest through this daemon's own handlers), and the cache must not overlap the origin (piece files would land on the shared store and nodes would stomp each other). Origin data-plane opens (`originPread` / `originPwrite` in src/store.zig) use `O_NOFOLLOW`; chmod and readdir lstat first and return `ELOOP` on a final-component symlink. Weight files on the origin must be regular files (a Hugging Face hub-cache snapshot tree will not serve; see [operations.md](operations.md)).
 
@@ -182,7 +182,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 | 206 | `/data` partial content (`Content-Range`, `application/octet-stream`) |
 | 400 | Missing, empty, undecodable, or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
 | 401 | Missing or wrong bearer token (`WWW-Authenticate: Bearer`), including on non-GET |
-| 404 | Unknown path, or the origin has no regular file at `path` |
+| 404 | Unknown path, a `.cluster` control path, or the origin has no regular file at `path` |
 | 405 | Authenticated request whose method is not GET (`Allow: GET`) |
 | 416 | `/data` range start at/after EOF, with `Content-Range: bytes */<size>` naming the complete length (an over-long end clamps to EOF instead) |
 | 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write) |

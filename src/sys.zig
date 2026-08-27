@@ -396,10 +396,13 @@ pub fn readOnce(fd: c_int, buf: []u8) !usize {
 
 /// Writes data at path; when `durable` is set, fsyncs before close so a
 /// later destructive step keyed to the same name cannot be reordered ahead
-/// of these bytes by delayed allocation across a power loss.
-fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, durable: bool) i32 {
-    const fd = open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | extra_flags, 0o644);
+/// of these bytes by delayed allocation across a power loss. `mode` is the
+/// create mode and is fchmod'd onto the fd: O_CREAT ignores mode when the
+/// name already exists, and umask would otherwise strip bits from a new file.
+fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, durable: bool, mode: c.mode_t) i32 {
+    const fd = open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | extra_flags, mode);
     if (fd < 0) return negErrno();
+    _ = c.fchmod(fd, mode);
     const n = writeAll(fd, data);
     if (n < 0) {
         _ = closeWrite(fd);
@@ -423,22 +426,30 @@ fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, dura
 }
 
 pub fn writeFile(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFull(path, data, 0, false);
+    return writeFileFull(path, data, 0, false, 0o644);
 }
 
-/// writeFile for daemon-owned artifact paths (cache data/meta/pin, lease and
-/// status staging files). O_NOFOLLOW: a local writer who can plant a symlink
+/// writeFile for daemon-owned artifact paths (cache data/meta/pin, lease
+/// staging files). O_NOFOLLOW: a local writer who can plant a symlink
 /// at one of those names must not redirect a truncate-and-write onto an
-/// arbitrary file as the daemon user.
+/// arbitrary file as the daemon user. `status.json` uses writeFileOwnerOnly.
 pub fn writeFileNoFollow(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFull(path, data, c.O_NOFOLLOW, false);
+    return writeFileFull(path, data, c.O_NOFOLLOW, false, 0o644);
 }
 
 /// writeFileNoFollow plus fsync-before-close: for artifact writes whose
 /// durability orders them against a later destructive step on the same key
 /// (the bitfield cleared ahead of a hole punch).
 pub fn writeFileDurable(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFull(path, data, c.O_NOFOLLOW, true);
+    return writeFileFull(path, data, c.O_NOFOLLOW, true, 0o644);
+}
+
+/// writeFileNoFollow at 0600. For cache-root artifacts that sit next to a
+/// world-searchable directory (`status.json`): a local uid that can search
+/// the cache root must not read operational state. Leftover 0644 files are
+/// tightened on the fd that was written, the same leftover-open as cache data.
+pub fn writeFileOwnerOnly(path: [*:0]const u8, data: []const u8) i32 {
+    return writeFileFull(path, data, c.O_NOFOLLOW, false, 0o600);
 }
 
 pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![]u8 {
