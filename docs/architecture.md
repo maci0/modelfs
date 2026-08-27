@@ -227,4 +227,5 @@ Canonical status is [design.md](design.md) sections 2.1 (G1–G10) and 13 (key d
 - Origin-less two-node (no shared dir)
 - Content-addressed dedup / blake3 chunks
 - Full-file background stripe
+- Sparse-file hydrate / FUSE passthrough (the agent stays in the I/O path; `direct_io` is the default)
 - cachefilesd stacked on FUSE (FUSE is not an FS-Cache client)

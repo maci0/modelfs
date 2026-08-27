@@ -2,7 +2,7 @@
 
 | Field | Value |
 |---|---|
-| Status | Sketch. Shipped behavior is [architecture.md](architecture.md) |
+| Status | Historical design. Goals (section 2.1) and decisions (section 13) carry ship status. Shipped behavior is [architecture.md](architecture.md) |
 | Date | 2026-08-27 (goals/decisions/security rows and overview/targets/path notes re-verified against `src/`) |
 | Audience | Implementation |
 
@@ -70,7 +70,7 @@ Status is against the shipped code and [architecture.md](architecture.md) (2026-
 | G3 | Each node that uses a file caches its bytes locally ("cache everything" of the working set). | Partial: pieces cache locally on read; no full-file prefetch. |
 | G4 | Nodes exchange missing pieces with each other, torrent-style, in the background. | Partial: peers serve miss pieces on demand; no background swarm. |
 | G5 | Mount is immediately usable: names and sizes exist before bytes arrive. | Shipped (origin `stat`/`readdir`; no local catalog). |
-| G6 | Optional pin: pinned chunks are never LRU-evicted. | Shipped (path-level pin marker). |
+| G6 | Optional pin: pinned chunks are never LRU-evicted. | Shipped (path-level pin marker; chunk-level pin was G9 and did not ship). |
 | G7 | Ingest on any node (download, `cp`, `modelfs pull`). Replicate back to origin. | Partial: writes are write-through to origin; no `modelfs pull`. |
 | G8 | Two-node mode with no extra store. Replication factor 2. No Redis, no etcd required. | Not shipped (origin required); "no Redis, no etcd" still holds. |
 | G9 | Content-addressed dedup across files and nodes. | Not shipped. |
@@ -104,9 +104,9 @@ JuiceFS, Nydus, Dragonfly, and CVMFS are closer. Section 6 maps them onto these 
 
 ---
 
-## 4. Proposed design
+## 4. Original proposal
 
-Original proposal. It did not ship as written; goal status is section 2.1, decisions are section 13, and current behavior is [architecture.md](architecture.md).
+It did not ship as written; goal status is section 2.1, decisions are section 13, and current behavior is [architecture.md](architecture.md).
 
 ### 4.1 Cache policy: replicate-on-read
 
@@ -746,33 +746,39 @@ Original sketch risks. Passthrough, sqlite, CDC, and `commit=origin`/`rf=2` miti
 
 ## 12. Open questions
 
-1. **Transport:** QUIC one-port vs HTTP/2 for v1? HTTP/2 is easier to debug; QUIC is fewer moving parts at scale. Resolved otherwise: shipped peers speak plain HTTP/1.1 (`GET /ping`, `/have?path=`, `/data?path=` with Range and Bearer PSK) on one TCP port; see [architecture.md](architecture.md).
-2. **Passthrough vs bind-mount** as the default on kernels without FUSE passthrough. Moot: neither shipped; the mount is a FUSE read path and defaults to `direct_io` (section 13, Frontend row).
-3. **Default piece size:** 4 MiB vs 16 MiB on 100 GbE. Resolved: 16 MiB (`--piece` overrides).
-4. **Pin cluster-wide default** for `modelfs pull`, or local-only until the user pins. Open: `modelfs pull` does not exist; pins are local markers today.
-5. **Hub Xet in v1** or dumb HTTP download first. Open: no Hub ingest ships at all.
-6. **k8s in v1** or two systemd units first. Resolved: no Kubernetes; one foreground binary per node under systemd `Type=simple`.
+Still open (v1 product choices, not decisions):
 
-Resolved items were settled by the shipped code, not re-decided here; the rest remain v1 product choices.
+1. **Pin cluster-wide default** for `modelfs pull`, or local-only until the user pins. `modelfs pull` does not exist; pins are local markers today.
+2. **Hub Xet in v1** or dumb HTTP download first. No Hub ingest ships at all.
+
+Resolved by the shipped code and recorded in section 13 (not re-decided here):
+
+- **Transport** (QUIC vs HTTP/2): section 13 Transport.
+- **Passthrough vs bind-mount**: section 13 Frontend.
+- **Default piece size** (4 vs 16 MiB): section 13 v1 chunking.
+- **k8s in v1** vs systemd: section 13 Kubernetes.
 
 ---
 
 ## 13. Key decisions
 
+Status values: **Accepted** (still in force), **Partial** (part shipped), **Superseded** (replaced; the cell names what replaced it), **Not shipped** (never implemented). What runs is [architecture.md](architecture.md).
+
 | Decision | Choice | Why | Status (2026-08-27) |
 |---|---|---|---|
-| Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partly: POSIX piece cache shipped; no content-addressed store (path-keyed) |
-| Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Holds |
-| Frontend | Sparse-file hydrate, then leave the I/O path | mmap for llama.cpp / vLLM | Not shipped: FUSE read path with `direct_io`; agent stays in the I/O path |
-| Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partly: fixed 16 MiB transfer pieces; chunks/CDC absent |
+| Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partial: POSIX piece cache shipped; no content-addressed store (path-keyed) |
+| Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Accepted |
+| Frontend | Sparse-file hydrate, then leave the I/O path | mmap for llama.cpp / vLLM | Superseded: FUSE read path with `direct_io`; agent stays in the I/O path (UMA OOM; reverses section 4.8 rule 6) |
+| Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partial: fixed 16 MiB transfer pieces; chunks/CDC absent |
 | Hash | blake3 | Fast, enough collision resistance for this | Not shipped |
-| Two-node | Embedded metadata, RF=2 | No extra store | Not shipped: leases on a required origin |
+| Two-node | Embedded metadata, RF=2 | No extra store | Not shipped (origin-less RF=2). Membership is origin `.cluster/<id>.json` leases (see Origin) |
 | Origin | Optional peer that never evicts | Same protocol | Superseded: origin is required (POSIX dir); "never evicts" holds |
-| Engines | POSIX directory | No plugins | Holds |
+| Transport | QUIC or HTTP/2 Have/Want/Piece | One port; inspectable | Superseded: plaintext HTTP/1.1 `GET /ping`, `/have`, `/data` (see architecture.md) |
+| Auth | static shared secret or mTLS | No anonymous P2P | Partial: bearer PSK on plaintext HTTP; mTLS did not ship (section 9) |
+| Engines | POSIX directory | No plugins | Accepted |
 | v1 language | Go | Protocol/state bound, not CPU bound | Superseded: Zig |
-| v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 16 MiB pieces, no chunking |
-
-Superseded and not-shipped rows defer to [architecture.md](architecture.md), which is authoritative for what runs: plain HTTP peer protocol (`GET /ping`, `/have`, `/data`) instead of Have/Want/Piece frames, `.cluster/<id>.json` lease membership instead of an embedded store.
+| v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 16 MiB pieces (`--piece` overrides); no chunking |
+| Kubernetes | Not required for v1 | Two-node first | Accepted: no Kubernetes; one foreground binary, systemd `Type=simple` |
 
 ---
 
