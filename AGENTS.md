@@ -10,7 +10,7 @@ this file holds what is specific to this tree.
 | Path | Contents |
 |---|---|
 | `src/*.zig` | The daemon. Tests live beside the code they cover; `root.zig` aggregates them into the test binary |
-| `src/c.h`, `src/c.zig` | The only door to libfuse3 and libc. `build.zig` translates the header once into a module that `src/c.zig` re-exports; every module reaches libc only through it |
+| `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once; import via `c.zig` / `sys.c`, never `@cImport` |
 | `scripts/` | Gates and harnesses. `lib.sh` is sourced by every shell script for `ROOT_DIR`, `SCRIPTS_DIR`, `SCRATCH_DIR` |
 | `docs/` | `README.md` indexes them. `architecture.md` is authoritative for shipped behavior |
 | `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files plus provenance. `build.zig` verifies both sha256 digests before compiling |
@@ -18,15 +18,15 @@ this file holds what is specific to this tree.
 ## Gates
 
 `./scripts/check.sh` is the blocking gate: `zig fmt --check`, `zig build test`,
-shellcheck with the extra option set the script names, the restore-drill stub
-suite (`test_dr_restore_drill.sh`), ruff check, ruff format, mypy. CI runs the
-same script plus a cross-aarch64 compile and the reproducibility rebuild.
-Never loosen a rule to pass it.
+shellcheck (`-o` extras on `scripts/*.sh`), `test_dr_restore_drill.sh`,
+`ruff check`, `ruff format --check`, mypy. CI runs that plus the aarch64
+cross-compile and the reproducibility rebuild. Never loosen a rule to pass it.
 
-The end-to-end suites need `/dev/fuse` and a `fusermount` helper, so they run
-locally rather than in CI: `run_e2e_tests.sh`, `run_cluster_e2e_9nodes.sh`,
-`test_fault_tolerance.sh`. `dr_restore_drill.sh` runs on the NAS;
-`test_dr_restore_drill.sh` is the CI stand-in (stub `zfs`).
+`run_cluster_e2e_9nodes.sh` needs `/dev/fuse` and `fusermount3`, so it runs
+locally rather than in CI. `run_e2e_tests.sh` is CLI/protocol only (no FUSE).
+`test_fault_tolerance.sh` needs a live peer or skips loudly.
+`dr_restore_drill.sh` runs on the NAS; `test_dr_restore_drill.sh` is the CI
+stand-in (stub `zfs`).
 
 ## Constraints
 
@@ -34,8 +34,10 @@ locally rather than in CI: `run_e2e_tests.sh`, `run_cluster_e2e_9nodes.sh`,
   world-readable through `/proc/<pid>/cmdline`.
 - **Run artifacts go to `.scratch/`**, never `/tmp`: it is tmpfs here, and a
   piece cache written there is charged to RAM.
+- **Harness knobs use `MF_`, never `MODELFS_`.** The daemon refuses unknown
+  `MODELFS_*` as typo'd knobs.
 - **Every peer input is untrusted.** Request heads, lease JSON, and encoded
-  paths pass a fuzzed parser and `relOk` before touching origin or cache.
+  paths have fuzzed parsers; paths also pass `relOk` before origin or cache.
 - **No hot-path allocation.** Piece hydration and request parsing use stack
   buffers or one reusable piece-sized buffer; allocating functions take an
   explicit `gpa`.
