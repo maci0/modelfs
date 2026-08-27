@@ -182,6 +182,12 @@ pub const Store = struct {
     /// read the origin (FUSE default_permissions) cannot read the cache copy.
     const cache_data_mode: c.mode_t = 0o600;
 
+    /// Owner-only directories under the cache root (`data/`, `meta/`, `pin/`
+    /// and every nested parent). 0755 would let a local user blocked by
+    /// origin modes and FUSE `default_permissions` list which weights are
+    /// cached or pinned.
+    const cache_dir_mode: c.mode_t = 0o700;
+
     gpa: std.mem.Allocator,
     io: std.Io,
     origin: []const u8,
@@ -355,7 +361,7 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
             const p = self.cacheSubPath(&buf, sub, "") catch return -sys.c.ENAMETOOLONG;
-            if (sys.mkdirAll(std.mem.span(p), 0o700) != 0) return sys.negErrno();
+            if (sys.mkdirAll(std.mem.span(p), cache_dir_mode) != 0) return sys.negErrno();
         }
         return 0;
     }
@@ -384,7 +390,7 @@ pub const Store = struct {
         const p = self.cachePinPath(&buf, rel) catch return -c.ENAMETOOLONG;
         if (on) {
             const parent = sys.parentOf(std.mem.span(p));
-            _ = sys.mkdirAll(parent, 0o755);
+            _ = sys.mkdirAll(parent, cache_dir_mode);
             return sys.writeFileNoFollow(p, "");
         }
         if (c.unlink(p) != 0) {
@@ -590,7 +596,7 @@ pub const Store = struct {
         else
             sys.writeFileNoFollow(path_z, data);
         if (w != -c.ENOENT) return w;
-        _ = sys.mkdirAll(sys.parentOf(std.mem.span(path_z)), 0o755);
+        _ = sys.mkdirAll(sys.parentOf(std.mem.span(path_z)), cache_dir_mode);
         return if (durable)
             sys.writeFileDurable(path_z, data)
         else
@@ -1329,7 +1335,7 @@ pub const Store = struct {
         // reopen after the reaper closed the fd pays no mkdir walk.
         var fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, cache_data_mode);
         if (fd < 0 and sys.errno() == c.ENOENT) {
-            _ = sys.mkdirAll(parent, 0o700);
+            _ = sys.mkdirAll(parent, cache_dir_mode);
             fd = sys.open(p, c.O_RDWR | c.O_CREAT | c.O_NOFOLLOW, cache_data_mode);
         }
         if (fd < 0) return sys.negErrno();
@@ -1485,7 +1491,14 @@ pub const Store = struct {
         defer _ = c.closedir(dir);
         while (c.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
-            if (name.len == 0 or name[0] == '.') continue;
+            // Skip the directory's own `.` / `..` only. relOk allows a
+            // leading-dot component (`.hidden.gguf`, `dir/.cache/w.bin`),
+            // and those files occupy cache blocks like any other: treating
+            // every `.*` name as non-cache would leave them invisible to
+            // disk culling after a restart, filling the cache fs past the
+            // watermarks. Lease walks skip every leading-dot name because
+            // validId refuses those ids; this tree is user paths.
+            if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             var child: [sys.c.PATH_MAX]u8 = undefined;
             const cp = sys.joinZ(&child, dir_path, name) catch continue;
             var st: c.struct_stat = undefined;
@@ -3876,6 +3889,49 @@ test "walkData never samples or descends planted symlinks" {
     try std.testing.expect(saw_real and saw_hidden);
 }
 
+test "walkData samples dot-prefixed cache files that relOk allows" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-walk-dot");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, "/unused", cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // relOk admits a leading-dot component; skipping every `.*` readdir
+    // name (the `.` / `..` filter written as name[0]=='.') left those
+    // cache files invisible to disk culling after a restart.
+    try std.testing.expect(relOk(".hidden.bin"));
+    try std.testing.expect(relOk("dir/.cache.bin"));
+    const entries = [_][]const u8{ "plain.bin", ".hidden.bin", "dir/.cache.bin" };
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    for (entries) |e| {
+        var fb: [320]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&fb, "{s}/data/{s}", .{ cache_d, e });
+        try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(sys.parentOf(fp), 0o700));
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "cached"));
+    }
+
+    var rb: [sys.c.PATH_MAX]u8 = undefined;
+    const root = try sys.joinZ(&rb, cache_d, "data");
+    var victims: [Store.walk_sample_cap]Store.DiskVictim = undefined;
+    var count: usize = 0;
+    st.walkData(std.mem.span(root), "", &victims, &count, 0);
+
+    try std.testing.expectEqual(@as(usize, 3), count);
+    var saw_plain = false;
+    var saw_dotfile = false;
+    var saw_dotdir = false;
+    for (victims[0..count]) |v| {
+        const got = v.rel[0..v.len];
+        if (std.mem.eql(u8, got, "plain.bin")) saw_plain = true;
+        if (std.mem.eql(u8, got, ".hidden.bin")) saw_dotfile = true;
+        if (std.mem.eql(u8, got, "dir/.cache.bin")) saw_dotdir = true;
+    }
+    try std.testing.expect(saw_plain and saw_dotfile and saw_dotdir);
+}
+
 test "get survives concurrent artifact invalidation between loadBits and insert" {
     // Regression harness for the purge_epoch contract: a get() builder whose
     // sidecar read raced a forget/reap-punch must retry instead of publishing
@@ -4240,6 +4296,25 @@ test "openCache creates owner-only data files and tightens leftovers" {
     try std.testing.expect(st.openCache(f) >= 0);
     try std.testing.expectEqual(@as(i32, 0), sys.statPath(path, &stbuf));
     try std.testing.expectEqual(@as(c.mode_t, 0o600), stbuf.st_mode & 0o777);
+
+    // Nested parents under data/meta/pin must be 0700 too: a 0755 `pin/gguf`
+    // or `meta/gguf` would list which nested weights are cached/pinned even
+    // when the files themselves are 0600. openCache already used 0700 for
+    // data/; pin and sidecar saves used to mkdirAll 0755.
+    const nested = try st.get("gguf/w.bin", 32, sys.monoSec(std.testing.io));
+    defer st.releaseFile(nested);
+    try std.testing.expect(st.openCache(nested) >= 0);
+    const data_sub = try st.cacheSubPath(&db, "data", "gguf");
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(data_sub, &dst));
+    try std.testing.expectEqual(@as(c.mode_t, 0o700), dst.st_mode & 0o777);
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("gguf/w.bin", true));
+    const pin_sub = try st.cacheSubPath(&db, "pin", "gguf");
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(pin_sub, &dst));
+    try std.testing.expectEqual(@as(c.mode_t, 0o700), dst.st_mode & 0o777);
+    try std.testing.expect(st.copyIntoCache(nested, 0, &[_]u8{0} ** 32));
+    const meta_sub = try st.cacheSubPath(&db, "meta", "gguf");
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(meta_sub, &dst));
+    try std.testing.expectEqual(@as(c.mode_t, 0o700), dst.st_mode & 0o777);
 }
 
 test "loadBits refuses a symlink planted at the sidecar path" {

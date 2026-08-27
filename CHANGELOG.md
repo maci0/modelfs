@@ -29,6 +29,9 @@ below.
 
 ### Changes
 
+- **Disk culling visits cache files whose names start with a dot**: `walkData` skipped every readdir name with a leading `.`, which hid `.` and `..` but also `.hidden.gguf` and `dir/.cache/w.bin` -- paths `relOk` admits. After a restart those files never became disk-cull victims, so they filled the cache filesystem past the watermarks. Only `.` and `..` are skipped now.
+- **Nested `pin/` and `meta/` directories are owner-only (0700)**: `data/` nested parents already used 0700, but `setPin` and sidecar saves created `pin/gguf` and `meta/gguf` as 0755, so a local user blocked by origin modes could list which nested weights were pinned or cached. All cache-tree mkdirs share `cache_dir_mode`.
+
 - **`/have` probes one address walk per peer, not every path**: architecture.md's miss sequence said GET /have went to all paths. `probeCandidates` walks one best-first address list per `peer id` (a dead preferred NIC falls through to that node's remaining interfaces) and `pickBest` breaks score ties by ip then port so lease `getifaddrs` order cannot pick the winner. `modelfs help` states that a defaulted `--advertise` port follows `--listen`.
 - **`./scripts/check.sh` includes the restore-drill stub and the SBOM check**: README's Tests comment and the script's `--help` summary omitted them while CONTRIBUTING and the script body already ran both.
 - **Peer reply status codes are exactly three digits, and a 206 body's length must match its Content-Range**: prefix matching `"HTTP/1.1 200"` also accepted `2000` and `200OK`, and `4040` counted as a healthy `/have` miss. The fetch client now requires RFC 9110 `3DIGIT` after `HTTP/1.1`, treats an advertised `X-Piece-Size: 0` as a bad grid (absence is still unknown), and refuses a 206 whose `Content-Length` disagrees with the selected Content-Range window so a short body cannot be marked filled under the requested piece bounds.
