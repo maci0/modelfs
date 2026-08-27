@@ -102,6 +102,21 @@ pub fn parseU64Fast(s: []const u8) ?u64 {
     return n;
 }
 
+/// True when `status_line` is HTTP/1.1 with this 3-digit status code.
+/// RFC 9110 `status-code` is `3DIGIT`; a prefix match on `"HTTP/1.1 200"`
+/// would also accept `2000` and `200OK`. A missing reason-phrase is allowed
+/// (`HTTP/1.1 200`); anything other than end-of-line or SP after the code
+/// is not.
+pub fn httpStatusIs(status_line: []const u8, code: u16) bool {
+    const p = "HTTP/1.1 ";
+    if (!std.mem.startsWith(u8, status_line, p)) return false;
+    const rest = status_line[p.len..];
+    if (rest.len < 3) return false;
+    if (rest.len > 3 and rest[3] != ' ') return false;
+    const n = parseU64Fast(rest[0..3]) orelse return false;
+    return n == @as(u64, code);
+}
+
 /// Parses an HTTP Range header value ("bytes=start-end"). End is inclusive.
 /// An open-ended form ("bytes=start-") names everything through EOF; the
 /// server clamps the end like any over-long explicit end.
@@ -192,6 +207,7 @@ pub fn containsControl(s: []const u8) bool {
 /// A successful /have answer: the peer's cached-piece bitmap plus the piece
 /// size its bits are indexed against. piece_size 0 means the peer did not
 /// advertise one (an older build); consumers assume alignment for those.
+/// A present X-Piece-Size of 0 is rejected at parse, not stored here.
 pub const HaveBits = struct {
     bits: []u8,
     piece_size: u32,
@@ -340,6 +356,18 @@ test "range and query" {
     try std.testing.expect(parseU64Fast("16Mi") == null);
     try std.testing.expect(parseU64Fast("-1") == null);
     try std.testing.expect(parseU64Fast(" 16") == null);
+
+    try std.testing.expect(httpStatusIs("HTTP/1.1 200 OK", 200));
+    try std.testing.expect(httpStatusIs("HTTP/1.1 206 Partial Content", 206));
+    try std.testing.expect(httpStatusIs("HTTP/1.1 404 Not Found", 404));
+    try std.testing.expect(httpStatusIs("HTTP/1.1 200", 200));
+    try std.testing.expect(httpStatusIs("HTTP/1.1 200 ", 200));
+    try std.testing.expect(!httpStatusIs("HTTP/1.1 2000", 200));
+    try std.testing.expect(!httpStatusIs("HTTP/1.1 200OK", 200));
+    try std.testing.expect(!httpStatusIs("HTTP/1.1 4040", 404));
+    try std.testing.expect(!httpStatusIs("HTTP/1.0 200 OK", 200));
+    try std.testing.expect(!httpStatusIs("HTTP/1.1 20", 200));
+    try std.testing.expect(!httpStatusIs("HTTP/1.1 206", 200));
 
     const cr = parseContentRange("bytes 16-31/48").?;
     try std.testing.expectEqual(@as(u64, 16), cr.start);

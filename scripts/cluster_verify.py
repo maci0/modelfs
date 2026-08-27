@@ -85,17 +85,23 @@ def main(argv: list[str]) -> int:
         have_url = f"http://127.0.0.1:{port}/have?path={path_enc}"
         have_req = urllib.request.Request(have_url, headers=headers)
         with peer_ping.open_http(have_req, timeout=30) as resp:
+            # Current peers advertise the grid the bitmap is indexed against.
+            # A missing or zero value is the mixed-grid footgun X-Piece-Size
+            # exists to close; this verifier talks to a same-version cluster.
+            ps = resp.headers.get("X-Piece-Size")
             bits = resp.read()
             # /have body is the raw cache bitfield: one bit per piece, packed
             # (nbits+7)//8 bytes. A non-empty but short blob would still look
             # like a pass under a mere len>0 check, then hide missing pieces.
             want_len = (total_pieces + 7) // 8
-            if len(bits) != want_len:
-                print(
-                    f"Node {target_node} bitfield length {len(bits)} != {want_len} "
-                    f"for {total_pieces} pieces",
-                    file=sys.stderr,
+            ps_ok = ps is not None and ps.isascii() and ps.isdigit() and int(ps) != 0
+            if not ps_ok or len(bits) != want_len:
+                why = (
+                    f"X-Piece-Size {ps!r}"
+                    if not ps_ok
+                    else f"bitfield length {len(bits)} != {want_len} for {total_pieces} pieces"
                 )
+                print(f"Node {target_node} /have {why}", file=sys.stderr)
                 return 1
 
     t1 = time.monotonic()

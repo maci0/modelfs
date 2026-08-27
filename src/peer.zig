@@ -764,9 +764,10 @@ fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) 
 /// pieces of the SERVER's --piece grid, so without the size on the wire a
 /// fleet running mixed piece sizes silently misreads every answer -- bit i
 /// covers different byte ranges per node. Absent header (an older peer)
-/// reads as 0, meaning unknown; consumers assume alignment for those. A
-/// malformed header fails the probe like any other bad reply so failures
-/// stay uncached and retried.
+/// reads as 0, meaning unknown; consumers assume alignment for those. An
+/// advertised 0 is not unknown: no legal --piece is zero, so it fails the
+/// probe like any other malformed grid. A malformed header fails the probe
+/// like any other bad reply so failures stay uncached and retried.
 fn fetchHave(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !proto.HaveBits {
     const fd = try sendRequest(io, psk, ip, port, rel, null);
     defer sys.close(fd);
@@ -787,18 +788,25 @@ fn haveFromHead(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf
 fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, deadline_ms: ?i64) !proto.HaveBits {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
-    if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 200")) {
+    const status_line = head[0..status_end];
+    if (!proto.httpStatusIs(status_line, 200)) {
         // A 404 is a healthy peer answering "not cached here" -- the normal
         // shape of a fleet where replicas differ. It gets its own error so
         // the probe-failure counter can exclude it and stay meaningful;
         // everything else (auth rejected, peer broken, malformed reply)
         // means this node cannot actually talk to the cluster.
-        if (std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 404")) return error.PeerMiss;
+        if (proto.httpStatusIs(status_line, 404)) return error.PeerMiss;
         return error.HttpStatus;
     }
-    const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
-    const piece_size_n = proto.parseU64Fast(ps_str) orelse return error.BadPieceSize;
-    const piece_size = std.math.cast(u32, piece_size_n) orelse return error.BadPieceSize;
+    // Absent X-Piece-Size (an older peer) is unknown (0) and assumed
+    // aligned. An advertised 0 is not absence: no legal --piece is zero,
+    // so it is malformed like any other bad grid.
+    const piece_size: u32 = if (proto.headerGet(head, "X-Piece-Size")) |ps_str| blk: {
+        const piece_size_n = proto.parseU64Fast(ps_str) orelse return error.BadPieceSize;
+        const ps = std.math.cast(u32, piece_size_n) orelse return error.BadPieceSize;
+        if (ps == 0) return error.BadPieceSize;
+        break :blk ps;
+    } else 0;
     // Refuse absurd bitmaps before the allocation instead of letting
     // finishBodyAlloc honor them up to max_alloc_body_bytes (see
     // max_have_body_bytes). A missing header reads as length 0, matching the
@@ -857,10 +865,18 @@ fn fetchRangeInto(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []con
 fn checkRangeReply(head: []const u8, start: u64, end: u64) !void {
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
-    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 206")) return error.HttpStatus;
+    if (!proto.httpStatusIs(status_line, 206)) return error.HttpStatus;
     const cr = proto.headerGet(head, "Content-Range") orelse return error.MissingContentRange;
     const r = proto.parseContentRange(cr) orelse return error.BadContentRange;
     if (r.start != start or r.end < start or r.end > end) return error.RangeMismatch;
+    // Content-Length is the body the caller will accept; Content-Range is
+    // the window those bytes claim to cover. A mismatch would mark a
+    // shorter (or longer) body filled under the requested piece bounds.
+    // Absent length keeps the same 0 reading finishBodyAlloc uses.
+    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
+    const cl = proto.parseU64Fast(cl_str) orelse return error.BadContentLength;
+    const want = r.end -| r.start +| 1;
+    if (cl != want) return error.LengthMismatch;
 }
 
 fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, start: u64, end: u64, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
@@ -942,9 +958,7 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
-    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 200") and
-        !std.mem.startsWith(u8, status_line, "HTTP/1.1 206"))
-    {
+    if (!proto.httpStatusIs(status_line, 200) and !proto.httpStatusIs(status_line, 206)) {
         return error.HttpStatus;
     }
 
@@ -1395,6 +1409,13 @@ test "readFlexBodyAlloc rejects hostile responses" {
         defer sys.close(pair[1]);
         try std.testing.expectError(error.HttpStatus, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
     }
+    // A four-digit status sharing the 200 prefix is not success.
+    {
+        const pair = try responsePair("HTTP/1.1 2000 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nz");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.HttpStatus, readFlexBodyAlloc(gpa, std.testing.io, pair[1], null));
+    }
     // Content-Length above the 512MiB cap is refused before any allocation.
     {
         const pair = try responsePair("HTTP/1.1 200 OK\r\nContent-Length: 536870913\r\nConnection: close\r\n\r\n");
@@ -1475,6 +1496,22 @@ test "range fetch binds the 206 body to the requested Content-Range" {
         const body = try readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 0, 999, null, null);
         defer gpa.free(body);
         try std.testing.expectEqualStrings("ABCDEFGH", body);
+    }
+    // Content-Range and Content-Length must name the same selected size:
+    // a 4-byte body under an 8-byte window would be marked filled as the
+    // requested piece.
+    {
+        const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/8\r\nContent-Length: 4\r\nConnection: close\r\n\r\nABCD");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.LengthMismatch, readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 0, 7, null, null));
+    }
+    // A four-digit status is not 206, even when it shares the "206" prefix.
+    {
+        const pair = try responsePair("HTTP/1.1 2060\r\nContent-Range: bytes 0-7/8\r\nContent-Length: 8\r\nConnection: close\r\n\r\nABCDEFGH");
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.HttpStatus, readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 0, 7, null, null));
     }
 }
 
@@ -2297,6 +2334,30 @@ test "fetchHave surfaces the advertised piece size and rejects malformed ones" {
         defer sys.close(pair[1]);
         try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
     }
+    // An advertised 0 is not "unknown": unknown is the header missing.
+    // --piece 0 is refused at mount, so 0 on the wire is a bad grid.
+    {
+        const head = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: 0\r\nConnection: close\r\n\r\nz";
+        const pair = try responsePair(head);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.BadPieceSize, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
+    }
+    // Prefix match would treat 2000 as 200 and 4040 as a healthy miss.
+    {
+        const head = "HTTP/1.1 2000 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nz";
+        const pair = try responsePair(head);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.HttpStatus, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
+    }
+    {
+        const head = "HTTP/1.1 4040 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        const pair = try responsePair(head);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        try std.testing.expectError(error.HttpStatus, haveFromHead(gpa, std.testing.io, pair[1], head, head.len, head.len));
+    }
 }
 
 test "haveFromHead refuses a bitmap above the /have body bound before allocating" {
@@ -3037,6 +3098,10 @@ const seed_reply_206_cr_eq = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nC
 const seed_reply_plus_cl = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: +3\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nabc");
 const seed_reply_underscore_cl = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1_0\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\n0123456789");
 const seed_reply_plus_ps = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: +16\r\nConnection: close\r\n\r\nz");
+const seed_reply_zero_ps = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: 0\r\nConnection: close\r\n\r\nz");
+const seed_reply_status_2000 = fuzzcorpus.entry("HTTP/1.1 2000 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nz");
+const seed_reply_status_4040 = fuzzcorpus.entry("HTTP/1.1 4040 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+const seed_reply_206_cl_mismatch = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-7/8\r\nConnection: close\r\n\r\nABCD");
 
 const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_ok,
@@ -3055,6 +3120,10 @@ const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_plus_cl,
     &seed_reply_underscore_cl,
     &seed_reply_plus_ps,
+    &seed_reply_zero_ps,
+    &seed_reply_status_2000,
+    &seed_reply_status_4040,
+    &seed_reply_206_cl_mismatch,
 };
 
 /// Connected socketpair with `wire` already written into fds[0]: a
@@ -3075,12 +3144,31 @@ fn refDigitsU64(s: []const u8) ?u64 {
     return std.fmt.parseInt(u64, s, 10) catch null;
 }
 
-/// Independent restatement of checkRangeReply: 206 required, first
-/// Content-Range header parsed with parseInt (not parseU64Fast), start must
-/// equal the request, advertised end must sit in [start, request end].
+/// Independent restatement of httpStatusIs: "HTTP/1.1" SP 3DIGIT, then
+/// end-of-line or SP. Digit math instead of parseU64Fast so a corrupted
+/// 3-digit slice cannot self-confirm.
+fn refHttpStatusIs(status_line: []const u8, code: u16) bool {
+    const tag = "HTTP/1.1 ";
+    if (status_line.len < tag.len + 3) return false;
+    if (!std.mem.eql(u8, status_line[0..tag.len], tag)) return false;
+    const d0 = status_line[tag.len];
+    const d1 = status_line[tag.len + 1];
+    const d2 = status_line[tag.len + 2];
+    if (d0 < '0' or d0 > '9' or d1 < '0' or d1 > '9' or d2 < '0' or d2 > '9') return false;
+    const n: u16 = (@as(u16, d0 - '0') * 100) + (@as(u16, d1 - '0') * 10) + (d2 - '0');
+    if (n != code) return false;
+    if (status_line.len == tag.len + 3) return true;
+    return status_line[tag.len + 3] == ' ';
+}
+
+/// Independent restatement of checkRangeReply: 206 required (exactly 3
+/// digits), first Content-Range header parsed with digit-only integers,
+/// start must equal the request, advertised end must sit in [start, request
+/// end], and Content-Length (missing reads as 0) must equal the selected
+/// window size.
 fn refCheckRangeReply(head: []const u8, start: u64, end: u64) !void {
     const status_end = std.mem.indexOf(u8, head, "\r\n") orelse return error.BadHttp;
-    if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 206")) return error.HttpStatus;
+    if (!refHttpStatusIs(head[0..status_end], 206)) return error.HttpStatus;
     const cr = blk: {
         var pos: usize = status_end + 2;
         while (pos <= head.len) {
@@ -3114,6 +3202,26 @@ fn refCheckRangeReply(head: []const u8, start: u64, end: u64) !void {
         _ = refDigitsU64(complete_s) orelse return error.BadContentRange;
     }
     if (a != start or b < start or b > end) return error.RangeMismatch;
+    const cl_str = blk: {
+        var pos: usize = status_end + 2;
+        while (pos <= head.len) {
+            const rel_end = std.mem.indexOf(u8, head[pos..], "\r\n") orelse head.len - pos;
+            const line = head[pos .. pos + rel_end];
+            if (line.len == 0) break;
+            if (std.mem.findScalar(u8, line, ':')) |colon| {
+                if (colon == "Content-Length".len and std.ascii.eqlIgnoreCase(line[0..colon], "Content-Length")) {
+                    var v = line[colon + 1 ..];
+                    while (v.len > 0 and (v[0] == ' ' or v[0] == '\t')) v = v[1..];
+                    while (v.len > 0 and (v[v.len - 1] == ' ' or v[v.len - 1] == '\t')) v = v[0 .. v.len - 1];
+                    break :blk v;
+                }
+            }
+            pos += rel_end + 2;
+        }
+        break :blk "0";
+    };
+    const cl = refDigitsU64(cl_str) orelse return error.BadContentLength;
+    if (cl != b -| a +| 1) return error.LengthMismatch;
 }
 
 fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
@@ -3177,8 +3285,8 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                     }
                 }
                 const status_end = std.mem.find(u8, dest_head, "\r\n") orelse return;
-                const status_ok = std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 200") or
-                    std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 206");
+                const status_ok = proto.httpStatusIs(dest_head[0..status_end], 200) or
+                    proto.httpStatusIs(dest_head[0..status_end], 206);
                 const dest_cl_str = proto.headerGet(dest_head, "Content-Length") orelse "0";
                 const dest_want: ?usize = if (proto.parseU64Fast(dest_cl_str)) |n| std.math.cast(usize, n) else null;
 
