@@ -954,13 +954,16 @@ const ProbeCtx = struct {
     gpa: std.mem.Allocator,
     psk: []const u8,
     rel: []const u8,
+    idx: u32,
+    local_piece_size: u32,
     paths: []const discover.Path,
     /// Per unique peer id: indexes into paths, ordered best-first by the
     /// lease priors (discover.pathScore over ewma/hops).
     groups: []const []const usize,
     /// Group indexes that still need a probe (the rest came from cache).
     todo: []const usize,
-    slots: []?discover.HaveBits,
+    /// Per group: null = no answer, else whether that node has piece idx.
+    slots: []?bool,
     cat: *discover.Catalog,
     stats: ?*store_mod.Stats = null,
     /// The fill's one edge instant (see probeSlots): fresh answers are put
@@ -994,26 +997,30 @@ fn probeWorker(ctx: *ProbeCtx) void {
                 }
                 continue;
             };
-            ctx.slots[gi] = rep;
+            defer ctx.gpa.free(rep.bits);
             ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size, ctx.now_ms);
+            ctx.slots[gi] = rep.hasPiece(ctx.idx, ctx.local_piece_size);
             break;
         }
     }
 }
 
-/// Fills slots[] with one /have bitmap per peer group: groups answered by the
-/// recent-probe cache skip the wire entirely; the rest are probed
-/// concurrently (a serial probe would pay one full connect+request+response
-/// round trip per peer before any piece data moves), walking each group's
-/// addresses best-first until one answers. slots must be all-null.
+/// Fills slots[] with whether each peer group has piece idx: groups answered
+/// by the recent-probe cache skip the wire entirely (haveHas tests the one
+/// bit in place, no bitmap copy); the rest are probed concurrently (a serial
+/// probe would pay one full connect+request+response round trip per peer
+/// before any piece data moves), walking each group's addresses best-first
+/// until one answers. slots must be all-null.
 fn probeSlots(
     gpa: std.mem.Allocator,
     psk: []const u8,
     cat: *discover.Catalog,
     rel: []const u8,
+    idx: u32,
+    local_piece_size: u32,
     paths: []const discover.Path,
     groups: []const []const usize,
-    slots: []?discover.HaveBits,
+    slots: []?bool,
     stats: ?*store_mod.Stats,
 ) !void {
     var todo: std.ArrayList(usize) = .empty;
@@ -1027,8 +1034,8 @@ fn probeSlots(
         var answered = false;
         for (g) |pi| {
             const p = paths[pi];
-            if (cat.haveGet(gpa, rel, p.ip, p.port, now_ms)) |cached| {
-                slots[gi] = cached;
+            if (cat.haveHas(rel, p.ip, p.port, idx, local_piece_size, now_ms)) |has| {
+                slots[gi] = has;
                 answered = true;
                 break;
             }
@@ -1041,6 +1048,8 @@ fn probeSlots(
         .gpa = gpa,
         .psk = psk,
         .rel = rel,
+        .idx = idx,
+        .local_piece_size = local_piece_size,
         .paths = paths,
         .groups = groups,
         .todo = todo.items,
@@ -1142,16 +1151,13 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
         try group_of.put(paths[g[0]].peer_id, gi);
     }
 
-    const slots = try gpa.alloc(?discover.HaveBits, groups.len);
-    defer {
-        for (slots) |s| if (s) |rep| gpa.free(rep.bits);
-        gpa.free(slots);
-    }
+    const slots = try gpa.alloc(?bool, groups.len);
+    defer gpa.free(slots);
     @memset(slots, null);
 
     // One concurrent best-first probe per unique peer id, so a sequential
     // fill of one file probes once per peer per TTL instead of once per piece.
-    try probeSlots(gpa, psk, cat, rel, paths, groups, slots, stats);
+    try probeSlots(gpa, psk, cat, rel, idx, local_piece_size, paths, groups, slots, stats);
 
     var cands: std.ArrayList(discover.PathCand) = .empty;
     errdefer {
@@ -1161,18 +1167,7 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
     for (paths) |p| {
         var has = false;
         if (group_of.get(p.peer_id)) |gi| {
-            if (slots[gi]) |rep| {
-                // A bitmap's bit i names pieces of the answering peer's
-                // --piece grid. Only an answer indexed against our own grid
-                // can route a fill; a mismatched one is treated as no
-                // answer (the fetch falls through to the next peer, then
-                // origin) instead of reading bits that cover different
-                // byte ranges than ours. piece_size 0 means the peer did
-                // not advertise one: assume alignment for compatibility.
-                if (rep.piece_size == 0 or rep.piece_size == local_piece_size) {
-                    has = idx / 8 < rep.bits.len and (rep.bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
-                }
-            }
+            if (slots[gi]) |has_piece| has = has_piece;
         }
         const ip_copy = try gpa.dupe(u8, p.ip);
         errdefer gpa.free(ip_copy);

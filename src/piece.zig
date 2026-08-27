@@ -191,19 +191,32 @@ pub const Bitfield = struct {
         return null;
     }
 
+    pub fn encodedLen(self: Bitfield) usize {
+        return magic.len + 12 + self.bytes.len;
+    }
+
+    /// Writes the sidecar into `out` without allocating. saveBits uses this
+    /// against a stack buffer so a piece fill does not heap-allocate a
+    /// copy of bits it already holds.
+    pub fn encodeTo(self: Bitfield, piece_size: u32, file_size: u64, out: []u8) ![]u8 {
+        const need = self.encodedLen();
+        if (out.len < need) return error.NoSpaceLeft;
+        @memcpy(out[0..4], magic);
+        std.mem.writeInt(u32, out[4..8], piece_size, .little);
+        std.mem.writeInt(u64, out[8..16], file_size, .little);
+        @memcpy(out[16..][0..self.bytes.len], self.bytes);
+        return out[0..need];
+    }
+
     pub fn encode(self: Bitfield, piece_size: u32, file_size: u64, out: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
         // Exact size up front: saves run per piece fill and per punch, and an
         // empty-list append chain would otherwise realloc-copy the growing
         // blob several times per save.
-        try out.ensureTotalCapacity(gpa, out.items.len + magic.len + 12 + self.bytes.len);
-        try out.appendSlice(gpa, magic);
-        var ps: [4]u8 = undefined;
-        std.mem.writeInt(u32, &ps, piece_size, .little);
-        try out.appendSlice(gpa, &ps);
-        var fs: [8]u8 = undefined;
-        std.mem.writeInt(u64, &fs, file_size, .little);
-        try out.appendSlice(gpa, &fs);
-        try out.appendSlice(gpa, self.bytes);
+        const need = self.encodedLen();
+        try out.ensureTotalCapacity(gpa, out.items.len + need);
+        const start = out.items.len;
+        out.items.len = start + need;
+        _ = self.encodeTo(piece_size, file_size, out.items[start..]) catch unreachable;
     }
 
     pub fn decode(gpa: std.mem.Allocator, blob: []const u8, piece_size: u32, file_size: u64) !Bitfield {
@@ -297,6 +310,11 @@ test "bitfield set get persist" {
     try std.testing.expect(bf2.get(3));
     try std.testing.expect(bf2.get(9));
     try std.testing.expect(!bf2.get(1));
+
+    var direct: [64]u8 = undefined;
+    const encoded = try bf.encodeTo(4096, 40960, &direct);
+    try std.testing.expectEqualSlices(u8, blob.items, encoded);
+    try std.testing.expectError(error.NoSpaceLeft, bf.encodeTo(4096, 40960, direct[0..8]));
 }
 
 test "decode masks pad bits past nbits" {

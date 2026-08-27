@@ -456,15 +456,28 @@ pub const Store = struct {
     /// claiming filled over hole zeros). Fill-path saves stay best-effort;
     /// losing one only costs a refill over intact bytes.
     pub fn saveBits(self: *Store, file: *Cached, durable: bool) bool {
-        var blob: std.ArrayList(u8) = .empty;
-        defer blob.deinit(self.gpa);
-        file.bits.encode(self.piece_size, file.size, &blob, self.gpa) catch {
+        // Stack for any sidecar that fits (16 KiB of bits is a 2 TiB file at
+        // the default 16 MiB piece): a piece fill used to heap-allocate a
+        // copy of bits the entry already holds, once per hydrated piece.
+        const need = file.bits.encodedLen();
+        var stack: [16 * 1024]u8 = undefined;
+        var heap: []u8 = &.{};
+        defer if (heap.len != 0) self.gpa.free(heap);
+        const buf: []u8 = if (need <= stack.len) stack[0..need] else blk: {
+            const h = self.gpa.alloc(u8, need) catch {
+                std.log.warn("bitfield encode failed for {s}; cache state resets on restart", .{file.rel});
+                return false;
+            };
+            heap = h;
+            break :blk h;
+        };
+        const blob = file.bits.encodeTo(self.piece_size, file.size, buf) catch {
             std.log.warn("bitfield encode failed for {s}; cache state resets on restart", .{file.rel});
             return false;
         };
-        var buf: [sys.c.PATH_MAX]u8 = undefined;
-        const p = self.cacheMetaPath(&buf, file.rel) catch return false;
-        const w = writeFileMakingParent(p, blob.items, durable);
+        var path_buf: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.cacheMetaPath(&path_buf, file.rel) catch return false;
+        const w = writeFileMakingParent(p, blob, durable);
         if (w != 0) {
             std.log.warn("bitfield save failed for {s} (errno {d}); cache state resets on restart", .{ file.rel, -w });
             return false;
@@ -764,6 +777,19 @@ pub const Store = struct {
         // (per-piece claim stamps alone go stale mid-loop).
         file.last_access.store(now_sec, .monotonic);
         return file.bits.get(idx);
+    }
+
+    /// Caller holds file.mu. True when every piece overlapping [off, off+n)
+    /// against this size sample is marked filled. The FUSE warm-read path
+    /// uses this under the size-sample lock so a fully-cached range skips
+    /// ensureRange's per-piece lock round trips.
+    pub fn rangeFilled(file: *Cached, fsize: u64, off: u64, n: u64, piece_size: u32) bool {
+        const cov = piece.cover(off, n, fsize, piece_size);
+        var i = cov.start;
+        while (i < cov.end) : (i += 1) {
+            if (!file.bits.get(i)) return false;
+        }
+        return true;
     }
 
     /// Writes one piece at its offset. Internal step of completeFill; the
@@ -1374,6 +1400,29 @@ pub fn relOk(rel: []const u8) bool {
         if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
     }
     return true;
+}
+
+test "rangeFilled is true only when every covered piece is marked" {
+    const gpa = std.testing.allocator;
+    var bits = try piece.Bitfield.init(gpa, 4);
+    defer bits.deinit(gpa);
+    bits.set(0);
+    bits.set(1);
+    var filling = std.AutoHashMap(u32, void).init(gpa);
+    defer filling.deinit();
+    var rel = [_]u8{ 't', '.', 'b', 'i', 'n' };
+    var file = Store.Cached{
+        .rel = &rel,
+        .size = 64,
+        .bits = bits,
+        .filling = filling,
+    };
+    const ps: u32 = 16;
+    try std.testing.expect(Store.rangeFilled(&file, 64, 0, 16, ps));
+    try std.testing.expect(Store.rangeFilled(&file, 64, 0, 32, ps));
+    try std.testing.expect(!Store.rangeFilled(&file, 64, 0, 33, ps));
+    try std.testing.expect(!Store.rangeFilled(&file, 64, 32, 16, ps));
+    try std.testing.expect(Store.rangeFilled(&file, 64, 100, 8, ps));
 }
 
 test "cacheFill grows entry preserving earlier piece marks" {

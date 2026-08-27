@@ -157,6 +157,15 @@ pub fn printable(s: []const u8) bool {
 pub const HaveBits = struct {
     bits: []u8,
     piece_size: u32,
+
+    /// True when bit `idx` is set on a grid compatible with `local_piece_size`.
+    /// A mismatched advertised grid is treated as no-answer at this index
+    /// (the fetch falls through) rather than reading bits that cover
+    /// different byte ranges than ours.
+    pub fn hasPiece(self: HaveBits, idx: u32, local_piece_size: u32) bool {
+        if (self.piece_size != 0 and self.piece_size != local_piece_size) return false;
+        return idx / 8 < self.bits.len and (self.bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
+    }
 };
 
 /// Name safe to echo into a log line: the input when printable, else a fixed
@@ -228,6 +237,18 @@ pub const Catalog = struct {
         gpa.free(e.bits);
     }
 
+    /// Live cache line for (rel, ip, port) at `now_ms`, or null when none
+    /// is unexpired. Caller must hold have_mu: the pointer is invalidated
+    /// by any havePut that replaces or evicts this key.
+    fn haveLookup(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, now_ms: i64) ?*HaveEntry {
+        for (self.have_cache.items) |*e| {
+            if (e.port != port or !std.mem.eql(u8, e.rel, rel) or !std.mem.eql(u8, e.ip, ip)) continue;
+            if (now_ms >= e.expires_ms) return null;
+            return e;
+        }
+        return null;
+    }
+
     /// Owned copy of a fresh /have bitmap for (rel, ip, port), or null when
     /// no unexpired entry exists at `now_ms`, the caller's monotonic-ms
     /// instant: the TTL decision is a pure function of cache state plus
@@ -237,13 +258,23 @@ pub const Catalog = struct {
     pub fn haveGet(self: *Catalog, gpa: std.mem.Allocator, rel: []const u8, ip: []const u8, port: u16, now_ms: i64) ?HaveBits {
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
-        for (self.have_cache.items) |e| {
-            if (e.port != port or !std.mem.eql(u8, e.rel, rel) or !std.mem.eql(u8, e.ip, ip)) continue;
-            if (now_ms >= e.expires_ms) return null;
-            const bits = gpa.dupe(u8, e.bits) catch return null;
-            return .{ .bits = bits, .piece_size = e.piece_size };
-        }
-        return null;
+        const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
+        const bits = gpa.dupe(u8, e.bits) catch return null;
+        return .{ .bits = bits, .piece_size = e.piece_size };
+    }
+
+    /// Whether piece `idx` is present in an unexpired (rel, ip, port) line
+    /// whose grid matches `local_piece_size` (unknown advertised size is
+    /// assumed aligned). Null means no usable line -- the caller must
+    /// probe. Reads the one bit under the lock and copies nothing: sequential
+    /// fills of one file used to dupe the whole bitmap per peer per piece
+    /// just to test this bit, allocating bytesLen(pieces) on every 16 MiB
+    /// for the TTL window.
+    pub fn haveHas(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, idx: u32, local_piece_size: u32, now_ms: i64) ?bool {
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
+        return (HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
     }
 
     /// Caches a successful probe result; failures are never cached so a
@@ -770,7 +801,17 @@ test "have cache stores, replaces, evicts at cap, and frees" {
         // The alignment context rides with the bits: a TTL hit must answer
         // exactly what a fresh probe would have.
         try std.testing.expectEqual(@as(u32, 4096), got.piece_size);
+        try std.testing.expect(got.hasPiece(0, 4096));
+        try std.testing.expect(!got.hasPiece(1, 4096));
+        try std.testing.expect(got.hasPiece(9, 4096));
+        try std.testing.expect(!got.hasPiece(0, 8192));
     }
+    // haveHas reads the same line without copying the bitmap.
+    try std.testing.expectEqual(@as(?bool, true), cat.haveHas("a.bin", "10.0.0.1", 18080, 0, 4096, t0));
+    try std.testing.expectEqual(@as(?bool, false), cat.haveHas("a.bin", "10.0.0.1", 18080, 1, 4096, t0));
+    try std.testing.expectEqual(@as(?bool, true), cat.haveHas("a.bin", "10.0.0.1", 18080, 9, 4096, t0));
+    try std.testing.expectEqual(@as(?bool, false), cat.haveHas("a.bin", "10.0.0.1", 18080, 0, 8192, t0));
+    try std.testing.expect(cat.haveHas("b.bin", "10.0.0.1", 18080, 0, 4096, t0) == null);
     // A different rel, ip, or port must not hit this entry.
     try std.testing.expect(cat.haveGet(gpa, "b.bin", "10.0.0.1", 18080, t0) == null);
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.2", 18080, t0) == null);
@@ -792,7 +833,9 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     if (cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0 + Catalog.have_ttl_ms - 1)) |fresh| {
         gpa.free(fresh.bits);
     } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?bool, true), cat.haveHas("a.bin", "10.0.0.1", 18080, 0, 8192, t0 + Catalog.have_ttl_ms - 1));
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0 + Catalog.have_ttl_ms) == null);
+    try std.testing.expect(cat.haveHas("a.bin", "10.0.0.1", 18080, 0, 8192, t0 + Catalog.have_ttl_ms) == null);
 
     // Distinct keys fill to the cap; one more insert evicts exactly one
     // entry so the bound holds. Expiries are staggered (earlier inserts

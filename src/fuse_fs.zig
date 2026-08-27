@@ -550,12 +550,19 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     // A warm read touches no other state until readCache stamps at the end:
     // without a stamp here, a cull punch (idle past the window, all gates
     // green) could land between ensureRange's bit checks and the read and
-    // serve hole zeros behind bits this call already trusted.
+    // serve hole zeros behind bits this call already trusted. Checking the
+    // covered bits in this same window lets a fully-cached range skip
+    // ensureRange's per-piece lock (hasPiece stamps and re-checks what we
+    // already know).
     file.last_access.store(sys.monoSec(), .monotonic);
-    file.mu.unlock(st.io);
-    if (uoff >= fsize) return 0;
+    if (uoff >= fsize) {
+        file.mu.unlock(st.io);
+        return 0;
+    }
     const n = @min(want, @as(usize, @intCast(fsize - uoff)));
-    const rc = ensureRange(st, file, fsize, uoff, n);
+    const ready = store_mod.Store.rangeFilled(file, fsize, uoff, n, st.store.piece_size);
+    file.mu.unlock(st.io);
+    const rc = if (ready) 0 else ensureRange(st, file, fsize, uoff, n);
     if (rc != 0) {
         // The failing tier kept its own fill_err_* count; the op-level
         // counter must still see the read fail, or error-rate alerts keying
