@@ -1543,13 +1543,17 @@ pub const Store = struct {
 /// Applied to every externally supplied path before it joins a root (FUSE,
 /// peer HTTP, CLI pin); without it a peer request can escape the origin/cache
 /// trees or forge multi-line entries in operator logs via \n in a path.
-/// Control character means C0 bytes and DEL outright plus their UTF-8-encoded
-/// C1 counterparts (U+0080..U+009F, the 0xC2 0x80..0xC2 0x9F sequences):
-/// several terminal families honor those as 8-bit controls (OSC/CSI) even in
-/// UTF-8 mode, so a C0-only byte gate would still let a planted file name
-/// inject into the journal an operator tails. Non-control text above the C1
-/// pair (NFC/NFD spellings, astral emoji, names that are not valid UTF-8 at
-/// all) passes byte-exact; identity is byte equality all the way down.
+/// Control character means C0 bytes and DEL outright, their UTF-8-encoded
+/// C1 counterparts (U+0080..U+009F, the 0xC2 0x80..0xC2 0x9F sequences),
+/// and the Unicode line/paragraph separators (U+2028/U+2029, E2 80 A8 /
+/// E2 80 A9). Several terminal families honor C1 as 8-bit controls (OSC/CSI)
+/// even in UTF-8 mode, and Unicode-aware terminals treat U+2028/U+2029 as
+/// line breaks the same way they treat CR/LF, so a C0-only byte gate would
+/// still let a planted file name inject into the journal an operator tails.
+/// Same set discover.printable applies before echoing a lease name. Non-control
+/// text above that set (NFC/NFD spellings, astral emoji, names that are not
+/// valid UTF-8 at all) passes byte-exact; identity is byte equality all the
+/// way down.
 pub fn relOk(rel: []const u8) bool {
     if (rel.len == 0 or rel[0] == '/') return false;
     var i: usize = 0;
@@ -1557,9 +1561,10 @@ pub fn relOk(rel: []const u8) bool {
         const ch = rel[i];
         // NUL truncation at the syscall boundary, CR/LF log injection, ESC
         // terminal escapes: none of these can appear in a legitimate model
-        // path, and neither can their C1 spellings.
+        // path, and neither can their C1 or U+2028/U+2029 spellings.
         if (ch < 0x20 or ch == 0x7f) return false;
         if (ch == 0xc2 and i + 1 < rel.len and rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f) return false;
+        if (ch == 0xe2 and i + 2 < rel.len and rel[i + 1] == 0x80 and (rel[i + 2] == 0xa8 or rel[i + 2] == 0xa9)) return false;
     }
     var it = std.mem.splitScalar(u8, rel, '/');
     while (it.next()) |seg| {
@@ -2119,6 +2124,11 @@ test "relOk rejects traversal and absolute paths" {
     // closed too.
     try std.testing.expect(!relOk("a\xc2\x9bb.bin"));
     try std.testing.expect(!relOk("\xc2\x9d0;pwned\xc2\x9c.bin"));
+    // Unicode line/paragraph separators (U+2028/U+2029) are the remaining
+    // Unicode line terminators after C0/C1: a C0/C1-only gate still lets
+    // "gguf/a\u{2028}ERROR forged.bin" pass and split a journal line.
+    try std.testing.expect(!relOk("gguf/a\u{2028}ERROR forged.bin"));
+    try std.testing.expect(!relOk("a\u{2029}b.bin"));
 }
 
 test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
@@ -2140,6 +2150,10 @@ test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
     // NBSP is U+00A0: same 0xC2 lead byte as the rejected C1 controls but a
     // continuation above their range, so the C1 gate must not swallow it.
     try std.testing.expect(relOk("model\u{a0}v2.bin"));
+    // Incomplete U+2028 encodings are invalid UTF-8 display noise, not a
+    // separator, matching a trailing 0xC2 with no C1 continuation.
+    try std.testing.expect(relOk("a\xe2\x80.bin"));
+    try std.testing.expect(relOk("a\xe2.bin"));
 }
 
 const seed_rel_model = fuzzcorpus.entry("gguf/a.gguf");

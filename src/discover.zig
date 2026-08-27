@@ -129,24 +129,28 @@ pub fn pickBest(cands: []const PathCand) ?usize {
 pub const cluster_dir = ".cluster";
 
 /// True when s carries no control character in its terminal-visible form:
-/// C0 bytes and DEL outright, plus their UTF-8-encoded C1 counterparts
-/// (U+0080..U+009F, the 0xC2 0x80..0xC2 0x9F sequences), which several
-/// terminal families honor as 8-bit controls (OSC/CSI) even in UTF-8 mode.
-/// Lease file names come off shared NFS storage and lease ids out of other
-/// nodes' JSON, so neither is trustworthy for verbatim echo: a co-tenant
-/// planting ".cluster/<newline> forged line.json" would forge multi-line
-/// daemon log entries, an id holding ESC or its C1 spelling "\u{9d}0;pwned
-/// \u{9c}" would inject into the terminal running `modelfs peers`. Same
-/// policy store.relOk applies to paths; such entries are still swept, only
-/// their names are withheld from output. Bytes above the C1 pair (NFC/NFD
-/// spellings, astral emoji, bare high bytes) are display text, not
-/// controls, and stay echoable.
+/// C0 bytes and DEL outright, their UTF-8-encoded C1 counterparts
+/// (U+0080..U+009F, the 0xC2 0x80..0xC2 0x9F sequences), and the Unicode
+/// line/paragraph separators (U+2028/U+2029, E2 80 A8 / E2 80 A9). Several
+/// terminal families honor C1 as 8-bit controls (OSC/CSI) even in UTF-8 mode,
+/// and Unicode-aware terminals treat U+2028/U+2029 as line breaks the same
+/// way they treat CR/LF. Lease file names come off shared NFS storage and
+/// lease ids out of other nodes' JSON, so neither is trustworthy for
+/// verbatim echo: a co-tenant planting ".cluster/<newline> forged line.json"
+/// would forge multi-line daemon log entries, an id holding ESC, its C1
+/// spelling "\u{9d}0;pwned\u{9c}", or "spark1\u{2028}ERROR forged" would
+/// inject into the terminal running `modelfs peers`. Same policy
+/// store.relOk applies to paths; such entries are still swept, only their
+/// names are withheld from output. Bytes above that set (NFC/NFD spellings,
+/// astral emoji, bare high bytes) are display text, not controls, and stay
+/// echoable.
 pub fn printable(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         const ch = s[i];
         if (ch < 0x20 or ch == 0x7f) return false;
         if (ch == 0xc2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9f) return false;
+        if (ch == 0xe2 and i + 2 < s.len and s[i + 1] == 0x80 and (s[i + 2] == 0xa8 or s[i + 2] == 0xa9)) return false;
     }
     return true;
 }
@@ -865,19 +869,27 @@ test "printable gates lease names and ids for log echo" {
     try std.testing.expect(!printable("a\xc2\x9bd"));
     try std.testing.expect(!printable("\xc2\x9d0;pwned\xc2\x9c"));
     try std.testing.expect(!printable("\xc2\x9b"));
+    // Unicode line/paragraph separators split log lines in Unicode-aware
+    // terminals the same way CR/LF does; a C0/C1-only gate still echoes
+    // "spark1\u{2028}ERROR forged" as two lines.
+    try std.testing.expect(!printable("spark1\u{2028}ERROR forged"));
+    try std.testing.expect(!printable("spark1\u{2029}p"));
     // Display text above the C1 range stays echoable: NBSP (U+00A0) shares
     // the 0xC2 lead byte but is not a control, nor are accented names.
     try std.testing.expect(printable("caf\xc3\xa9"));
     try std.testing.expect(printable("\xc2\xa0"));
     // A trailing 0xC2 with no continuation byte is invalid UTF-8 display
-    // noise, not an injectable control.
+    // noise, not an injectable control. Incomplete U+2028 encodings match.
     try std.testing.expect(printable("a\xc2"));
+    try std.testing.expect(printable("a\xe2\x80"));
+    try std.testing.expect(printable("a\xe2"));
 }
 
 test "displayName echoes printable names and withholds the rest" {
     try std.testing.expectEqualStrings("spark1.json", displayName("spark1.json"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("a\nb"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("\x7f"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{2028}ERROR forged"));
 }
 
 test "validId gates the lease file name and JSON document" {
@@ -916,6 +928,7 @@ const seed_id_newline = fuzzcorpus.entry("a\nb");
 const seed_id_nul = fuzzcorpus.entry("a\x00b");
 const seed_id_non_ascii = fuzzcorpus.entry("h\xc3\xa9llo");
 const seed_id_space = fuzzcorpus.entry("spark 1");
+const seed_id_line_sep = fuzzcorpus.entry("spark1\u{2028}ERROR forged");
 
 const fuzz_id_corpus = [_][]const u8{
     &seed_id_plain,
@@ -931,6 +944,7 @@ const fuzz_id_corpus = [_][]const u8{
     &seed_id_nul,
     &seed_id_non_ascii,
     &seed_id_space,
+    &seed_id_line_sep,
 };
 
 /// Lease ids arrive as other nodes' JSON on shared NFS storage and fan out
