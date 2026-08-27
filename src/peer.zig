@@ -535,7 +535,14 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             // lock traffic on fully-warm transfers. Punches cannot land under
             // us either way -- serveData holds xfer across the whole response.
             if (!self.store.hasPiece(file, pi, sys.monoSec(self.io))) {
-                replyStatus(self, fd, "404 Not Found");
+                // completeFill returns 0 on a skipped claim (local write
+                // generation mismatch, forget) as well as a landed fill.
+                // Treating that as 404 tells the fetching peer the path is
+                // gone, the same lie the cache-write-fail branch above
+                // already refuses. The origin stat at the top of serveData
+                // already proved the file exists.
+                std.log.warn("piece unmarked after fill for {s} piece {d}; replying 500", .{ file.rel, pi });
+                replyStatus(self, fd, "500 Internal Server Error");
                 return false;
             }
         }
@@ -632,9 +639,9 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
 
 fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range) void {
     var st: sys.c.struct_stat = undefined;
-    const src = self.store.statOrigin(rel, &st);
-    if (src != 0) {
-        replyOriginStat(self, fd, rel, src);
+    const rc = self.store.statOrigin(rel, &st);
+    if (rc != 0) {
+        replyOriginStat(self, fd, rel, rc);
         return;
     }
     // Same answer as /have for the same resource state: a directory (or any

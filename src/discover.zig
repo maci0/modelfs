@@ -128,31 +128,19 @@ pub fn pickBest(cands: []const PathCand) ?usize {
 /// `modelfs peers`; every module referencing the path must use this constant.
 pub const cluster_dir = ".cluster";
 
-/// True when s carries no control character in its terminal-visible form:
-/// C0 bytes and DEL outright, their UTF-8-encoded C1 counterparts
-/// (U+0080..U+009F, the 0xC2 0x80..0xC2 0x9F sequences), and the Unicode
-/// line/paragraph separators (U+2028/U+2029, E2 80 A8 / E2 80 A9). Several
-/// terminal families honor C1 as 8-bit controls (OSC/CSI) even in UTF-8 mode,
-/// and Unicode-aware terminals treat U+2028/U+2029 as line breaks the same
-/// way they treat CR/LF. Lease file names come off shared NFS storage and
-/// lease ids out of other nodes' JSON, so neither is trustworthy for
-/// verbatim echo: a co-tenant planting ".cluster/<newline> forged line.json"
-/// would forge multi-line daemon log entries, an id holding ESC, its C1
-/// spelling "\u{9d}0;pwned\u{9c}", or "spark1\u{2028}ERROR forged" would
-/// inject into the terminal running `modelfs peers`. Same policy
+/// True when s carries no control character in its terminal-visible form
+/// (proto.containsControl's set). Lease file names come off shared NFS
+/// storage and lease ids out of other nodes' JSON, so neither is trustworthy
+/// for verbatim echo: a co-tenant planting ".cluster/<newline> forged
+/// line.json" would forge multi-line daemon log entries, an id holding ESC,
+/// its C1 spelling "\u{9d}0;pwned\u{9c}", or "spark1\u{2028}ERROR forged"
+/// would inject into the terminal running `modelfs peers`. Same policy
 /// store.relOk applies to paths; such entries are still swept, only their
 /// names are withheld from output. Bytes above that set (NFC/NFD spellings,
 /// astral emoji, bare high bytes) are display text, not controls, and stay
 /// echoable.
 pub fn printable(s: []const u8) bool {
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        const ch = s[i];
-        if (ch < 0x20 or ch == 0x7f) return false;
-        if (ch == 0xc2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9f) return false;
-        if (ch == 0xe2 and i + 2 < s.len and s[i + 1] == 0x80 and (s[i + 2] == 0xa8 or s[i + 2] == 0xa9)) return false;
-    }
-    return true;
+    return !proto.containsControl(s);
 }
 
 /// Name safe to echo into a log line: the input when printable, else a fixed

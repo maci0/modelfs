@@ -416,8 +416,8 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     var ost: sys.c.struct_stat = undefined;
     // Return the captured errno, like getattr/read do: re-reading errno here
     // would report whatever ran between the failed stat and this return.
-    const src = st.store.statOrigin(rel, &ost);
-    if (src != 0) return src;
+    const rc = st.store.statOrigin(rel, &ost);
+    if (rc != 0) return rc;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
         const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch return -sys.c.ENOMEM;
         defer st.store.releaseFile(file);
@@ -592,17 +592,17 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     // Report the real origin failure (EIO on NFS, ENOENT, ...): collapsing it
     // into EISDIR would send readers hunting for a directory that is not there.
     var ost: sys.c.struct_stat = undefined;
-    const src = st.store.statOrigin(rel, &ost);
+    const rc_stat = st.store.statOrigin(rel, &ost);
     // Edge-triggered: the first EIO/ESTALE logs path+errno, later ones ride
     // reads_err and the tick line. ENOENT stays counted but does not raise
     // the origin-down flag (see Store.noteOriginIo).
-    st.store.noteOriginIo(rel, src, "stat");
-    if (src != 0) {
+    st.store.noteOriginIo(rel, rc_stat, "stat");
+    if (rc_stat != 0) {
         // An origin outage fails every uncached read here before any tier
         // runs; without this count reads_err stays flat while clients see
         // an EIO storm.
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
-        return src;
+        return rc_stat;
     }
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return -sys.c.EISDIR;
     const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch |err| {
@@ -687,8 +687,8 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     // cacheFill (marks preserved); any divergence keeps the conservative
     // reset below.
     var ost: sys.c.struct_stat = undefined;
-    const src = st.store.statOrigin(rel, &ost);
-    const regular = src == 0 and (ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG;
+    const rc = st.store.statOrigin(rel, &ost);
+    const regular = rc == 0 and (ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG;
     if (regular and @as(u64, @intCast(ost.st_size)) == end) {
         st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)], sys.monoSec(st.io));
         return @intCast(n);
@@ -1096,11 +1096,11 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     if (std.meta.eql(d, store_mod.Stats.Snap{})) return;
     const mib = 1024 * 1024;
     const reads_attempted = d.reads_ok + d.reads_err;
-    const rd_us = if (reads_attempted > 0) d.read_nanos / (reads_attempted * std.time.ns_per_us) else 0;
+    const rd_us = if (reads_attempted > 0) @divTrunc(d.read_nanos, reads_attempted * std.time.ns_per_us) else 0;
     const writes_attempted = d.writes_ok + d.writes_err;
-    const wr_us = if (writes_attempted > 0) d.write_nanos / (writes_attempted * std.time.ns_per_us) else 0;
-    const fill_ms_peer = if (d.fills_peer > 0) d.fill_peer_nanos / (d.fills_peer * std.time.ns_per_ms) else 0;
-    const fill_ms_origin = if (d.fills_origin > 0) d.fill_origin_nanos / (d.fills_origin * std.time.ns_per_ms) else 0;
+    const wr_us = if (writes_attempted > 0) @divTrunc(d.write_nanos, writes_attempted * std.time.ns_per_us) else 0;
+    const fill_peer_ms = if (d.fills_peer > 0) @divTrunc(d.fill_peer_nanos, d.fills_peer * std.time.ns_per_ms) else 0;
+    const fill_origin_ms = if (d.fills_origin > 0) @divTrunc(d.fill_origin_nanos, d.fills_origin * std.time.ns_per_ms) else 0;
     std.log.info(
         // Field names mirror Stats.Snap's (what status.json publishes), so
         // the journal line and the machine artifact share one vocabulary and
@@ -1112,23 +1112,23 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.reads_ok,
             d.reads_err,
             d.reads_warm,
-            d.bytes_read / mib,
+            @divTrunc(d.bytes_read, mib),
             rd_us,
             d.writes_ok,
             d.writes_err,
-            d.bytes_written / mib,
+            @divTrunc(d.bytes_written, mib),
             wr_us,
             d.fills_peer,
             d.fills_origin,
-            fill_ms_peer,
-            fill_ms_origin,
+            fill_peer_ms,
+            fill_origin_ms,
             d.fill_err_peer,
             d.fill_err_origin,
             d.fill_err_cache,
             d.probe_err,
-            d.bytes_from_peer / mib,
-            d.bytes_from_origin / mib,
-            d.bytes_to_peer / mib,
+            @divTrunc(d.bytes_from_peer, mib),
+            @divTrunc(d.bytes_from_origin, mib),
+            @divTrunc(d.bytes_to_peer, mib),
             d.pieces_culled,
             d.http_ok,
             d.http_unauthorized,

@@ -104,7 +104,7 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 | `c.h`, `c.zig` | Sole door to libfuse3 and libc |
 | `sys.zig` | Syscall wrappers; no policy beyond EINTR retry |
 | `piece.zig` | Piece arithmetic and the persisted bitfield codec |
-| `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON) |
+| `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`) |
 | `cull.zig` | Free-space watermark policy |
 | `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
 | `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names |

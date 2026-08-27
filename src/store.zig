@@ -2,6 +2,7 @@
 //! claims, pinning, and hole-punch culling (in-memory and disk-only victims).
 const std = @import("std");
 const piece = @import("piece.zig");
+const proto = @import("proto.zig");
 const cull = @import("cull.zig");
 const sys = @import("sys.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
@@ -1543,29 +1544,14 @@ pub const Store = struct {
 /// Applied to every externally supplied path before it joins a root (FUSE,
 /// peer HTTP, CLI pin); without it a peer request can escape the origin/cache
 /// trees or forge multi-line entries in operator logs via \n in a path.
-/// Control character means C0 bytes and DEL outright, their UTF-8-encoded
-/// C1 counterparts (U+0080..U+009F, the 0xC2 0x80..0xC2 0x9F sequences),
-/// and the Unicode line/paragraph separators (U+2028/U+2029, E2 80 A8 /
-/// E2 80 A9). Several terminal families honor C1 as 8-bit controls (OSC/CSI)
-/// even in UTF-8 mode, and Unicode-aware terminals treat U+2028/U+2029 as
-/// line breaks the same way they treat CR/LF, so a C0-only byte gate would
-/// still let a planted file name inject into the journal an operator tails.
-/// Same set discover.printable applies before echoing a lease name. Non-control
-/// text above that set (NFC/NFD spellings, astral emoji, names that are not
-/// valid UTF-8 at all) passes byte-exact; identity is byte equality all the
-/// way down.
+/// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
+/// U+2028/U+2029), the same discover.printable applies before echoing a
+/// lease name. Non-control text above that set (NFC/NFD spellings, astral
+/// emoji, names that are not valid UTF-8 at all) passes byte-exact; identity
+/// is byte equality all the way down.
 pub fn relOk(rel: []const u8) bool {
     if (rel.len == 0 or rel[0] == '/') return false;
-    var i: usize = 0;
-    while (i < rel.len) : (i += 1) {
-        const ch = rel[i];
-        // NUL truncation at the syscall boundary, CR/LF log injection, ESC
-        // terminal escapes: none of these can appear in a legitimate model
-        // path, and neither can their C1 or U+2028/U+2029 spellings.
-        if (ch < 0x20 or ch == 0x7f) return false;
-        if (ch == 0xc2 and i + 1 < rel.len and rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f) return false;
-        if (ch == 0xe2 and i + 2 < rel.len and rel[i + 1] == 0x80 and (rel[i + 2] == 0xa8 or rel[i + 2] == 0xa9)) return false;
-    }
+    if (proto.containsControl(rel)) return false;
     var it = std.mem.splitScalar(u8, rel, '/');
     while (it.next()) |seg| {
         if (seg.len == 0) continue;
@@ -2168,6 +2154,7 @@ const seed_rel_trailing_slash = fuzzcorpus.entry("gguf/");
 const seed_rel_control = fuzzcorpus.entry("a\x1b[31mb\x7f");
 const seed_rel_nul = fuzzcorpus.entry("a\x00b");
 const seed_rel_c1 = fuzzcorpus.entry("a\xc2\x9bb.bin");
+const seed_rel_line_sep = fuzzcorpus.entry("gguf/a\u{2028}ERROR.bin");
 const seed_rel_nbsp = fuzzcorpus.entry("model\u{a0}v2.bin");
 const seed_rel_lone_c1byte = fuzzcorpus.entry("a\x9bb.bin");
 const seed_rel_trailing_c2 = fuzzcorpus.entry("foo\xc2");
@@ -2186,24 +2173,27 @@ const fuzz_rel_corpus = [_][]const u8{
     &seed_rel_control,
     &seed_rel_nul,
     &seed_rel_c1,
+    &seed_rel_line_sep,
     &seed_rel_nbsp,
     &seed_rel_lone_c1byte,
     &seed_rel_trailing_c2,
     &seed_rel_unicode,
 };
 
-/// Independent restatement of relOk: empty/absolute refuse, C0/DEL and the
-/// UTF-8 C1 pair refuse, "." / ".." components refuse, empty components
-/// (double slash, trailing slash) do not. Walks segments by index instead
-/// of splitScalar so a corrupted splitter cannot self-confirm.
+/// Independent restatement of relOk: empty/absolute refuse, C0/DEL, the
+/// UTF-8 C1 pair, and U+2028/U+2029 refuse, "." / ".." components refuse,
+/// empty components (double slash, trailing slash) do not. Walks segments
+/// by index instead of splitScalar so a corrupted splitter cannot self-confirm.
 fn refRelOk(rel: []const u8) bool {
     if (rel.len == 0 or rel[0] == '/') return false;
     var seg_start: usize = 0;
     var i: usize = 0;
     while (i <= rel.len) : (i += 1) {
         if (i != rel.len and rel[i] != '/') {
-            if (rel[i] < 0x20 or rel[i] == 0x7f) return false;
-            if (rel[i] == 0xc2 and i + 1 < rel.len and rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f) return false;
+            const ch = rel[i];
+            if (ch < 0x20 or ch == 0x7f) return false;
+            if (ch == 0xc2 and i + 1 < rel.len and rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f) return false;
+            if (ch == 0xe2 and i + 2 < rel.len and rel[i + 1] == 0x80 and (rel[i + 2] == 0xa8 or rel[i + 2] == 0xa9)) return false;
             continue;
         }
         const seg = rel[seg_start..i];
@@ -2235,6 +2225,9 @@ fn fuzzRelOkOne(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expect(rel[i] >= 0x20 and rel[i] != 0x7f);
         if (rel[i] == 0xc2 and i + 1 < rel.len) {
             try std.testing.expect(!(rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f));
+        }
+        if (rel[i] == 0xe2 and i + 2 < rel.len) {
+            try std.testing.expect(!(rel[i + 1] == 0x80 and (rel[i + 2] == 0xa8 or rel[i + 2] == 0xa9)));
         }
     }
     var seg_start: usize = 0;

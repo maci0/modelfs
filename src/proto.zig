@@ -163,6 +163,21 @@ pub fn bearerOk(got: []const u8, want: []const u8) bool {
     return std.crypto.timing_safe.eql([32]u8, ha, hb);
 }
 
+/// True when s holds a C0 byte, DEL, a UTF-8 C1 pair (U+0080..U+009F), or a
+/// Unicode line/paragraph separator (U+2028/U+2029). store.relOk and
+/// discover.printable share this set so a planted name cannot inject into
+/// logs or terminals through only one of the two gates.
+pub fn containsControl(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const ch = s[i];
+        if (ch < 0x20 or ch == 0x7f) return true;
+        if (ch == 0xc2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9f) return true;
+        if (ch == 0xe2 and i + 2 < s.len and s[i + 1] == 0x80 and (s[i + 2] == 0xa8 or s[i + 2] == 0xa9)) return true;
+    }
+    return false;
+}
+
 /// A successful /have answer: the peer's cached-piece bitmap plus the piece
 /// size its bits are indexed against. piece_size 0 means the peer did not
 /// advertise one (an older build); consumers assume alignment for those.
@@ -217,6 +232,17 @@ pub fn formatLease(buf: []u8, id: []const u8, until: i64, addrs: []const LeaseAd
     }
     try w.writeAll("]}");
     return w.buffered();
+}
+
+test "containsControl covers C0 C1 and Unicode line separators only" {
+    try std.testing.expect(!containsControl("gguf/a.gguf"));
+    try std.testing.expect(!containsControl("model\u{a0}v2.bin"));
+    try std.testing.expect(!containsControl("a\xe2\x80.bin"));
+    try std.testing.expect(containsControl("a\nb"));
+    try std.testing.expect(containsControl("a\x7fb"));
+    try std.testing.expect(containsControl("a\xc2\x9bb"));
+    try std.testing.expect(containsControl("a\u{2028}b"));
+    try std.testing.expect(containsControl("a\u{2029}b"));
 }
 
 test "url encode decode" {
