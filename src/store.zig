@@ -273,13 +273,20 @@ pub const Store = struct {
         };
     }
 
-    /// Client-shaped origin errnos: the path is absent, not a directory, too
-    /// long to name, or is a directory. Same split replyOriginStat uses
-    /// (404/400 vs 502) plus EISDIR for the write path. These stay counted
-    /// in reads_err/writes_err but must not raise the origin-down flag --
-    /// an NFS outage is EIO/ESTALE/ETIMEDOUT, not a missing file.
-    pub fn originErrnoExpected(e: i32) bool {
-        return e == c.ENOENT or e == c.ENOTDIR or e == c.ENAMETOOLONG or e == c.EISDIR;
+    /// True when `e` is an origin-infrastructure outage. The edge-triggered
+    /// journal (first failure logs path+errno, recovery logs "origin recovered")
+    /// is for these three: a busy FUSE storm must not flood the journal, and
+    /// an operator grepping for recovery must be looking at NFS/transport
+    /// health, not at a single path. Every other errno is a path-level
+    /// answer (ENOENT, ELOOP from O_NOFOLLOW, EACCES, ENOSPC, ENAMETOOLONG)
+    /// and stays counted in reads_err/writes_err without raising the flag --
+    /// a planted-symlink write would otherwise look like the origin died,
+    /// then log "origin recovered" on the next successful op of a different
+    /// file. replyOriginStat keeps its own 404/400/502 split: a peer fetch
+    /// still needs to tell "nobody has this file" from "this node cannot
+    /// stat the origin", including ELOOP through a looping parent.
+    pub fn originIoOutage(e: i32) bool {
+        return e == c.EIO or e == c.ESTALE or e == c.ETIMEDOUT;
     }
 
     /// First infrastructure origin failure logs path and errno; later ones
@@ -292,7 +299,7 @@ pub const Store = struct {
             return;
         }
         const e: i32 = -rc;
-        if (originErrnoExpected(e)) return;
+        if (!originIoOutage(e)) return;
         if (!self.origin_io_down.swap(true, .monotonic))
             std.log.warn("origin {s} failed for {s} (errno {d})", .{ what, rel, e });
     }
@@ -1653,19 +1660,33 @@ test "noteOriginIo edge-triggers infrastructure origin failures" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
-    // Client-shaped misses must not raise the outage flag: an operator
+    // Path-level answers must not raise the outage flag: an operator
     // grepping for "origin recovered" would otherwise see a flap on every
-    // ENOENT the workload throws.
+    // ENOENT the workload throws, and a planted symlink (ELOOP) or a
+    // permission/space refusal would look like NFS died.
     st.noteOriginIo("gone.bin", -c.ENOENT, "stat");
     try std.testing.expect(!st.origin_io_down.load(.monotonic));
     st.noteOriginIo("dir.bin", -c.EISDIR, "write");
     try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    st.noteOriginIo("planted.bin", -c.ELOOP, "write");
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    st.noteOriginIo("denied.bin", -c.EACCES, "write");
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    st.noteOriginIo("full.bin", -c.ENOSPC, "write");
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    try std.testing.expect(!Store.originIoOutage(c.ENOENT));
+    try std.testing.expect(!Store.originIoOutage(c.ELOOP));
+    try std.testing.expect(Store.originIoOutage(c.EIO));
+    try std.testing.expect(Store.originIoOutage(c.ESTALE));
+    try std.testing.expect(Store.originIoOutage(c.ETIMEDOUT));
 
     // First infrastructure failure raises the flag; a second one stays quiet
     // so a busy FUSE read storm cannot flood the journal.
     st.noteOriginIo("a.bin", -c.EIO, "stat");
     try std.testing.expect(st.origin_io_down.load(.monotonic));
-    st.noteOriginIo("b.bin", -c.EIO, "stat");
+    st.noteOriginIo("b.bin", -c.ESTALE, "stat");
+    try std.testing.expect(st.origin_io_down.load(.monotonic));
+    st.noteOriginIo("c.bin", -c.ETIMEDOUT, "write");
     try std.testing.expect(st.origin_io_down.load(.monotonic));
 
     // The next success is the recovery edge: one info line, flag cleared.

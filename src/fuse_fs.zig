@@ -594,9 +594,10 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     // into EISDIR would send readers hunting for a directory that is not there.
     var ost: sys.c.struct_stat = undefined;
     const rc_stat = st.store.statOrigin(rel, &ost);
-    // Edge-triggered: the first EIO/ESTALE logs path+errno, later ones ride
-    // reads_err and the tick line. ENOENT stays counted but does not raise
-    // the origin-down flag (see Store.noteOriginIo).
+    // Edge-triggered: the first EIO/ESTALE/ETIMEDOUT logs path+errno, later
+    // ones ride reads_err and the tick line. Path-level answers (ENOENT,
+    // ELOOP, ...) stay counted but do not raise the origin-down flag
+    // (see Store.originIoOutage).
     st.store.noteOriginIo(rel, rc_stat, "stat");
     if (rc_stat != 0) {
         // An origin outage fails every uncached read here before any tier

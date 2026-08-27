@@ -413,7 +413,11 @@ pub const Catalog = struct {
     /// line (its CR/LF or terminal escapes included) while dialing it. The
     /// gate accepts digits and dots only, so nothing unprintable survives
     /// it; legitimate publishers emit inet_ntop output, never hostnames
-    /// (--advertise refuses those at the flag for the same reason).
+    /// (--advertise refuses those at the flag for the same reason). Port 0
+    /// is the same class as a non-quad: --listen/--advertise/--seed already
+    /// refuse it (an ephemeral bind whose lease would still advertise 0),
+    /// and a planted lease with port 0 is undialable, so it must not occupy
+    /// a path slot that fillFromPeers will burn a dial-timeout on.
     fn pushPath(
         self: *Catalog,
         list: *std.ArrayList(Path),
@@ -423,6 +427,7 @@ pub const Catalog = struct {
     ) void {
         var quad: [4]u8 = undefined;
         if (!parseV4(addr.ip, &quad)) return;
+        if (addr.port == 0) return;
         const id = arena.dupe(u8, peer_id) catch return;
         const ip = arena.dupe(u8, addr.ip) catch return;
         var hops: u32 = 1;
@@ -1489,7 +1494,7 @@ test "refresh skips self and expired leases" {
     try std.testing.expectEqual(@as(u32, 0), cat.inflight("10.0.0.1", 18080, -1));
 }
 
-test "refresh drops lease addresses that are not dialable dotted quads" {
+test "refresh drops undialable lease addresses" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     const origin_d = try sys.scratchDir(&ob, "modelfs-disc-addr");
@@ -1502,7 +1507,8 @@ test "refresh drops lease addresses that are not dialable dotted quads" {
     // a forged journal line, its second a hostname no dialer can resolve,
     // its third a leading-zero quad parseV4 must refuse exactly like the
     // dialer's inet_pton (admitting it would list a path no fetch can
-    // ever use). Only the trailing dotted quad survives.
+    // ever use), its fourth a port-0 address the CLI already refuses as
+    // undialable. Only the trailing dotted quad with a real port survives.
     var zbuf: [192]u8 = undefined;
     var pbuf: [192]u8 = undefined;
     const fp = try std.fmt.bufPrint(&pbuf, "{s}/forged.json", .{cluster_d});
@@ -1510,6 +1516,7 @@ test "refresh drops lease addresses that are not dialable dotted quads" {
         "{\"ip\":\"10.0.0.1\\r2026-08-26 ERROR forged\",\"port\":18080,\"mbps\":0}," ++
         "{\"ip\":\"spark9.example\",\"port\":18080,\"mbps\":0}," ++
         "{\"ip\":\"010.0.0.7\",\"port\":18080,\"mbps\":0}," ++
+        "{\"ip\":\"10.0.0.8\",\"port\":0,\"mbps\":0}," ++
         "{\"ip\":\"10.0.0.9\",\"port\":18080,\"mbps\":0}]}";
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), forged));
 
