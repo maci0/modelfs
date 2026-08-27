@@ -322,10 +322,16 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         return;
     };
     const head = head_buf[0..n];
-    const line_end = std.mem.find(u8, head, "\r\n") orelse return;
+    const line_end = std.mem.find(u8, head, "\r\n") orelse {
+        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
+        return;
+    };
     const line = head[0..line_end];
     var it = std.mem.splitScalar(u8, line, ' ');
-    const method = it.next() orelse return;
+    const method = it.next() orelse {
+        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
+        return;
+    };
     const target = it.next() orelse {
         // A completed head whose request line names no target ("HELP\r\n")
         // is the same scanner noise the timeout/oversize paths count; a

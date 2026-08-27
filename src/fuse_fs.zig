@@ -423,6 +423,7 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     const rc = st.store.statOrigin(rel, &ost);
     st.store.noteOriginIo(rel, rc, "stat");
     if (rc != 0) return rc;
+    if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
         const file = st.store.get(rel, @intCast(ost.st_size), sys.monoSec(st.io)) catch |err| {
             std.log.warn("cache entry open failed for {s} ({t}); failing open", .{ rel, err });
@@ -850,8 +851,7 @@ export fn mf_mkdir(path: [*c]const u8, mode: fuse.mode_t) callconv(.c) c_int {
     if (rerr != 0) return rerr;
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    if (std.c.mkdir(op, clientCreateMode(mode)) != 0) return sys.negErrno();
-    return 0;
+    return sys.mkdir(op, clientCreateMode(mode));
 }
 
 export fn mf_rmdir(path: [*c]const u8) callconv(.c) c_int {
@@ -862,8 +862,7 @@ export fn mf_rmdir(path: [*c]const u8) callconv(.c) c_int {
     if (rerr != 0) return rerr;
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    if (std.c.rmdir(op) != 0) return sys.negErrno();
-    return 0;
+    return sys.rmdir(op);
 }
 
 export fn mf_rename(old: [*c]const u8, new: [*c]const u8, flags: c_uint) callconv(.c) c_int {
@@ -904,8 +903,7 @@ export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_i
     const lrc = sys.lstatPath(op, &lst);
     if (lrc != 0) return lrc;
     if ((lst.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
-    if (std.c.chmod(op, clientCreateMode(mode)) != 0) return sys.negErrno();
-    return 0;
+    return sys.chmod(op, clientCreateMode(mode));
 }
 
 export fn mf_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: fuse.fuse_fill_dir_t, off: fuse.off_t, fi: ?*fuse.fuse_file_info, flags: fuse.enum_fuse_readdir_flags) callconv(.c) c_int {
@@ -1003,10 +1001,9 @@ export fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.
     // Lookup-shaped denial: /.cluster is hidden from readdir and getattr.
     const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
     if (rerr != 0) return rerr;
-    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const op = st.store.originPath(&pbuf, rel) catch return -sys.c.ENAMETOOLONG;
     var vs: sys.c.struct_statvfs = undefined;
-    if (sys.c.statvfs(op, &vs) != 0) return sys.negErrno();
+    const rc = st.store.originStatvfs(rel, &vs);
+    if (rc != 0) return rc;
     if (stbuf) |out| out.* = vs;
     return 0;
 }
@@ -1255,7 +1252,7 @@ fn statusJson(st: *State) !void {
         _ = sys.c.unlink(tp);
         return error.StatusWriteFailed;
     }
-    if (std.c.rename(tp, p) != 0) {
+    if (sys.rename(tp, p) != 0) {
         _ = sys.c.unlink(tp);
         return error.StatusRenameFailed;
     }

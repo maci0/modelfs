@@ -1126,6 +1126,20 @@ pub const Store = struct {
         return sys.pwriteAll(fd, buf, off);
     }
 
+    /// Filesystem stats for the origin name. A planted final symlink would
+    /// otherwise make statvfs(2) report the target's filesystem (df of a
+    /// link to `/` leaks the host root's size/free through the mount).
+    /// ELOOP matches originPread/originPwrite and the FUSE lstat gates.
+    pub fn originStatvfs(self: Store, rel: []const u8, vs: *c.struct_statvfs) i32 {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
+        var lst: c.struct_stat = undefined;
+        const lrc = sys.lstatPath(p, &lst);
+        if (lrc != 0) return lrc;
+        if ((lst.st_mode & c.S_IFMT) == c.S_IFLNK) return -c.ELOOP;
+        return sys.statvfsPath(p, vs);
+    }
+
     /// Origin unlink plus cache-identity drop. Forget runs even when the
     /// origin name is already gone: a FUSE retry after the first attempt
     /// unlinked then crashed (or lost the reply) would otherwise leave
@@ -1282,7 +1296,7 @@ pub const Store = struct {
         var vs: c.struct_statvfs = undefined;
         var z: [sys.c.PATH_MAX]u8 = undefined;
         const p = sys.toZ(&z, self.cache) catch return null;
-        if (c.statvfs(p, &vs) != 0) return null;
+        if (sys.statvfsPath(p, &vs) != 0) return null;
         return cull.freePercent(@as(u64, vs.f_bavail), @as(u64, vs.f_blocks));
     }
 
@@ -4409,9 +4423,9 @@ test "origin access refuses a symlink planted at the model path" {
 
     // O_NOFOLLOW contract on the origin tier: the origin is shared storage a
     // co-tenant can plant names in, so a symlink at a model path must never
-    // turn the daemon's stat/pread/pwrite into reads or writes of the link's
-    // client-local target. statOrigin reports S_IFLNK (every caller's S_IFREG
-    // gate then rejects fail-closed), and both data syscalls answer ELOOP.
+    // turn the daemon's stat/pread/pwrite/statvfs into reads or writes of the
+    // link's client-local target. statOrigin reports S_IFLNK (every caller's
+    // S_IFREG gate then rejects fail-closed), and data/statvfs answer ELOOP.
     var tb: [192]u8 = undefined;
     const target = try std.fmt.bufPrint(&tb, "{s}/secret.txt", .{origin_d});
     var zb: [192]u8 = undefined;
@@ -4429,6 +4443,8 @@ test "origin access refuses a symlink planted at the model path" {
     var rbuf: [8]u8 = undefined;
     try std.testing.expectEqual(-c.ELOOP, st.originPread("planted.gguf", &rbuf, 0));
     try std.testing.expectEqual(-c.ELOOP, st.originPwrite("planted.gguf", &rbuf, 0));
+    var vs: c.struct_statvfs = undefined;
+    try std.testing.expectEqual(-c.ELOOP, st.originStatvfs("planted.gguf", &vs));
     // The planted target keeps its bytes: nothing read or wrote through.
     try std.testing.expectEqualStrings("s3cret", try sys.readFileBuf(&rbuf, target_z));
 
@@ -4438,6 +4454,8 @@ test "origin access refuses a symlink planted at the model path" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(real_z, "model"));
     try std.testing.expectEqual(@as(isize, 5), st.originPread("real.bin", rbuf[0..5], 0));
     try std.testing.expectEqualStrings("model", rbuf[0..5]);
+    try std.testing.expectEqual(@as(i32, 0), st.originStatvfs("real.bin", &vs));
+    try std.testing.expect(vs.f_blocks > 0);
 }
 
 test "late finisher on a forgotten entry does not resurrect the sidecar" {

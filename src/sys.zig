@@ -275,6 +275,31 @@ pub fn lstatPath(path: [*:0]const u8, st: *c.struct_stat) i32 {
     return 0;
 }
 
+pub fn statvfsPath(path: [*:0]const u8, vs: *c.struct_statvfs) i32 {
+    if (c.statvfs(path, vs) != 0) return negErrno();
+    return 0;
+}
+
+pub fn mkdir(path: [*:0]const u8, mode: c.mode_t) i32 {
+    if (c.mkdir(path, mode) != 0) return negErrno();
+    return 0;
+}
+
+pub fn rmdir(path: [*:0]const u8) i32 {
+    if (c.rmdir(path) != 0) return negErrno();
+    return 0;
+}
+
+pub fn chmod(path: [*:0]const u8, mode: c.mode_t) i32 {
+    if (c.chmod(path, mode) != 0) return negErrno();
+    return 0;
+}
+
+pub fn rename(old_path: [*:0]const u8, new_path: [*:0]const u8) i32 {
+    if (c.rename(old_path, new_path) != 0) return negErrno();
+    return 0;
+}
+
 pub fn ftruncate(fd: c_int, size: u64) i32 {
     if (c.ftruncate(fd, @intCast(size)) != 0) return negErrno();
     return 0;
