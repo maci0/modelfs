@@ -21,7 +21,7 @@ sequenceDiagram
   alt hit
     L-->>P: bytes
   else miss
-    F->>Peers: GET /have (all paths, 2s per-peer cache)
+    F->>Peers: GET /have (all paths; 2s cache per peer and file)
     alt some peer has k
       F->>F: pick path by score
       F->>Peers: Range GET
@@ -47,7 +47,7 @@ One piece, one source. Misses block the read until that hole is filled. No full-
 | `/net/192.168.0.100/models` | NFS origin on sparks, **no `fsc`** |
 | `/models` | FUSE (sparks). Empty local dir, uid 1000 |
 | `/var/cache/modelfs` | pieces (`data/`, `meta/*.pieces`, `pin/`) |
-| `:18080` | peer HTTP, bound on all interfaces; non-loopback IPv4 advertised in the lease |
+| `:18080` | peer HTTP, bound on all interfaces; non-loopback IPv4 advertised in the lease (127.0.0.1 if none) |
 
 Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run `modelfs` there.
 
@@ -59,13 +59,14 @@ Origin is **required**. It can be any POSIX dir both nodes see, not only NFS. Tw
 
 ## Run
 
-Needs `fuse3`. Same PSK on every spark. Id is the short hostname. Advertise is every non-loopback IPv4 except 169.254.
+Needs `fuse3`. Same PSK on every spark (file or `MODELFS_PSK_VALUE`); mount refuses to start without one. Id is the short hostname. Advertise is every non-loopback IPv4 except 169.254; `--advertise` replaces that list rather than adding to it; with no qualifying NIC the lease publishes `127.0.0.1`.
 
 ```bash
 # once
 sudo mkdir -p /models /var/cache/modelfs
 sudo chown 1000:1000 /models /net/192.168.0.100/models /var/cache/modelfs
-# optional: umask 077; openssl rand -hex 32 | sudo tee /etc/modelfs.psk
+# same file on every node; skip if it already exists
+umask 077; openssl rand -hex 32 | sudo tee /etc/modelfs.psk
 
 # spark1 and spark2, same command (hostname + NICs differ)
 ~/bin/modelfs mount /models --origin /net/192.168.0.100/models \
@@ -85,7 +86,7 @@ modelfs unpin gguf/foo.gguf
 
 Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_ID` set the same values as their flags, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts, and `MODELFS_LOG` moves the log ceiling (`err`, `warn`, `info` default, `debug`) for every command; an explicit flag wins and an empty environment value counts as unset. `MODELFS_PSK_VALUE` cannot be combined with `--psk` or `MODELFS_PSK` on mount (`loadPsk` would otherwise silently prefer the inline secret). Any other `MODELFS_*` variable is refused as a typo'd knob on every command, which is why the harness and drill scripts keep their own knobs outside this namespace (`MF_TEST_*`, `MF_DRILL_*`). `--listen`/`--advertise`/`--seed` refuse port 0 (an ephemeral bind whose lease would still advertise 0).
 
-`--id`, `--advertise IP[:PORT][,...]`, `--cache`, `--listen [IP:]PORT` override defaults. `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
+`--id`, `--cache`, `--listen [IP:]PORT` override defaults. `--advertise IP[:PORT][,...]` replaces the auto-detected NIC list (not additive; no qualifying NIC falls back to 127.0.0.1). `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
 
 Build:
 
@@ -155,7 +156,7 @@ score = ewma_goodput_bps / (1 + hops) / (1 + inflight)
 
 On miss: among paths whose `/have` bit is set, max score. GET fails: next path, then NFS. Never two sources for one piece. A node that has written the path through the mount (`Store.wroteLocally`) hydrates further misses of that path from the origin, not from peers: a peer's cached piece can predate the write, and landing it would hide the writer's own bytes.
 
-Probe answers are cached per (path, file) for 2 s (`Catalog.have_ttl_ms`), so a sequential fill of one large model sends `/have` once per peer per TTL window instead of once per peer per piece. Sequential fills consult that line through `Catalog.haveHas` (one bit, no bitmap copy); `haveGet` still returns an owned `proto.HaveBits` for callers that need the whole field. Only hits are cached: a stale bitmap can at worst route a fetch to a peer that no longer has the piece, which the next-path fallback already handles; failed probes are never cached, so a down peer is retried on the next piece.
+Probe answers are cached per (path, file) for 2 s (`Catalog.have_ttl_ms`), so a sequential fill of one large model sends `/have` once per peer per TTL window instead of once per peer per piece. The cache holds 32 (file, peer) lines (`Catalog.have_cache_cap`); overflow evicts the soonest-to-expire entry, so a concurrent multi-file fill may re-probe within the TTL. Sequential fills consult that line through `Catalog.haveHas` (one bit, no bitmap copy); `haveGet` still returns an owned `proto.HaveBits` for callers that need the whole field. Only hits are cached: a stale bitmap can at worst route a fetch to a peer that no longer has the piece, which the next-path fallback already handles; failed probes are never cached, so a down peer is retried on the next piece.
 
 ---
 
@@ -195,7 +196,7 @@ Every endpoint requires the bearer token, including `/ping`. Listen `0.0.0.0` on
 
 ## Cache cull
 
-Like cachefilesd, on **percent free** of the filesystem that holds `/var/cache/modelfs` (here the 3.6T root):
+Like cachefilesd, on **percent free** of the filesystem that holds `/var/cache/modelfs` (here the 3.6T root): unprivileged available blocks (`statvfs.f_bavail` via `cull.freePercent`), not root-reserved `f_bfree`.
 
 | flag | default | meaning |
 |---|---|---|
@@ -211,7 +212,7 @@ Culling punches piece-sized holes (default 16 MiB, `FALLOC_FL_PUNCH_HOLE`), clea
 
 ## Writes and races
 
-Write is NFS 1:1, then a copy into this node's cache. If NFS fails, the write fails. No write-back buffer. `Store.copyIntoCache` bumps a per-entry write generation; `Store.completeFill` drops an in-flight fill whose generation no longer matches, so a peer fill that claimed the piece before the write cannot overwrite the write-through bytes. Further misses on the writing node take the origin (`hydratePiece` in `src/fuse_fs.zig`).
+Write is NFS 1:1, then a copy into this node's cache. If NFS fails, the write fails. No write-back buffer. `create` / `mkdir` / `chmod` apply the caller's permission bits only (`clientCreateMode` in src/fuse_fs.zig): setuid, setgid, and sticky are stripped so a mount writer cannot plant a daemon-owned special-bit executable. `Store.copyIntoCache` bumps a per-entry write generation; `Store.completeFill` drops an in-flight fill whose generation no longer matches, so a peer fill that claimed the piece before the write cannot overwrite the write-through bytes. Further misses on the writing node take the origin (`hydratePiece` in `src/fuse_fs.zig`).
 
 Two writers on the same path: last `pwrite` on NFS wins. No cluster lock. The other node's cache can keep stale pieces until cull or size change. Ingest on one node; everyone else reads. Second copy of a model: new path.
 

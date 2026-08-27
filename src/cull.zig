@@ -25,6 +25,9 @@ pub fn ordered(w: Water) bool {
 
 pub const Phase = enum { run, cull, stop };
 
+/// Hysteresis over percent-free: start culling at bcull, keep going until
+/// brun, and always punch harder at or below bstop. `culling` is the previous
+/// tick's phase so the run/cull band does not flap while free space sits still.
 pub fn phase(free_pct: u32, w: Water, culling: bool) Phase {
     if (free_pct <= w.bstop) return .stop;
     if (culling) {
@@ -35,6 +38,10 @@ pub fn phase(free_pct: u32, w: Water, culling: bool) Phase {
     return .run;
 }
 
+/// Percent of filesystem blocks available to an unprivileged writer
+/// (`statvfs.f_bavail`), matching cachefilesd. Root-reserved `f_bfree` would
+/// understate the pressure this daemon actually hits. Empty or unknown
+/// capacity reads as 100 (culling off).
 pub fn freePercent(bavail: u64, blocks: u64) u32 {
     if (blocks == 0) return 100;
     // bavail * 100 can exceed u64 on huge filesystems; widen before dividing.

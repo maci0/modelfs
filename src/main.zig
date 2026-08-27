@@ -55,10 +55,11 @@ const usage =
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
     \\  --id NAME             Override node id (default: short hostname)
     \\  --listen [IP:]PORT    Peer HTTP port (default 18080, 1-65535); binds all interfaces
-    \\  --advertise ADDRS     Extra addresses IP[:PORT], comma separated
-    \\                        (default: every local IPv4 except loopback and 169.254)
+    \\  --advertise ADDRS     Lease addresses IP[:PORT], comma separated
+    \\                        (replaces auto-detect; default: every local IPv4
+    \\                        except loopback and 169.254; none -> 127.0.0.1)
     \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
-    \\  --seed HOST[:PORT]    Peer seed if origin/.cluster is empty; repeatable
+    \\  --seed HOST[:PORT]    Peer seed while origin/.cluster has no live lease; repeatable
     \\  --piece SIZE          Piece size (default 16M)
     \\  --direct-io           FUSE direct_io (default; skips kernel cache)
     \\  --kernel-cache        Allow kernel page cache (uses UMA RAM, can OOM)
@@ -855,8 +856,8 @@ fn ensureDirReal(gpa: std.mem.Allocator, path: []const u8, label: []const u8) ![
 }
 
 /// Addresses published in this node's lease: explicit --advertise entries
-/// (whose parse-defaulted ports follow --listen), or every advertised local
-/// IP, or loopback when nothing else is available.
+/// replace auto-detect (parse-defaulted ports follow --listen). Otherwise
+/// every advertised local IP, or loopback when nothing else is available.
 fn leaseAddrs(gpa: std.mem.Allocator, opts: Opts, local_ips: []const []const u8, eff_port: u16) !std.ArrayList(proto.LeaseAddr) {
     var addrs: std.ArrayList(proto.LeaseAddr) = .empty;
     errdefer addrs.deinit(gpa);
@@ -2513,6 +2514,17 @@ test "leaseAddrs follows --listen and falls back to loopback" {
         try std.testing.expectEqual(@as(usize, 2), addrs.items.len);
         try std.testing.expectEqual(@as(u16, 19091), addrs.items[0].port);
         try std.testing.expectEqual(@as(u16, 19090), addrs.items[1].port);
+    }
+    // --advertise replaces auto-detect: local IPs must not also be published.
+    {
+        var opts = Opts{};
+        try opts.advertise.append(gpa, .{ .ip = "10.0.0.9", .port = 18080 });
+        defer opts.advertise.deinit(gpa);
+        const local = [_][]const u8{ "192.168.1.5", "10.1.1.5" };
+        var addrs = try leaseAddrs(gpa, opts, &local, 18080);
+        defer addrs.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), addrs.items.len);
+        try std.testing.expectEqualStrings("10.0.0.9", addrs.items[0].ip);
     }
     // Without --advertise, every advertised local IP publishes with the
     // effective listening port.
