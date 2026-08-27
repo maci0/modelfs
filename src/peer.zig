@@ -170,15 +170,15 @@ const sock_timeout_ms: u32 = 30_000;
 /// side's default window.
 const sock_buf_bytes: c_int = 2 * 1024 * 1024;
 
-/// Wall-clock budget for one outbound dial (connect(2) wait plus the steady
-/// socket timeout armed before it). A blocking connect can otherwise sit for
-/// minutes on a blackholed peer address.
+/// Elapsed-time budget for one outbound dial (connect(2) wait plus the
+/// steady socket timeout armed before it), measured with monoMs. A blocking
+/// connect can otherwise sit for minutes on a blackholed peer address.
 const dial_timeout_ms: u32 = 15_000;
 
-/// Wall-clock budget for reading one request/response head. SO_RCVTIMEO is
-/// per-recv and resets on every dribbled byte, so without a total cap one
-/// connection can hold an inflight slot (or a client fill thread) forever by
-/// sending a partial head slower than the timeout.
+/// Elapsed-time budget for reading one request/response head, measured with
+/// monoMs. SO_RCVTIMEO is per-recv and resets on every dribbled byte, so
+/// without a total cap one connection can hold an inflight slot (or a client
+/// fill thread) forever by sending a partial head slower than the timeout.
 const head_deadline_ms: i64 = 10_000;
 
 /// Largest request head the protocol can produce: a PATH_MAX rel whose bytes
@@ -191,9 +191,9 @@ const head_deadline_ms: i64 = 10_000;
 /// serving them.
 const max_head_bytes: usize = 4096 * 3 + proto.max_psk_bytes + 512;
 
-/// Wall-clock budget for one response body, read or served: a base allowance
-/// plus 1s per expected MiB (Content-Length is known before any body byte
-/// moves). Same per-transfer-reset hole as the head budget covers: SO_RCVTIMEO
+/// Elapsed-time budget for one response body, read or served, measured with
+/// monoMs: a base allowance plus 1s per expected MiB (Content-Length is known
+/// before any body byte moves). Same per-transfer-reset hole as the head budget covers: SO_RCVTIMEO
 /// resets on every dribbled byte, so a slow sender must not hold a client fill
 /// (and the piece's filling claim every other reader of that piece waits
 /// behind) open-endedly; SO_SNDTIMEO resets on every drain, so a receiver
@@ -208,10 +208,10 @@ const body_deadline_per_mib_ms: i64 = 1_000;
 /// chunk check compares against one sample.
 fn bodyDeadlineFor(io: std.Io, want_len: u64) i64 {
     const mibs: i64 = @intCast(want_len / (1024 * 1024));
-    return sys.monoMs(io) + body_deadline_base_ms + mibs * body_deadline_per_mib_ms;
+    return sys.monoMs(io) +| body_deadline_base_ms +| (mibs *| body_deadline_per_mib_ms);
 }
 
-/// Arms one blocking chunk against a total wall-clock budget. False when
+/// Arms one blocking chunk against a total elapsed-time budget. False when
 /// `deadline_ms` has already passed (the caller reports its own timeout
 /// error); otherwise the socket timeout is clamped to the remaining budget,
 /// so the last blocking syscall wakes at the deadline instead of a full
@@ -219,9 +219,10 @@ fn bodyDeadlineFor(io: std.Io, want_len: u64) i64 {
 /// loop: the clamp condition and the expiry comparison must not drift
 /// between them. Connections close when a transfer stage ends, so the
 /// clamp never needs restoring mid-stage (readHeadFull restores it for the
-/// body stages that follow a completed head).
+/// body stages that follow a completed head). Saturating remainder so a
+/// deadline behind monoMs cannot wrap to a huge positive wait.
 fn armChunkTimeout(io: std.Io, fd: std.posix.fd_t, deadline_ms: i64) bool {
-    const remain_ms = deadline_ms - sys.monoMs(io);
+    const remain_ms = deadline_ms -| sys.monoMs(io);
     if (remain_ms <= 0) return false;
     if (remain_ms < sock_timeout_ms)
         sys.setSockTimeout(fd, @intCast(remain_ms));
@@ -242,7 +243,7 @@ const max_alloc_body_bytes: usize = 512 * 1024 * 1024;
 const max_have_body_bytes: usize = 16 * 1024 * 1024;
 
 fn readHeadFull(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize) !void {
-    return readHeadFullDeadline(io, fd, buf, out_head_len, out_total_read, sys.monoMs(io) + head_deadline_ms);
+    return readHeadFullDeadline(io, fd, buf, out_head_len, out_total_read, sys.monoMs(io) +| head_deadline_ms);
 }
 
 /// readHeadFull with an injectable budget: a non-null deadline drives the
@@ -259,11 +260,11 @@ fn readHeadFullDeadline(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len:
     while (n < buf.len) {
         if (!armChunkTimeout(io, fd, deadline_ms)) return error.HeadTimeout;
         const r = sys.readOnce(fd, buf[n..]) catch {
-            if (deadline_ms - sys.monoMs(io) <= 0) return error.HeadTimeout;
+            if (deadline_ms -| sys.monoMs(io) <= 0) return error.HeadTimeout;
             return error.Head;
         };
         if (r == 0) {
-            if (deadline_ms - sys.monoMs(io) <= 0) return error.HeadTimeout;
+            if (deadline_ms -| sys.monoMs(io) <= 0) return error.HeadTimeout;
             return error.Head;
         }
         const old_n = n;
@@ -890,7 +891,7 @@ fn sockaddrV4(ip: []const u8, port: u16, out: *c.struct_sockaddr_in) !void {
 /// the wire round trip at the dial instead of after it.
 fn dialBudgetMs(io: std.Io, deadline_ms: ?i64) u32 {
     const d = deadline_ms orelse return dial_timeout_ms;
-    const remain_ms = d - sys.monoMs(io);
+    const remain_ms = d -| sys.monoMs(io);
     if (remain_ms <= 0) return 0;
     return @intCast(@min(remain_ms, @as(i64, dial_timeout_ms)));
 }
@@ -984,11 +985,11 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_
     while (got < want_len) {
         if (!armChunkTimeout(io, fd, deadline)) return error.BodyTimeout;
         const n = sys.readOnce(fd, buf[got..]) catch {
-            if (deadline - sys.monoMs(io) <= 0) return error.BodyTimeout;
+            if (deadline -| sys.monoMs(io) <= 0) return error.BodyTimeout;
             return error.Read;
         };
         if (n == 0) {
-            if (deadline - sys.monoMs(io) <= 0) return error.BodyTimeout;
+            if (deadline -| sys.monoMs(io) <= 0) return error.BodyTimeout;
             break;
         }
         got += n;

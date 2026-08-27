@@ -166,7 +166,10 @@ if [[ "${CLONE_MP_WANT}" == "${LIVE}" ]]; then
     die "clone mountpoint ${CLONE_MP_WANT} collides with the live tree; the drill would hash production against itself"
 fi
 
-T0="$(date +%s.%N)"
+# CLOCK_BOOTTIME via /proc/uptime, not date +%s: an NTP step or admin
+# clock set during a multi-minute clone would otherwise log a negative or
+# huge RTO. Suspend time counts, which is what recovery.md's RTO row wants.
+T0="$(awk '{print $1}' /proc/uptime)"
 zfs clone -o "mountpoint=${CLONE_MP_WANT}" "${SNAP}" "${CLONE}" || die "zfs clone of ${SNAP} failed"
 CLONE_MP="$(zfs get -H -o value mountpoint "${CLONE}")"
 if [[ "${CLONE_MP}" == "${LIVE}" ]]; then
@@ -175,8 +178,8 @@ fi
 if [[ ! -d "${CLONE_MP}" ]]; then
     die "clone ${CLONE} did not appear at its mountpoint ${CLONE_MP}"
 fi
-T1="$(date +%s.%N)"
-ELAPSED="$(awk -v a="${T0}" -v b="${T1}" 'BEGIN { printf "%.1f", b - a }')"
+T1="$(awk '{print $1}' /proc/uptime)"
+ELAPSED="$(awk -v a="${T0}" -v b="${T1}" 'BEGIN { printf "%.1f", (b - a < 0) ? 0 : b - a }')"
 echo "drill: cloned to ${CLONE_MP} in ${ELAPSED}s (recorded in the log; this number keeps recovery.md's RTO row honest)"
 
 # Payload files only: .cluster leases republish every 10 s and are not the
@@ -255,7 +258,11 @@ if [[ "${HASH_CLONE}" != "${HASH_LIVE}" ]]; then
 fi
 
 touch "${LOG_FILE}" || die "cannot write the drill log ${LOG_FILE}"
-STAMP="$(date -Is)"
+# UTC, second precision, trailing Z: lexicographically sortable and the
+# same on every host, unlike `date -Is` which is local time with a DST
+# offset (fall-back 01:30 happens twice; string sort then disagrees with
+# instant order).
+STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "${STAMP} ${SNAP} ok snap_age_s=${SNAP_AGE} clone_s=${ELAPSED} drift=${DRIFT} sample=${SAMPLE_REL} replica=${REPLICA_STATUS}" >>"${LOG_FILE}"
 echo "drill OK: ${SNAP} restored and verified (${FILE_COUNT} files, drift ${DRIFT} lines, sample sha256 match on ${SAMPLE_REL})"
 echo "drill log line appended to ${LOG_FILE}; alert when its newest entry ages past 35 days (docs/recovery.md section 6)"

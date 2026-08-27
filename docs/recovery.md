@@ -169,7 +169,7 @@ The script ([scripts/dr_restore_drill.sh](../scripts/dr_restore_drill.sh)) picks
 
 The pool-loss copy is not visible to a local `zfs list` when syncoid pushed it to another host. Run the same script on the replica host (or import the replica and set `MF_DRILL_REPLICA`), otherwise the log line records `replica=unchecked`. When `MF_DRILL_REPLICA` is set, a missing dataset, an empty snapshot list, or a replica older than `MF_DRILL_MAX_SNAP_AGE` fails the drill the same way a dead sanoid.timer does.
 
-The timed clone is the measured restore rate that keeps the RTO row honest; the log line is the artifact proving the drill ran. Alert when the newest entry ages past 35 days. `scripts/test_dr_restore_drill.sh` (also run by `scripts/check.sh`) drives the drill through a stub `zfs` so a clone-onto-live or empty-snapshot false pass cannot ship.
+The timed clone is the measured restore rate that keeps the RTO row honest (elapsed from `/proc/uptime`, so an NTP step during the clone cannot log a negative RTO); the log line is the artifact proving the drill ran. Its stamp is UTC (`YYYY-MM-DDTHH:MM:SSZ`), so aging it does not depend on the NAS timezone or a DST fall-back. Alert when the newest entry ages past 35 days. `scripts/test_dr_restore_drill.sh` (also run by `scripts/check.sh`) drives the drill through a stub `zfs` so a clone-onto-live or empty-snapshot false pass cannot ship.
 
 ## 7. Open questions (not answerable from this repo)
 

@@ -322,6 +322,11 @@ if [[ -f "${LOG1}" ]] && grep -q "sample=/gguf/model.gguf" "${LOG1}" && grep -q 
 else
     fail "log missing sample or replica field: $(cat "${LOG1}" 2>/dev/null || true)"
 fi
+if [[ -f "${LOG1}" ]] && grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z ' "${LOG1}"; then
+    pass "log stamp is UTC Z-form"
+else
+    fail "log stamp is not UTC Z-form: $(cat "${LOG1}" 2>/dev/null || true)"
+fi
 # Clone must have been destroyed by the EXIT trap.
 if [[ -f "${STUB_STATE}/clone" ]]; then
     fail "happy path left the clone dataset behind"

@@ -280,7 +280,7 @@ pub const Catalog = struct {
             };
             gpa.free(e.bits);
             self.have_cache.items[i].bits = b;
-            self.have_cache.items[i].expires_ms = now_ms + have_ttl_ms;
+            self.have_cache.items[i].expires_ms = now_ms +| have_ttl_ms;
             self.have_cache.items[i].piece_size = piece_size;
             return;
         }
@@ -312,7 +312,7 @@ pub const Catalog = struct {
             .ip = ip_own,
             .port = port,
             .bits = bits_own,
-            .expires_ms = now_ms + have_ttl_ms,
+            .expires_ms = now_ms +| have_ttl_ms,
             .piece_size = piece_size,
         }) catch {
             gpa.free(bits_own);
@@ -428,7 +428,7 @@ pub const Catalog = struct {
             return;
         };
         var json_buf: [2048]u8 = undefined;
-        const until = now_sec + lease_ttl_secs;
+        const until = now_sec +| lease_ttl_secs;
         const json = proto.formatLease(&json_buf, self.self_id, until, self.addrs) catch {
             std.log.warn("lease publish skipped: {d} addresses do not fit the lease document", .{self.addrs.len});
             return;
@@ -567,7 +567,7 @@ pub const Catalog = struct {
         const dirz = self.clusterDir(&dbuf) catch return;
         const dir = c.opendir(dirz) orelse return;
         defer _ = c.closedir(dir);
-        const cutoff = now_sec - sweep_min_age_secs;
+        const cutoff = now_sec -| sweep_min_age_secs;
         while (c.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
             if (name.len == 0 or name[0] == '.') continue;

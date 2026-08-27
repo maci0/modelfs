@@ -17,6 +17,8 @@ commit hash if you are not on the tag.
   so a leftover from `v0.1.0` still parses; without it only the pid check
   runs. Saturation at the 16-handler cap is visible as `http_dropped` /
   `httpdrop` on the tick line and in the document.
+- **`modelfs status` no longer flaps on an NTP step.** The wedge gate compared `now_s` (CLOCK_REALTIME) to the CLI's wall clock, so a forward jump of more than 120 s retired a ticking mount until the next discovery tick, and a backward jump kept a hung daemon looking live. `statusJson` now publishes `mono_s` (CLOCK_MONOTONIC, comparable across processes on that machine); `cmdStatus` prefers it and saturates the age subtract so a hostile i64-min stamp cannot overflow. Wall-clock `now_s` remains for operators and as the fallback for older artifacts.
+- **Restore-drill log stamps are UTC, and clone elapsed time ignores wall-clock jumps.** `date -Is` wrote local time with a DST offset, so lexicographic order of the log disagreed with instant order around fall-back, and `date +%s.%N` around the clone would log a negative or huge RTO if NTP stepped. New lines use `YYYY-MM-DDTHH:MM:SSZ`; clone duration is `/proc/uptime` (CLOCK_BOOTTIME).
 - **Origin and cache opens do not follow a planted symlink**:
   `originPread` / `originPwrite` and cache data opens use `O_NOFOLLOW`,
   so a symlink at a model path fails closed (`ELOOP`) instead of serving

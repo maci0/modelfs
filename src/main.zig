@@ -1065,10 +1065,10 @@ fn pidAlive(pid: i64) bool {
 }
 
 /// Only liveness fields matter here; every other status.json field is
-/// ignored (and validated by whoever consumes the full document). now_s is
-/// optional so artifacts from older builds keep parsing: without it the
-/// staleness gate below simply cannot fire.
-const StatusLiveness = struct { pid: i64, now_s: ?i64 = null };
+/// ignored (and validated by whoever consumes the full document). now_s and
+/// mono_s are optional so artifacts from older builds keep parsing: without
+/// a stamp the staleness gate below simply cannot fire.
+const StatusLiveness = struct { pid: i64, now_s: ?i64 = null, mono_s: ?i64 = null };
 
 /// How long a status.json may go unrefreshed before `status` stops serving
 /// it as evidence of a working mount. The discovery tick rewrites the
@@ -1076,6 +1076,18 @@ const StatusLiveness = struct { pid: i64, now_s: ?i64 = null };
 /// wedged inside a hung origin call or a stuck worker leaves the file aging
 /// past it while its pid lives on, which the pid check alone cannot catch.
 const max_status_age_secs: i64 = 120;
+
+/// Seconds since the heartbeat was written. Prefer `mono_s` (CLOCK_MONOTONIC,
+/// comparable across processes on this machine) so an NTP step or admin
+/// clock set cannot make a wedged daemon look fresh or a healthy one look
+/// dead. Fall back to wall-clock `now_s` for artifacts from older builds.
+/// Saturating subtract so a hostile i64-min stamp cannot overflow the
+/// subtraction in safe builds.
+fn statusAgeSecs(io: std.Io, doc: StatusLiveness) ?i64 {
+    if (doc.mono_s) |stamp| return sys.monoSec(io) -| stamp;
+    if (doc.now_s) |stamp| return sys.nowSec(io) -| stamp;
+    return null;
+}
 
 fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
@@ -1120,10 +1132,10 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // (origin call that never returns, deadlocked worker) and keeps status.json
     // exactly as it was when the discovery tick last got to run. Serving it
     // would report a mount that cannot serve reads as healthy to every
-    // monitor keying on this command's exit code. A wall-clock step backward
-    // makes the age negative, which reads as fresh; only real aging retires.
-    if (doc.value.now_s) |stamp| {
-        const age = sys.nowSec(io) - stamp;
+    // monitor keying on this command's exit code. Age is monotonic when the
+    // document carries mono_s, so a wall-clock step no longer flips the
+    // verdict; the now_s fallback still treats a backward step as fresh.
+    if (statusAgeSecs(io, doc.value)) |age| {
         if (age > max_status_age_secs) {
             if (!builtin.is_test)
                 std.debug.print("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ opts.cache, store_mod.status_file, age });
@@ -1645,7 +1657,8 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     // A live writer whose artifact has stopped ticking is the wedged daemon:
     // pid alive, discovery tick hung. Past the freshness window the document
     // must read as not serving (exit 1) instead of reporting frozen stats as
-    // a healthy node; inside the window it still serves.
+    // a healthy node; inside the window it still serves. now_s-only artifacts
+    // are the older-build fallback.
     {
         var old_buf: [128]u8 = undefined;
         const old_doc = try std.fmt.bufPrint(&old_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) - 121 });
@@ -1656,6 +1669,38 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
         const fresh_doc = try std.fmt.bufPrint(&fresh_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), fresh_doc));
         try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+    }
+
+    // NTP step / admin clock set: wall time and monotonic disagree. Prefer
+    // mono_s so a forward jump does not retire a ticking daemon and a
+    // backward jump does not keep a wedged one looking live.
+    {
+        var ntp_ok_buf: [192]u8 = undefined;
+        const ntp_ok = try std.fmt.bufPrint(&ntp_ok_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
+            std.os.linux.getpid(),
+            sys.nowSec(std.testing.io) - 121,
+            sys.monoSec(std.testing.io),
+        });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), ntp_ok));
+        try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+
+        var ntp_dead_buf: [192]u8 = undefined;
+        const ntp_dead = try std.fmt.bufPrint(&ntp_dead_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
+            std.os.linux.getpid(),
+            sys.nowSec(std.testing.io),
+            sys.monoSec(std.testing.io) - 121,
+        });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), ntp_dead));
+        try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+    }
+
+    // A hostile/corrupt now_s of i64 min used to overflow the age subtract
+    // (panic in safe builds). Saturating treat it as stale, not live.
+    {
+        var min_buf: [128]u8 = undefined;
+        const min_doc = try std.fmt.bufPrint(&min_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), std.math.minInt(i64) });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), min_doc));
+        try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
     }
 
     // An unparseable leftover gets the same verdict as an absent one.

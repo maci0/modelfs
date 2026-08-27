@@ -25,10 +25,11 @@ pub fn nowSec(io: std.Io) i64 {
     return std.Io.Clock.now(.real, io).toSeconds();
 }
 
-/// Monotonic seconds: for elapsed-time comparisons within this process only
-/// (never persisted, never shared across processes or machines). Sampled
-/// through `io` (CLOCK_MONOTONIC via Clock.awake) so recency, reap, and
-/// fill stamps stay a function of the injected clock.
+/// Monotonic seconds: elapsed-time comparisons on this machine
+/// (CLOCK_MONOTONIC is comparable across processes, not across reboots or
+/// hosts). Sampled through `io` (CLOCK_MONOTONIC via Clock.awake) so recency,
+/// reap, fill stamps, and status.json's `mono_s` stay a function of the
+/// injected clock.
 pub fn monoSec(io: std.Io) i64 {
     return std.Io.Clock.now(.awake, io).toSeconds();
 }

@@ -753,12 +753,12 @@ pub const Store = struct {
             // Cheap gates outside file.mu: busy entries and steady-state
             // warm ones (fd closed, pieces cached) cost one atomic load.
             if (f.refs.load(.acquire) != 0) continue;
-            if (now_sec - f.last_access.load(.monotonic) < min_idle_secs) continue;
+            if (now_sec -| f.last_access.load(.monotonic) < min_idle_secs) continue;
             var evict = false;
             f.mu.lockUncancelable(self.io);
             candidate: {
                 if (f.filling.count() != 0) break :candidate;
-                if (now_sec - f.last_access.load(.monotonic) < min_idle_secs) break :candidate;
+                if (now_sec -| f.last_access.load(.monotonic) < min_idle_secs) break :candidate;
                 if (f.cache_fd >= 0) {
                     sys.close(f.cache_fd);
                     f.cache_fd = -1;
@@ -1180,7 +1180,7 @@ pub const Store = struct {
         // started since (its stamp lands under this same lock). Punching a
         // piece mid-transfer would serve hole zeros and the peer would mark
         // them filled.
-        if (now_sec - file.last_access.load(.monotonic) < recency_secs) return false;
+        if (now_sec -| file.last_access.load(.monotonic) < recency_secs) return false;
         if (self.pinExists(file.rel)) return false;
         if (file.filling.contains(idx)) return false;
         // Bytes of this entry may be mid-send to a fetching peer (stalled
@@ -1265,7 +1265,7 @@ pub const Store = struct {
         while (it.next()) |e| {
             const f = e.value_ptr.*;
             const at = f.last_access.load(.monotonic);
-            if (now_sec - at < recency_secs) continue;
+            if (now_sec -| at < recency_secs) continue;
             _ = f.refs.fetchAdd(1, .monotonic);
             cands.append(self.gpa, .{ .f = f, .at = at }) catch {
                 _ = f.refs.fetchSub(1, .monotonic);
@@ -3500,13 +3500,14 @@ test "walkData samples oldest-first disk-only files across subdirs" {
         .{ .rel = "new.bin", .age = 100 },
     };
     var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const walk_now = sys.nowSec(std.testing.io);
     for (entries) |e| {
         var fb: [320]u8 = undefined;
         const fp = try std.fmt.bufPrint(&fb, "{s}/data/{s}", .{ cache_d, e.rel });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "cached"));
         const past = [2]std.os.linux.timespec{
-            .{ .sec = sys.nowSec(std.testing.io) - e.age, .nsec = 0 },
-            .{ .sec = sys.nowSec(std.testing.io) - e.age, .nsec = 0 },
+            .{ .sec = walk_now - e.age, .nsec = 0 },
+            .{ .sec = walk_now - e.age, .nsec = 0 },
         };
         const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zbuf, fp), &past, 0);
         try std.testing.expectEqual(@as(usize, 0), rc);
@@ -3548,6 +3549,7 @@ test "walkData keeps the oldest cap files when candidates exceed the sample" {
     // sampled.
     var zbuf: [sys.c.PATH_MAX]u8 = undefined;
     const n: usize = Store.walk_sample_cap + 4;
+    const walk_now = sys.nowSec(std.testing.io);
     for (0..n) |i| {
         var fb: [320]u8 = undefined;
         var nb: [32]u8 = undefined;
@@ -3555,10 +3557,12 @@ test "walkData keeps the oldest cap files when candidates exceed the sample" {
         const fp = try std.fmt.bufPrint(&fb, "{s}/data/{s}", .{ cache_d, name });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "cached"));
         // Descending age with index: f00 is the oldest, fNN the youngest.
+        // One wall sample for the whole set so a second boundary mid-loop
+        // cannot reorder two files whose ages differ by that second.
         const age: i64 = @intCast(100 * (n - i));
         const past = [2]std.os.linux.timespec{
-            .{ .sec = sys.nowSec(std.testing.io) - age, .nsec = 0 },
-            .{ .sec = sys.nowSec(std.testing.io) - age, .nsec = 0 },
+            .{ .sec = walk_now - age, .nsec = 0 },
+            .{ .sec = walk_now - age, .nsec = 0 },
         };
         const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zbuf, fp), &past, 0);
         try std.testing.expectEqual(@as(usize, 0), rc);

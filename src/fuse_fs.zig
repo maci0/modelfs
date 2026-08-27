@@ -543,7 +543,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     const s = &st.store.stats;
     // Sampled after the cache write lands: the published average is the full
     // claim-to-cache-write stall the reader ate for this piece.
-    const fill_dt: u64 = @intCast(sys.monoNs(st.io) - fill_t0);
+    const fill_dt: u64 = @intCast(@max(sys.monoNs(st.io) - fill_t0, 0));
     if (from_peer) {
         _ = s.fills_peer.fetchAdd(1, .monotonic);
         _ = s.bytes_from_peer.fetchAdd(ln, .monotonic);
@@ -585,7 +585,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     // Latency covers the whole handler: warm reads too, so the tick line's
     // average tracks real reader-perceived latency, not just miss stalls.
     const rd_t0 = sys.monoNs(st.io);
-    defer _ = st.store.stats.read_nanos.fetchAdd(@intCast(sys.monoNs(st.io) - rd_t0), .monotonic);
+    defer _ = st.store.stats.read_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - rd_t0, 0)), .monotonic);
     var rel: []const u8 = "";
     const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
     if (rerr != 0) return rerr;
@@ -660,7 +660,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     // Same whole-handler coverage as mf_read: origin pwrite is the stall,
     // and wr_us on the tick line is the only way to see writes got slow.
     const wr_t0 = sys.monoNs(st.io);
-    defer _ = st.store.stats.write_nanos.fetchAdd(@intCast(sys.monoNs(st.io) - wr_t0), .monotonic);
+    defer _ = st.store.stats.write_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - wr_t0, 0)), .monotonic);
     var rel: []const u8 = "";
     // Lookup-shaped denial: open on /.cluster already fails with ENOENT, so
     // write must agree instead of leaking that the control dir exists.
@@ -1165,16 +1165,23 @@ fn statusJson(st: *State) !void {
     // emitted from Stats.Snap's fields (the same list logStatsTick diffs),
     // so a new counter publishes here by construction instead of by
     // remembering to edit this document's format string.
+    // One pair of samples for the whole document: uptime_s and mono_s share
+    // the monotonic instant, and now_s is the matching wall-clock read.
+    // mono_s is the wedge gate (same-machine CLOCK_MONOTONIC, immune to NTP
+    // steps); now_s stays the human/monitor wall stamp.
+    const now_mono = sys.monoSec(st.io);
+    const now_wall = sys.nowSec(st.io);
     var w = std.Io.Writer.fixed(&buf);
-    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"now_s\":{d},\"stats\":{{", .{
+    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"now_s\":{d},\"mono_s\":{d},\"stats\":{{", .{
         st.catalog.self_id,
         std.os.linux.getpid(),
-        sys.monoSec(st.io) - st.start_secs,
+        now_mono -| st.start_secs,
         npeers,
         st.store.piece_size,
         st.server.http_inflight.load(.monotonic),
         cache_free_pct,
-        sys.nowSec(st.io),
+        now_wall,
+        now_mono,
     });
     inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields, 0..) |f, i| {
         if (i != 0) try w.writeByte(',');
@@ -1284,6 +1291,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
         inflight: u32,
         cache_free_pct: i32,
         now_s: i64,
+        mono_s: i64,
         stats: StatsDoc,
     };
     const doc = try std.json.parseFromSlice(StatusDoc, gpa, blob, .{});
@@ -1297,10 +1305,11 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // The saturation gauge rides along: statvfs works here, so a real
     // percentage, not the -1 unknown marker.
     try std.testing.expect(doc.value.cache_free_pct >= 0);
-    // The wall-clock stamp is what lets `status` (and any monitor) tell a
-    // wedged daemon from a ticking one from a single read: it must be a
-    // current epoch second, not zero or a monotonic value.
+    // now_s is a current epoch second (operators/monitors); mono_s is the
+    // same-machine monotonic instant the wedge gate compares against. Zero
+    // or a swapped pair would make `status` misread a live node.
     try std.testing.expect(doc.value.now_s >= sys.nowSec(st.io) - 5);
+    try std.testing.expect(doc.value.mono_s >= sys.monoSec(st.io) - 5);
     // Counters ride along with the liveness fields: an operator answers
     // "is it serving, from where, is it failing" from one artifact.
     try std.testing.expectEqual(@as(u64, 0), doc.value.stats.reads_ok);
