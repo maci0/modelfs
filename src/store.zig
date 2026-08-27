@@ -941,8 +941,12 @@ pub const Store = struct {
     /// Caller holds file.mu. True when every piece overlapping [off, off+n)
     /// against this size sample is marked filled. The FUSE warm-read path
     /// uses this under the size-sample lock so a fully-cached range skips
-    /// ensureRange's per-piece lock round trips.
+    /// ensureRange's per-piece lock round trips. A range the bitfield cannot
+    /// name (piece index past u32, after count() clamps) is never filled:
+    /// cover() of that tail is empty, which would otherwise look like a hit
+    /// and serve hole zeros.
     pub fn rangeFilled(file: *Cached, fsize: u64, off: u64, n: u64, piece_size: u32) bool {
+        if (!piece.rangeTracked(off, n, fsize, piece_size)) return false;
         const cov = piece.cover(off, n, fsize, piece_size);
         var i = cov.start;
         while (i < cov.end) : (i += 1) {
@@ -977,7 +981,13 @@ pub const Store = struct {
     /// turn a dead cache mount into a total read outage for every file with
     /// cached pieces. Each fallback is warned: without the line a silently
     /// degraded node is indistinguishable from normal service.
+    ///
+    /// Bytes past `piece.trackedEnd` have no bit and a sparse cache pread
+    /// returns hole zeros as a successful read, so those ranges go to origin
+    /// without touching the cache fd.
     pub fn readServed(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64) isize {
+        if (!piece.rangeTracked(off, buf.len, file.size, self.piece_size))
+            return self.originPread(file.rel, buf, off);
         const n = self.readCache(file, buf, off, now_sec);
         if (n >= 0) return n;
         std.log.warn("cache read failed for {s} (errno {d}); serving from origin", .{ file.rel, -n });
@@ -1611,6 +1621,11 @@ test "rangeFilled is true only when every covered piece is marked" {
     try std.testing.expect(!Store.rangeFilled(&file, 64, 0, 33, ps));
     try std.testing.expect(!Store.rangeFilled(&file, 64, 32, 16, ps));
     try std.testing.expect(Store.rangeFilled(&file, 64, 100, 8, ps));
+    // Piece-size 1 past 4 GiB: cover() of the tail is empty (indexAt
+    // clamps), which used to look filled.
+    const tail_off: u64 = std.math.maxInt(u32);
+    try std.testing.expect(!Store.rangeFilled(&file, tail_off + 100, tail_off, 8, 1));
+    try std.testing.expect(!Store.rangeFilled(&file, tail_off + 100, tail_off - 10, 20, 1));
 }
 
 test "cacheFill grows entry preserving earlier piece marks" {
@@ -3422,6 +3437,44 @@ test "readServed falls back to origin when the cache tier cannot answer" {
     // The plain cache read still reports the failure itself: the fallback
     // must not swallow the errno from callers that want it.
     try std.testing.expect(st.readCache(f, &rb, 0, sys.monoSec(std.testing.io)) < 0);
+}
+
+test "readServed takes origin for the tail past the u32 piece-index clamp" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-untracked");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-untracked");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Piece size 1: count() clamps at maxInt(u32), so bytes at that offset
+    // have no bit. A sparse origin write there is cheap; the cache fd would
+    // pread hole zeros and used to return them as a successful warm read.
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 1);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const tail_off: u64 = std.math.maxInt(u32);
+    const pattern = "UNTRACKED_TAIL!";
+    var zbuf: [192]u8 = undefined;
+    var fbuf: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&zbuf, "{s}/tail.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fbuf, fp), ""));
+    try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), st.originPwrite("tail.bin", pattern, tail_off));
+
+    // Allocate a tiny bitfield (get at a small size) then raise file.size so
+    // the production rangeTracked check fires without a 512 MiB sidecar.
+    const f = try st.get("tail.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    f.mu.lockUncancelable(std.testing.io);
+    f.size = tail_off + pattern.len;
+    f.mu.unlock(std.testing.io);
+
+    var rb: [16]u8 = undefined;
+    const n = st.readServed(f, rb[0..pattern.len], tail_off, sys.monoSec(std.testing.io));
+    try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
+    try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
 }
 
 test "considerVictim keeps a bounded oldest-first sample" {

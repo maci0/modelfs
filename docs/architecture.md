@@ -103,7 +103,7 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 |---|---|
 | `c.h`, `c.zig` | Sole door to libfuse3 and libc |
 | `sys.zig` | Syscall wrappers; no policy beyond EINTR retry |
-| `piece.zig` | Piece arithmetic and the persisted bitfield codec |
+| `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`) and the persisted bitfield codec |
 | `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`) |
 | `cull.zig` | Free-space watermark policy |
 | `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
@@ -171,7 +171,7 @@ Range: bytes=start-end
 Authorization: Bearer <psk>
 ```
 
-`/have` replies carry `X-Piece-Size: <n>`, the piece grid the bitmap's bits are indexed against; a fetcher running a different `--piece` treats that peer's answer as no-answer instead of routing fills by bits that cover different byte ranges (a fleet should still run one piece size; mixed grids degrade to origin traffic, never to wrong data). Peers older than this header read as unknown and are assumed aligned. The bitmap body itself stays raw bits: one byte per eight pieces, bit i naming piece i least-significant-bit first, `ceil(pieces / 8)` bytes long.
+`/have` replies carry `X-Piece-Size: <n>`, the piece grid the bitmap's bits are indexed against; a fetcher running a different `--piece` treats that peer's answer as no-answer instead of routing fills by bits that cover different byte ranges (a fleet should still run one piece size; mixed grids degrade to origin traffic, never to wrong data). Peers older than this header read as unknown and are assumed aligned. The bitmap body itself stays raw bits: one byte per eight pieces, bit i naming piece i least-significant-bit first, `ceil(pieces / 8)` bytes long. `piece.count` clamps at 2^32-1 pieces (`trackedEnd` in src/piece.zig); bytes past that have no bit, and FUSE/peer reads take them from the origin rather than treating an empty `cover` as a cache hit (a sparse pread of the hole would otherwise return zeros).
 
 Status codes, identical framing on every endpoint (`Content-Length` always present, `Connection: close`, empty body on errors):
 

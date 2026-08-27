@@ -563,7 +563,11 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
 /// per-chunk clamp to its remainder is what keeps a dribbling receiver from
 /// holding an inflight slot forever.
 fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, deadline_ms: i64) void {
-    const cfd = self.store.openCache(file);
+    // Sendfile copies the cache fd, including sparse holes. A range the
+    // bitfield cannot name would ship those zeros as a 206 body and the
+    // fetching peer would mark them filled.
+    const cache_ok = piece.rangeTracked(start, want, file.size, self.store.piece_size);
+    const cfd = if (cache_ok) self.store.openCache(file) else @as(c_int, -1);
     if (cfd >= 0) {
         var done: u64 = 0;
         while (done < want) {
@@ -613,7 +617,7 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
             return;
         }
         const take = @min(remaining, buf.len);
-        const n = self.store.readCache(file, buf[0..take], off, sys.monoSec(self.io));
+        const n = self.store.readServed(file, buf[0..take], off, sys.monoSec(self.io));
         if (n < 0 or @as(u64, @intCast(n)) != take) {
             // Same contract as the sendfile path: the peer sees a truncated
             // body, so the local log must carry where and why. A negative

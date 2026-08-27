@@ -50,6 +50,27 @@ fn tailValidBits(lo: u32, span: u32, nbits: u32) ?u6 {
     return @intCast(v);
 }
 
+/// Exclusive end of the byte range the bitfield can name. `count` clamps at
+/// maxInt(u32), so a file whose true piece count would exceed that (piece
+/// size 1 past 4 GiB, or a sparse truncate near i64 max with a small piece)
+/// has a tail no sidecar bit can mark. `cover` of that tail collapses to an
+/// empty span; callers must not treat that as "already filled".
+pub fn trackedEnd(file_size: u64, piece_size: u32) u64 {
+    const n = count(file_size, piece_size);
+    if (n == 0) return 0;
+    const last = n - 1;
+    return offset(last, piece_size) + @as(u64, len(file_size, last, piece_size));
+}
+
+/// True when [off, off+n) against file_size lies entirely inside trackedEnd.
+/// Empty and past-EOF ranges are vacuously tracked: there are no bytes to
+/// serve from either tier.
+pub fn rangeTracked(off: u64, n: u64, file_size: u64, piece_size: u32) bool {
+    if (n == 0 or off >= file_size) return true;
+    const end = @min(off +| n, file_size);
+    return end <= trackedEnd(file_size, piece_size);
+}
+
 /// Inclusive start, exclusive end of pieces overlapping [file_off, file_off+n).
 pub fn cover(file_off: u64, n: u64, file_size: u64, piece_size: u32) struct { start: u32, end: u32 } {
     if (n == 0 or piece_size == 0 or file_off >= file_size) return .{ .start = 0, .end = 0 };
@@ -460,6 +481,38 @@ test "cover saturation near max int" {
     const past = cover(max - 2049, 10, 100, 1024);
     try std.testing.expectEqual(@as(u32, 0), past.start);
     try std.testing.expectEqual(@as(u32, 0), past.end);
+}
+
+test "trackedEnd matches file_size until the u32 piece count clamps" {
+    const ps: u32 = 16 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u64, 0), trackedEnd(0, ps));
+    try std.testing.expectEqual(@as(u64, 100), trackedEnd(100, ps));
+    try std.testing.expectEqual(@as(u64, ps), trackedEnd(ps, ps));
+    try std.testing.expectEqual(@as(u64, ps + 100), trackedEnd(ps + 100, ps));
+    try std.testing.expect(rangeTracked(0, 100, 100, ps));
+    try std.testing.expect(rangeTracked(100, 8, 100, ps));
+    try std.testing.expect(rangeTracked(50, 0, 100, ps));
+
+    // piece size 1: the bitfield names bytes 0..maxInt(u32)-1; a 5 GiB
+    // sparse file's tail has no piece index that fits u32. Concrete miss:
+    // offset maxInt(u32) used to make cover() empty, rangeFilled vacuously
+    // true, and a FUSE/peer read served hole zeros instead of origin bytes.
+    const ps1: u32 = 1;
+    const tail_off: u64 = std.math.maxInt(u32);
+    const huge: u64 = tail_off + 100;
+    try std.testing.expectEqual(tail_off, trackedEnd(huge, ps1));
+    try std.testing.expect(rangeTracked(tail_off - 1, 1, huge, ps1));
+    try std.testing.expect(!rangeTracked(tail_off, 1, huge, ps1));
+    try std.testing.expect(!rangeTracked(tail_off - 10, 20, huge, ps1));
+    const empty = cover(tail_off, 8, huge, ps1);
+    try std.testing.expectEqual(empty.start, empty.end);
+
+    // Default 16 MiB pieces clamp at 64 PiB, well below i64 max; a read in
+    // the untracked tail must not look filled.
+    const clamp_off = offset(std.math.maxInt(u32), ps);
+    try std.testing.expect(clamp_off < std.math.maxInt(i64));
+    try std.testing.expect(!rangeTracked(clamp_off, 1, std.math.maxInt(i64), ps));
+    try std.testing.expect(rangeTracked(0, ps, std.math.maxInt(i64), ps));
 }
 
 /// One sidecar blob as it lands on shared storage, wrapped in the corpus
