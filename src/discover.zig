@@ -734,6 +734,18 @@ pub const Catalog = struct {
         const dir = c.opendir(dirz) orelse return;
         defer _ = c.closedir(dir);
         const cutoff = self.sweepCutoff(dirz, now_sec);
+
+        // Collect then sort: NFS readdir order must not decide which stale
+        // claim is unlinked first. A crash mid-sweep would otherwise leave
+        // a remainder that is a function of directory cookies, not of the
+        // name set -- the same reason reapIdle sorts equally idle entries.
+        // OOM mid-collect skips the tick rather than unlinking a partial,
+        // readdir-dependent subset; the next discovery pass retries.
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |n| self.gpa.free(n);
+            names.deinit(self.gpa);
+        }
         while (c.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
             if (name.len == 0 or name[0] == '.') continue;
@@ -742,6 +754,19 @@ pub const Catalog = struct {
             } else if (!std.mem.endsWith(u8, name, ".tmp")) {
                 continue;
             }
+            const owned = self.gpa.dupe(u8, name) catch return;
+            names.append(self.gpa, owned) catch {
+                self.gpa.free(owned);
+                return;
+            };
+        }
+        std.mem.sort([]u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []u8, b: []u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+
+        for (names.items) |name| {
             var fbuf: [sys.c.PATH_MAX]u8 = undefined;
             const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
             var st: c.struct_stat = undefined;
@@ -1404,6 +1429,53 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
+}
+
+test "sweepLeases unlinks stale names as a set, not readdir arrival order" {
+    // zzz written first so creation-order readdir would visit it before aaa.
+    // Both must go; the survivor set is the name set, not directory cookies.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-sweep-order");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    const lease_json = "{\"id\":\"x\",\"until\":1,\"addrs\":[]}";
+    var zbuf: [192]u8 = undefined;
+    var zzz_buf: [192]u8 = undefined;
+    const zzz_fp = try std.fmt.bufPrint(&zzz_buf, "{s}/zzz.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, zzz_fp), lease_json));
+    var mmm_buf: [192]u8 = undefined;
+    const mmm_fp = try std.fmt.bufPrint(&mmm_buf, "{s}/mmm.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, mmm_fp), lease_json));
+    var aaa_buf: [192]u8 = undefined;
+    const aaa_fp = try std.fmt.bufPrint(&aaa_buf, "{s}/aaa.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, aaa_fp), lease_json));
+    var me_buf: [192]u8 = undefined;
+    const me_fp = try std.fmt.bufPrint(&me_buf, "{s}/me.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, me_fp), lease_json));
+
+    const sweep_now = sys.nowSec(std.testing.io);
+    const past = [2]std.os.linux.timespec{
+        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
+        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
+    };
+    for ([_][]const u8{ zzz_fp, mmm_fp, aaa_fp }) |fp| {
+        var zb: [192]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, fp), &past, 0));
+    }
+
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    cat.sweepLeases(sweep_now);
+
+    var stbuf: c.struct_stat = undefined;
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, zzz_fp), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, mmm_fp), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, aaa_fp), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
 }
 

@@ -429,12 +429,12 @@ fn unknownEnvLine(buf: []u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "unknown environment variable {s} (see 'modelfs help')\n", .{discover.displayName(name)}) catch "unknown environment variable (see 'modelfs help')\n";
 }
 
-/// The MODELFS_ prefix is this CLI's environment namespace; anything under
-/// it that no flag answers to is a misspelling, not a foreign variable.
-/// Variables outside the namespace are never this binary's business and
-/// pass untouched.
-fn checkKnownEnv(environ: *const std.process.Environ.Map) !void {
+/// First unknown `MODELFS_*` name in the environment, or null. The name
+/// aliases the map. HashMap iteration must not choose which typo is
+/// reported when several exist: the refusal is a function of the name set.
+fn unknownEnvName(environ: *const std.process.Environ.Map) ?[]const u8 {
     const known = [_][]const u8{ "MODELFS_ORIGIN", "MODELFS_CACHE", "MODELFS_PSK", "MODELFS_PSK_VALUE", "MODELFS_ID", "MODELFS_LOG" };
+    var best: ?[]const u8 = null;
     var it = environ.iterator();
     while (it.next()) |e| {
         const name = e.key_ptr.*;
@@ -442,13 +442,23 @@ fn checkKnownEnv(environ: *const std.process.Environ.Map) !void {
         for (known) |k| {
             if (std.mem.eql(u8, name, k)) break;
         } else {
-            if (!builtin.is_test) {
-                var lbuf: [512]u8 = undefined;
-                std.debug.print("{s}", .{unknownEnvLine(&lbuf, name)});
-            }
-            return error.UnknownEnv;
+            if (best == null or std.mem.order(u8, name, best.?) == .lt) best = name;
         }
     }
+    return best;
+}
+
+/// The MODELFS_ prefix is this CLI's environment namespace; anything under
+/// it that no flag answers to is a misspelling, not a foreign variable.
+/// Variables outside the namespace are never this binary's business and
+/// pass untouched.
+fn checkKnownEnv(environ: *const std.process.Environ.Map) !void {
+    const name = unknownEnvName(environ) orelse return;
+    if (!builtin.is_test) {
+        var lbuf: [512]u8 = undefined;
+        std.debug.print("{s}", .{unknownEnvLine(&lbuf, name)});
+    }
+    return error.UnknownEnv;
 }
 
 /// True when sub lies beneath dir (component-wise). Both sides are
@@ -1364,8 +1374,10 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // Collect before printing: readdir order is filesystem-dependent (and
     // the origin is NFS), so sorting by lease file name keeps the listing a
     // function of the directory's contents alone and run-to-run diffable.
-    // walkLeases's parsed value aliases a stack buffer, so every string
-    // printed below is copied here.
+    // Each row's addrs are sorted the same way the published lease is
+    // (addrTieLess), so a mixed-fleet document that still carries getifaddrs
+    // order cannot change the listing. walkLeases's parsed value aliases a
+    // stack buffer, so every string printed below is copied here.
     const Addr = struct {
         ip: []u8,
         port: u16,
@@ -1453,6 +1465,13 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             return std.mem.order(u8, a.name, b.name) == .lt;
         }
     }.lessThan);
+    for (rows.items) |*r| {
+        std.mem.sort(Addr, r.addrs, {}, struct {
+            fn lessThan(_: void, a: Addr, b: Addr) bool {
+                return discover.addrTieLess(a.ip, a.port, b.ip, b.port);
+            }
+        }.lessThan);
+    }
 
     const now = sys.nowSec(io);
     var any = false;
@@ -1841,6 +1860,20 @@ test "parseArgs refuses unknown MODELFS_ variables as typos" {
     }
 }
 
+test "unknownEnvName reports the lexicographically first typo" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    // Insert Z first so HashMap iteration would otherwise surface it
+    // ahead of A. The refusal must name A: the env set, not insertion.
+    try environ.put("MODELFS_ZZZ", "1");
+    try environ.put("MODELFS_AAA", "1");
+    try environ.put("PATH", "/usr/bin");
+    try environ.put("MODELFS_CACHE", "/env/cache");
+    try std.testing.expectEqualStrings("MODELFS_AAA", unknownEnvName(&environ).?);
+    try std.testing.expectError(error.UnknownEnv, parseArgs(gpa, &environ, &.{"status"}));
+}
+
 test "unknownEnvLine renders refused names through the displayName echo gate" {
     // An unknown MODELFS_ variable arrives from whatever composed this
     // process's environment (systemd unit, CI wrapper, remote shell), so the
@@ -2224,6 +2257,34 @@ test "cmdPeers skips an unleasable lease entry instead of failing the listing" {
     defer captured_stdout = null;
     try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
     try std.testing.expectEqualStrings("old (until=1, expired)\nspark9 (until=4102444800, live)\n", out.items);
+}
+
+test "cmdPeers lists lease addrs by ip then port, not document order" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&cb, "modelfs-peers-addr-order");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    var zbuf: [256]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const live_fp = try std.fmt.bufPrint(&pbuf, "{s}/spark.json", .{cluster_d});
+    // Scrambled addrs: document order is .9:18081 then .1:18080. Listing
+    // must still be ip then port, matching the published lease document.
+    const live = "{\"id\":\"spark\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.9\",\"port\":18081,\"mbps\":0},{\"ip\":\"10.0.0.1\",\"port\":18080,\"mbps\":1}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, live_fp), live));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
+    try std.testing.expectEqualStrings(
+        "spark (until=4102444800, live)\n  -> 10.0.0.1:18080 (speed=1mbps)\n  -> 10.0.0.9:18081 (speed=0mbps)\n",
+        out.items,
+    );
 }
 
 test "cmdPeers skips a planted lease symlink instead of ingesting its target" {
