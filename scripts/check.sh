@@ -11,8 +11,8 @@ cd "${ROOT_DIR}"
 usage_no_args "$@" <<'EOF'
 Usage: ./scripts/check.sh
 
-The blocking static gate: zig fmt, changelog headings versus
-build.zig.zon, unit tests, the restore-drill stub suite, vendored
+The blocking static gate: zig fmt, changelog headings and tag links
+versus build.zig.zon, unit tests, the restore-drill stub suite, vendored
 libfuse3 digests and extract, shellcheck, ruff, mypy, sbom. Same
 command the CI `check` job runs. Requires the pinned .venv from
 setup.
@@ -93,32 +93,75 @@ zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported u
 
 # ## [Name] is a release to changelog readers and tools. Dated notes nest
 # as ### under a version so they are not read as one (CONTRIBUTING.md).
+# Footer [name]: links are the compare/tag URLs; a heading without one
+# cannot be fetched. README/SECURITY.md/THREAT_MODEL.md name the current
+# tag so a cut cannot leave those sentences on the previous release.
 echo "=== changelog headings ==="
 zon_ver="$(sed -n 's/^[[:space:]]*\.version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
 [[ -n "${zon_ver}" ]] || fail "cannot read .version from build.zig.zon"
 saw_unreleased=0
 saw_current=0
+first_h2=""
+versions=()
 while IFS= read -r line; do
     case "${line}" in
         '## [Unreleased]')
+            if [[ -z "${first_h2}" ]]; then
+                first_h2="Unreleased"
+            fi
+            if [[ "${saw_unreleased}" -eq 1 ]]; then
+                fail "CHANGELOG.md has more than one ## [Unreleased]"
+            fi
             saw_unreleased=1
             ;;
         '## ['*)
             name="${line#\#\# \[}"
             name="${name%%]*}"
+            if [[ -z "${first_h2}" ]]; then
+                first_h2="${name}"
+            fi
             if [[ ! "${name}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)*$ ]]; then
                 fail "changelog heading is not Unreleased or semver: ${line}"
             fi
+            case "${line}" in
+                "## [${name}] - "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])
+                    ;;
+                *)
+                    fail "changelog version heading must be ## [x.y.z] - YYYY-MM-DD: ${line}"
+                    ;;
+            esac
             if [[ "${name}" == "${zon_ver}" ]]; then
                 saw_current=1
             fi
+            versions+=("${name}")
             ;;
         *)
             ;;
     esac
 done < "${ROOT_DIR}/CHANGELOG.md"
 [[ "${saw_unreleased}" -eq 1 ]] || fail "CHANGELOG.md missing ## [Unreleased]"
+[[ "${first_h2}" == "Unreleased" ]] || fail "CHANGELOG.md first ## heading must be [Unreleased] (got ${first_h2:-none})"
 [[ "${saw_current}" -eq 1 ]] || fail "CHANGELOG.md missing ## [${zon_ver}] (build.zig.zon .version)"
+
+if ! grep -q '^\[Unreleased\]:' "${ROOT_DIR}/CHANGELOG.md"; then
+    fail "CHANGELOG.md missing [Unreleased] link"
+fi
+if ! grep '^\[Unreleased\]:' "${ROOT_DIR}/CHANGELOG.md" | grep -Fq "v${zon_ver}"; then
+    fail "CHANGELOG.md [Unreleased] compare link must name v${zon_ver}"
+fi
+if [[ "${#versions[@]}" -gt 0 ]]; then
+    for ver in "${versions[@]}"; do
+        if ! grep -q "^\[${ver}\]:" "${ROOT_DIR}/CHANGELOG.md"; then
+            fail "CHANGELOG.md missing [${ver}] link"
+        fi
+    done
+fi
+
+for f in README.md SECURITY.md docs/THREAT_MODEL.md; do
+    if ! grep -Fq "v${zon_ver}" "${ROOT_DIR}/${f}"; then
+        fail "${f} does not mention v${zon_ver} (build.zig.zon .version)"
+    fi
+done
 
 echo "=== vendored fuse3 hashes ==="
 (

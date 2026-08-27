@@ -39,7 +39,7 @@ commands; each listed script answers `--help` instead of starting work.
 ./scripts/check.sh
 ```
 
-Formatting, CHANGELOG headings versus `build.zig.zon`, unit tests, the
+Formatting, CHANGELOG headings and tag links versus `build.zig.zon`, unit tests, the
 restore-drill stub suite, vendored libfuse3 digest and extract checks,
 shellcheck, ruff, mypy, and the CycloneDX inventory: exactly what the
 `check` CI job runs. Every CI job (that gate, the
@@ -82,8 +82,10 @@ The blocking requirement is green CI: `./scripts/check.sh`, the
 `cross-aarch64` compile job, and the `reproducibility` job
 (`./scripts/ci.sh` runs all three). There is no sign-off gate and no
 requirement that a PR add a changelog entry, but `scripts/check.sh`
-requires CHANGELOG.md's `##` headings to be `[Unreleased]` or a semver
-version matching build.zig.zon. Behavior changes belong in
+requires CHANGELOG.md's `##` headings to be `[Unreleased]` first or a dated
+semver version matching build.zig.zon, plus a `[name]:` footer link for
+each heading and a current-tag mention in README.md, SECURITY.md, and
+docs/THREAT_MODEL.md. Behavior changes belong in
 [CHANGELOG.md](CHANGELOG.md) as a dated
 `###` section under `[Unreleased]` (`## [Unreleased]` and `## [x.y.z] - date`
 are the only `##` headings; a sibling `## [Name] - date` reads as a
@@ -104,11 +106,21 @@ vendored arm64 libfuse3 `.deb`s must regenerate
 
 ## Cutting a release
 
-`.version` in [build.zig.zon](build.zig.zon) is the single source: `build.zig`
-extracts it into `build_options`, `modelfs version` prints it, and the
-"embedded version parses as semver" unit test rejects a malformed value.
-Nothing else carries a version, so a release is four steps that must stay in
-sync:
+`.version` in [build.zig.zon](build.zig.zon) is the single source the binary
+prints: `build.zig` extracts it into `build_options`, `modelfs version`
+prints it, and the "embedded version parses as semver" unit test rejects a
+malformed value. README.md, SECURITY.md, docs/THREAT_MODEL.md, CHANGELOG
+headings, and the `v<version>` tag must name that same value;
+`scripts/check.sh` pins the headings, the compare/tag footer links, and
+that those three docs mention `v<version>`.
+
+Choose the next version with SemVer against the last tag. This tree is still
+`0.y.z`: a change that breaks the CLI, peer HTTP, on-disk sidecar, or a
+default operators already rely on is a minor bump (`0.1.0` → `0.2.0`); a
+compatible feature is also a minor; a bugfix is a patch. Do not ship a
+break in a patch tag.
+
+A release is these steps, kept in sync:
 
 1. Bump `.version` in [build.zig.zon](build.zig.zon).
 2. Regroup [CHANGELOG.md](CHANGELOG.md): every entry under `[Unreleased]` is
@@ -117,9 +129,12 @@ sync:
    after the new version and today's date, leaving `[Unreleased]` empty at
    the top of the file. Point the `[Unreleased]` compare link at the new
    tag and add a `[x.y.z]` tag link beside it.
-3. Tag `v<version>`, exactly matching the manifest (`v0.1.0` for
+3. Update the current-tag sentences in [README.md](README.md),
+   [SECURITY.md](SECURITY.md), and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
+   so they name the new `v<version>`.
+4. Tag `v<version>`, exactly matching the manifest (`v0.1.0` for
    `.version = "0.1.0"`), so a checkout can be matched to a version.
-4. Confirm the built binary answers with the declared version before
+5. Confirm the built binary answers with the declared version before
    announcing:
 
    ```bash

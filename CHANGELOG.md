@@ -6,6 +6,10 @@ Work since `v0.1.0`. A binary built from this tree still prints `0.1.0`
 until the next tag is cut (CONTRIBUTING.md, Cutting a release); pin a
 commit hash if you are not on the tag.
 
+### Upgrade notes match the tagged status.json - 2026-08-27
+- **Upgrade from v0.1.0 no longer claims `now_s` shipped in the tag.** Tagged `status.json` published `id`, `pid`, `uptime_s`, `peers`, `piece`, `inflight`, `cache_free_pct`, and `stats` only. `now_s`, `mono_s`, and `origin_down` are new on this tree; a leftover without stamps still parses (pid check only). `mkdir` of an existing directory through the mount is success (was EEXIST); a write whose `close` fails is an error (v0.1.0 reported success after pwrite).
+- **The changelog gate pins compare/tag links and the current-tag sentences.** `scripts/check.sh` requires `[Unreleased]` first, dated `## [x.y.z] - YYYY-MM-DD` headings, a footer link per heading, the Unreleased compare URL to name `v<version>`, and README.md / SECURITY.md / docs/THREAT_MODEL.md to mention that tag. CONTRIBUTING's cut-a-release steps name those files and the 0.y.z bump rule (a CLI, peer-wire, on-disk, or default-behavior break is a minor, not a patch).
+
 ### CLI log flag and helper usage - 2026-08-27
 - **`--log` is the flag `MODELFS_LOG` always claimed to have.** Help, README, architecture.md, and the threat model said an explicit flag wins over `MODELFS_LOG`, but no flag existed, so a cron'd `status` could only quiet the journal by exporting a shell-wide variable. `--log err|warn|info|debug` is accepted on every command, `--log=VALUE` too, and it wins over the environment the same way `--origin` wins over `MODELFS_ORIGIN`. A bad value names the knob (`--log verbose` / `MODELFS_LOG verbose`).
 - **Contributor Python CLIs and the restore drill answer `--help` without starting work.** `run_benchmarks_and_plots.py --help` ran the FUSE preflight before argparse, so a host without `/dev/fuse` never saw usage. Argument parsing now happens first; a failed `zig build` inside that driver prints on stderr. `dr_restore_drill.sh` treated a dash-prefixed token as a dataset name (so `--not-a-flag` started a drill); unknown flags now exit 2 with `Usage:`. Helper usage lines that mixed `usage:` and `Usage:` now match `Usage:`. `scripts/test_scripts_help.sh` covers the Python CLIs and the drill script.
@@ -18,12 +22,13 @@ commit hash if you are not on the tag.
 
 ### Upgrade from v0.1.0
 
-CLI, peer-wire, and on-disk changes that will surprise a node still
+CLI, peer-wire, FUSE, and on-disk changes that will surprise a node still
 running the tagged binary, or a script written against it. A mixed
 fleet with `v0.1.0` peers still fills: those servers already send
-`Content-Range` on every 206, and a `status.json` they wrote still
-parses (`now_s` stays, `mono_s` is new). Details stay in the entries
-below.
+`Content-Range` on every 206. A `status.json` they wrote still
+parses: the tag never published `now_s`, `mono_s`, or `origin_down`,
+so without a stamp `modelfs status` uses the pid check only. Details
+stay in the entries below.
 
 - **`modelfs status` exits 1** on a leftover or wedged `status.json` (was 0 with the stale document printed).
 - **Unauthenticated peer requests, including POST, are 401** (was 405 before the token was checked).
@@ -42,6 +47,8 @@ below.
 - **Soft hyphen, combining grapheme joiner, Hangul fillers, tags, and VS17-256 in paths are refused.**
 - **A world-readable PSK file is refused** (was a warning). Group-readable still warns.
 - **Mount refuses to start if core dumps cannot be disabled** after the PSK is loaded.
+- **`mkdir` of an existing directory through the mount is success** (was EEXIST). A non-directory at that name is still EEXIST.
+- **A write whose `close` fails is an error** (NFS delayed-write). v0.1.0 reported success after a successful pwrite even when close failed.
 
 ### Changes
 

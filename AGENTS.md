@@ -17,8 +17,9 @@ and an NFS origin as the write authority. Linux only.
 ## Gates
 
 `./scripts/check.sh` is the blocking gate: `zig fmt --check`, CHANGELOG `##`
-headings (`[Unreleased]` and semver matching `build.zig.zon`; dated notes are
-`###`), `zig build test`, shellcheck (`.shellcheckrc` on `scripts/*.sh`),
+headings (`[Unreleased]` first, dated semver matching `build.zig.zon`,
+`[name]:` footer links, and current-tag sentences in README/SECURITY.md/
+THREAT_MODEL.md; dated notes are `###`), `zig build test`, shellcheck (`.shellcheckrc` on `scripts/*.sh`),
 `test_dr_restore_drill.sh`, vendored libfuse3 digest and extract checks,
 contributor-script `--help` handlers (`test_scripts_help.sh`),
 `ruff check scripts/`, `ruff format --check scripts/`, `mypy scripts/`, and
