@@ -24,6 +24,10 @@ pub const Stats = struct {
     /// uncounted so the error rate tracks service health, not client bugs.
     reads_ok: std.atomic.Value(u64) = .init(0),
     reads_err: std.atomic.Value(u64) = .init(0),
+    /// Fully-cached FUSE reads: ensureRange was skipped and the cache
+    /// served the range. Hit rate is reads_warm / reads_ok; a node whose
+    /// cache is not earning its keep shows fills climbing and this flat.
+    reads_warm: std.atomic.Value(u64) = .init(0),
     bytes_read: std.atomic.Value(u64) = .init(0),
     /// Cumulative wall time inside mf_read, every op included (warm path
     /// pays two clock reads). Divided by attempted reads it is the average
@@ -33,13 +37,24 @@ pub const Stats = struct {
     writes_ok: std.atomic.Value(u64) = .init(0),
     writes_err: std.atomic.Value(u64) = .init(0),
     bytes_written: std.atomic.Value(u64) = .init(0),
+    /// Cumulative wall time inside mf_write. wr_us on the tick line is the
+    /// only signal that origin writes stalled (NFS), the write-side twin of
+    /// read_nanos.
+    write_nanos: std.atomic.Value(u64) = .init(0),
     /// Piece hydration outcomes by source: peer fetch vs origin pread.
     fills_peer: std.atomic.Value(u64) = .init(0),
     fills_origin: std.atomic.Value(u64) = .init(0),
     bytes_from_peer: std.atomic.Value(u64) = .init(0),
     bytes_from_origin: std.atomic.Value(u64) = .init(0),
+    /// Content-Length of accepted /have 200 and /data 206 replies. Counted
+    /// when the status goes on the wire, not after the body drain, so a
+    /// client that has already read the reply cannot race the bump. Truncated
+    /// sends keep the count and a warn. A serving node is otherwise
+    /// indistinguishable from an idle one: http_5xx only moves when replies fail.
+    bytes_to_peer: std.atomic.Value(u64) = .init(0),
     /// Cumulative wall time per piece fill by tier, claim through cache
-    /// write. This is exactly the stall a reader eats on a miss.
+    /// write. This is the stall a FUSE reader or a fetching peer eats on a
+    /// miss; peer-serving origin hydrations count here too.
     fill_peer_nanos: std.atomic.Value(u64) = .init(0),
     fill_origin_nanos: std.atomic.Value(u64) = .init(0),
     /// Fill failures by tier: peer fetch failed (fell through to origin or
@@ -52,7 +67,10 @@ pub const Stats = struct {
     /// degraded to NFS-only shows here while reads keep succeeding.
     probe_err: std.atomic.Value(u64) = .init(0),
     pieces_culled: std.atomic.Value(u64) = .init(0),
-    /// Peer HTTP server: rejected bearer tokens and 5xx replies served.
+    /// Peer HTTP server: accepted /have 200 and /data 206 replies, rejected
+    /// bearer tokens, and 5xx replies served. http_ok is the missing half of
+    /// the error rate: without it a node serving pieces looks idle.
+    http_ok: std.atomic.Value(u64) = .init(0),
     http_unauthorized: std.atomic.Value(u64) = .init(0),
     http_5xx: std.atomic.Value(u64) = .init(0),
     /// Connections whose head never became a routable request: scanners
@@ -75,15 +93,18 @@ pub const Stats = struct {
     pub const Snap = struct {
         reads_ok: u64 = 0,
         reads_err: u64 = 0,
+        reads_warm: u64 = 0,
         bytes_read: u64 = 0,
         read_nanos: u64 = 0,
         writes_ok: u64 = 0,
         writes_err: u64 = 0,
         bytes_written: u64 = 0,
+        write_nanos: u64 = 0,
         fills_peer: u64 = 0,
         fills_origin: u64 = 0,
         bytes_from_peer: u64 = 0,
         bytes_from_origin: u64 = 0,
+        bytes_to_peer: u64 = 0,
         fill_peer_nanos: u64 = 0,
         fill_origin_nanos: u64 = 0,
         fill_err_peer: u64 = 0,
@@ -91,6 +112,7 @@ pub const Stats = struct {
         fill_err_cache: u64 = 0,
         probe_err: u64 = 0,
         pieces_culled: u64 = 0,
+        http_ok: u64 = 0,
         http_unauthorized: u64 = 0,
         http_5xx: u64 = 0,
         http_malformed: u64 = 0,
@@ -140,6 +162,12 @@ pub const Store = struct {
     piece_size: u32,
     water: cull.Water = .{},
     stats: Stats = .{},
+    /// Edge-triggered origin I/O outage flag. FUSE read/write handlers share
+    /// this so an NFS outage logs once (path + errno) instead of once per
+    /// syscall, and recovery logs once too -- same shape as cullLoop's
+    /// statvfs suspension. Peer HTTP keeps its per-request origin-stat
+    /// warns: that path is already bounded by the inflight cap.
+    origin_io_down: std.atomic.Value(bool) = .init(false),
     mu: std.Io.Mutex = .init,
     files: std.StringHashMap(*Cached),
     /// Bumped under mu after every mutation of on-disk cache artifacts
@@ -216,6 +244,30 @@ pub const Store = struct {
             .piece_size = piece_size,
             .files = std.StringHashMap(*Cached).init(gpa),
         };
+    }
+
+    /// Client-shaped origin errnos: the path is absent, not a directory, too
+    /// long to name, or is a directory. Same split replyOriginStat uses
+    /// (404/400 vs 502) plus EISDIR for the write path. These stay counted
+    /// in reads_err/writes_err but must not raise the origin-down flag --
+    /// an NFS outage is EIO/ESTALE/ETIMEDOUT, not a missing file.
+    pub fn originErrnoExpected(e: i32) bool {
+        return e == c.ENOENT or e == c.ENOTDIR or e == c.ENAMETOOLONG or e == c.EISDIR;
+    }
+
+    /// First infrastructure origin failure logs path and errno; later ones
+    /// stay counted-only until a success (rc >= 0) clears the flag. `what`
+    /// names the syscall ("stat", "write") so the line is greppable.
+    pub fn noteOriginIo(self: *Store, rel: []const u8, rc: i32, what: []const u8) void {
+        if (rc >= 0) {
+            if (self.origin_io_down.swap(false, .monotonic))
+                std.log.info("origin recovered", .{});
+            return;
+        }
+        const e: i32 = -rc;
+        if (originErrnoExpected(e)) return;
+        if (!self.origin_io_down.swap(true, .monotonic))
+            std.log.warn("origin {s} failed for {s} (errno {d})", .{ what, rel, e });
     }
 
     pub fn deinit(self: *Store) void {
@@ -1515,6 +1567,36 @@ pub fn relOk(rel: []const u8) bool {
         if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
     }
     return true;
+}
+
+test "noteOriginIo edge-triggers infrastructure origin failures" {
+    const gpa = std.testing.allocator;
+    var st = Store.init(gpa, std.testing.io, "/unused", "/unused", 4096);
+    defer st.deinit();
+
+    // Expected-path warn/info stay off the runner's stderr like sibling tests.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    // Client-shaped misses must not raise the outage flag: an operator
+    // grepping for "origin recovered" would otherwise see a flap on every
+    // ENOENT the workload throws.
+    st.noteOriginIo("gone.bin", -c.ENOENT, "stat");
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+    st.noteOriginIo("dir.bin", -c.EISDIR, "write");
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
+
+    // First infrastructure failure raises the flag; a second one stays quiet
+    // so a busy FUSE read storm cannot flood the journal.
+    st.noteOriginIo("a.bin", -c.EIO, "stat");
+    try std.testing.expect(st.origin_io_down.load(.monotonic));
+    st.noteOriginIo("b.bin", -c.EIO, "stat");
+    try std.testing.expect(st.origin_io_down.load(.monotonic));
+
+    // The next success is the recovery edge: one info line, flag cleared.
+    st.noteOriginIo("a.bin", 0, "stat");
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
 }
 
 test "rangeFilled is true only when every covered piece is marked" {

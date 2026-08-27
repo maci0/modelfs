@@ -434,7 +434,14 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
     const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Piece-Size: {d}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ self.store.piece_size, snap.len }) catch {
         return;
     };
-    _ = sys.writeAll(fd, h);
+    if (sys.writeAll(fd, h) < 0) return;
+    // Counted once the 200 is on the wire, Content-Length included: a
+    // serving node must be visible in status.json even when every transfer
+    // succeeds (http_5xx stays 0). Truncated bodies keep the count and the
+    // warn below; the bump is before the body write so a client that has
+    // already read the reply cannot race it, matching replyStatus.
+    _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
+    _ = self.store.stats.bytes_to_peer.fetchAdd(snap.len, .monotonic);
     const put = sys.writeAll(fd, snap);
     if (put < 0) {
         // The 200 header is already on the wire, so the fetching peer only
@@ -486,6 +493,11 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                 // 404 would tell the peer the path is gone over a size race.
                 .raced => continue,
                 .len => |ln| {
+                    // Same fill accounting as FUSE hydratePiece: a peer-serving
+                    // origin hydration that never touched a local read used to
+                    // leave fills_origin and fill_err_* flat while this node
+                    // hammered NFS on behalf of the fleet.
+                    const fill_t0 = sys.monoNs(self.io);
                     const got = self.store.originPread(file.rel, pbuf.?[0..ln], piece.offset(pi, piece_size));
                     if (got == @as(isize, @intCast(ln))) {
                         const w = self.store.completeFill(file, pi, pbuf.?[0..ln], sys.monoSec(self.io));
@@ -494,10 +506,15 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                             // (full or failing disk). Falling through to the
                             // !hasPiece check would reply 404 and make the
                             // fetching peer believe the path is gone.
+                            _ = self.store.stats.fill_err_cache.fetchAdd(1, .monotonic);
                             std.log.warn("cache write failed for {s} piece {d} (errno {d}); replying 500", .{ file.rel, pi, -w });
                             replyStatus(self, fd, "500 Internal Server Error");
                             return false;
                         }
+                        const fill_dt: u64 = @intCast(sys.monoNs(self.io) - fill_t0);
+                        _ = self.store.stats.fills_origin.fetchAdd(1, .monotonic);
+                        _ = self.store.stats.bytes_from_origin.fetchAdd(ln, .monotonic);
+                        _ = self.store.stats.fill_origin_nanos.fetchAdd(fill_dt, .monotonic);
                     } else {
                         self.store.finishPiece(file, pi, false, sys.monoSec(self.io));
                         // statOrigin passed, so the file exists: a failed or short
@@ -505,6 +522,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
                         // would make peers believe the path is gone. Log it too:
                         // the 502 alone leaves the local operator no trace of why
                         // hydration failed.
+                        _ = self.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
                         std.log.warn("origin pread failed for {s} piece {d} (rc {d}); replying 502", .{ file.rel, pi, -got });
                         replyStatus(self, fd, "502 Bad Gateway");
                         return false;
@@ -670,7 +688,13 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {d}-{d}/{d}\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
         rg.start, rg_end, size, want,
     }) catch return;
-    _ = sys.writeAll(fd, h);
+    if (sys.writeAll(fd, h) < 0) return;
+    // Same as serveHave: the 206 going out is the success this node's
+    // http_ok / bytes_to_peer must see, or a busy serving node looks idle
+    // in status.json. Counted before the body so a client that has already
+    // read the reply cannot race the bump, matching replyStatus.
+    _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
+    _ = self.store.stats.bytes_to_peer.fetchAdd(want, .monotonic);
 
     streamRange(self, fd, file, rg.start, want, bodyDeadlineFor(self.io, want));
 }
@@ -1734,6 +1758,7 @@ test "fault tolerance: bad psk fetchHave fails with http status" {
     // Reading the error reply above proves the handler finished its bump.
     try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_unauthorized.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
 }
 
 test "fault tolerance: traversal path is rejected with 400" {
@@ -2147,6 +2172,13 @@ test "serveHave answers with the exact cached bitfield blob" {
     try std.testing.expectEqual(@as(usize, 1), rep.bits.len);
     try std.testing.expectEqual(@as(u8, 0b00000011), rep.bits[0]);
     try std.testing.expectEqual(@as(u32, 16), rep.piece_size);
+    // Serving path used to leave status.json looking idle: one /data 206
+    // (32 body bytes, two origin hydrations) plus one /have 200 (1-byte
+    // bitmap) must land in http_ok / bytes_to_peer / fills_origin.
+    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_ok.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 33), srv.store.stats.bytes_to_peer.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.fills_origin.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 32), srv.store.stats.bytes_from_origin.load(.monotonic));
 
     // A directory at the requested path is a miss (404), same as ENOENT:
     // /have advertises regular files only.
@@ -2240,6 +2272,8 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 200 OK\r\n"));
         try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Type: text/plain\r\n") != null);
         try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\nok"));
+        // /ping is liveness, not a piece transfer: it must not inflate http_ok.
+        try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
     }
     // A non-GET method is refused even with valid auth, and the refusal
     // names what the resource accepts (RFC 9110 §15.5.5).
@@ -2366,8 +2400,12 @@ test "serveData replies 500 when the cache refuses hydrated bytes" {
     try std.testing.expect(std.mem.startsWith(u8, head_buf[0..head_len], "HTTP/1.1 500"));
     // The same event feeds the http_5xx counter status.json publishes (the
     // bump precedes the head this client just read): a cache tier refusing
-    // hydrated bytes must be visible without journal access.
+    // hydrated bytes must be visible without journal access. The fill-tier
+    // counter must move too -- this is an origin hydration the cache then
+    // refused, not a FUSE read, and used to leave fill_err_cache flat.
     try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_5xx.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_cache.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
 }
 
 test "serve joins its accept loops once stop shuts the listeners down" {
