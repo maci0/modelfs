@@ -19,10 +19,11 @@ pub const status_file = "status.json";
 /// peer HTTP, CLI pin); without it a peer request can escape the origin/cache
 /// trees or forge multi-line entries in operator logs via \n in a path.
 /// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
-/// U+2028/U+2029), the same discover.printable applies before echoing a
-/// lease name. Non-control text above that set (NFC/NFD spellings, astral
-/// emoji, names that are not valid UTF-8 at all) passes byte-exact; identity
-/// is byte equality all the way down.
+/// Unicode line separators, and bidi format controls), the same
+/// discover.printable applies before echoing a lease name. Non-control text
+/// above that set (NFC/NFD spellings, astral emoji, names that are not
+/// valid UTF-8 at all) passes byte-exact; identity is byte equality all
+/// the way down.
 pub fn relOk(rel: []const u8) bool {
     if (rel.len == 0 or rel[0] == '/') return false;
     if (proto.containsControl(rel)) return false;
@@ -2463,6 +2464,12 @@ test "relOk rejects traversal and absolute paths" {
     // "gguf/a\u{2028}ERROR forged.bin" pass and split a journal line.
     try std.testing.expect(!relOk("gguf/a\u{2028}ERROR forged.bin"));
     try std.testing.expect(!relOk("a\u{2029}b.bin"));
+    // Bidi format controls spoof display order in the same log and pin
+    // lines: "gguf/a\u{202e}gnp.bin" renders as a .png next to a .bin.
+    try std.testing.expect(!relOk("gguf/a\u{202e}gnp.bin"));
+    try std.testing.expect(!relOk("a\u{200e}b.bin"));
+    try std.testing.expect(!relOk("a\u{2066}b.bin"));
+    try std.testing.expect(!relOk("a\u{061c}b.bin"));
 }
 
 test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
@@ -2484,10 +2491,12 @@ test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
     // NBSP is U+00A0: same 0xC2 lead byte as the rejected C1 controls but a
     // continuation above their range, so the C1 gate must not swallow it.
     try std.testing.expect(relOk("model\u{a0}v2.bin"));
-    // Incomplete U+2028 encodings are invalid UTF-8 display noise, not a
-    // separator, matching a trailing 0xC2 with no C1 continuation.
+    // Incomplete U+2028/bidi encodings are invalid UTF-8 display noise, not
+    // a control, matching a trailing 0xC2 with no C1 continuation.
     try std.testing.expect(relOk("a\xe2\x80.bin"));
     try std.testing.expect(relOk("a\xe2.bin"));
+    try std.testing.expect(relOk("a\xe2\x81.bin"));
+    try std.testing.expect(relOk("a\xd8.bin"));
 }
 
 const seed_rel_model = fuzzcorpus.entry("gguf/a.gguf");
@@ -2503,6 +2512,7 @@ const seed_rel_control = fuzzcorpus.entry("a\x1b[31mb\x7f");
 const seed_rel_nul = fuzzcorpus.entry("a\x00b");
 const seed_rel_c1 = fuzzcorpus.entry("a\xc2\x9bb.bin");
 const seed_rel_line_sep = fuzzcorpus.entry("gguf/a\u{2028}ERROR.bin");
+const seed_rel_bidi = fuzzcorpus.entry("gguf/a\u{202e}gnp.bin");
 const seed_rel_nbsp = fuzzcorpus.entry("model\u{a0}v2.bin");
 const seed_rel_lone_c1byte = fuzzcorpus.entry("a\x9bb.bin");
 const seed_rel_trailing_c2 = fuzzcorpus.entry("foo\xc2");
@@ -2522,14 +2532,15 @@ const fuzz_rel_corpus = [_][]const u8{
     &seed_rel_nul,
     &seed_rel_c1,
     &seed_rel_line_sep,
+    &seed_rel_bidi,
     &seed_rel_nbsp,
     &seed_rel_lone_c1byte,
     &seed_rel_trailing_c2,
     &seed_rel_unicode,
 };
 
-/// Independent restatement of relOk: empty/absolute refuse, C0/DEL, the
-/// UTF-8 C1 pair, and U+2028/U+2029 refuse, "." / ".." components refuse,
+/// Independent restatement of relOk: empty/absolute refuse, C0/DEL, and
+/// proto.utf8FormatControlAt's set refuse, "." / ".." components refuse,
 /// empty components (double slash, trailing slash) do not. Walks segments
 /// by index instead of splitScalar so a corrupted splitter cannot self-confirm.
 fn refRelOk(rel: []const u8) bool {
@@ -2540,8 +2551,7 @@ fn refRelOk(rel: []const u8) bool {
         if (i != rel.len and rel[i] != '/') {
             const ch = rel[i];
             if (ch < 0x20 or ch == 0x7f) return false;
-            if (ch == 0xc2 and i + 1 < rel.len and rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f) return false;
-            if (ch == 0xe2 and i + 2 < rel.len and rel[i + 1] == 0x80 and (rel[i + 2] == 0xa8 or rel[i + 2] == 0xa9)) return false;
+            if (proto.utf8FormatControlAt(rel, i)) return false;
             continue;
         }
         const seg = rel[seg_start..i];
@@ -2571,12 +2581,7 @@ fn fuzzRelOkOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var i: usize = 0;
     while (i < rel.len) : (i += 1) {
         try std.testing.expect(rel[i] >= 0x20 and rel[i] != 0x7f);
-        if (rel[i] == 0xc2 and i + 1 < rel.len) {
-            try std.testing.expect(!(rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f));
-        }
-        if (rel[i] == 0xe2 and i + 2 < rel.len) {
-            try std.testing.expect(!(rel[i + 1] == 0x80 and (rel[i + 2] == 0xa8 or rel[i + 2] == 0xa9)));
-        }
+        try std.testing.expect(!proto.utf8FormatControlAt(rel, i));
     }
     var seg_start: usize = 0;
     var j: usize = 0;

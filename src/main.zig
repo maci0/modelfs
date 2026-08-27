@@ -825,7 +825,8 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     var z: [sys.c.PATH_MAX]u8 = undefined;
     const p = try sys.toZ(&z, opts.psk_file);
     var open_errno: i32 = 0;
-    const raw = sys.readFileAllocOpenErrno(gpa, p, proto.max_psk_bytes, &open_errno) catch |err| switch (err) {
+    var file_mode: sys.c.mode_t = 0;
+    const raw = sys.readFileAllocOpenErrno(gpa, p, proto.max_psk_bytes, &open_errno, &file_mode) catch |err| switch (err) {
         // Remediation output for operators, like every other usage print in
         // this file: suppressed under test so the named errors stay
         // assertable without tripping the runner's error-log counter. A
@@ -851,12 +852,18 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
         },
     };
     defer gpa.free(raw);
-    // A group/world-readable PSK lets any local user impersonate this node to
-    // every cluster peer; never refuse an existing deployment, but always
-    // surface it.
-    var st: sys.c.struct_stat = undefined;
-    if (sys.statPath(p, &st) == 0 and (st.st_mode & 0o077) != 0) {
-        std.log.warn("PSK file {s} is readable by group/other; run: chmod 600 {s}", .{ opts.psk_file, opts.psk_file });
+    // Mode of the fd we just read, not a later path-stat: swapping the
+    // file between read and chmod-check would otherwise let a world-readable
+    // secret through. Other bits mean any local user can steal the cluster
+    // credential; group bits are a warning (a dedicated group is a valid
+    // deployment).
+    if ((file_mode & 0o007) != 0) {
+        if (!builtin.is_test)
+            std.log.err("PSK file {s} is world-readable; chmod 600 {s} and remount", .{ opts.psk_file, opts.psk_file });
+        return error.PskWorldReadable;
+    }
+    if ((file_mode & 0o070) != 0) {
+        std.log.warn("PSK file {s} is readable by group; run: chmod 600 {s}", .{ opts.psk_file, opts.psk_file });
     }
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) {
@@ -1039,7 +1046,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     // steps inside loadPsk; anything else still needs a one-line cause before
     // the clean exit.
     const psk = loadPsk(gpa, opts) catch |err| {
-        if (err != error.MissingPsk and err != error.EmptyPsk and err != error.PskUnreadable)
+        if (err != error.MissingPsk and err != error.EmptyPsk and err != error.PskUnreadable and err != error.PskWorldReadable)
             std.log.err("load PSK: {t}", .{err});
         return 1;
     };
@@ -1050,7 +1057,10 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     // The secret is in memory from here: refuse cores so a crash cannot
     // spill it, and drop MODELFS_PSK_VALUE so fuse_main's auto_unmount
     // helper cannot inherit it through the environment block.
-    sys.disableCoreDumps();
+    sys.disableCoreDumps() catch {
+        std.log.err("cannot disable core dumps; refusing to start with the PSK in a dumpable process");
+        return 1;
+    };
     sys.scrubPskEnv();
 
     var id_buf: [256]u8 = undefined;
@@ -1506,6 +1516,11 @@ test "badIdLine renders refused ids through the displayName echo gate" {
     {
         const line = badIdLine(&buf, "spark1\u{2028}ERROR forged");
         try std.testing.expect(std.mem.indexOf(u8, line, "\u{2028}") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+    }
+    {
+        const line = badIdLine(&buf, "spark1\u{202e}gnp");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\u{202e}") == null);
         try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
     }
     // A printable but invalid id (quote) still names itself verbatim, so the
@@ -2599,9 +2614,9 @@ test "loadPsk refuses empty secrets and trims file contents" {
     const scratch = try sys.scratchDir(&db, "modelfs-psk");
     defer sys.deleteTree(std.testing.io, scratch);
 
-    // Scratch files carry 0644, so the group/other permission warning is an
-    // expected line here; raising the log level keeps it off the runner's
-    // stderr. Restored on scope exit so later tests still surface warnings.
+    // Group-readable PSK files warn at load; world-readable ones refuse.
+    // Tests that must load a secret chmod 0600 after write. The log ceiling
+    // still hides the group warning for the 0640 case below.
     const prev_log_level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
@@ -2673,6 +2688,7 @@ test "loadPsk refuses empty secrets and trims file contents" {
         var pb: [160]u8 = undefined;
         const fp = try std.fmt.bufPrint(&pb, "{s}/trimmed.psk", .{scratch});
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "  topsecret \r\n"));
+        try std.testing.expectEqual(@as(i32, 0), sys.c.chmod(try sys.toZ(&zb, fp), 0o600));
         const psk = try loadPsk(gpa, .{ .psk_file = fp });
         defer gpa.free(psk);
         try std.testing.expectEqualStrings("topsecret", psk);
@@ -2682,7 +2698,24 @@ test "loadPsk refuses empty secrets and trims file contents" {
         var pb: [160]u8 = undefined;
         const fp = try std.fmt.bufPrint(&pb, "{s}/blank.psk", .{scratch});
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "\n\t  \n"));
+        try std.testing.expectEqual(@as(i32, 0), sys.c.chmod(try sys.toZ(&zb, fp), 0o600));
         try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, .{ .psk_file = fp }));
+    }
+    // World-readable is a stolen credential waiting to happen: refuse
+    // rather than warn. Group-readable still loads (a dedicated group
+    // is a valid deployment) and is the warning the log ceiling hides.
+    {
+        var pb: [160]u8 = undefined;
+        const world = try std.fmt.bufPrint(&pb, "{s}/world.psk", .{scratch});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, world), "secret"));
+        try std.testing.expectEqual(@as(i32, 0), sys.c.chmod(try sys.toZ(&zb, world), 0o644));
+        try std.testing.expectError(error.PskWorldReadable, loadPsk(gpa, .{ .psk_file = world }));
+        const group = try std.fmt.bufPrint(&pb, "{s}/group.psk", .{scratch});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, group), "secret"));
+        try std.testing.expectEqual(@as(i32, 0), sys.c.chmod(try sys.toZ(&zb, group), 0o640));
+        const psk = try loadPsk(gpa, .{ .psk_file = group });
+        defer gpa.free(psk);
+        try std.testing.expectEqualStrings("secret", psk);
     }
 }
 
@@ -2708,6 +2741,7 @@ test "loadPsk refuses line breaks but rides every other byte header-safe" {
         var pb: [160]u8 = undefined;
         const fp = try std.fmt.bufPrint(&pb, "{s}/wrapped.psk", .{scratch});
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "first\r\nsecond\n"));
+        try std.testing.expectEqual(@as(i32, 0), sys.c.chmod(try sys.toZ(&zb, fp), 0o600));
         try std.testing.expectError(error.PskNotHeaderSafe, loadPsk(gpa, .{ .psk_file = fp }));
     }
     // Everything else survives verbatim: spaces and tabs (both sides trim

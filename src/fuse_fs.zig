@@ -180,6 +180,7 @@ const seed_path_double_slash = fuzzcorpus.entry("/gguf//a.gguf");
 const seed_path_trailing_slash = fuzzcorpus.entry("/gguf/");
 const seed_path_control = fuzzcorpus.entry("/a\x1b[31mb\x7f");
 const seed_path_line_sep = fuzzcorpus.entry("/gguf/a\u{2028}ERROR.bin");
+const seed_path_bidi = fuzzcorpus.entry("/gguf/a\u{202e}gnp.bin");
 const seed_path_empty = fuzzcorpus.entry("");
 const seed_path_unicode = fuzzcorpus.entry("/权重/mödel.gguf");
 
@@ -196,6 +197,7 @@ const fuzz_path_corpus = [_][]const u8{
     &seed_path_trailing_slash,
     &seed_path_control,
     &seed_path_line_sep,
+    &seed_path_bidi,
     &seed_path_empty,
     &seed_path_unicode,
 };

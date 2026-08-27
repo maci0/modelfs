@@ -162,7 +162,7 @@ Probe answers are cached per (path, file) for 2 s (`Catalog.have_ttl_ms`), so a 
 
 ## Auth and HTTP
 
-Same secret on every spark: `/etc/modelfs.psk` mode 0600, or `MODELFS_PSK_VALUE` in the environment. On mount the daemon zeros `RLIMIT_CORE` so a crash cannot dump the secret, drops `MODELFS_PSK_VALUE` from the process environment so the `auto_unmount` helper cannot inherit it, and wipes the in-memory copy on teardown.
+Same secret on every spark: `/etc/modelfs.psk` mode 0600, or `MODELFS_PSK_VALUE` in the environment. A world-readable PSK file is refused at load (group-readable warns). On mount the daemon zeros `RLIMIT_CORE` so a crash cannot dump the secret (the mount exits if that limit cannot be set), drops `MODELFS_PSK_VALUE` from the process environment so the `auto_unmount` helper cannot inherit it, and wipes the in-memory copy on teardown.
 
 ```
 GET /ping

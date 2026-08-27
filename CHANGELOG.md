@@ -25,7 +25,9 @@ below.
 - **Mount refuses** `--listen`/`--advertise`/`--seed` port 0, `--advertise`/`--seed` `0.0.0.0` and `255.255.255.255`, origin overlapping the cache, `MODELFS_PSK_VALUE` combined with `--psk`/`MODELFS_PSK`, empty `--origin`/`--cache`/`--psk` or mount directory, a regular file at `--origin`/`--cache`/the mountpoint, and a whitespace-only `MODELFS_PSK_VALUE` (surrounding whitespace is now trimmed like the PSK file).
 - **Usage errors print one named line** (no help dump).
 - **Harness and drill knobs are `MF_TEST_*` / `MF_DRILL_*`** (were `MODELFS_TEST_*` / `MODELFS_DRILL_*`).
-- **U+2028 / U+2029 in paths and lease ids are refused.**
+- **U+2028 / U+2029 and bidi format controls in paths are refused.**
+- **A world-readable PSK file is refused** (was a warning). Group-readable still warns.
+- **Mount refuses to start if core dumps cannot be disabled** after the PSK is loaded.
 
 ### Changes
 
@@ -41,6 +43,9 @@ below.
 - **CI pins the Python interpreter and uv, and the libfuse3-dev apt retry lives in one script**: setup-uv installed latest uv and did not pass `.python-version` into `python-version`, and the uv cache key ignored that file, so a pin bump could restore a venv built for the previous interpreter. The check job now reads `.python-version` into setup-uv, keys the cache on it, and `[tool.uv] required-version` in pyproject.toml is the uv range setup-uv already looks for. The duplicated apt retry in the check and reproducibility jobs is `scripts/install_libfuse3_dev.sh` (DEBIAN_FRONTEND on the sudo command line, because sudo resets the environment).
 - **Origin sizes that do not fit `off_t` fail the op instead of wrapping into piece math**: NFS fattr is u64, so a size of 2^63 or more shows up as a negative `st_size`. `@intCast` into cache/piece arithmetic panicked in safe builds and became a multi-exabyte bitfield in ReleaseFast (`st_size = -1` is 2^64-1 bytes). Negative sizes now fail closed (FUSE EIO, peer 502, cull skip). I/O wrappers return `EFBIG` for offsets that do not fit `off_t` rather than truncating into a kernel syscall.
 - **Tick-line per-op averages divide by the time unit first**: `count * ns_per_us` of a u64 counter overflows the divisor (panic in safe builds, wrapped `rd_us`/`http_us` in ReleaseFast). Same integer mean, no intermediate multiply.
+- **Bidi format controls no longer pass the path and echo gates**: `relOk` and `discover.printable` already refused C0/DEL, UTF-8 C1, and U+2028/U+2029, but a planted path `gguf/a\u202Egnp.bin` or lease name carrying U+200E/U+200F, U+202A..U+202E, U+2066..U+2069, or U+061C still echoed into the journal and `modelfs peers`, spoofing the displayed identity. Those sequences are refused now; incomplete encodings stay legal display noise.
+- **A world-readable PSK file is refused at load**: group/other bits used to warn and continue, so a `0644` `/etc/modelfs.psk` let any local user steal the cluster credential. Other bits now fail the mount; group-readable still warns. The check uses the fstat of the fd that was read, not a later path-stat.
+- **Mount fails if core dumps cannot be disabled**: `setrlimit(RLIMIT_CORE, 0)` failure used to be ignored after the PSK was in memory, so a crash could still dump the secret. The mount now exits instead.
 
 - **Disk culling visits cache files whose names start with a dot**: `walkData` skipped every readdir name with a leading `.`, which hid `.` and `..` but also `.hidden.gguf` and `dir/.cache/w.bin` -- paths `relOk` admits. After a restart those files never became disk-cull victims, so they filled the cache filesystem past the watermarks. Only `.` and `..` are skipped now.
 - **Nested `pin/` and `meta/` directories are owner-only (0700)**: `data/` nested parents already used 0700, but `setPin` and sidecar saves created `pin/gguf` and `meta/gguf` as 0755, so a local user blocked by origin modes could list which nested weights were pinned or cached. All cache-tree mkdirs share `cache_dir_mode`.

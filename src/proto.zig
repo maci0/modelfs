@@ -189,17 +189,38 @@ pub fn bearerOk(got: []const u8, want: []const u8) bool {
     return std.crypto.timing_safe.eql([32]u8, ha, hb);
 }
 
-/// True when s holds a C0 byte, DEL, a UTF-8 C1 pair (U+0080..U+009F), or a
-/// Unicode line/paragraph separator (U+2028/U+2029). store.relOk and
-/// discover.printable share this set so a planted name cannot inject into
-/// logs or terminals through only one of the two gates.
+/// True when s holds a C0 byte, DEL, a UTF-8 C1 pair (U+0080..U+009F), a
+/// Unicode line/paragraph separator (U+2028/U+2029), or a bidi format
+/// control (U+061C, U+200E/U+200F, U+202A..U+202E, U+2066..U+2069).
+/// store.relOk and discover.printable share this set so a planted name
+/// cannot inject into logs or terminals, or spoof an identity, through
+/// only one of the two gates. Incomplete UTF-8 encodings are display
+/// noise, not controls.
 pub fn containsControl(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         const ch = s[i];
         if (ch < 0x20 or ch == 0x7f) return true;
-        if (ch == 0xc2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9f) return true;
-        if (ch == 0xe2 and i + 2 < s.len and s[i + 1] == 0x80 and (s[i + 2] == 0xa8 or s[i + 2] == 0xa9)) return true;
+        if (utf8FormatControlAt(s, i)) return true;
+    }
+    return false;
+}
+
+/// UTF-8 format controls refused in identity-bearing input. Incomplete
+/// sequences (truncated C1, ALM, or E2 prefixes) are not controls.
+pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
+    const ch = s[i];
+    // C1 (U+0080..U+009F) as UTF-8: some terminals still honor 8-bit CSI/OSC.
+    if (ch == 0xc2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9f) return true;
+    // U+061C ARABIC LETTER MARK: a bidi control that is not in the E2 block.
+    if (ch == 0xd8 and i + 1 < s.len and s[i + 1] == 0x9c) return true;
+    if (ch == 0xe2 and i + 2 < s.len) {
+        const b = s[i + 1];
+        const c3 = s[i + 2];
+        // U+200E LRM, U+200F RLM; U+2028..U+202E line separators and bidi embeddings/overrides.
+        if (b == 0x80 and (c3 == 0x8e or c3 == 0x8f or (c3 >= 0xa8 and c3 <= 0xae))) return true;
+        // U+2066..U+2069 bidi isolates.
+        if (b == 0x81 and c3 >= 0xa6 and c3 <= 0xa9) return true;
     }
     return false;
 }
@@ -261,15 +282,27 @@ pub fn formatLease(buf: []u8, id: []const u8, until: i64, addrs: []const LeaseAd
     return w.buffered();
 }
 
-test "containsControl covers C0 C1 and Unicode line separators only" {
+test "containsControl covers C0 C1 line separators and bidi format controls" {
     try std.testing.expect(!containsControl("gguf/a.gguf"));
     try std.testing.expect(!containsControl("model\u{a0}v2.bin"));
     try std.testing.expect(!containsControl("a\xe2\x80.bin"));
+    try std.testing.expect(!containsControl("a\xe2\x81.bin"));
+    try std.testing.expect(!containsControl("a\xd8.bin"));
     try std.testing.expect(containsControl("a\nb"));
     try std.testing.expect(containsControl("a\x7fb"));
     try std.testing.expect(containsControl("a\xc2\x9bb"));
     try std.testing.expect(containsControl("a\u{2028}b"));
     try std.testing.expect(containsControl("a\u{2029}b"));
+    // Bidi marks, embeddings, overrides, isolates, and Arabic letter mark:
+    // a path or lease name carrying these spoofs display order in logs and
+    // `modelfs peers` (`gguf/txt.exe` via U+202E) without splitting lines.
+    try std.testing.expect(containsControl("a\u{200e}b"));
+    try std.testing.expect(containsControl("a\u{200f}b"));
+    try std.testing.expect(containsControl("gguf/a\u{202e}gnp.bin"));
+    try std.testing.expect(containsControl("a\u{202a}b"));
+    try std.testing.expect(containsControl("a\u{2066}b"));
+    try std.testing.expect(containsControl("a\u{2069}b"));
+    try std.testing.expect(containsControl("a\u{061c}b"));
 }
 
 test "url encode decode" {

@@ -3432,6 +3432,7 @@ const seed_req_max_range = fuzzcorpus.entry("GET /data?path=a HTTP/1.1\r\nAuthor
 const seed_req_control_path = fuzzcorpus.entry("GET /have?path=%00%1b%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_c1_path = fuzzcorpus.entry("GET /have?path=a%C2%9Bb.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_line_sep_path = fuzzcorpus.entry("GET /have?path=a%E2%80%A8ERROR.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_bidi_path = fuzzcorpus.entry("GET /have?path=a%E2%80%AEgnp.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_inverted_range = fuzzcorpus.entry("GET /data?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=10-5\r\n\r\n");
 const seed_req_no_path = fuzzcorpus.entry("GET /have HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_c1_csi_path = fuzzcorpus.entry("GET /have?path=%C2%9B%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
@@ -3444,6 +3445,7 @@ const fuzz_request_corpus = [_][]const u8{
     &seed_req_control_path,
     &seed_req_c1_path,
     &seed_req_line_sep_path,
+    &seed_req_bidi_path,
     &seed_req_inverted_range,
     &seed_req_no_path,
     &seed_req_c1_csi_path,
@@ -3471,10 +3473,9 @@ fn refRelOk(rel: []const u8) bool {
         if (i != rel.len and rel[i] != '/') {
             const ch = rel[i];
             if (ch < 0x20 or ch == 0x7f) return false;
-            // Independent restatement of store.relOk's UTF-8 control set:
-            // C1 (U+0080..U+009F) and the Unicode line/paragraph separators.
-            if (ch == 0xc2 and i + 1 < rel.len and rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f) return false;
-            if (ch == 0xe2 and i + 2 < rel.len and rel[i + 1] == 0x80 and (rel[i + 2] == 0xa8 or rel[i + 2] == 0xa9)) return false;
+            // Independent restatement of store.relOk's UTF-8 control set
+            // (C1, line separators, bidi format controls).
+            if (proto.utf8FormatControlAt(rel, i)) return false;
             continue;
         }
         const seg = rel[seg_start..i];

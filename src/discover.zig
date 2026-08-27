@@ -137,12 +137,12 @@ pub const cluster_dir = ".cluster";
 /// storage and lease ids out of other nodes' JSON, so neither is trustworthy
 /// for verbatim echo: a co-tenant planting ".cluster/<newline> forged
 /// line.json" would forge multi-line daemon log entries, an id holding ESC,
-/// its C1 spelling "\u{9d}0;pwned\u{9c}", or "spark1\u{2028}ERROR forged"
-/// would inject into the terminal running `modelfs peers`. Same policy
-/// store.relOk applies to paths; such entries are still swept, only their
-/// names are withheld from output. Bytes above that set (NFC/NFD spellings,
-/// astral emoji, bare high bytes) are display text, not controls, and stay
-/// echoable.
+/// its C1 spelling "\u{9d}0;pwned\u{9c}", "spark1\u{2028}ERROR forged",
+/// or a bidi override that spoofs the displayed id, would inject into the
+/// terminal running `modelfs peers`. Same policy store.relOk applies to
+/// paths; such entries are still swept, only their names are withheld from
+/// output. Bytes above that set (NFC/NFD spellings, astral emoji, bare
+/// high bytes) are display text, not controls, and stay echoable.
 pub fn printable(s: []const u8) bool {
     return !proto.containsControl(s);
 }
@@ -1074,6 +1074,10 @@ test "printable gates lease names and ids for log echo" {
     // "spark1\u{2028}ERROR forged" as two lines.
     try std.testing.expect(!printable("spark1\u{2028}ERROR forged"));
     try std.testing.expect(!printable("spark1\u{2029}p"));
+    try std.testing.expect(!printable("spark1\u{202e}gnp"));
+    try std.testing.expect(!printable("spark1\u{200f}"));
+    try std.testing.expect(!printable("spark1\u{2066}x"));
+    try std.testing.expect(!printable("spark1\u{061c}"));
     // Display text above the C1 range stays echoable: NBSP (U+00A0) shares
     // the 0xC2 lead byte but is not a control, nor are accented names.
     try std.testing.expect(printable("caf\xc3\xa9"));
@@ -1090,6 +1094,7 @@ test "displayName echoes printable names and withholds the rest" {
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("a\nb"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("\x7f"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{2028}ERROR forged"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{202e}gnp"));
 }
 
 test "validId gates the lease file name and JSON document" {

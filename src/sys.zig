@@ -180,10 +180,12 @@ pub fn close(fd: c_int) void {
 /// memory for the mount lifetime; a crash would otherwise write it
 /// wherever kernel.core_pattern points (often a world-readable file).
 /// Both soft and hard limits go to zero so a later setrlimit in this
-/// process cannot raise them without CAP_SYS_RESOURCE.
-pub fn disableCoreDumps() void {
+/// process cannot raise them without CAP_SYS_RESOURCE. Failure is
+/// returned so mount can refuse to keep the secret in a dumpable process.
+pub fn disableCoreDumps() !void {
     std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch |err| {
         std.log.err("cannot disable core dumps ({t}); a crash may write the cluster PSK", .{err});
+        return err;
     };
 }
 
@@ -399,7 +401,7 @@ pub fn writeFileDurable(path: [*:0]const u8, data: []const u8) i32 {
 }
 
 pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![]u8 {
-    return readFileAllocOpenErrno(gpa, path, max, null);
+    return readFileAllocOpenErrno(gpa, path, max, null, null);
 }
 
 /// readFileAlloc plus the failing open's errno written through open_errno_out
@@ -408,8 +410,10 @@ pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![
 /// Follows a final symlink: for operator-specified paths (the PSK file) that
 /// are commonly a link into a secrets volume. Daemon-owned artifacts in
 /// trees someone else can plant names in use the NoFollow form.
-pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32) ![]u8 {
-    return readFileAllocFlags(gpa, path, max, 0, open_errno_out);
+/// `mode_out`, when set, is the fstat mode of the fd that was read, so a
+/// permission check cannot race a path-stat of a different inode.
+pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32, mode_out: ?*c.mode_t) ![]u8 {
+    return readFileAllocFlags(gpa, path, max, 0, open_errno_out, mode_out);
 }
 
 /// readFileAllocOpenErrno for daemon-owned artifacts (cache sidecars,
@@ -417,10 +421,10 @@ pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: 
 /// the read into an arbitrary file as the daemon user, or load a crafted
 /// sidecar/lease from outside the tree.
 pub fn readFileAllocNoFollowOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32) ![]u8 {
-    return readFileAllocFlags(gpa, path, max, c.O_NOFOLLOW, open_errno_out);
+    return readFileAllocFlags(gpa, path, max, c.O_NOFOLLOW, open_errno_out, null);
 }
 
-fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, extra_flags: c_int, open_errno_out: ?*i32) ![]u8 {
+fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, extra_flags: c_int, open_errno_out: ?*i32, mode_out: ?*c.mode_t) ![]u8 {
     const fd = open(path, c.O_RDONLY | extra_flags, 0);
     if (fd < 0) {
         if (open_errno_out) |out| out.* = errno();
@@ -429,6 +433,7 @@ fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, e
     defer close(fd);
     var st: c.struct_stat = undefined;
     if (fstat(fd, &st) != 0) return error.StatFailed;
+    if (mode_out) |out| out.* = st.st_mode;
     const n64 = sizeFromStat(st.st_size) orelse return error.StatFailed;
     const size = std.math.cast(usize, n64) orelse return error.FileTooBig;
     if (size > max) return error.FileTooBig;
@@ -677,7 +682,7 @@ fn fdIsCloexec(fd: c_int) bool {
 }
 
 test "disableCoreDumps zeros RLIMIT_CORE" {
-    disableCoreDumps();
+    try disableCoreDumps();
     const lim = std.posix.getrlimit(.CORE) catch return error.SkipZigTest;
     try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.cur);
     try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.max);
