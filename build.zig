@@ -114,6 +114,29 @@ fn linkFuse(m: *std.Build.Module, fuse_lib: ?[]const u8) void {
     }
 }
 
+/// Fail `zig build` / `zig build test` unless the shipped ELF is a PIE with
+/// full RELRO, BIND_NOW, and a non-executable stack. Linking the executable
+/// as part of the test step also compiles `pub fn main`, which the test
+/// binary does not reference.
+fn checkHardenedElf(exe: *std.Build.Step.Compile) *std.Build.Step {
+    const check = exe.checkObject();
+    // Debug images can exceed CheckObject's 20 MiB default; headers+phdrs
+    // still fit, but the step reads the whole file.
+    check.max_bytes = 64 * 1024 * 1024;
+    check.checkInHeaders();
+    check.checkExact("type DYN");
+    check.checkInHeaders();
+    check.checkExact("type GNU_RELRO");
+    check.checkInHeaders();
+    check.checkExact("type GNU_STACK");
+    check.checkExact("flags RW");
+    check.checkInDynamicSection();
+    check.checkContains("NOW");
+    check.checkInDynamicSection();
+    check.checkContains("PIE");
+    return &check.step;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -201,13 +224,14 @@ pub fn build(b: *std.Build) void {
     linkFuse(exe_mod, fuse_lib);
     exe_mod.addIncludePath(.{ .cwd_relative = fuse_inc });
 
-    // Stack canaries in every mode: Zig enables them by default only in safe
-    // modes, so an unhardened -Doptimize=ReleaseFast ship build would link
-    // without any. Debug info stays on for Debug development but is stripped
-    // from anything shippable: DWARF records absolute build paths
-    // (DW_AT_comp_dir), which is what makes two builds of the same tree from
-    // different directories produce different bytes.
+    // Stack canaries and stack probes in every mode: Zig enables both by
+    // default only in safe modes, so an unhardened -Doptimize=ReleaseFast
+    // ship build would link without either. Debug info stays on for Debug
+    // development but is stripped from anything shippable: DWARF records
+    // absolute build paths (DW_AT_comp_dir), which is what makes two builds
+    // of the same tree from different directories produce different bytes.
     exe_mod.stack_protector = true;
+    exe_mod.stack_check = true;
     if (optimize != .Debug) {
         exe_mod.strip = true;
     }
@@ -221,15 +245,26 @@ pub fn build(b: *std.Build) void {
     // ASLR for the main image: without this Zig links ET_EXEC, so the
     // long-lived networked daemon runs at a fixed address.
     exe.pie = true;
+    // Zig already defaults these on; pin them so a default flip cannot ship
+    // a lazy-binding or partial-RELRO networked image.
+    exe.link_z_relro = true;
+    exe.link_z_lazy = false;
     b.installArtifact(exe);
+
+    if (target.result.ofmt == .elf) {
+        const hardening = checkHardenedElf(exe);
+        b.getInstallStep().dependOn(hardening);
+        test_step.dependOn(hardening);
+    }
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        // Exercise the same canary-instrumented code the executable ships.
+        // Exercise the same canary- and probe-instrumented code the executable ships.
         .stack_protector = true,
+        .stack_check = true,
     });
     linkFuse(test_mod, fuse_lib);
     test_mod.addIncludePath(.{ .cwd_relative = fuse_inc });

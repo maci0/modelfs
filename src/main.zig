@@ -1058,7 +1058,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     // spill it, and drop MODELFS_PSK_VALUE so fuse_main's auto_unmount
     // helper cannot inherit it through the environment block.
     sys.disableCoreDumps() catch {
-        std.log.err("cannot disable core dumps; refusing to start with the PSK in a dumpable process");
+        std.log.err("cannot disable core dumps; refusing to start with the PSK in a dumpable process", .{});
         return 1;
     };
     sys.scrubPskEnv();
