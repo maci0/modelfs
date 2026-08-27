@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Shipped-behavior reference; kept current against `src/` |
-| Date | 2026-08-26 (re-verified against `src/`) |
+| Date | 2026-08-27 (re-verified against `src/`) |
 | Design history | [design.md](design.md): original architecture, goals G1-G10 with ship status, key decisions and what did not ship |
 
 Shipped in `modelfs` (Zig, libfuse3). A process on a spark only opens `/models/...`.
@@ -51,7 +51,7 @@ One piece, one source. Misses block the read until that hole is filled. No full-
 
 Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run `modelfs` there.
 
-`stat` / `readdir` / `mkdir` / `unlink` / `rename` → origin. `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`.
+`stat` / `readdir` / `mkdir` / `unlink` / `rename` → origin. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`.
 
 Origin is **required**. It can be any POSIX dir both nodes see, not only NFS. Two-node with no shared store is not implemented.
 

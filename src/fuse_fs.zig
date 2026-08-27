@@ -675,6 +675,14 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
     if (live) |file| {
         defer st.store.releaseFile(file);
         file.mu.lockUncancelable(st.io);
+        if (file.size == new_size) {
+            // Already applied: a FUSE retry after a lost reply, or a no-op
+            // truncate to the current size. Re-wiping bits would discard
+            // pieces re-hydrated after the first truncate to this size.
+            if (file.cache_fd >= 0) _ = sys.ftruncate(file.cache_fd, new_size);
+            file.mu.unlock(st.io);
+            return 0;
+        }
         const nb = piece.Bitfield.init(st.gpa, piece.count(new_size, st.store.piece_size)) catch {
             file.mu.unlock(st.io);
             return -sys.c.ENOMEM;
@@ -701,15 +709,7 @@ export fn mf_unlink(path: [*c]const u8) callconv(.c) c_int {
     var rel: []const u8 = "";
     const rerr = resolveRel(p, -sys.c.EPERM, &rel);
     if (rerr != 0) return rerr;
-    var buf: [sys.c.PATH_MAX]u8 = undefined;
-    const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    if (std.c.unlink(op) != 0) return sys.negErrno();
-    // Cache artifacts keyed to this rel must not outlive it, or a same-size
-    // recreate would resurrect stale bits over fresh empty data. forget also
-    // empties the live in-memory entry (bits + open fd), which disk cleanup
-    // alone leaves pointing at the old inode.
-    st.store.forget(rel);
-    return 0;
+    return st.store.unlinkOrigin(rel);
 }
 
 export fn mf_mkdir(path: [*c]const u8, mode: fuse.mode_t) callconv(.c) c_int {
@@ -744,29 +744,13 @@ export fn mf_rename(old: [*c]const u8, new: [*c]const u8, flags: c_uint) callcon
     if (oerr != 0) return oerr;
     const nerr = resolveRel(cPath(new), -sys.c.EPERM, &nrel);
     if (nerr != 0) return nerr;
-    var a: [sys.c.PATH_MAX]u8 = undefined;
-    var b: [sys.c.PATH_MAX]u8 = undefined;
-    const oa = st.store.originPath(&a, orel) catch return -sys.c.ENAMETOOLONG;
-    const ob = st.store.originPath(&b, nrel) catch return -sys.c.ENAMETOOLONG;
     // Namespace ops present the origin's own rename semantics, flags
     // included: the kernel routes RENAME_NOREPLACE/EXCHANGE through FUSE's
     // rename2 and libfuse forwards them here. Dropping them would silently
     // overwrite a destination the caller asked to keep (mv -n, cp -n) or
-    // move instead of swap (renameat2 EXCHANGE). The origin filesystem
-    // answers for whatever it cannot do -- loud failure, never a silently
-    // different operation.
-    if (fuse.renameat2(sys.c.AT_FDCWD, oa, sys.c.AT_FDCWD, ob, flags) != 0)
-        return sys.negErrno();
-    // Both names lose their cache identity with this rename: the source name
-    // no longer exists on the origin, and the destination name now holds the
-    // source's bytes in place of whatever its bits describe. Purge both like
-    // unlink does, or a same-size recreate at either name would serve the
-    // previous content through resurrected bits.
-    if (!std.mem.eql(u8, orel, nrel)) {
-        st.store.forget(orel);
-        st.store.forget(nrel);
-    }
-    return 0;
+    // move instead of swap (renameat2 EXCHANGE). Cache drop on both names,
+    // including when the origin rename returns ENOENT, is Store.renameOrigin.
+    return st.store.renameOrigin(orel, nrel, flags);
 }
 
 export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {

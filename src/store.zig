@@ -824,6 +824,57 @@ pub const Store = struct {
         return sys.pwriteAll(fd, buf, off);
     }
 
+    /// Origin unlink plus cache-identity drop. Forget runs even when the
+    /// origin name is already gone: a FUSE retry after the first attempt
+    /// unlinked then crashed (or lost the reply) would otherwise leave
+    /// data/meta/pin in place, and a same-size recreate would serve the
+    /// deleted file's bytes. Forget also runs before the unlink so a crash
+    /// between the two steps cannot leave a filled sidecar over a name that
+    /// is already gone. The empty rel (FUSE "/") is the origin root itself
+    /// and is not a cache key -- skipping forget there keeps unlink of the
+    /// mount root from targeting cache/data. The origin errno is returned
+    /// as-is (ENOENT stays ENOENT); only the cache side is retry-safe.
+    pub fn unlinkOrigin(self: *Store, rel: []const u8) i32 {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const op = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
+        if (rel.len != 0) self.forget(rel);
+        const rc = c.unlink(op);
+        const e: i32 = if (rc != 0) sys.errno() else 0;
+        // A racer's get() between the first forget and the unlink may have
+        // rebuilt an entry over the still-live origin name; drop it now that
+        // the name is gone (or was already gone).
+        if (rel.len != 0) self.forget(rel);
+        if (e != 0) return -e;
+        return 0;
+    }
+
+    /// Origin rename plus cache-identity drop of both names. Flags ride
+    /// through to renameat2 (RENAME_NOREPLACE/EXCHANGE) so the origin's own
+    /// semantics answer, matching mf_rename. Forget runs before and after
+    /// the origin rename, and on every errno including ENOENT, so a retry
+    /// after a completed rename cannot leave either name's sidecar
+    /// describing the pre-rename inode. Empty names are not cache keys
+    /// (same mount-root skip as unlinkOrigin). The origin errno is returned
+    /// as-is.
+    pub fn renameOrigin(self: *Store, orel: []const u8, nrel: []const u8, flags: c_uint) i32 {
+        var a: [sys.c.PATH_MAX]u8 = undefined;
+        var b: [sys.c.PATH_MAX]u8 = undefined;
+        const oa = self.originPath(&a, orel) catch return -c.ENAMETOOLONG;
+        const ob = self.originPath(&b, nrel) catch return -c.ENAMETOOLONG;
+        if (!std.mem.eql(u8, orel, nrel)) {
+            if (orel.len != 0) self.forget(orel);
+            if (nrel.len != 0) self.forget(nrel);
+        }
+        const rc = c.renameat2(c.AT_FDCWD, oa, c.AT_FDCWD, ob, flags);
+        const e: i32 = if (rc != 0) sys.errno() else 0;
+        if (!std.mem.eql(u8, orel, nrel)) {
+            if (orel.len != 0) self.forget(orel);
+            if (nrel.len != 0) self.forget(nrel);
+        }
+        if (e != 0) return -e;
+        return 0;
+    }
+
     /// Copies bytes this node just wrote through the mount into the local
     /// cache and marks the pieces they fully span. The entry is grown with
     /// its piece marks preserved: an append is our own write, not an external
@@ -2358,6 +2409,161 @@ test "pin and unpin run twice converge on the one-marker state" {
     try std.testing.expect(sys.statPath(pp_z, &stat) != 0);
     try std.testing.expectEqual(@as(i32, 0), st.setPin("m.bin", false));
     try std.testing.expect(!st.pinExists("m.bin"));
+}
+
+// Re-execution of unlink is the FUSE retry after a lost reply (daemon
+// crash between origin unlink and the response, or a dropped FUSE
+// buffer). The origin name is already gone, so the second call returns
+// ENOENT; cache identity must still drop, or a same-size recreate serves
+// the deleted file's bytes. Twice-versus-once: both end with origin,
+// data, meta, and pin gone.
+test "unlinkOrigin twice matches once, and a retry after origin-only unlink still drops cache" {
+    const gpa = std.testing.allocator;
+    var ob1: [128]u8 = undefined;
+    var cb1: [128]u8 = undefined;
+    var ob2: [128]u8 = undefined;
+    var cb2: [128]u8 = undefined;
+    const origin_1 = try sys.scratchDir(&ob1, "modelfs-o-ul-once");
+    defer sys.deleteTree(std.testing.io, origin_1);
+    const cache_1 = try sys.scratchDir(&cb1, "modelfs-c-ul-once");
+    defer sys.deleteTree(std.testing.io, cache_1);
+    const origin_2 = try sys.scratchDir(&ob2, "modelfs-o-ul-twice");
+    defer sys.deleteTree(std.testing.io, origin_2);
+    const cache_2 = try sys.scratchDir(&cb2, "modelfs-c-ul-twice");
+    defer sys.deleteTree(std.testing.io, cache_2);
+
+    var once = Store.init(gpa, std.testing.io, origin_1, cache_1, 16);
+    defer once.deinit();
+    var twice = Store.init(gpa, std.testing.io, origin_2, cache_2, 16);
+    defer twice.deinit();
+    try std.testing.expectEqual(@as(i32, 0), once.ensureLayout());
+    try std.testing.expectEqual(@as(i32, 0), twice.ensureLayout());
+
+    const content = "0123456789abcdef";
+    const now = sys.monoSec();
+    var op1: [sys.c.PATH_MAX]u8 = undefined;
+    var op2: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try once.originPath(&op1, "gone.bin"), content));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try twice.originPath(&op2, "gone.bin"), content));
+
+    const f1 = try once.get("gone.bin", content.len, now);
+    defer once.releaseFile(f1);
+    const f2 = try twice.get("gone.bin", content.len, now);
+    defer twice.releaseFile(f2);
+    try std.testing.expect((try once.beginFill(f1, 0, now)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), once.completeFill(f1, 0, content, now));
+    try std.testing.expect((try twice.beginFill(f2, 0, now)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), twice.completeFill(f2, 0, content, now));
+    try std.testing.expectEqual(@as(i32, 0), once.setPin("gone.bin", true));
+    try std.testing.expectEqual(@as(i32, 0), twice.setPin("gone.bin", true));
+
+    try std.testing.expectEqual(@as(i32, 0), once.unlinkOrigin("gone.bin"));
+    try std.testing.expectEqual(@as(i32, 0), twice.unlinkOrigin("gone.bin"));
+    // Retry: origin already gone, POSIX ENOENT, cache still purged.
+    try std.testing.expectEqual(@as(i32, -c.ENOENT), twice.unlinkOrigin("gone.bin"));
+
+    var stbuf: c.struct_stat = undefined;
+    try std.testing.expect(sys.statPath(try once.originPath(&op1, "gone.bin"), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try twice.originPath(&op2, "gone.bin"), &stbuf) != 0);
+    var mb1: [sys.c.PATH_MAX]u8 = undefined;
+    var mb2: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expect(sys.statPath(try once.cacheMetaPath(&mb1, "gone.bin"), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try twice.cacheMetaPath(&mb2, "gone.bin"), &stbuf) != 0);
+    var db1: [sys.c.PATH_MAX]u8 = undefined;
+    var db2: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expect(sys.statPath(try once.cacheDataPath(&db1, "gone.bin"), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try twice.cacheDataPath(&db2, "gone.bin"), &stbuf) != 0);
+    try std.testing.expect(!once.pinExists("gone.bin"));
+    try std.testing.expect(!twice.pinExists("gone.bin"));
+
+    // Crash window: origin unlinked, forget never ran, retry must still
+    // drop the sidecar so a same-size recreate cannot resurrect bits.
+    var ob3: [128]u8 = undefined;
+    var cb3: [128]u8 = undefined;
+    const origin_3 = try sys.scratchDir(&ob3, "modelfs-o-ul-retry");
+    defer sys.deleteTree(std.testing.io, origin_3);
+    const cache_3 = try sys.scratchDir(&cb3, "modelfs-c-ul-retry");
+    defer sys.deleteTree(std.testing.io, cache_3);
+    var retry = Store.init(gpa, std.testing.io, origin_3, cache_3, 16);
+    defer retry.deinit();
+    try std.testing.expectEqual(@as(i32, 0), retry.ensureLayout());
+    var op3: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try retry.originPath(&op3, "gone.bin"), content));
+    const f3 = try retry.get("gone.bin", content.len, now);
+    defer retry.releaseFile(f3);
+    try std.testing.expect((try retry.beginFill(f3, 0, now)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), retry.completeFill(f3, 0, content, now));
+    try std.testing.expect(retry.hasPiece(f3, 0, now));
+    try std.testing.expectEqual(@as(i32, 0), c.unlink(try retry.originPath(&op3, "gone.bin")));
+    var mb3: [sys.c.PATH_MAX]u8 = undefined;
+    const meta3 = try retry.cacheMetaPath(&mb3, "gone.bin");
+    try std.testing.expect(sys.statPath(meta3, &stbuf) == 0);
+    try std.testing.expectEqual(@as(i32, -c.ENOENT), retry.unlinkOrigin("gone.bin"));
+    try std.testing.expect(sys.statPath(meta3, &stbuf) != 0);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try retry.originPath(&op3, "gone.bin"), content));
+    const f4 = try retry.get("gone.bin", content.len, now);
+    defer retry.releaseFile(f4);
+    try std.testing.expectEqual(@as(u32, 0), f4.bits.filled());
+}
+
+// Same retry contract for rename: an origin-only rename (first attempt
+// completed, reply lost) leaves both names' sidecars behind; the ENOENT
+// retry must still drop them, or a same-size recreate at either name
+// serves the pre-rename inode.
+test "renameOrigin on a retry after origin-only rename still drops cache" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-rn-retry");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-rn-retry");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const content = "0123456789abcdef";
+    const now = sys.monoSec();
+    var oa: [sys.c.PATH_MAX]u8 = undefined;
+    var obuf: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try st.originPath(&oa, "a.bin"), content));
+    const f = try st.get("a.bin", content.len, now);
+    defer st.releaseFile(f);
+    try std.testing.expect((try st.beginFill(f, 0, now)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, content, now));
+    try std.testing.expect(st.hasPiece(f, 0, now));
+
+    // First attempt's origin step, then crash before forget.
+    try std.testing.expectEqual(@as(i32, 0), c.rename(try st.originPath(&oa, "a.bin"), try st.originPath(&obuf, "b.bin")));
+    var ma: [sys.c.PATH_MAX]u8 = undefined;
+    var stbuf: c.struct_stat = undefined;
+    try std.testing.expect(sys.statPath(try st.cacheMetaPath(&ma, "a.bin"), &stbuf) == 0);
+
+    try std.testing.expectEqual(@as(i32, -c.ENOENT), st.renameOrigin("a.bin", "b.bin", 0));
+    try std.testing.expect(sys.statPath(try st.cacheMetaPath(&ma, "a.bin"), &stbuf) != 0);
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expect(sys.statPath(try st.cacheMetaPath(&mb, "b.bin"), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try st.originPath(&oa, "a.bin"), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try st.originPath(&obuf, "b.bin"), &stbuf) == 0);
+
+    const f2 = try st.get("b.bin", content.len, now);
+    defer st.releaseFile(f2);
+    try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
+
+    // Twice-versus-once on a fresh pair: rename then retry leave the same
+    // origin layout and empty cache as a single rename.
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try st.originPath(&oa, "c.bin"), content));
+    const f3 = try st.get("c.bin", content.len, now);
+    defer st.releaseFile(f3);
+    try std.testing.expect((try st.beginFill(f3, 0, now)) == .len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f3, 0, content, now));
+    try std.testing.expectEqual(@as(i32, 0), st.renameOrigin("c.bin", "d.bin", 0));
+    try std.testing.expectEqual(@as(i32, -c.ENOENT), st.renameOrigin("c.bin", "d.bin", 0));
+    try std.testing.expect(sys.statPath(try st.originPath(&oa, "c.bin"), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try st.originPath(&obuf, "d.bin"), &stbuf) == 0);
+    try std.testing.expect(sys.statPath(try st.cacheMetaPath(&ma, "c.bin"), &stbuf) != 0);
+    try std.testing.expect(sys.statPath(try st.cacheMetaPath(&mb, "d.bin"), &stbuf) != 0);
 }
 
 test "punchPiece refuses pinned and freshly accessed entries" {
