@@ -939,6 +939,15 @@ fn leaseAddrs(gpa: std.mem.Allocator, opts: Opts, local_ips: []const []const u8,
             try addrs.append(gpa, .{ .ip = "127.0.0.1", .port = eff_port, .mbps = 0 });
         }
     }
+    // Canonicalize so the published lease JSON is a function of the
+    // address set, never of getifaddrs or --advertise enumeration order.
+    // Probe walks already ignore that order (pathTieLess); this keeps the
+    // document itself replayable from the NIC set.
+    std.mem.sort(proto.LeaseAddr, addrs.items, {}, struct {
+        fn lessThan(_: void, a: proto.LeaseAddr, b: proto.LeaseAddr) bool {
+            return discover.addrTieLess(a.ip, a.port, b.ip, b.port);
+        }
+    }.lessThan);
     for (addrs.items) |a| {
         std.log.info("advertise {s}:{d}", .{ a.ip, a.port });
     }
@@ -2904,6 +2913,22 @@ test "leaseAddrs follows --listen and falls back to loopback" {
         try std.testing.expectEqual(@as(u16, 19091), addrs.items[0].port);
         try std.testing.expectEqual(@as(u16, 19090), addrs.items[1].port);
     }
+    // --advertise order is canonicalized the same way: 10.0.0.1 before
+    // 10.0.0.2 regardless of flag order.
+    {
+        var opts = Opts{};
+        opts.listen_port = 19091;
+        try opts.advertise.append(gpa, .{ .ip = "10.0.0.2", .port = 19090 });
+        try opts.advertise.append(gpa, .{ .ip = "10.0.0.1", .port = proto.default_port });
+        defer opts.advertise.deinit(gpa);
+        var addrs = try leaseAddrs(gpa, opts, &.{}, 19091);
+        defer addrs.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 2), addrs.items.len);
+        try std.testing.expectEqualStrings("10.0.0.1", addrs.items[0].ip);
+        try std.testing.expectEqual(@as(u16, 19091), addrs.items[0].port);
+        try std.testing.expectEqualStrings("10.0.0.2", addrs.items[1].ip);
+        try std.testing.expectEqual(@as(u16, 19090), addrs.items[1].port);
+    }
     // --advertise replaces auto-detect: local IPs must not also be published.
     {
         var opts = Opts{};
@@ -2916,14 +2941,16 @@ test "leaseAddrs follows --listen and falls back to loopback" {
         try std.testing.expectEqualStrings("10.0.0.9", addrs.items[0].ip);
     }
     // Without --advertise, every advertised local IP publishes with the
-    // effective listening port.
+    // effective listening port, sorted by ip so getifaddrs order cannot
+    // decide the lease document.
     {
         const local = [_][]const u8{ "192.168.1.5", "10.1.1.5" };
         var addrs = try leaseAddrs(gpa, .{}, &local, 18080);
         defer addrs.deinit(gpa);
         try std.testing.expectEqual(@as(usize, 2), addrs.items.len);
-        try std.testing.expectEqualStrings("192.168.1.5", addrs.items[0].ip);
+        try std.testing.expectEqualStrings("10.1.1.5", addrs.items[0].ip);
         try std.testing.expectEqual(@as(u16, 18080), addrs.items[0].port);
+        try std.testing.expectEqualStrings("192.168.1.5", addrs.items[1].ip);
         try std.testing.expectEqual(@as(u16, 18080), addrs.items[1].port);
     }
     // No addresses at all: loopback keeps the node visible on localhost.

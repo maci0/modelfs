@@ -1205,8 +1205,9 @@ fn probeOrderLess(a: discover.Path, b: discover.Path) bool {
 }
 
 /// Groups snapshot indexes by unique peer id, each group sorted best-first
-/// by probeOrderLess. Caller frees the outer slice and every inner group
-/// with gpa.
+/// by probeOrderLess, then the outer list by peer id so probe todo does
+/// not follow lease-readdir first-seen order. Caller frees the outer slice
+/// and every inner group with gpa.
 fn groupPathsByPeerId(gpa: std.mem.Allocator, paths: []const discover.Path) ![][]usize {
     var groups: std.ArrayList([]usize) = .empty;
     errdefer {
@@ -1236,6 +1237,14 @@ fn groupPathsByPeerId(gpa: std.mem.Allocator, paths: []const discover.Path) ![][
             j -= 1;
         }
     }
+    // Outer list in peer-id order so probe todo (and sequential havePut
+    // insertion on the single-thread path) is a function of the peer set,
+    // never of which lease refresh happened to visit first.
+    std.mem.sort([]usize, groups.items, paths, struct {
+        fn lessThan(p: []const discover.Path, a: []usize, b: []usize) bool {
+            return std.mem.order(u8, p[a[0]].peer_id, p[b[0]].peer_id) == .lt;
+        }
+    }.lessThan);
     return groups.toOwnedSlice(gpa);
 }
 
@@ -1425,13 +1434,12 @@ test "groupPathsByPeerId orders ties by ip and port, never by arrival order" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), groups1.len);
-    // Highest prior walks first; equal-prior ties break by ip, then port.
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, groups1[0]);
-    try std.testing.expectEqualSlices(usize, &.{3}, groups1[1]);
-
     try std.testing.expectEqual(@as(usize, 2), groups2.len);
-    // Same addresses, reversed arrival: identical walk order per group
-    // (fabric address first, then the mgmt pair by ip/port).
+    // Outer list is peer-id order ("other" < "spark"), not first-seen.
+    // Within spark, highest prior walks first; equal-prior ties break by
+    // ip, then port. Both arrival permutations must produce that walk.
+    try std.testing.expectEqualSlices(usize, &.{3}, groups1[0]);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, groups1[1]);
     try std.testing.expectEqualSlices(usize, &.{0}, groups2[0]);
     try std.testing.expectEqualSlices(usize, &.{ 3, 2, 1 }, groups2[1]);
 }

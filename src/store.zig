@@ -843,6 +843,16 @@ pub const Store = struct {
             }
         }
 
+        // Hash-map iteration order must not decide which equally idle
+        // empty entries are unlinked first (a crash mid-reap would otherwise
+        // leave a different remainder from the same set). Same total order
+        // cullOne already uses for equal-recency files.
+        std.mem.sort(*Cached, cands.items, {}, struct {
+            fn lessThan(_: void, a: *Cached, b: *Cached) bool {
+                return std.mem.order(u8, a.rel, b.rel) == .lt;
+            }
+        }.lessThan);
+
         // Phase 2: close idle fds; drop entries that still hold pieces or
         // a pin. lastSet returns on the first set bit from the end;
         // filled() scanned the whole field to count. pinExists is a stat

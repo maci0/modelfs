@@ -89,11 +89,24 @@ pub const PathCand = struct {
 /// environment enumeration order decide which peer serves a piece; cold
 /// clusters start every path at the same prior, making ties the steady state
 /// until the first goodput samples land.
-fn addrTieLess(a_ip: []const u8, a_port: u16, b_ip: []const u8, b_port: u16) bool {
+pub fn addrTieLess(a_ip: []const u8, a_port: u16, b_ip: []const u8, b_port: u16) bool {
     switch (std.mem.order(u8, a_ip, b_ip)) {
         .lt => return true,
         .gt => return false,
         .eq => return a_port < b_port,
+    }
+}
+
+/// Total order over live catalog Paths: peer id, then ip, then port.
+/// Catalog.refresh sorts the rebuilt list with it so snapshot, probe
+/// grouping, and sequential have-cache insertion are a function of the
+/// membership set, never of lease-directory readdir or a publisher's
+/// getifaddrs / --advertise enumeration order.
+fn pathListLess(_: void, a: Path, b: Path) bool {
+    switch (std.mem.order(u8, a.peer_id, b.peer_id)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => return pathTieLess(a, b),
     }
 }
 
@@ -290,6 +303,22 @@ pub const Catalog = struct {
         gpa.free(e.bits);
     }
 
+    /// True when `a` is the better have-cache eviction victim than `b`.
+    /// Expired lines beat live ones; among that class, sooner expiry; then
+    /// (rel, ip, port). havePut uses this so a cap spill is a function of
+    /// the cached keys and `now_ms`, never of insert order.
+    fn haveVictimLess(now_ms: i64, a: HaveEntry, b: HaveEntry) bool {
+        const a_dead = now_ms >= a.expires_ms;
+        const b_dead = now_ms >= b.expires_ms;
+        if (a_dead != b_dead) return a_dead;
+        if (a.expires_ms != b.expires_ms) return a.expires_ms < b.expires_ms;
+        switch (std.mem.order(u8, a.rel, b.rel)) {
+            .lt => return true,
+            .gt => return false,
+            .eq => return addrTieLess(a.ip, a.port, b.ip, b.port),
+        }
+    }
+
     /// Live cache line for (rel, ip, port) at `now_ms`, or null when none
     /// is unexpired. Caller must hold have_mu: the pointer is invalidated
     /// by any havePut that replaces or evicts this key.
@@ -353,15 +382,16 @@ pub const Catalog = struct {
             return;
         }
         if (self.have_cache.items.len >= have_cache_cap) {
-            // Evict an expired entry when one exists, else the soonest to
-            // expire (items.len >= cap > 0, so a victim always exists).
+            // Evict expired first, else the soonest to expire. Equal
+            // expires_ms is the steady state for one fill: probe workers
+            // stamp every fresh line with the same now_ms, so array order
+            // would otherwise be which worker won the have_mu race -- OS
+            // scheduling choosing the casualty. Ties break by (rel, ip,
+            // port), a function of the cached key set alone.
             var victim: usize = 0;
             for (self.have_cache.items, 0..) |e, i| {
-                if (now_ms >= e.expires_ms) {
-                    victim = i;
-                    break;
-                }
-                if (e.expires_ms < self.have_cache.items[victim].expires_ms) victim = i;
+                if (i == 0) continue;
+                if (haveVictimLess(now_ms, e, self.have_cache.items[victim])) victim = i;
             }
             freeHaveEntry(gpa, self.have_cache.orderedRemove(victim));
         }
@@ -656,6 +686,13 @@ pub const Catalog = struct {
             }
         }
 
+        // Membership set, not directory walk: readdir of origin/.cluster
+        // and each lease's addrs array (the publisher's getifaddrs order)
+        // must not decide snapshot, probe-group, or sequential have-cache
+        // insertion order. pathListLess is a total order, so equal keys
+        // (same peer, same address) keep either relative placement.
+        std.mem.sort(Path, new_paths.items, {}, pathListLess);
+
         // Lease refresh replaces membership, not measurements: EWMA goodput
         // and in-flight transfer counts are properties of an address,
         // learned from the fetches since the last publish/refresh tick.
@@ -891,6 +928,15 @@ pub fn localIpv4(gpa: std.mem.Allocator) ![][]const u8 {
         if (dup) continue;
         try list.append(gpa, try gpa.dupe(u8, span));
     }
+    // getifaddrs enumeration order varies across reboots and machines;
+    // hopsBetween takes the min so order is already irrelevant there, but
+    // leaseAddrs publishes this list into the lease JSON, so sort by dotted
+    // quad so the document is a function of the NIC set alone.
+    std.mem.sort([]const u8, list.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
     return list.toOwnedSlice(gpa);
 }
 
@@ -1026,6 +1072,48 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     // The next spill drains the next-soonest expiry in sequence.
     try std.testing.expect(cat.haveGet(gpa, "f1.bin", "10.1.0.1", 18080, t0) == null);
     if (cat.haveGet(gpa, "f31.bin", "10.1.0.1", 18080, t0)) |fresh| {
+        gpa.free(fresh.bits);
+    } else return error.TestUnexpectedResult;
+}
+
+test "have cache evicts equal-TTL ties by key, never by insert order" {
+    const gpa = std.testing.allocator;
+    // Virtual instant: every line in a fill shares one now_ms (ProbeCtx),
+    // so equal expires_ms is the overflow case a concurrent probe hits.
+    const t0: i64 = 1_000_000;
+
+    const Fill = struct {
+        fn toCap(cat: *Catalog, first: []const []const u8) void {
+            for (first) |name| cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, t0);
+            var i: usize = first.len;
+            while (i < Catalog.have_cache_cap) : (i += 1) {
+                var name_buf: [32]u8 = undefined;
+                const name = std.fmt.bufPrint(&name_buf, "n{d:0>2}.bin", .{i}) catch unreachable;
+                cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, t0);
+            }
+            cat.havePut("spill.bin", "10.0.0.1", 18080, &.{1}, 0, t0);
+        }
+    };
+
+    // Smallest key last: array-order eviction would drop c.bin (slot 0).
+    var cat_scrambled = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+    defer cat_scrambled.deinit();
+    Fill.toCap(&cat_scrambled, &.{ "c.bin", "b.bin", "a.bin" });
+    try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat_scrambled.have_cache.items.len);
+    try std.testing.expect(cat_scrambled.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0) == null);
+    if (cat_scrambled.haveGet(gpa, "c.bin", "10.0.0.1", 18080, t0)) |fresh| {
+        gpa.free(fresh.bits);
+    } else return error.TestUnexpectedResult;
+    if (cat_scrambled.haveGet(gpa, "spill.bin", "10.0.0.1", 18080, t0)) |fresh| {
+        gpa.free(fresh.bits);
+    } else return error.TestUnexpectedResult;
+
+    // Smallest key first: the same casualty, so insert order cannot matter.
+    var cat_sorted = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+    defer cat_sorted.deinit();
+    Fill.toCap(&cat_sorted, &.{ "a.bin", "b.bin", "c.bin" });
+    try std.testing.expect(cat_sorted.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0) == null);
+    if (cat_sorted.haveGet(gpa, "c.bin", "10.0.0.1", 18080, t0)) |fresh| {
         gpa.free(fresh.bits);
     } else return error.TestUnexpectedResult;
 }
@@ -2073,4 +2161,43 @@ test "refresh carries learned goodput and inflight across ticks" {
 
     // The carried inflight drains exactly once.
     try std.testing.expectEqual(@as(u32, 0), cat.inflight("10.0.0.9", 19099, -1));
+}
+
+test "refresh snapshot order is membership, not readdir or lease addrs order" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-order");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    // Write zzz first so creation-order readdir would list it before aaa,
+    // and scramble each lease's addrs so getifaddrs order would put .9
+    // ahead of .1. The snapshot must still be peer-id then ip then port.
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const zzz_fp = try std.fmt.bufPrint(&pbuf, "{s}/zzz.json", .{cluster_d});
+    const zzz = "{\"id\":\"zzz\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.1.0.9\",\"port\":18080,\"mbps\":0},{\"ip\":\"10.1.0.1\",\"port\":18080,\"mbps\":0}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, zzz_fp), zzz));
+    const aaa_fp = try std.fmt.bufPrint(&pbuf, "{s}/aaa.json", .{cluster_d});
+    const aaa = "{\"id\":\"aaa\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.9\",\"port\":18081,\"mbps\":0},{\"ip\":\"10.0.0.9\",\"port\":18080,\"mbps\":0}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, aaa_fp), aaa));
+
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    cat.refresh(sys.nowSec(std.testing.io));
+
+    const snap = try cat.snapshot(gpa);
+    defer Catalog.freeSnapshot(gpa, snap);
+    try std.testing.expectEqual(@as(usize, 4), snap.len);
+    try std.testing.expectEqualStrings("aaa", snap[0].peer_id);
+    try std.testing.expectEqualStrings("10.0.0.9", snap[0].ip);
+    try std.testing.expectEqual(@as(u16, 18080), snap[0].port);
+    try std.testing.expectEqualStrings("aaa", snap[1].peer_id);
+    try std.testing.expectEqual(@as(u16, 18081), snap[1].port);
+    try std.testing.expectEqualStrings("zzz", snap[2].peer_id);
+    try std.testing.expectEqualStrings("10.1.0.1", snap[2].ip);
+    try std.testing.expectEqualStrings("zzz", snap[3].peer_id);
+    try std.testing.expectEqualStrings("10.1.0.9", snap[3].ip);
 }
