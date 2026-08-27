@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
+from typing import override
 
 # Sibling module (this directory is sys.path[0] when the script runs): the
 # daemon-readiness policy shared with cluster_verify.py.
@@ -643,10 +644,22 @@ peer latency.
     print(f"✓ Generated Benchmark Report: {report_path}")
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse's usage line, capitalized to match the shell scripts."""
+
+    @override
+    def format_usage(self) -> str:
+        return super().format_usage().replace("usage:", "Usage:", 1)
+
+    @override
+    def format_help(self) -> str:
+        return super().format_help().replace("usage:", "Usage:", 1)
+
+
 def main() -> None:
     reexec_under_venv()
-    parser = argparse.ArgumentParser(
-        description="Run the modelfs benchmarks and render report + figures."
+    parser = _Parser(
+        description="Run the modelfs benchmarks and render report + figures.",
     )
     parser.add_argument(
         "--update-docs",

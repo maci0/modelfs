@@ -36,8 +36,63 @@ echo "supersecretkey1234567890abcdef12345678" > "${PSK_FILE}"
 chmod 600 "${PSK_FILE}"
 
 echo "=== Test Case 1: CLI Help & Status ==="
-"${MODELFS_BIN}" help > /dev/null
+HELP_OUT="${TEMP_DIR}/help.out"
+HELP_ERR="${TEMP_DIR}/help.err"
+
+# --help is the documented help request: stdout, exit 0, nothing on stderr.
+"${MODELFS_BIN}" --help >"${HELP_OUT}" 2>"${HELP_ERR}"
+grep -q '^Usage:' "${HELP_OUT}" || {
+    echo "Error: --help did not print Usage: on stdout"
+    exit 1
+}
+if [[ -s "${HELP_ERR}" ]]; then
+    echo "Error: --help wrote to stderr"
+    cat "${HELP_ERR}"
+    exit 1
+fi
 echo "✓ Help command succeeded"
+
+# No-args is a usage error (exit 2), one named line, not a help dump.
+"${MODELFS_BIN}" >"${HELP_OUT}" 2>"${HELP_ERR}" && RC=0 || RC=$?
+if [[ "${RC}" -ne 2 ]] || ! grep -q 'missing command' "${HELP_ERR}" || [[ -s "${HELP_OUT}" ]]; then
+    echo "Error: expected exit 2 + 'missing command' on stderr for no-args (got rc=${RC})"
+    exit 1
+fi
+if grep -q '^Usage:' "${HELP_ERR}"; then
+    echo "Error: no-args dumped Usage: (want one named line)"
+    exit 1
+fi
+echo "✓ No-args usage error is one named line"
+
+"${MODELFS_BIN}" version >"${HELP_OUT}" 2>"${HELP_ERR}"
+grep -q '^modelfs ' "${HELP_OUT}" || {
+    echo "Error: version did not print on stdout"
+    exit 1
+}
+if [[ -s "${HELP_ERR}" ]]; then
+    echo "Error: version wrote to stderr"
+    cat "${HELP_ERR}"
+    exit 1
+fi
+echo "✓ Version command succeeded"
+
+# A failed stdout write must not look like success: monitors redirect
+# `status` onto a path, and /dev/full is ENOSPC the way a full disk is.
+if [[ -e /dev/full ]]; then
+    "${MODELFS_BIN}" version >/dev/full 2>/dev/null && RC=0 || RC=$?
+    if [[ "${RC}" -ne 1 ]]; then
+        echo "Error: version to /dev/full should exit 1 (got rc=${RC})"
+        exit 1
+    fi
+    echo "✓ Stdout write failure exits 1"
+fi
+
+"${MODELFS_BIN}" frobnicate >"${HELP_OUT}" 2>"${HELP_ERR}" && RC=0 || RC=$?
+if [[ "${RC}" -ne 2 ]] || ! grep -q 'unknown command' "${HELP_ERR}" || [[ -s "${HELP_OUT}" ]]; then
+    echo "Error: expected exit 2 + 'unknown command' for a typo (got rc=${RC})"
+    exit 1
+fi
+echo "✓ Unknown command exits 2"
 
 # Status on uninitialized cache must report 'not running' AND exit nonzero.
 # NB: status intentionally exits 1 here; capture instead of piping because

@@ -72,7 +72,7 @@ const usage =
     \\  --detach              Background after mount
     \\  -f, --foreground      Stay in the foreground (default)
     \\
-    \\every command:
+    \\mount/status/peers/pin/unpin:
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
     \\
     \\status/peers/pin/unpin take only the flags shown on their Usage line plus
@@ -108,7 +108,11 @@ pub fn main(init: std.process.Init) !u8 {
     while (it.next()) |a| try argv.append(gpa, a);
 
     if (argv.items.len == 0) {
-        std.debug.print("{s}", .{usage});
+        // Same one-line usage channel as a missing operand or unknown
+        // command: dumping the help blob here made `modelfs` with no args
+        // the only usage error that printed the full text instead of
+        // naming what was missing.
+        std.debug.print("missing command (want mount, status, peers, pin, unpin, version, help)\n", .{});
         return 2;
     }
     // Bare global forms live at position 0, where parseArgs sees a command
@@ -118,14 +122,8 @@ pub fn main(init: std.process.Init) !u8 {
     // command also accepts -h/--help" instead of dying as a positional error.
     switch (classifyMeta(argv.items)) {
         .none => {},
-        .help => {
-            writeOut(init.io, usage);
-            return 0;
-        },
-        .version => {
-            printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
-            return 0;
-        },
+        .help => return if (writeOut(init.io, usage)) 0 else 1,
+        .version => return if (printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
         .bad => {
             const what: []const u8 = if (isHelpTok(argv.items[0])) "help" else "version";
             std.debug.print("{s} takes no arguments (see 'modelfs help')\n", .{what});
@@ -133,14 +131,8 @@ pub fn main(init: std.process.Init) !u8 {
         },
     }
     const parsed = parseArgs(gpa, init.environ_map, argv.items) catch |err| switch (err) {
-        error.Help => {
-            writeOut(init.io, usage);
-            return 0;
-        },
-        error.Version => {
-            printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version});
-            return 0;
-        },
+        error.Help => return if (writeOut(init.io, usage)) 0 else 1,
+        error.Version => return if (printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
         // Usage errors exit 2, like every other bad invocation in this CLI
         // (missing subcommand argument, unknown command). Each one is named
         // at its own flag site inside parseArgs; only a failure before any
@@ -190,36 +182,39 @@ pub fn main(init: std.process.Init) !u8 {
 
 /// Data output (help text, status JSON, lease listings, pin confirmations)
 /// goes to stdout so pipes and redirections see only results; diagnostics
-/// stay on stderr via std.log/std.debug.print. Best effort: the runtime
-/// ignores SIGPIPE, so a closed reader surfaces here as BrokenPipe and the
-/// consumer is gone either way.
-fn writeOut(io: std.Io, bytes: []const u8) void {
+/// stay on stderr via std.log/std.debug.print. False means the write
+/// failed: the runtime ignores SIGPIPE, so a closed pipe, a full disk,
+/// and EIO all surface as WriteFailed. Callers exit 1 so a monitor that
+/// redirected `status` onto a full filesystem cannot read the command as
+/// healthy after the JSON never landed.
+fn writeOut(io: std.Io, bytes: []const u8) bool {
     // Under test, stdout is the runner's IPC channel (--listen=-): raw data
     // written there corrupts the protocol and wedges the run. A test that
     // needs the operator-facing bytes installs a buffer on captured_stdout.
     if (builtin.is_test) {
         if (captured_stdout) |buf| {
-            buf.appendSlice(std.testing.allocator, bytes) catch {};
+            buf.appendSlice(std.testing.allocator, bytes) catch return false;
         }
-        return;
+        return true;
     }
-    std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
+    std.Io.File.stdout().writeStreamingAll(io, bytes) catch return false;
+    return true;
 }
 
 var captured_stdout: ?*std.ArrayList(u8) = null;
 
-fn printOut(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+fn printOut(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) bool {
     var buf: [4096]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, fmt, args) catch {
         // A rendered line can outgrow the stack buffer: a lease id comes off
         // other nodes' JSON bounded by the read cap, not by validId, and a
         // pin relpath is whatever argv carried. Dropping the line would hide
         // a real result behind exit 0, so fall back to the heap instead.
-        const heap = std.fmt.allocPrint(gpa, fmt, args) catch return;
+        const heap = std.fmt.allocPrint(gpa, fmt, args) catch return false;
         defer gpa.free(heap);
         return writeOut(io, heap);
     };
-    writeOut(io, line);
+    return writeOut(io, line);
 }
 
 const Opts = struct {
@@ -1345,8 +1340,7 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             return 1;
         }
     }
-    writeOut(io, blob);
-    return 0;
+    return if (writeOut(io, blob)) 0 else 1;
 }
 
 fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
@@ -1455,8 +1449,7 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             // unreadable .cluster dir here is a fresh/empty cluster, not an
             // error: same exit-0 empty output as below, with the reason on
             // stdout next to where the listing would have been.
-            printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir });
-            return 0;
+            return if (printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir })) 0 else 1;
         },
     }
 
@@ -1482,14 +1475,14 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         // JSON; echo them only when free of control bytes so `modelfs peers`
         // cannot be turned into a terminal-injection vector.
         const id_shown = if (discover.printable(r.id)) r.id else "<id withheld: control bytes>";
-        printOut(io, gpa, "{s} (until={d}, {s})\n", .{ id_shown, r.until, status_str });
+        if (!printOut(io, gpa, "{s} (until={d}, {s})\n", .{ id_shown, r.until, status_str })) return 1;
         for (r.addrs) |a| {
             const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
-            printOut(io, gpa, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps });
+            if (!printOut(io, gpa, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps })) return 1;
         }
         any = true;
     }
-    if (!any) printOut(io, gpa, "no leases\n", .{});
+    if (!any) return if (printOut(io, gpa, "no leases\n", .{})) 0 else 1;
     return 0;
 }
 
@@ -1542,8 +1535,7 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     // when stdout went down a pipe. rel passed relOk, so echoing it cannot
     // forge log lines.
     std.log.info("{s} {s}", .{ if (on) "pinned" else "unpinned", rel });
-    printOut(io, gpa, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel });
-    return 0;
+    return if (printOut(io, gpa, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel })) 0 else 1;
 }
 
 test "badIdLine renders refused ids through the displayName echo gate" {

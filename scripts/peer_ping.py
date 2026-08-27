@@ -79,3 +79,18 @@ def wait_for_peers_ready(ports: list[int], headers: dict[str, str], timeout_s: f
     deadline = time.monotonic() + timeout_s
     for port in ports:
         wait_for_ping(port, headers, max(deadline - time.monotonic(), 0.0))
+
+
+def main(argv: list[str]) -> int:
+    """Direct invocation is not a probe: this file is imported by the other CLIs."""
+    help_only = argv[1:] == ["-h"] or argv[1:] == ["--help"]
+    print(
+        "Usage: import peer_ping from cluster_verify.py or "
+        "run_benchmarks_and_plots.py (not a standalone command)",
+        file=sys.stdout if help_only else sys.stderr,
+    )
+    return 0 if help_only else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

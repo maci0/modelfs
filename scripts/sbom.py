@@ -14,7 +14,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -541,11 +541,23 @@ def self_test(root: Path) -> None:
     print("ok: sbom self-test")
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse's usage line, capitalized to match the shell scripts."""
+
+    @override
+    def format_usage(self) -> str:
+        return super().format_usage().replace("usage:", "Usage:", 1)
+
+    @override
+    def format_help(self) -> str:
+        return super().format_help().replace("usage:", "Usage:", 1)
+
+
 def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         description=(
             "Generate or verify sbom.cdx.json from the in-tree lock, SHA256SUMS, and CI workflows."
-        )
+        ),
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
