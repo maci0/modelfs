@@ -41,7 +41,7 @@ pub const Server = struct {
     fn bindOne(self: *Server, ip: []const u8, port: u16) !void {
         var addr: c.struct_sockaddr_in = undefined;
         sockaddrV4(ip, port, &addr) catch return error.BadIp;
-        const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        const fd = sys.socket(c.AF_INET, c.SOCK_STREAM, 0);
         if (fd < 0) return error.Socket;
         var yes: c_int = 1;
         // SO_REUSEADDR alone keeps restarts fast (TIME_WAIT leftovers from
@@ -113,8 +113,7 @@ fn acceptLoop(self: *Server, fd: c_int) void {
         // The accepted address rides along so security-relevant events can
         // name their source; connection handlers are the only consumers.
         var peer: c.struct_sockaddr_in = undefined;
-        var peer_len: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        const cfd = c.accept(fd, .{ .__sockaddr__ = @ptrCast(&peer) }, &peer_len);
+        const cfd = sys.accept(fd, &peer);
         if (cfd < 0) {
             if (!self.running.load(.acquire)) return;
             const e = sys.errno();
@@ -877,7 +876,7 @@ fn dial(io: std.Io, ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     try sockaddrV4(ip, port, &addr);
     const budget_ms = dialBudgetMs(io, deadline_ms);
     if (budget_ms == 0) return error.Connect;
-    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    const fd = sys.socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (fd < 0) return error.Socket;
     sys.setSockTimeout(fd, budget_ms);
     sys.setTcpNoDelay(fd);

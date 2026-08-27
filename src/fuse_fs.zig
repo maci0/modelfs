@@ -1170,8 +1170,16 @@ fn statusJson(st: *State) !void {
     // Atomic swap: a torn half-written status.json would make `modelfs status`
     // print garbage; readers see either the old or the new file. O_NOFOLLOW
     // on the staging write keeps a planted symlink from redirecting it.
-    if (sys.writeFileNoFollow(tp, json) != 0) return error.StatusWriteFailed;
-    if (std.c.rename(tp, p) != 0) return error.StatusRenameFailed;
+    if (sys.writeFileNoFollow(tp, json) != 0) {
+        // Staging file may exist from a partial write; leave none behind.
+        // A retry every tick would refresh mtime, so no sweeper ages it out.
+        _ = sys.c.unlink(tp);
+        return error.StatusWriteFailed;
+    }
+    if (std.c.rename(tp, p) != 0) {
+        _ = sys.c.unlink(tp);
+        return error.StatusRenameFailed;
+    }
 }
 
 pub fn ops() fuse.fuse_operations {
@@ -1293,6 +1301,39 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expectEqual(@as(u32, 1), doc2.value.peers);
     try std.testing.expectEqual(@as(u64, 1), doc2.value.stats.fills_peer);
     try std.testing.expectEqual(@as(u64, 4096), doc2.value.stats.bytes_from_peer);
+}
+
+test "statusJson unlinks the staging file when rename fails" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-status-tmp");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = State{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .store = store_mod.Store.init(gpa, std.testing.io, "/unused", cache_d, 4096),
+        .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
+        .server = undefined,
+        .direct_io = true,
+        .start_secs = sys.monoSec(std.testing.io),
+    };
+    st.server = .{ .gpa = gpa, .io = std.testing.io, .psk = "", .store = &st.store };
+    defer st.store.deinit();
+    defer st.catalog.deinit();
+
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const fp = try sys.joinZ(&pbuf, cache_d, status_file);
+    // Destination is a directory: rename(status.json.tmp, status.json) fails
+    // and must not leave the staging file (a retry every tick would refresh
+    // mtime with no sweeper to age it out).
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(fp), 0o755));
+    try std.testing.expectError(error.StatusRenameFailed, statusJson(&st));
+
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const tmp_fp = try sys.appendExt(&zbuf, fp, ".tmp");
+    var stbuf: sys.c.struct_stat = undefined;
+    try std.testing.expect(sys.statPath(tmp_fp, &stbuf) != 0);
 }
 
 test "logStatsTick summarizes deltas and stays silent when idle" {

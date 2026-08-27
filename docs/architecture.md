@@ -138,7 +138,7 @@ Node identity is hostname, not an IP. Each spark writes a lease on the **origin*
 }
 ```
 
-Refresh every 10s, `until` = now+30s. Drop expired. Skip your own `id`. No PSK in the JSON. Every node also sweeps the directory each tick: lease files whose mtime is older than 300 s and abandoned `<id>.json.tmp` staging files from crashed publishes are unlinked, except this node's own lease. Origin root must be writable by uid 1000 so `.cluster` can be created.
+Refresh every 10s, `until` = now+30s. Drop expired. Skip your own `id`. No PSK in the JSON. A failed write or rename of `<id>.json.tmp` unlinks the staging file in `Catalog.publish` so a retrying tick cannot keep it alive by refreshing mtime. Every node also sweeps the directory each tick: lease files whose mtime is older than 300 s and abandoned `<id>.json.tmp` staging files from crashed publishes are unlinked, except this node's own lease. Origin root must be writable by uid 1000 so `.cluster` can be created.
 
 ---
 
@@ -190,7 +190,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 
 A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. The fetching peer requires `206` plus a `Content-Range` whose start matches the request and whose end is at most the request end (EOF clamp); a same-length window at a different offset is refused rather than cached. Errors carry no body: both peers of a conversation parse only the status line.
 
-Every endpoint requires the bearer token, including `/ping`. Listen `0.0.0.0:18080`; `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status.
+Every endpoint requires the bearer token, including `/ping`. Listen `0.0.0.0:18080`; `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status. Listen sockets, accepted connections, and files are opened close-on-exec (`sys.socket`, `sys.accept`, `sys.open`) so the `auto_unmount` fusermount helper spawned at mount cannot inherit them: a helper still holding the listen fd would keep the port bound after `Server.stop`, and the next start would fail to bind.
 
 ---
 

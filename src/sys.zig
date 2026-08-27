@@ -150,8 +150,25 @@ pub fn parentOf(path: []const u8) []const u8 {
     return path[0..slash];
 }
 
+/// Every daemon-owned file is close-on-exec. libfuse's auto_unmount helper
+/// is spawned from fuse_main after bindAll, and without O_CLOEXEC it would
+/// inherit cache and origin fds for the life of the mount.
 pub fn open(path: [*:0]const u8, flags: c_int, mode: c.mode_t) c_int {
-    return c.open(path, flags, mode);
+    return c.open(path, flags | c.O_CLOEXEC, mode);
+}
+
+/// Peer-protocol TCP sockets (listen and dial). SOCK_CLOEXEC is set here so
+/// the auto_unmount fusermount helper cannot inherit the listen fd bindAll
+/// opens before fuse_main: a helper holding that fd keeps the port bound
+/// after Server.stop, and the next start fails Bind.
+pub fn socket(domain: c_int, type_: c_int, protocol: c_int) c_int {
+    return c.socket(domain, type_ | c.SOCK_CLOEXEC, protocol);
+}
+
+/// Accept with SOCK_CLOEXEC (accept4). Same inherit contract as socket.
+pub fn accept(listen_fd: c_int, peer: *c.struct_sockaddr_in) c_int {
+    var peer_len: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+    return c.accept4(listen_fd, .{ .__sockaddr__ = @ptrCast(peer) }, &peer_len, c.SOCK_CLOEXEC);
 }
 
 pub fn close(fd: c_int) void {
@@ -532,8 +549,53 @@ test "parentOf" {
     try std.testing.expectEqualStrings("/", parentOf("///"));
 }
 
+fn fdIsCloexec(fd: c_int) bool {
+    const flags = c.fcntl(fd, c.F_GETFD, @as(c_int, 0));
+    return flags >= 0 and (flags & c.FD_CLOEXEC) != 0;
+}
+
+test "open, socket, and accept are close-on-exec" {
+    var path_buf: [128]u8 = undefined;
+    var z_buf: [128]u8 = undefined;
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/cloexec-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const z = try toZ(&z_buf, p);
+    const file_fd = open(z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, 0o644);
+    try std.testing.expect(file_fd >= 0);
+    defer close(file_fd);
+    defer _ = c.unlink(z);
+    try std.testing.expect(fdIsCloexec(file_fd));
+
+    const lfd = socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (lfd < 0) return error.SkipZigTest;
+    defer close(lfd);
+    try std.testing.expect(fdIsCloexec(lfd));
+    var yes: c_int = 1;
+    _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
+    var addr = std.mem.zeroes(c.struct_sockaddr_in);
+    addr.sin_family = c.AF_INET;
+    addr.sin_port = 0;
+    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
+    if (c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)) != 0) return error.SkipZigTest;
+    if (c.listen(lfd, 1) != 0) return error.SkipZigTest;
+    var got = std.mem.zeroes(c.struct_sockaddr_in);
+    var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+    if (c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen) != 0) return error.SkipZigTest;
+
+    const cfd = socket(c.AF_INET, c.SOCK_STREAM, 0);
+    try std.testing.expect(cfd >= 0);
+    defer close(cfd);
+    try std.testing.expect(fdIsCloexec(cfd));
+    try std.testing.expectEqual(@as(i32, 0), connectIn(cfd, &got, 5000));
+
+    var peer = std.mem.zeroes(c.struct_sockaddr_in);
+    const afd = accept(lfd, &peer);
+    try std.testing.expect(afd >= 0);
+    defer close(afd);
+    try std.testing.expect(fdIsCloexec(afd));
+}
+
 test "connectIn succeeds against a local listener" {
-    const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    const lfd = socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (lfd < 0) return error.SkipZigTest;
     defer close(lfd);
     var yes: c_int = 1;
@@ -548,14 +610,14 @@ test "connectIn succeeds against a local listener" {
     var got = std.mem.zeroes(c.struct_sockaddr_in);
     var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
     if (c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen) != 0) return error.SkipZigTest;
-    const cfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    const cfd = socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(cfd >= 0);
     defer close(cfd);
     try std.testing.expectEqual(@as(i32, 0), connectIn(cfd, &got, 5000));
 }
 
 test "connectIn bounds a dead dial" {
-    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    const fd = socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (fd < 0) return error.SkipZigTest;
     defer close(fd);
     var addr = std.mem.zeroes(c.struct_sockaddr_in);

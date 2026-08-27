@@ -449,11 +449,17 @@ pub const Catalog = struct {
             w = sys.writeFileNoFollow(ztmp, json);
         }
         if (w != 0) {
+            // Staging file may exist from a partial write; leave none behind.
+            // A retry every tick would refresh mtime, so sweepLeases would
+            // never age it out.
+            _ = c.unlink(ztmp);
             std.log.warn("lease publish failed at {s} (errno {d})", .{ zpath, -w });
             return;
         }
         if (std.c.rename(ztmp, zpath) != 0) {
-            std.log.warn("lease publish rename failed at {s} (errno {d})", .{ zpath, sys.errno() });
+            const e = sys.errno();
+            _ = c.unlink(ztmp);
+            std.log.warn("lease publish rename failed at {s} (errno {d})", .{ zpath, e });
         }
     }
 
@@ -1273,6 +1279,34 @@ test "publish stages a parseable lease, leaves no tmp, and replaces in place" {
     const parsed3 = try proto.parseLease(gpa, blob3);
     defer parsed3.deinit();
     try std.testing.expectEqualStrings("me", parsed3.value.id);
+}
+
+test "publish unlinks the staging file when rename fails" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-pub-tmp");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+    // Destination is a directory: rename(me.json.tmp, me.json) fails and
+    // must not leave the staging file (a retry every tick would refresh
+    // mtime so sweepLeases never aged it out).
+    var lbuf: [192]u8 = undefined;
+    const lease_fp = try std.fmt.bufPrint(&lbuf, "{s}/me.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(lease_fp, 0o755));
+
+    const addrs = [_]proto.LeaseAddr{.{ .ip = "10.0.0.1", .port = 18080, .mbps = 0 }};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+    cat.publish(sys.nowSec(std.testing.io));
+
+    var zbuf: [192]u8 = undefined;
+    var stbuf: c.struct_stat = undefined;
+    var tbuf: [192]u8 = undefined;
+    const tmp_fp = try std.fmt.bufPrint(&tbuf, "{s}/me.json.tmp", .{cluster_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
 }
 
 test "refresh skips self and expired leases" {
