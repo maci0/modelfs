@@ -16,6 +16,9 @@ const unreserved_lut: [256]bool = blk: {
     break :blk tbl;
 };
 
+/// RFC 3986 percent-encoding of a path query value. The unreserved set
+/// matches urlDecode: '+' stays '+', spaces become %20, so two spellings
+/// cannot collapse onto one file.
 pub fn urlEncode(out: []u8, s: []const u8) ![]u8 {
     const hex = "0123456789ABCDEF";
     var n: usize = 0;
@@ -157,6 +160,9 @@ pub fn headerGet(head: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Timing-safe bearer check. Tokens are hashed with SHA-256 first so a
+/// length mismatch cannot leak through a byte-by-byte compare: the
+/// comparison is always 32 bytes.
 pub fn bearerOk(got: []const u8, want: []const u8) bool {
     const prefix = "Bearer ";
     if (!std.ascii.startsWithIgnoreCase(got, prefix)) return false;

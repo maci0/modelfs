@@ -1239,6 +1239,10 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
     return cands.toOwnedSlice(gpa);
 }
 
+/// Hydrate one piece from the cluster: probe one best-first address walk
+/// per peer, then fetch from the max-score path whose /have bit is set.
+/// Sequential fallback (never two sources at once); error.NoPeer means the
+/// caller should take the origin.
 pub fn fillFromPeers(
     gpa: std.mem.Allocator,
     psk: []const u8,

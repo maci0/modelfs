@@ -6,6 +6,9 @@ const fuzzcorpus = @import("fuzzcorpus.zig");
 pub const default_size: u32 = 16 * 1024 * 1024;
 pub const magic = "MFS1";
 
+/// Piece count for a file, clamped at u32 max. piece_size 0 or an empty
+/// file is 0; a sparse truncate near i64 max must not panic or wrap the
+/// bitfield to a size too small to name the file.
 pub fn count(file_size: u64, piece_size: u32) u32 {
     if (file_size == 0 or piece_size == 0) return 0;
     const ps: u64 = piece_size;

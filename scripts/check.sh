@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Single blocking gate for all static analysis: formatting, compile+unit tests,
-# vendored libfuse3 digests and extract, shell lint, Python lint, Python type
-# check.
+# restore-drill stub, vendored libfuse3 digests and extract, shell lint,
+# Python lint, Python type check, CycloneDX inventory.
 set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
@@ -12,9 +12,10 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<'EOF'
 Usage: ./scripts/check.sh
 
-The blocking static gate: zig fmt, unit tests, vendored libfuse3
-digests and extract, shellcheck, ruff, mypy, sbom. Same command the CI
-`check` job runs. Requires the pinned .venv from setup.
+The blocking static gate: zig fmt, unit tests, the restore-drill stub
+suite, vendored libfuse3 digests and extract, shellcheck, ruff, mypy,
+sbom. Same command the CI `check` job runs. Requires the pinned .venv
+from setup.
 
 Contributor commands (also listed by `zig build --help`):
   zig build                                 build the binary
@@ -28,6 +29,7 @@ Contributor commands (also listed by `zig build --help`):
   ./scripts/run_e2e_tests.sh                CLI and peer protocol; no FUSE
   ./scripts/run_cluster_e2e_9nodes.sh       9 FUSE mounts (/dev/fuse + fusermount3)
   ./scripts/test_fault_tolerance.sh         peer loss and lease expiry
+  ./scripts/test_dr_restore_drill.sh        restore drill against stub zfs (also in this script)
   ./scripts/repro_check.sh                  two ReleaseFast builds, compare bytes
 
 Setup, once per clone: see CONTRIBUTING.md.

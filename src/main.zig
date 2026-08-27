@@ -56,8 +56,9 @@ const usage =
     \\  --id NAME             Override node id (default: short hostname)
     \\  --listen [IP:]PORT    Peer HTTP port (default 18080, 1-65535); binds all interfaces
     \\  --advertise ADDRS     Lease addresses IP[:PORT], comma separated
-    \\                        (replaces auto-detect; default: every local IPv4
-    \\                        except loopback and 169.254; none -> 127.0.0.1)
+    \\                        (replaces auto-detect; a defaulted port follows
+    \\                        --listen; default: every local IPv4 except
+    \\                        loopback and 169.254; none -> 127.0.0.1)
     \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
     \\  --seed HOST[:PORT]    Peer seed while origin/.cluster has no live lease; repeatable
     \\  --piece SIZE          Piece size (default 16M)

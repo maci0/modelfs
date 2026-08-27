@@ -60,6 +60,9 @@ fn hopsBetween(local_ip: []const u8, remote_ip: []const u8) u32 {
     return 1;
 }
 
+/// Path score: goodput / (1+hops) / (1+inflight). ewma_bps at or below 1 B/s
+/// is floored to 1 so a zero prior cannot make every path score 0 and leave
+/// pickBest with no winner; unprobed paths start at 100 MB/s instead.
 pub fn pathScore(ewma_bps: f64, hops: u32, inflight: u32) f64 {
     const g = if (ewma_bps > 1.0) ewma_bps else 1.0;
     return g / (1.0 + @as(f64, hops)) / (1.0 + @as(f64, inflight));

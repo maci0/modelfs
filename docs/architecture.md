@@ -21,7 +21,7 @@ sequenceDiagram
   alt hit
     L-->>P: bytes
   else miss
-    F->>Peers: GET /have (all paths; 2s cache per peer and file)
+    F->>Peers: GET /have (one walk per peer; 2s cache)
     alt some peer has k
       F->>F: pick path by score
       F->>Peers: Range GET
@@ -86,7 +86,7 @@ modelfs unpin gguf/foo.gguf
 
 Env: `MODELFS_ORIGIN` `MODELFS_CACHE` `MODELFS_PSK` `MODELFS_ID` set the same values as their flags, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts, and `MODELFS_LOG` moves the log ceiling (`err`, `warn`, `info` default, `debug`) for every command; an explicit flag wins and an empty environment value counts as unset. `MODELFS_PSK_VALUE` cannot be combined with `--psk` or `MODELFS_PSK` on mount (`loadPsk` would otherwise silently prefer the inline secret). Any other `MODELFS_*` variable is refused as a typo'd knob on every command, which is why the harness and drill scripts keep their own knobs outside this namespace (`MF_TEST_*`, `MF_DRILL_*`). `--listen`/`--advertise`/`--seed` refuse port 0 (an ephemeral bind whose lease would still advertise 0).
 
-`--id`, `--cache`, `--listen [IP:]PORT` override defaults. `--advertise IP[:PORT][,...]` replaces the auto-detected NIC list (not additive; no qualifying NIC falls back to 127.0.0.1). `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
+`--id`, `--cache`, `--listen [IP:]PORT` override defaults. `--advertise IP[:PORT][,...]` replaces the auto-detected NIC list (not additive; no qualifying NIC falls back to 127.0.0.1). A defaulted advertise port follows `--listen`; an explicit non-default port is bound as written (`leaseAddrs` in src/main.zig). The IP in `--listen IP:PORT` is ignored: binding is always all interfaces. `--seed HOST[:PORT]` bootstraps peers while `origin/.cluster` has no live lease. `--kernel-cache` turns kernel page cache back on (UMA can OOM). `--brun` / `--bcull` / `--bstop` are cull watermarks.
 
 Build:
 
@@ -154,9 +154,9 @@ score = ewma_goodput_bps / (1 + hops) / (1 + inflight)
 - **hops**: 0 if same IPv4 /24 as a local addr, else 1.
 - **inflight**: pieces already assigned to that path.
 
-On miss: among paths whose `/have` bit is set, max score. GET fails: next path, then NFS. Never two sources for one piece. A node that has written the path through the mount (`Store.wroteLocally`) hydrates further misses of that path from the origin, not from peers: a peer's cached piece can predate the write, and landing it would hide the writer's own bytes.
+On miss, one `/have` walk per peer (`probeCandidates` in src/peer.zig): addresses of the same `peer id` are tried best-first until one answers, so a multi-homed node costs one round trip and a dead preferred NIC falls through to that node's remaining interfaces rather than hiding the whole node. Among paths whose bit is set, fetch from the max-score address (`pickBest`). Score ties break by ip bytes then port (`pathTieLess`), never by lease-file or `getifaddrs` order: cold clusters start every path at the same prior, so an unspecified tie would let environment enumeration pick the winner. GET fails: next path, then NFS. Never two sources for one piece. A node that has written the path through the mount (`Store.wroteLocally`) hydrates further misses of that path from the origin, not from peers: a peer's cached piece can predate the write, and landing it would hide the writer's own bytes.
 
-Probe answers are cached per (path, file) for 2 s (`Catalog.have_ttl_ms`), so a sequential fill of one large model sends `/have` once per peer per TTL window instead of once per peer per piece. The cache holds 32 (file, peer) lines (`Catalog.have_cache_cap`); overflow evicts the soonest-to-expire entry, so a concurrent multi-file fill may re-probe within the TTL. Sequential fills consult that line through `Catalog.haveHas` (one bit, no bitmap copy); `haveGet` still returns an owned `proto.HaveBits` for callers that need the whole field. Only hits are cached: a stale bitmap can at worst route a fetch to a peer that no longer has the piece, which the next-path fallback already handles; failed probes are never cached, so a down peer is retried on the next piece.
+Probe answers are cached per (path, file) for 2 s (`Catalog.have_ttl_ms`), so a sequential fill of one large model sends `/have` once per peer per TTL window instead of once per peer per piece. The cache holds 32 (file, ip, port) lines (`Catalog.have_cache_cap`); overflow evicts the soonest-to-expire entry, so a concurrent multi-file fill may re-probe within the TTL. Sequential fills consult that line through `Catalog.haveHas` (one bit, no bitmap copy); `haveGet` still returns an owned `proto.HaveBits` for callers that need the whole field. Only hits are cached: a stale bitmap can at worst route a fetch to a peer that no longer has the piece, which the next-path fallback already handles; failed probes are never cached, so a down peer is retried on the next piece.
 
 ---
 
@@ -190,7 +190,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 
 A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. Wire integers (`Range`, `Content-Range`, `Content-Length`, `X-Piece-Size`) are unsigned decimal digits only: a leading sign or interior underscore is malformed, the same rule RFC 9110 uses for Content-Length. The fetching peer requires `206` plus a `Content-Range` whose start matches the request and whose end is at most the request end (EOF clamp); a same-length window at a different offset is refused rather than cached. `v0.1.0` servers already send that header on every 206, so a mixed fleet still fills. Errors carry no body: both peers of a conversation parse only the status line.
 
-Every request requires the bearer token, including `/ping` and non-GET methods (those answer 401 without a token, 405 with one). Listen `0.0.0.0` on each unique advertised port (default 18080); `--listen [IP:]PORT` picks the port, binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status. Listen sockets, accepted connections, and files are opened close-on-exec (`sys.socket`, `sys.accept`, `sys.open`) so the `auto_unmount` fusermount helper spawned at mount cannot inherit them: a helper still holding the listen fd would keep the port bound after `Server.stop`, and the next start would fail to bind.
+Every request requires the bearer token, including `/ping` and non-GET methods (those answer 401 without a token, 405 with one). Listen `0.0.0.0` on each unique advertised port (default 18080); `--listen [IP:]PORT` picks the port (the IP is ignored), binding stays on all interfaces. At most 16 HTTP handlers; a connection arriving while all 16 are busy is closed immediately without a reply, so saturation shows up on the fetching peer as a failed transfer (it falls through to its next candidate address, then the origin), never as queuing, and a manual probe sees an empty reply rather than an error status. Listen sockets, accepted connections, and files are opened close-on-exec (`sys.socket`, `sys.accept`, `sys.open`) so the `auto_unmount` fusermount helper spawned at mount cannot inherit them: a helper still holding the listen fd would keep the port bound after `Server.stop`, and the next start would fail to bind.
 
 ---
 
@@ -204,7 +204,7 @@ Like cachefilesd, on **percent free** of the filesystem that holds `/var/cache/m
 | `--bcull` | 7 | start culling |
 | `--bstop` | 3 | cull harder |
 
-Culling punches piece-sized holes (default 16 MiB, `FALLOC_FL_PUNCH_HOLE`), clears that bit, leaves the sparse file. LRU by last read. Skip `pin`, files read in the last 10s, and entries with a peer transfer in flight (punching mid-send would ship hole zeros the fetching peer cannot tell from real data). Next read hydrates that piece again.
+Culling punches piece-sized holes (default 16 MiB, `FALLOC_FL_PUNCH_HOLE`), clears that bit, leaves the sparse file. LRU by last read. Skip `pin`, files read in the last 10s, pieces this node is still filling, and entries with a peer transfer in flight (`Cached.xfer`; punching mid-send would ship hole zeros the fetching peer cannot tell from real data). Next read hydrates that piece again.
 
 `pin` is a marker under `pin/`. Nothing else is deleted as a whole file.
 

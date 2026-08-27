@@ -1228,6 +1228,9 @@ pub const Store = struct {
         // them filled.
         if (now_sec -| file.last_access.load(.monotonic) < recency_secs) return false;
         if (self.pinExists(file.rel)) return false;
+        // A fill still writing this piece: punching now would ship hole
+        // zeros the same way a mid-send punch would, and completeFill would
+        // then mark them filled.
         if (file.filling.contains(idx)) return false;
         // Bytes of this entry may be mid-send to a fetching peer (stalled
         // socket, multi-piece response): punching now ships hole zeros that

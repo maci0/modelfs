@@ -109,7 +109,7 @@ The piece-size sweep is why the default piece is 16 MiB: past it the gain is sma
 zig build test -Dtest-filter=relOk        # only tests whose names contain this substring
 zig build test --watch                    # rebuild and re-run on change
 zig build fmt                             # apply zig fmt
-./scripts/check.sh                        # fmt, unit tests, vendored fuse extract, shellcheck, ruff, mypy
+./scripts/check.sh                        # fmt, unit tests, restore-drill stub, vendored fuse extract, shellcheck, ruff, mypy, sbom
 ./scripts/ci.sh                           # every CI job: check, aarch64 cross, repro
 ./scripts/repro_check.sh                  # build twice, require byte-identical output
 ./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end

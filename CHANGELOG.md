@@ -6,6 +6,9 @@ Work since `v0.1.0`. A binary built from this tree still prints `0.1.0`
 until the next tag is cut (CONTRIBUTING.md, Cutting a release); pin a
 commit hash if you are not on the tag.
 
+- **`/have` probes one address walk per peer, not every path**: architecture.md's miss sequence said GET /have went to all paths. `probeCandidates` walks one best-first address list per `peer id` (a dead preferred NIC falls through to that node's remaining interfaces) and `pickBest` breaks score ties by ip then port so lease `getifaddrs` order cannot pick the winner. `modelfs help` states that a defaulted `--advertise` port follows `--listen`.
+- **`./scripts/check.sh` includes the restore-drill stub and the SBOM check**: README's Tests comment and the script's `--help` summary omitted them while CONTRIBUTING and the script body already ran both.
+
 - **Unauthenticated peer requests always get 401**: a POST (or any non-GET) without a valid bearer used to answer `405 Allow: GET` before the token was consulted, so a scanner learned the listener was a GET-only peer service. Auth now runs first; 405 is only for an authenticated client using the wrong method. docs/THREAT_MODEL.md matches that order.
 - **Peer reply lengths are decimal digits, like Range**: `Content-Length` and `X-Piece-Size` used `parseInt`, which accepts a leading `+` and interior `_` that RFC 9110 `1*DIGIT` and the Range parser both refuse. A signed or grouped length is now `BadContentLength` / `BadPieceSize` so a body cannot be sized differently from a Range the same peer sent. Missing or empty `path` on `/have` and `/data` stays 400, now named in the architecture status table.
 - **A crashing daemon no longer dumps the cluster PSK**: mount sets `RLIMIT_CORE` to zero after loading the secret, wipes `MODELFS_PSK_VALUE` from the environment so the `auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown.
