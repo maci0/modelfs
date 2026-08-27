@@ -190,12 +190,14 @@ pub fn bearerOk(got: []const u8, want: []const u8) bool {
 }
 
 /// True when s holds a C0 byte, DEL, a UTF-8 C1 pair (U+0080..U+009F), a
-/// Unicode line/paragraph separator (U+2028/U+2029), or a bidi format
-/// control (U+061C, U+200E/U+200F, U+202A..U+202E, U+2066..U+2069).
-/// store.relOk and discover.printable share this set so a planted name
-/// cannot inject into logs or terminals, or spoof an identity, through
-/// only one of the two gates. Incomplete UTF-8 encodings are display
-/// noise, not controls.
+/// Unicode line/paragraph separator (U+2028/U+2029), a bidi format
+/// control (U+061C, U+200E/U+200F, U+202A..U+202E, U+2066..U+2069), a
+/// zero-width format control (U+200B/U+200C/U+200D, U+2060..U+2064,
+/// U+206A..U+206F), a variation selector (U+FE00..U+FE0F), or BOM
+/// (U+FEFF). store.relOk and discover.printable share this set so a
+/// planted name cannot inject into logs or terminals, or spoof an
+/// identity, through only one of the two gates. Incomplete UTF-8
+/// encodings are display noise, not controls.
 pub fn containsControl(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
@@ -207,7 +209,7 @@ pub fn containsControl(s: []const u8) bool {
 }
 
 /// UTF-8 format controls refused in identity-bearing input. Incomplete
-/// sequences (truncated C1, ALM, or E2 prefixes) are not controls.
+/// sequences (truncated C1, ALM, E2, or EF prefixes) are not controls.
 pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
     const ch = s[i];
     // C1 (U+0080..U+009F) as UTF-8: some terminals still honor 8-bit CSI/OSC.
@@ -217,10 +219,23 @@ pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
     if (ch == 0xe2 and i + 2 < s.len) {
         const b = s[i + 1];
         const c3 = s[i + 2];
-        // U+200E LRM, U+200F RLM; U+2028..U+202E line separators and bidi embeddings/overrides.
-        if (b == 0x80 and (c3 == 0x8e or c3 == 0x8f or (c3 >= 0xa8 and c3 <= 0xae))) return true;
-        // U+2066..U+2069 bidi isolates.
-        if (b == 0x81 and c3 >= 0xa6 and c3 <= 0xa9) return true;
+        // U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+200E LRM, U+200F RLM;
+        // U+2028..U+202E line separators and bidi embeddings/overrides.
+        if (b == 0x80 and ((c3 >= 0x8b and c3 <= 0x8f) or (c3 >= 0xa8 and c3 <= 0xae))) return true;
+        // U+2060..U+2064 invisible operators; U+2066..U+2069 bidi isolates;
+        // U+206A..U+206F deprecated format. U+2065 is unassigned in that
+        // run and is refused with them.
+        if (b == 0x81 and c3 >= 0xa0 and c3 <= 0xaf) return true;
+    }
+    if (ch == 0xef and i + 2 < s.len) {
+        const b = s[i + 1];
+        const c3 = s[i + 2];
+        // U+FE00..U+FE0F variation selectors: the same base character with
+        // and without a selector is two identities that render as one.
+        if (b == 0xb8 and c3 >= 0x80 and c3 <= 0x8f) return true;
+        // U+FEFF BOM / ZWNBSP: a leading BOM is invisible and prefixes a
+        // different identity than the same name without it.
+        if (b == 0xbb and c3 == 0xbf) return true;
     }
     return false;
 }
@@ -282,12 +297,18 @@ pub fn formatLease(buf: []u8, id: []const u8, until: i64, addrs: []const LeaseAd
     return w.buffered();
 }
 
-test "containsControl covers C0 C1 line separators and bidi format controls" {
+test "containsControl covers C0 C1 line separators and format controls" {
     try std.testing.expect(!containsControl("gguf/a.gguf"));
     try std.testing.expect(!containsControl("model\u{a0}v2.bin"));
     try std.testing.expect(!containsControl("a\xe2\x80.bin"));
     try std.testing.expect(!containsControl("a\xe2\x81.bin"));
     try std.testing.expect(!containsControl("a\xd8.bin"));
+    try std.testing.expect(!containsControl("a\xef.bin"));
+    try std.testing.expect(!containsControl("a\xef\xb8.bin"));
+    try std.testing.expect(!containsControl("a\xef\xbb.bin"));
+    // U+2010 hyphen sits in the E2 80 gap between ZWSP and U+2028; visible
+    // punctuation in that block is not a format control.
+    try std.testing.expect(!containsControl("a\u{2010}b"));
     try std.testing.expect(containsControl("a\nb"));
     try std.testing.expect(containsControl("a\x7fb"));
     try std.testing.expect(containsControl("a\xc2\x9bb"));
@@ -303,6 +324,21 @@ test "containsControl covers C0 C1 line separators and bidi format controls" {
     try std.testing.expect(containsControl("a\u{2066}b"));
     try std.testing.expect(containsControl("a\u{2069}b"));
     try std.testing.expect(containsControl("a\u{061c}b"));
+    // Zero-width format controls in the same E2 80 / E2 81 blocks: a path
+    // `gguf/model\u{200b}.bin` and a lease id `spark1\u{200b}` render as the
+    // unadorned names while remaining distinct byte identities.
+    try std.testing.expect(containsControl("gguf/model\u{200b}.bin"));
+    try std.testing.expect(containsControl("a\u{200c}b"));
+    try std.testing.expect(containsControl("a\u{200d}b"));
+    try std.testing.expect(containsControl("a\u{2060}b"));
+    try std.testing.expect(containsControl("a\u{2062}b"));
+    try std.testing.expect(containsControl("a\u{206a}b"));
+    try std.testing.expect(containsControl("a\u{206f}b"));
+    // Variation selectors and BOM: a name with U+FE0F or a leading U+FEFF
+    // is a different identity that renders as the unadorned name.
+    try std.testing.expect(containsControl("a\u{fe00}b"));
+    try std.testing.expect(containsControl("a\u{fe0f}b"));
+    try std.testing.expect(containsControl("\u{feff}a"));
 }
 
 test "url encode decode" {

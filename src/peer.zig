@@ -3489,6 +3489,8 @@ const seed_req_control_path = fuzzcorpus.entry("GET /have?path=%00%1b%5b0m HTTP/
 const seed_req_c1_path = fuzzcorpus.entry("GET /have?path=a%C2%9Bb.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_line_sep_path = fuzzcorpus.entry("GET /have?path=a%E2%80%A8ERROR.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_bidi_path = fuzzcorpus.entry("GET /have?path=a%E2%80%AEgnp.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_zwsp_path = fuzzcorpus.entry("GET /have?path=a%E2%80%8B.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_vs_path = fuzzcorpus.entry("GET /have?path=a%EF%B8%8F.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_inverted_range = fuzzcorpus.entry("GET /data?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=10-5\r\n\r\n");
 const seed_req_no_path = fuzzcorpus.entry("GET /have HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_c1_csi_path = fuzzcorpus.entry("GET /have?path=%C2%9B%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
@@ -3502,6 +3504,8 @@ const fuzz_request_corpus = [_][]const u8{
     &seed_req_c1_path,
     &seed_req_line_sep_path,
     &seed_req_bidi_path,
+    &seed_req_zwsp_path,
+    &seed_req_vs_path,
     &seed_req_inverted_range,
     &seed_req_no_path,
     &seed_req_c1_csi_path,
@@ -3530,7 +3534,7 @@ fn refRelOk(rel: []const u8) bool {
             const ch = rel[i];
             if (ch < 0x20 or ch == 0x7f) return false;
             // Independent restatement of store.relOk's UTF-8 control set
-            // (C1, line separators, bidi format controls).
+            // (C1, line separators, bidi/zero-width format controls, VS, BOM).
             if (proto.utf8FormatControlAt(rel, i)) return false;
             continue;
         }

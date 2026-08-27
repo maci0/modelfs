@@ -150,11 +150,13 @@ pub fn relIsCluster(rel: []const u8) bool {
 /// for verbatim echo: a co-tenant planting ".cluster/<newline> forged
 /// line.json" would forge multi-line daemon log entries, an id holding ESC,
 /// its C1 spelling "\u{9d}0;pwned\u{9c}", "spark1\u{2028}ERROR forged",
-/// or a bidi override that spoofs the displayed id, would inject into the
-/// terminal running `modelfs peers`. Same policy store.relOk applies to
+/// a bidi override that spoofs the displayed id, or a zero-width space /
+/// variation selector that makes two ids render as one, would inject into
+/// the terminal running `modelfs peers`. Same policy store.relOk applies to
 /// paths; such entries are still swept, only their names are withheld from
-/// output. Bytes above that set (NFC/NFD spellings, astral emoji, bare
-/// high bytes) are display text, not controls, and stay echoable.
+/// output. Bytes above that set (NFC/NFD spellings, astral emoji without a
+/// selector, bare high bytes) are display text, not controls, and stay
+/// echoable.
 pub fn printable(s: []const u8) bool {
     return !proto.containsControl(s);
 }
@@ -1090,6 +1092,10 @@ test "printable gates lease names and ids for log echo" {
     try std.testing.expect(!printable("spark1\u{200f}"));
     try std.testing.expect(!printable("spark1\u{2066}x"));
     try std.testing.expect(!printable("spark1\u{061c}"));
+    try std.testing.expect(!printable("spark1\u{200b}"));
+    try std.testing.expect(!printable("spark1\u{2060}"));
+    try std.testing.expect(!printable("spark1\u{fe0f}"));
+    try std.testing.expect(!printable("\u{feff}spark1"));
     // Display text above the C1 range stays echoable: NBSP (U+00A0) shares
     // the 0xC2 lead byte but is not a control, nor are accented names.
     try std.testing.expect(printable("caf\xc3\xa9"));
@@ -1099,6 +1105,8 @@ test "printable gates lease names and ids for log echo" {
     try std.testing.expect(printable("a\xc2"));
     try std.testing.expect(printable("a\xe2\x80"));
     try std.testing.expect(printable("a\xe2"));
+    try std.testing.expect(printable("a\xef"));
+    try std.testing.expect(printable("a\xef\xb8"));
 }
 
 test "displayName echoes printable names and withholds the rest" {
@@ -1107,6 +1115,8 @@ test "displayName echoes printable names and withholds the rest" {
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("\x7f"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{2028}ERROR forged"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{202e}gnp"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{200b}"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{fe0f}"));
 }
 
 test "relIsCluster matches the lease dir by prefix, not substring" {
@@ -1157,6 +1167,8 @@ const seed_id_nul = fuzzcorpus.entry("a\x00b");
 const seed_id_non_ascii = fuzzcorpus.entry("h\xc3\xa9llo");
 const seed_id_space = fuzzcorpus.entry("spark 1");
 const seed_id_line_sep = fuzzcorpus.entry("spark1\u{2028}ERROR forged");
+const seed_id_zwsp = fuzzcorpus.entry("spark1\u{200b}");
+const seed_id_vs = fuzzcorpus.entry("spark1\u{fe0f}");
 
 const fuzz_id_corpus = [_][]const u8{
     &seed_id_plain,
@@ -1173,6 +1185,8 @@ const fuzz_id_corpus = [_][]const u8{
     &seed_id_non_ascii,
     &seed_id_space,
     &seed_id_line_sep,
+    &seed_id_zwsp,
+    &seed_id_vs,
 };
 
 /// Lease ids arrive as other nodes' JSON on shared NFS storage and fan out

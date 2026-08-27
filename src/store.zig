@@ -21,11 +21,11 @@ pub const status_file = "status.json";
 /// `.cluster` is a sibling policy (`discover.relIsCluster`), not part of
 /// this gate: a leading-dot component is a legal model name.
 /// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
-/// Unicode line separators, and bidi format controls), the same
-/// discover.printable applies before echoing a lease name. Non-control text
-/// above that set (NFC/NFD spellings, astral emoji, names that are not
-/// valid UTF-8 at all) passes byte-exact; identity is byte equality all
-/// the way down.
+/// Unicode line separators, bidi and zero-width format controls, variation
+/// selectors, and BOM), the same discover.printable applies before echoing
+/// a lease name. Non-control text above that set (NFC/NFD spellings, astral
+/// emoji without a selector, names that are not valid UTF-8 at all) passes
+/// byte-exact; identity is byte equality all the way down.
 pub fn relOk(rel: []const u8) bool {
     if (rel.len == 0 or rel[0] == '/') return false;
     if (proto.containsControl(rel)) return false;
@@ -2600,6 +2600,18 @@ test "relOk rejects traversal and absolute paths" {
     try std.testing.expect(!relOk("a\u{200e}b.bin"));
     try std.testing.expect(!relOk("a\u{2066}b.bin"));
     try std.testing.expect(!relOk("a\u{061c}b.bin"));
+    // Zero-width format controls in the same E2 80 / E2 81 blocks as the
+    // bidi marks already refused: `gguf/model\u{200b}.bin` renders as
+    // `gguf/model.bin` in the journal and pin lines.
+    try std.testing.expect(!relOk("gguf/model\u{200b}.bin"));
+    try std.testing.expect(!relOk("a\u{200c}b.bin"));
+    try std.testing.expect(!relOk("a\u{200d}b.bin"));
+    try std.testing.expect(!relOk("a\u{2060}b.bin"));
+    try std.testing.expect(!relOk("a\u{206a}b.bin"));
+    // Variation selectors and BOM: the emoji without a selector still
+    // passes below; U+FE0F or a leading U+FEFF is an invisible extra.
+    try std.testing.expect(!relOk("\u{1f512}\u{fe0f}locked.bin"));
+    try std.testing.expect(!relOk("\u{feff}model.bin"));
 }
 
 test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
@@ -2621,12 +2633,18 @@ test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
     // NBSP is U+00A0: same 0xC2 lead byte as the rejected C1 controls but a
     // continuation above their range, so the C1 gate must not swallow it.
     try std.testing.expect(relOk("model\u{a0}v2.bin"));
-    // Incomplete U+2028/bidi encodings are invalid UTF-8 display noise, not
+    // Incomplete U+2028/bidi/VS encodings are invalid UTF-8 display noise, not
     // a control, matching a trailing 0xC2 with no C1 continuation.
     try std.testing.expect(relOk("a\xe2\x80.bin"));
     try std.testing.expect(relOk("a\xe2.bin"));
     try std.testing.expect(relOk("a\xe2\x81.bin"));
     try std.testing.expect(relOk("a\xd8.bin"));
+    try std.testing.expect(relOk("a\xef.bin"));
+    try std.testing.expect(relOk("a\xef\xb8.bin"));
+    try std.testing.expect(relOk("a\xef\xbb.bin"));
+    // U+2010 hyphen sits between ZWSP and U+2028 in the same lead-byte run
+    // and is visible punctuation, not a format control.
+    try std.testing.expect(relOk("a\u{2010}b.bin"));
 }
 
 const seed_rel_model = fuzzcorpus.entry("gguf/a.gguf");
@@ -2643,6 +2661,9 @@ const seed_rel_nul = fuzzcorpus.entry("a\x00b");
 const seed_rel_c1 = fuzzcorpus.entry("a\xc2\x9bb.bin");
 const seed_rel_line_sep = fuzzcorpus.entry("gguf/a\u{2028}ERROR.bin");
 const seed_rel_bidi = fuzzcorpus.entry("gguf/a\u{202e}gnp.bin");
+const seed_rel_zwsp = fuzzcorpus.entry("gguf/model\u{200b}.bin");
+const seed_rel_vs = fuzzcorpus.entry("a\u{fe0f}.bin");
+const seed_rel_bom = fuzzcorpus.entry("\u{feff}model.bin");
 const seed_rel_nbsp = fuzzcorpus.entry("model\u{a0}v2.bin");
 const seed_rel_lone_c1byte = fuzzcorpus.entry("a\x9bb.bin");
 const seed_rel_trailing_c2 = fuzzcorpus.entry("foo\xc2");
@@ -2663,6 +2684,9 @@ const fuzz_rel_corpus = [_][]const u8{
     &seed_rel_c1,
     &seed_rel_line_sep,
     &seed_rel_bidi,
+    &seed_rel_zwsp,
+    &seed_rel_vs,
+    &seed_rel_bom,
     &seed_rel_nbsp,
     &seed_rel_lone_c1byte,
     &seed_rel_trailing_c2,
@@ -2670,7 +2694,8 @@ const fuzz_rel_corpus = [_][]const u8{
 };
 
 /// Independent restatement of relOk: empty/absolute refuse, C0/DEL, and
-/// proto.utf8FormatControlAt's set refuse, "." / ".." components refuse,
+/// proto.utf8FormatControlAt's set (C1, line separators, bidi/zero-width
+/// format controls, variation selectors, BOM) refuse, "." / ".." components refuse,
 /// empty components (double slash, trailing slash) do not. Walks segments
 /// by index instead of splitScalar so a corrupted splitter cannot self-confirm.
 fn refRelOk(rel: []const u8) bool {

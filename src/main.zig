@@ -1531,6 +1531,11 @@ test "badIdLine renders refused ids through the displayName echo gate" {
         try std.testing.expect(std.mem.indexOf(u8, line, "\u{202e}") == null);
         try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
     }
+    {
+        const line = badIdLine(&buf, "spark1\u{200b}");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\u{200b}") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+    }
     // A printable but invalid id (quote) still names itself verbatim, so the
     // operator sees which value was refused.
     {
@@ -1819,6 +1824,11 @@ test "unknownEnvLine renders refused names through the displayName echo gate" {
     {
         const line = unknownEnvLine(&buf, "MODELFS_\u{2028}ERROR");
         try std.testing.expect(std.mem.indexOf(u8, line, "\u{2028}") == null);
+        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+    }
+    {
+        const line = unknownEnvLine(&buf, "MODELFS_\u{200b}X");
+        try std.testing.expect(std.mem.indexOf(u8, line, "\u{200b}") == null);
         try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
     }
     // A printable misspelling still names itself verbatim, so the operator
