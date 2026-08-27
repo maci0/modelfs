@@ -503,6 +503,13 @@ fn originFillBuf(st: *State, file: *store_mod.Store.Cached, idx: u32, buf: []u8)
     return -sys.c.EIO;
 }
 
+/// Extra fill attempts after completeFill discards a claim because a local
+/// write bumped the generation. The first retry is from origin so a peer
+/// fill cannot overwrite in-flight write-through bytes; a second discard
+/// fails the read instead of spinning the FUSE worker for as long as
+/// writers keep landing.
+const fill_discard_retries_max: u32 = 1;
+
 fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []u8) i32 {
     // piece.len() never exceeds piece_size, even when a concurrent append
     // grows the tail piece after cover() was computed, so the caller's
@@ -517,14 +524,15 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     const fill_t0 = sys.monoNs(st.io);
     var from_peer = false;
     var prefer_origin = st.store.wroteLocally(file);
-    var ln: u32 = 0;
+    var piece_len: u32 = 0;
+    var discard_retries: u32 = 0;
     while (true) {
         if (file.dead.load(.acquire)) return 0;
         const cl = st.store.beginFill(file, idx, sys.monoSec(st.io)) catch |err| {
             std.log.warn("fill claim failed for {s} piece {d} ({t}); failing read", .{ file.rel, idx, err });
             return -sys.c.ENOMEM;
         };
-        ln = switch (cl) {
+        piece_len = switch (cl) {
             // Filled by someone else, or a truncate shrank the file below the
             // piece between claim and sample (the claim was dropped unmarked):
             // report success either way -- the bounds-checked read below then
@@ -534,8 +542,11 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
             .filled, .raced => return 0,
             .len => |n| n,
         };
-        std.debug.assert(ln <= scratch.len);
-        const buf = scratch[0..ln];
+        // beginFill's .len arm already dropped a zero-length (past-EOF) claim
+        // as .raced, and piece.len never exceeds the piece grid.
+        std.debug.assert(piece_len > 0);
+        std.debug.assert(piece_len <= scratch.len);
+        const buf = scratch[0..piece_len];
         from_peer = !prefer_origin;
         if (from_peer) {
             peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
@@ -558,8 +569,15 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
         }
         if (st.store.hasPiece(file, idx, sys.monoSec(st.io))) break;
         // A local write-through discarded this fill (peer bytes would have
-        // overwritten it). Retry from origin; sleep so a simulator can
-        // interleave the writer the way beginFill yields on an in-flight claim.
+        // overwritten it). One origin retry is the intended recovery; looping
+        // past that would stall this FUSE worker for as long as writers keep
+        // bumping the generation, and returning 0 unmarked would serve hole
+        // zeros. Fail the read so the client retries.
+        if (discard_retries >= fill_discard_retries_max) {
+            std.log.warn("fill discarded for {s} piece {d} after origin retry; failing read", .{ file.rel, idx });
+            return -sys.c.EIO;
+        }
+        discard_retries += 1;
         prefer_origin = true;
         from_peer = false;
         sys.sleepMs(st.io, 2);
@@ -573,11 +591,11 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     const fill_dt: u64 = @intCast(@max(sys.monoNs(st.io) - fill_t0, 0));
     if (from_peer) {
         _ = s.fills_peer.fetchAdd(1, .monotonic);
-        _ = s.bytes_from_peer.fetchAdd(ln, .monotonic);
+        _ = s.bytes_from_peer.fetchAdd(piece_len, .monotonic);
         _ = s.fill_peer_nanos.fetchAdd(fill_dt, .monotonic);
     } else {
         _ = s.fills_origin.fetchAdd(1, .monotonic);
-        _ = s.bytes_from_origin.fetchAdd(ln, .monotonic);
+        _ = s.bytes_from_origin.fetchAdd(piece_len, .monotonic);
         _ = s.fill_origin_nanos.fetchAdd(fill_dt, .monotonic);
     }
     return 0;
@@ -1147,7 +1165,7 @@ fn discLoop(st: *State) void {
 /// Equivalent to `total / (count * unit)` for positive integers.
 fn meanPerOp(total: u64, count: u64, unit: u64) u64 {
     if (count == 0 or unit == 0) return 0;
-    return @divTrunc(total, unit) / count;
+    return @divTrunc(@divTrunc(total, unit), count);
 }
 
 /// One summary line per discovery tick, and only when some counter moved:
@@ -1522,4 +1540,89 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
     try std.testing.expectEqual(@as(u64, 4096), prev.bytes_from_origin);
     try std.testing.expectEqual(@as(u64, 1), prev.http_ok);
     try std.testing.expectEqual(@as(u64, 1000), prev.http_nanos);
+}
+
+test "hydratePiece fails closed when write generation keeps discarding fills" {
+    // A local write-through that races every completeFill used to retry
+    // unbounded and stall the FUSE worker. One origin retry is recovery;
+    // a second discard is EIO so the client retries instead of hanging
+    // (and instead of returning 0 unmarked, which would serve hole zeros).
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-hydrate-discard");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-hydrate-discard");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.store.deinit();
+    defer st.catalog.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+
+    var tb: [192]u8 = undefined;
+    var zb: [192]u8 = undefined;
+    const origin_z = try sys.toZ(&zb, try std.fmt.bufPrint(&tb, "{s}/race.bin", .{origin_d}));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, "0123456789abcdef"));
+
+    const file = try st.store.get("race.bin", 16, sys.monoSec(st.io));
+    defer st.store.releaseFile(file);
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var scratch: [16]u8 = undefined;
+    var rc: i32 = 0;
+    // Hold content_mu so completeFill blocks after beginFill claims. Bump
+    // writes, then release so the claim is dropped unmarked. Repeat once
+    // during the origin-retry sleep; the second discard must be EIO.
+    file.content_mu.lockUncancelable(st.io);
+    var holding_content = true;
+    const hydrator = try std.Thread.spawn(.{}, struct {
+        fn run(state: *State, f: *store_mod.Store.Cached, buf: []u8, out_rc: *i32) void {
+            out_rc.* = hydratePiece(state, f, 0, buf);
+        }
+    }.run, .{ &st, file, scratch[0..], &rc });
+    defer {
+        if (holding_content) file.content_mu.unlock(st.io);
+        hydrator.join();
+    }
+
+    var discards: u32 = 0;
+    while (discards < 2) {
+        var spins: u32 = 0;
+        while (true) {
+            file.mu.lockUncancelable(st.io);
+            const claimed = file.filling.contains(0);
+            file.mu.unlock(st.io);
+            if (claimed) break;
+            spins += 1;
+            try std.testing.expect(spins < 1_000_000);
+            std.Thread.yield() catch {};
+        }
+        file.mu.lockUncancelable(st.io);
+        file.writes +%= 1;
+        file.mu.unlock(st.io);
+        file.content_mu.unlock(st.io);
+        holding_content = false;
+        spins = 0;
+        while (true) {
+            file.mu.lockUncancelable(st.io);
+            const claimed = file.filling.contains(0);
+            file.mu.unlock(st.io);
+            if (!claimed) break;
+            spins += 1;
+            try std.testing.expect(spins < 1_000_000);
+            std.Thread.yield() catch {};
+        }
+        discards += 1;
+        if (discards < 2) {
+            file.content_mu.lockUncancelable(st.io);
+            holding_content = true;
+        }
+    }
+    try std.testing.expectEqual(@as(i32, -sys.c.EIO), rc);
+    try std.testing.expect(!st.store.hasPiece(file, 0, sys.monoSec(st.io)));
 }

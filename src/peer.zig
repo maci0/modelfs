@@ -208,7 +208,7 @@ const body_deadline_per_mib_ms: i64 = 1_000;
 /// Deadline instant for the body budget above, stamped at the call so every
 /// chunk check compares against one sample.
 fn bodyDeadlineFor(io: std.Io, want_len: u64) i64 {
-    const mibs: i64 = @intCast(want_len / (1024 * 1024));
+    const mibs: i64 = @intCast(@divFloor(want_len, 1024 * 1024));
     return sys.monoMs(io) +| body_deadline_base_ms +| (mibs *| body_deadline_per_mib_ms);
 }
 
@@ -421,29 +421,49 @@ fn decodePath(target: []const u8, out: []u8) ![]u8 {
     return proto.urlDecode(out, q);
 }
 
-fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
+/// Origin size of a regular file at `rel`, or null after sending the matching
+/// error reply. /have and /data share this so a directory cannot 404 on one
+/// route and 502 on the other, and an unusable st_size stays 502 on both.
+fn originRegularSize(self: *Server, fd: std.posix.fd_t, rel: []const u8) ?u64 {
     var st: sys.c.struct_stat = undefined;
     const rc = self.store.statOrigin(rel, &st);
     if (rc != 0) {
         replyOriginStat(self, fd, rel, rc);
-        return;
+        return null;
     }
+    // Same answer for the same resource state: a directory (or any
+    // non-regular file) at the path is a miss per the documented status
+    // table ("no regular file at path"), not an origin failure. Without this
+    // gate the directory's st_size passed the range checks and hydration's
+    // pread on the dir fd turned it into a 502 -- one resource, two answers,
+    // and fill_err_origin blaming the NFS tier for a client bug.
     if ((st.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) {
         replyStatus(self, fd, "404 Not Found");
-        return;
+        return null;
     }
-    const size = sys.sizeFromStat(st.st_size) orelse {
+    return sys.sizeFromStat(st.st_size) orelse {
         std.log.warn("origin size unusable for {s}; replying 502", .{rel});
         replyStatus(self, fd, "502 Bad Gateway");
-        return;
+        return null;
     };
-    const file = self.store.get(rel, size, sys.monoSec(self.io)) catch |err| {
+}
+
+/// Live cache entry for `rel`, or null after a 500. Shared by /have and
+/// /data so an open failure cannot 500 on one route and drop the connection
+/// on the other.
+fn cacheEntry(self: *Server, fd: std.posix.fd_t, rel: []const u8, size: u64) ?*store_mod.Store.Cached {
+    return self.store.get(rel, size, sys.monoSec(self.io)) catch |err| {
         // The fetching peer only sees 500; without this line the serving
         // node's log says nothing about why.
         std.log.warn("cache entry open failed for {s} ({t}); replying 500", .{ rel, err });
         replyStatus(self, fd, "500 Internal Server Error");
-        return;
+        return null;
     };
+}
+
+fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
+    const size = originRegularSize(self, fd, rel) orelse return;
+    const file = cacheEntry(self, fd, rel, size) orelse return;
     defer self.store.releaseFile(file);
     // Snapshot the bits under the lock and answer outside it: a stalled peer
     // socket (30s send timeout) must not pin file.mu and freeze local reads,
@@ -677,27 +697,7 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
 }
 
 fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range) void {
-    var st: sys.c.struct_stat = undefined;
-    const rc = self.store.statOrigin(rel, &st);
-    if (rc != 0) {
-        replyOriginStat(self, fd, rel, rc);
-        return;
-    }
-    // Same answer as /have for the same resource state: a directory (or any
-    // non-regular file) at the path is a miss per the documented status
-    // table ("no regular file at path"), not an origin failure. Without this
-    // gate the directory's st_size passed the range checks and hydration's
-    // pread on the dir fd turned it into a 502 -- one resource, two answers,
-    // and fill_err_origin blaming the NFS tier for a client bug.
-    if ((st.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) {
-        replyStatus(self, fd, "404 Not Found");
-        return;
-    }
-    const size = sys.sizeFromStat(st.st_size) orelse {
-        std.log.warn("origin size unusable for {s}; replying 502", .{rel});
-        replyStatus(self, fd, "502 Bad Gateway");
-        return;
-    };
+    const size = originRegularSize(self, fd, rel) orelse return;
     if (rg.start >= size or rg.end < rg.start) {
         // RFC 9110 §15.5.17/§14.4: a 416 should carry the selected
         // representation's complete length, so a client can recompute a
@@ -716,13 +716,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     // here would break ordinary HTTP clients asking for the rest of the file;
     // the internal peer protocol always sends exact piece bounds.
     const rg_end = @min(rg.end, size - 1);
-    const file = self.store.get(rel, size, sys.monoSec(self.io)) catch |err| {
-        // Same operator-trace contract as serveHave's 500: the peer sees the
-        // status alone, so the local log must carry the cause.
-        std.log.warn("cache entry open failed for {s} ({t}); replying 500", .{ rel, err });
-        replyStatus(self, fd, "500 Internal Server Error");
-        return;
-    };
+    const file = cacheEntry(self, fd, rel, size) orelse return;
     defer self.store.releaseFile(file);
     // The whole response (hydration plus streaming) is one transfer: hold
     // punchPiece off for its duration. Per-chunk recency stamping alone
@@ -877,11 +871,12 @@ fn fetchRange(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u
 
 /// Like fetchRange, but streams the body directly into `out` (whose length
 /// must match the peer's Content-Length): one fewer piece-sized allocation
-/// and copy per fetched piece.
-fn fetchRangeInto(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64, out: []u8) !void {
-    const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end });
+/// and copy per fetched piece. Inclusive `range` is named so the start and
+/// end cannot swap at the call site.
+fn fetchRangeInto(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, range: proto.Range, out: []u8) !void {
+    const fd = try sendRequest(io, psk, ip, port, rel, range);
     defer sys.close(fd);
-    _ = try readRangeBodyAllocDeadline(gpa, io, fd, start, end, out, null);
+    _ = try readRangeBodyAllocDeadline(gpa, io, fd, range.start, range.end, out, null);
 }
 
 /// Binds a 206 body to the range we asked for. Content-Length alone cannot
@@ -907,13 +902,13 @@ fn checkRangeReply(head: []const u8, start: u64, end: u64) !void {
     if (cl != want) return error.LengthMismatch;
 }
 
-fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, start: u64, end: u64, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
+fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, start: u64, end: u64, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
     try readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms);
     try checkRangeReply(head_buf[0..head_len], start, end);
-    return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, dest, deadline_ms);
+    return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, out, deadline_ms);
 }
 
 fn rangeBps(bytes: u64, dt_ns: i128) f64 {
@@ -968,25 +963,25 @@ fn dial(io: std.Io, ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     return fd;
 }
 
-fn readFlexBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, dest: ?[]u8) ![]u8 {
-    return readFlexBodyAllocDeadline(gpa, io, fd, dest, null);
+fn readFlexBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, out: ?[]u8) ![]u8 {
+    return readFlexBodyAllocDeadline(gpa, io, fd, out, null);
 }
 
-fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
+fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
     try readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms);
-    return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, dest, deadline_ms);
+    return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, out, deadline_ms);
 }
 
 /// Completes a response body whose head is already read: validates the
 /// status line, lifts pipelined body bytes out of head_buf, enforces
-/// Content-Length against dest (or allocates), and streams to the deadline.
+/// Content-Length against out (or allocates), and streams to the deadline.
 /// The one body reader every fetch path shares, so the length-matching
 /// contract cannot drift between them. head_buf must stay alive for the
 /// call; the returned slice never aliases it.
-fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, dest: ?[]u8, deadline_ms: ?i64) ![]u8 {
+fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
@@ -1001,7 +996,7 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_
     // and route every fill away from a healthy peer for the probe TTL. Same
     // policy as haveFromHead's X-Piece-Size parse, and the same 1*DIGIT
     // rule Range uses so a "+16" or "16_0" length cannot size a body.
-    // An absent header keeps its legacy 0 reading; the dest-length contract
+    // An absent header keeps its legacy 0 reading; the out-length contract
     // below still fails those.
     const want_len_n = proto.parseU64Fast(cl_str) orelse return error.BadContentLength;
     const want_len = std.math.cast(usize, want_len_n) orelse return error.BadContentLength;
@@ -1013,9 +1008,9 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_
     // is checked before any early return -- including the zero-length case,
     // or a peer omitting Content-Length would "succeed" without writing a
     // byte and the fetched piece would be marked filled over hole zeros.
-    if (dest) |d| {
-        if (d.len != want_len) return error.LengthMismatch;
-        if (want_len == 0) return d[0..0];
+    if (out) |supplied| {
+        if (supplied.len != want_len) return error.LengthMismatch;
+        if (want_len == 0) return supplied[0..0];
     } else {
         // Content-Length is untrusted peer input: refuse absurd bodies
         // instead of letting one bad response drive a giant allocation.
@@ -1025,8 +1020,8 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_
     // Now that the expected length is known, size the total budget to it.
     const deadline = deadline_ms orelse bodyDeadlineFor(io, want_len);
 
-    const buf = dest orelse try gpa.alloc(u8, want_len);
-    errdefer if (dest == null) gpa.free(buf);
+    const buf = out orelse try gpa.alloc(u8, want_len);
+    errdefer if (out == null) gpa.free(buf);
 
     var got: usize = 0;
     if (total_read > head_len) {
@@ -1333,11 +1328,11 @@ fn fetchFromCands(
         const start = piece.offset(idx, piece_size);
         // Saturating: a caller passing an empty buffer (only possible via an
         // out-of-band truncate race today) must not underflow the range end.
-        const end = start +| out.len -| 1;
+        const range: proto.Range = .{ .start = start, .end = start +| out.len -| 1 };
         const t0 = sys.monoNs(cat.io);
         // Stream the body straight into out: no piece-sized allocation or
         // copy on the fetch path.
-        fetchRangeInto(gpa, cat.io, psk, win.ip, win.port, rel, start, end, out) catch |err| {
+        fetchRangeInto(gpa, cat.io, psk, win.ip, win.port, rel, range, out) catch |err| {
             // The loop falls through to the next candidate (then the caller
             // falls back to the origin), but without this line nothing
             // records which dependency failed and why -- the read would
@@ -1524,7 +1519,7 @@ test "readFlexBodyAlloc rejects hostile responses" {
     }
 }
 
-test "readFlexBodyAlloc keeps the dest contract when Content-Length is absent" {
+test "readFlexBodyAlloc keeps the out contract when Content-Length is absent" {
     const gpa = std.testing.allocator;
     // A peer answering without Content-Length must fail the fetch rather
     // than silently succeed having written nothing: the caller would mark
@@ -1533,8 +1528,8 @@ test "readFlexBodyAlloc keeps the dest contract when Content-Length is absent" {
         const pair = try responsePair("HTTP/1.1 206 Partial Content\r\nConnection: close\r\n\r\n");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        var dest: [8]u8 = undefined;
-        try std.testing.expectError(error.LengthMismatch, readFlexBodyAlloc(gpa, std.testing.io, pair[1], &dest));
+        var out: [8]u8 = undefined;
+        try std.testing.expectError(error.LengthMismatch, readFlexBodyAlloc(gpa, std.testing.io, pair[1], &out));
     }
     // An explicit zero length against an explicitly empty destination is fine.
     {
@@ -3390,7 +3385,7 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
     // fetchHave leg: the bitmap answer rides an allocation sized by
     // Content-Length. A reply this parser rejects skips the assertions that
-    // need a parsed value; the dest leg below still runs on every input.
+    // need a parsed value; the out-buffer leg below still runs on every input.
     {
         var fds: [2]c_int = undefined;
         defer sys.close(fds[1]);

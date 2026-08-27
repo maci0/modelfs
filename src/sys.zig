@@ -533,7 +533,7 @@ fn readFileBufFlags(buf: []u8, path: [*:0]const u8, extra_flags: c_int, open_err
 
 pub fn setSockTimeout(fd: c_int, ms: u32) void {
     var tv = c.timeval{
-        .tv_sec = @intCast(ms / 1000),
+        .tv_sec = @intCast(@divFloor(ms, 1000)),
         .tv_usec = @intCast((ms % 1000) * 1000),
     };
     _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.timeval));
