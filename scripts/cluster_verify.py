@@ -26,7 +26,7 @@ def main(argv: list[str]) -> int:
     help_only = argv[1:] == ["-h"] or argv[1:] == ["--help"]
     if help_only or len(argv) != ARGC:
         print(
-            f"usage: {argv[0]} REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES",
+            f"Usage: {argv[0]} REL PSK_FILE BASE_PORT NUM_NODES TOTAL_PIECES",
             file=sys.stdout if help_only else sys.stderr,
         )
         return 0 if help_only else 2

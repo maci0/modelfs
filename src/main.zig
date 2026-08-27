@@ -72,19 +72,22 @@ const usage =
     \\  --detach              Background after mount
     \\  -f, --foreground      Stay in the foreground (default)
     \\
+    \\every command:
+    \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
+    \\
     \\status/peers/pin/unpin take only the flags shown on their Usage line plus
-    \\the shared --origin/--cache/--psk values; mount-only
+    \\the shared --origin/--cache/--psk/--log values; mount-only
     \\options are refused elsewhere. Every command also accepts -h/--help,
     \\and -V/--version prints the release. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
     \\accept --name VALUE or --name=VALUE.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
-    \\MODELFS_ID set the same values as their flags; an explicit flag wins.
-    \\MODELFS_PSK_VALUE cannot be combined with --psk or MODELFS_PSK on mount.
-    \\A PSK file or MODELFS_PSK_VALUE is trimmed of surrounding whitespace.
-    \\MODELFS_LOG sets the log ceiling: err, warn, info (default), or debug.
-    \\An empty environment value counts as unset (defaults apply).
+    \\MODELFS_ID MODELFS_LOG set the same values as their flags; an explicit
+    \\flag wins. MODELFS_PSK_VALUE cannot be combined with --psk or
+    \\MODELFS_PSK on mount. A PSK file or MODELFS_PSK_VALUE is trimmed of
+    \\surrounding whitespace. An empty environment value counts as unset
+    \\(defaults apply).
     \\
     \\Examples:
     \\  modelfs mount /models --origin /net/192.168.0.100/models
@@ -225,6 +228,7 @@ const Opts = struct {
     id: ?[]const u8 = null,
     psk_file: []const u8 = "/etc/modelfs.psk",
     psk_value: ?[]const u8 = null,
+    log_level: std.log.Level = .info,
     piece: u32 = piece.default_size,
     water: cull.Water = .{},
     direct_io: bool = true,
@@ -391,15 +395,26 @@ fn envValue(environ: *const std.process.Environ.Map, name: []const u8) ?[]const 
     return if (v.len == 0) null else v;
 }
 
-/// MODELFS_LOG values name a std.log.Level exactly; anything else ("Info",
-/// "warning", "verbose") is refused by the caller instead of silently
-/// leaving the default ceiling in force.
+/// MODELFS_LOG / --log values name a std.log.Level exactly; anything else
+/// ("Info", "warning", "verbose") is refused by the caller instead of
+/// silently leaving the default ceiling in force.
 fn parseLogLevel(s: []const u8) ?std.log.Level {
     if (std.mem.eql(u8, s, "err")) return .err;
     if (std.mem.eql(u8, s, "warn")) return .warn;
     if (std.mem.eql(u8, s, "info")) return .info;
     if (std.mem.eql(u8, s, "debug")) return .debug;
     return null;
+}
+
+/// Named refusal for a log-ceiling value that parseLogLevel rejects.
+/// `source` is `--log` or `MODELFS_LOG` so the operator sees which knob
+/// was wrong.
+fn takeLogLevel(source: []const u8, raw: []const u8) !std.log.Level {
+    return parseLogLevel(raw) orelse {
+        if (!builtin.is_test)
+            std.debug.print("{s} {s}: want err, warn, info, or debug\n", .{ source, raw });
+        return error.BadLogLevel;
+    };
 }
 
 /// Refusal line for a MODELFS_-prefixed variable no flag answers to. The
@@ -559,14 +574,9 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // command -- status/peers/pin log warnings too. A value outside the
     // documented set is refused like any other malformed knob: silently
     // keeping the default would leave the operator believing verbosity
-    // changed.
+    // changed. --log overwrites this below (explicit flag wins).
     if (envValue(environ, "MODELFS_LOG")) |v| {
-        const level = parseLogLevel(v) orelse {
-            if (!builtin.is_test)
-                std.debug.print("MODELFS_LOG {s}: want err, warn, info, or debug\n", .{v});
-            return error.BadLogLevel;
-        };
-        if (!builtin.is_test) active_log_level = level;
+        opts.log_level = try takeLogLevel("MODELFS_LOG", v);
     }
     // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin
     // never read the id, so an ambient shell-wide variable must neither leak
@@ -606,7 +616,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             try rejectInlineValue(flag, inline_val);
             return error.Version;
         }
-        if (std.mem.eql(u8, flag, "--origin")) {
+        if (std.mem.eql(u8, flag, "--log")) {
+            const raw = try takeValue(args, flag, &i, inline_val);
+            opts.log_level = try takeLogLevel(flag, raw);
+        } else if (std.mem.eql(u8, flag, "--origin")) {
             opts.origin = try takeValue(args, flag, &i, inline_val);
         } else if (std.mem.eql(u8, flag, "--cache")) {
             opts.cache = try takeValue(args, flag, &i, inline_val);
@@ -796,6 +809,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             }
         }
     }
+    // Applied once the parse succeeded so a later usage error does not
+    // leave a half-applied ceiling. Under test the process-wide logger
+    // stays at the runner default; callers assert opts.log_level.
+    if (!builtin.is_test) active_log_level = opts.log_level;
     return .{ .cmd = cmd, .opts = opts, .rest = try rest.toOwnedSlice(gpa) };
 }
 
@@ -2423,6 +2440,7 @@ test "empty environment variables read as unset" {
     try std.testing.expectEqualStrings("/etc/modelfs.psk", parsed.opts.psk_file);
     try std.testing.expect(parsed.opts.psk_value == null);
     try std.testing.expect(parsed.opts.id == null);
+    try std.testing.expectEqual(std.log.Level.info, parsed.opts.log_level);
 
     // Non-empty values still apply, and an explicitly empty flag keeps its
     // stricter meaning where one exists (--id "" is refused by the BadId
@@ -2479,6 +2497,40 @@ test "parseArgs refuses an unknown MODELFS_LOG value on every command" {
     try environ.put("MODELFS_LOG", "err");
     const parsed = try parseArgs(gpa, &environ, &.{"status"});
     defer freeParsed(parsed, gpa);
+    try std.testing.expectEqual(std.log.Level.err, parsed.opts.log_level);
+}
+
+test "parseArgs --log wins over MODELFS_LOG on every command" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("MODELFS_LOG", "debug");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"status"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqual(std.log.Level.debug, parsed.opts.log_level);
+    }
+    // Explicit flag wins, including the attached --name=VALUE form, and
+    // is not mount-only: a cron'd `status --log err` must quiet the
+    // journal without a shell-wide MODELFS_LOG.
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "status", "--log", "err" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqual(std.log.Level.err, parsed.opts.log_level);
+    }
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--log=warn" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqual(std.log.Level.warn, parsed.opts.log_level);
+    }
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--log", "info" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqual(std.log.Level.info, parsed.opts.log_level);
+    }
+    try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{ "status", "--log", "verbose" }));
+    try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{ "peers", "--log", "" }));
+    try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "unpin", "--log" }));
 }
 
 test "parseArgs refuses unknown commands before flag scanning" {
@@ -2507,9 +2559,10 @@ test "parseArgs rejects mount-only flags on other commands" {
     // Shared value flags stay legal on every command (the e2e suites pass
     // --psk/--origin to pin and peers).
     {
-        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--cache", "/c", "--origin", "/o", "--psk", "/p" });
+        const parsed = try parseArgs(gpa, &environ, &.{ "pin", "x.bin", "--cache", "/c", "--origin", "/o", "--psk", "/p", "--log", "err" });
         defer freeParsed(parsed, gpa);
         try std.testing.expectEqualStrings("/c", parsed.opts.cache);
+        try std.testing.expectEqual(std.log.Level.err, parsed.opts.log_level);
     }
 }
 

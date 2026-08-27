@@ -162,7 +162,7 @@ def build_modelfs() -> str:
         cwd=_ROOT,
     )
     if res.returncode != 0:
-        print("Build failed:", res.stderr)
+        print("Build failed:", res.stderr, file=sys.stderr)
         sys.exit(1)
     bin_path = _ROOT / "zig-out" / "bin" / "modelfs"
     if not bin_path.is_file():
@@ -645,7 +645,6 @@ peer latency.
 
 def main() -> None:
     reexec_under_venv()
-    require_fuse()
     parser = argparse.ArgumentParser(
         description="Run the modelfs benchmarks and render report + figures."
     )
@@ -656,7 +655,10 @@ def main() -> None:
         "(default: write to .scratch/benchmarks/, since every run records "
         "the local machine's numbers)",
     )
+    # Parse before the FUSE preflight so --help and unknown flags never
+    # die as "cannot run benchmarks: /dev/fuse is missing".
     args = parser.parse_args()
+    require_fuse()
     out_dir = _ROOT / "docs" if args.update_docs else _SCRATCH / "benchmarks"
     bin_path = build_modelfs()
     node_counts, latencies_ms = run_cluster_latency_benchmark(bin_path)

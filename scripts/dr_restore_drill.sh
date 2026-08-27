@@ -43,12 +43,26 @@ die() {
 # Answered before the zfs/scratch setup so --help works on machines that
 # never run the drill (and so extra operands stay a usage error, exit 2,
 # rather than a drill failure).
+print_usage() {
+    cat <<'EOF'
+Usage: ./scripts/dr_restore_drill.sh [DATASET]
+
+Monthly restore drill (docs/recovery.md section 6). Default DATASET is
+tank/models. Exit 0 means the newest snapshot restored, mounted off the
+live tree, and read back verified.
+
+Environment: MF_DRILL_LOG, MF_DRILL_LIVE, MF_DRILL_CLONE_MP, MF_DRILL_KEEP,
+MF_DRILL_MAX_SNAP_AGE, MF_DRILL_REPLICA, MF_DRILL_MAX_REPLICA_AGE,
+MF_DRILL_SCRATCH.
+EOF
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    echo "usage: dr_restore_drill.sh [DATASET]"
+    print_usage
     exit 0
 fi
-if [[ $# -gt 1 ]]; then
-    echo "usage: dr_restore_drill.sh [DATASET]" >&2
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" == -* ) ]]; then
+    print_usage >&2
     exit 2
 fi
 

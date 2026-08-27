@@ -23,20 +23,26 @@ fail() {
 
 command -v timeout >/dev/null 2>&1 || fail "timeout not found on PATH (coreutils)"
 
-# Scripts listed by ./scripts/check.sh --help, plus extract/install (same
-# pattern) and this file. Output must start with "Usage:" so a missing
-# handler that happens to finish inside the timeout still fails.
+# Scripts listed by ./scripts/check.sh --help, plus extract/install, the
+# Python CLIs, the restore drill, and this file. Output must start with
+# "Usage:" / "usage:" so a missing handler that happens to finish inside
+# the timeout still fails.
 scripts=(
     scripts/check.sh
     scripts/check_drill_log.sh
     scripts/ci.sh
+    scripts/cluster_verify.py
     scripts/cross_aarch64.sh
+    scripts/dr_restore_drill.sh
     scripts/extract_fuse3_arm64.sh
     scripts/install_libfuse3_dev.sh
     scripts/install_nas_backup.sh
+    scripts/peer_auth_probe.py
     scripts/repro_check.sh
+    scripts/run_benchmarks_and_plots.py
     scripts/run_cluster_e2e_9nodes.sh
     scripts/run_e2e_tests.sh
+    scripts/sbom.py
     scripts/test_dr_restore_drill.sh
     scripts/test_extract_fuse3_arm64.sh
     scripts/test_fault_tolerance.sh
@@ -53,7 +59,7 @@ for s in "${scripts[@]}"; do
         fail "${s} --help exited ${rc}"
     fi
     case "${out}" in
-        Usage:*)
+        Usage:* | usage:*)
             ;;
         *)
             fail "${s} --help did not print Usage: (got: ${out})"

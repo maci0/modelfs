@@ -31,7 +31,7 @@ fi
 PREFIX=""
 if [[ $# -gt 0 ]]; then
     if [[ "$1" != "--prefix" || $# -ne 2 || -z "${2}" ]]; then
-        echo "usage: ./scripts/cross_aarch64.sh [--prefix DIR]" >&2
+        echo "Usage: ./scripts/cross_aarch64.sh [--prefix DIR]" >&2
         exit 2
     fi
     PREFIX="$2"

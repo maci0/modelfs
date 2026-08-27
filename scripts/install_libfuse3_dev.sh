@@ -16,7 +16,7 @@ EOF
     exit 0
 fi
 if [[ $# -gt 0 ]]; then
-    echo "usage: ./scripts/install_libfuse3_dev.sh" >&2
+    echo "Usage: ./scripts/install_libfuse3_dev.sh" >&2
     exit 2
 fi
 
