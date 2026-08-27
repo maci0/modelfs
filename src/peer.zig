@@ -2025,6 +2025,11 @@ test "peer /have and /data hide .cluster the way FUSE does" {
     var model = try roundTrip(port, "GET /have?path=.clusterfoo HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
     defer model.deinit(gpa);
     try std.testing.expect(std.mem.startsWith(u8, model.items, "HTTP/1.1 200 OK\r\n"));
+    // Percent-encoded leading dot is still the control dir after decodePath;
+    // hiding only the literal spelling would let a PSK holder hydrate leases.
+    var encoded = try roundTrip(port, "GET /have?path=%2ecluster HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+    defer encoded.deinit(gpa);
+    try std.testing.expect(std.mem.startsWith(u8, encoded.items, "HTTP/1.1 404 Not Found\r\n"));
 }
 
 test "origin stat failures answer 502 while true misses stay healthy 404s" {

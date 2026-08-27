@@ -432,27 +432,37 @@ pub fn writeFile(path: [*:0]const u8, data: []const u8) i32 {
     return writeFileFull(path, data, 0, false, 0o644);
 }
 
-/// writeFile for daemon-owned artifact paths (cache data/meta/pin, lease
-/// staging files). O_NOFOLLOW: a local writer who can plant a symlink
-/// at one of those names must not redirect a truncate-and-write onto an
-/// arbitrary file as the daemon user. `status.json` uses writeFileOwnerOnly.
+/// writeFile for daemon-owned artifacts that other cluster members must
+/// read (lease staging under origin/.cluster). O_NOFOLLOW: a local writer
+/// who can plant a symlink at one of those names must not redirect a
+/// truncate-and-write onto an arbitrary file as the daemon user. Cache
+/// data/meta/pin and `status.json` use the owner-only helpers.
 pub fn writeFileNoFollow(path: [*:0]const u8, data: []const u8) i32 {
     return writeFileFull(path, data, c.O_NOFOLLOW, false, 0o644);
 }
 
-/// writeFileNoFollow plus fsync-before-close: for artifact writes whose
-/// durability orders them against a later destructive step on the same key
-/// (the bitfield cleared ahead of a hole punch).
+/// writeFileNoFollow plus fsync-before-close: for 0644 artifact writes
+/// whose durability orders them against a later destructive step on the
+/// same key. Cache sidecars use writeFileOwnerOnlyDurable.
 pub fn writeFileDurable(path: [*:0]const u8, data: []const u8) i32 {
     return writeFileFull(path, data, c.O_NOFOLLOW, true, 0o644);
 }
 
 /// writeFileNoFollow at 0600. For cache-root artifacts that sit next to a
-/// world-searchable directory (`status.json`): a local uid that can search
-/// the cache root must not read operational state. Leftover 0644 files are
-/// tightened on the fd that was written, the same leftover-open as cache data.
+/// world-searchable directory (`status.json`) and for cache-tree files
+/// (`meta/*.pieces`, `pin/` markers): a local uid that can search the
+/// cache root or a leftover 0755 `meta/`/`pin/` must not read them.
+/// Leftover 0644 files are tightened on the fd that was written, the same
+/// leftover-open as cache data.
 pub fn writeFileOwnerOnly(path: [*:0]const u8, data: []const u8) i32 {
     return writeFileFull(path, data, c.O_NOFOLLOW, false, 0o600);
+}
+
+/// writeFileOwnerOnly plus fsync-before-close: for owner-only writes whose
+/// durability orders them against a later destructive step on the same key
+/// (the bitfield cleared ahead of a hole punch).
+pub fn writeFileOwnerOnlyDurable(path: [*:0]const u8, data: []const u8) i32 {
+    return writeFileFull(path, data, c.O_NOFOLLOW, true, 0o600);
 }
 
 pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![]u8 {

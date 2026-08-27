@@ -191,12 +191,14 @@ pub const Store = struct {
 
     /// Cache data files hold origin bytes. 0600 so a local user who cannot
     /// read the origin (FUSE default_permissions) cannot read the cache copy.
+    /// Sidecars and pin markers share this mode via writeFileOwnerOnly.
     const cache_data_mode: c.mode_t = 0o600;
 
     /// Owner-only directories under the cache root (`data/`, `meta/`, `pin/`
     /// and every nested parent). 0755 would let a local user blocked by
     /// origin modes and FUSE `default_permissions` list which weights are
-    /// cached or pinned.
+    /// cached or pinned. Leftover 0755 dirs (pre-0700 daemons) are tightened
+    /// on ensureLayout; mkdirAll does not chmod an existing name.
     const cache_dir_mode: c.mode_t = 0o700;
 
     gpa: std.mem.Allocator,
@@ -381,8 +383,24 @@ pub const Store = struct {
         for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
             const p = self.cacheSubPath(&buf, sub, "") catch return -sys.c.ENAMETOOLONG;
             if (sys.mkdirAll(std.mem.span(p), cache_dir_mode) != 0) return sys.negErrno();
+            // mkdirAll leaves an existing dir's mode alone (EEXIST + is-dir).
+            // A leftover 0755 `data/` from an older daemon is world-listable
+            // even when the files inside are 0600; fchmod through an
+            // O_DIRECTORY|O_NOFOLLOW fd so a planted symlink cannot steer
+            // the mode change onto another tree.
+            tightenCacheDir(p);
         }
         return 0;
+    }
+
+    /// Owner-only the named cache directory. Best-effort: a failure leaves
+    /// the mkdirAll mode in place (0700 for a new dir, leftover for an
+    /// existing one) the same way openCache ignores a failed data fchmod.
+    fn tightenCacheDir(path_z: [*:0]const u8) void {
+        const fd = sys.open(path_z, c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW, 0);
+        if (fd < 0) return;
+        defer sys.close(fd);
+        _ = c.fchmod(fd, cache_dir_mode);
     }
 
     /// lstat semantics: the origin is shared storage other parties can write
@@ -412,7 +430,7 @@ pub const Store = struct {
         if (on) {
             const parent = sys.parentOf(std.mem.span(p));
             _ = sys.mkdirAll(parent, cache_dir_mode);
-            return sys.writeFileNoFollow(p, "");
+            return sys.writeFileOwnerOnly(p, "");
         }
         if (c.unlink(p) != 0) {
             const e = sys.errno();
@@ -620,15 +638,15 @@ pub const Store = struct {
     /// that cannot be created surfaces as the retried write's errno.
     fn writeFileMakingParent(path_z: [*:0]const u8, data: []const u8, durable: bool) i32 {
         const w = if (durable)
-            sys.writeFileDurable(path_z, data)
+            sys.writeFileOwnerOnlyDurable(path_z, data)
         else
-            sys.writeFileNoFollow(path_z, data);
+            sys.writeFileOwnerOnly(path_z, data);
         if (w != -c.ENOENT) return w;
         _ = sys.mkdirAll(sys.parentOf(std.mem.span(path_z)), cache_dir_mode);
         return if (durable)
-            sys.writeFileDurable(path_z, data)
+            sys.writeFileOwnerOnlyDurable(path_z, data)
         else
-            sys.writeFileNoFollow(path_z, data);
+            sys.writeFileOwnerOnly(path_z, data);
     }
 
     /// Persists the entry's current bits. Caller must hold file.mu: encode
@@ -1775,7 +1793,7 @@ pub const Store = struct {
         // persisted durably before any destructive step. A save failure leaves
         // the old sidecar standing and nothing punched; a crash after the save
         // but before the punch costs only a refill over intact bytes.
-        const w = sys.writeFileDurable(mp, blob.items);
+        const w = sys.writeFileOwnerOnlyDurable(mp, blob.items);
         if (w != 0) {
             std.log.warn("bitfield save failed for {s} (errno {d}); piece {d} stays cached", .{ rel, -w, idx });
             return false;
@@ -4761,6 +4779,21 @@ test "openCache creates owner-only data files and tightens leftovers" {
     try std.testing.expectEqual(@as(i32, 0), sys.statPath(data_dir, &dst));
     try std.testing.expectEqual(@as(c.mode_t, 0o700), dst.st_mode & 0o777);
 
+    // Leftover 0755 `data/`/`meta/`/`pin/` (pre-0700 daemon) stay world-
+    // listable until ensureLayout fchmods them: mkdirAll treats EEXIST as
+    // success without touching mode. A co-tenant blocked by origin modes
+    // could otherwise `ls` which weights are cached or pinned.
+    for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
+        const dir = try st.cacheSubPath(&db, sub, "");
+        try std.testing.expectEqual(@as(i32, 0), c.chmod(dir, 0o755));
+    }
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+    for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
+        const dir = try st.cacheSubPath(&db, sub, "");
+        try std.testing.expectEqual(@as(i32, 0), sys.statPath(dir, &dst));
+        try std.testing.expectEqual(@as(c.mode_t, 0o700), dst.st_mode & 0o777);
+    }
+
     const f = try st.get("weights.bin", 32, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     try std.testing.expect(st.openCache(f) >= 0);
@@ -4796,10 +4829,28 @@ test "openCache creates owner-only data files and tightens leftovers" {
     const pin_sub = try st.cacheSubPath(&db, "pin", "gguf");
     try std.testing.expectEqual(@as(i32, 0), sys.statPath(pin_sub, &dst));
     try std.testing.expectEqual(@as(c.mode_t, 0o700), dst.st_mode & 0o777);
+    const pin_fp = try st.cachePinPath(&db, "gguf/w.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(pin_fp, &dst));
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), dst.st_mode & 0o777);
+    // Leftover 0644 pin marker (writeFileNoFollow used to create these)
+    // is tightened on the next pin, matching leftover data files.
+    try std.testing.expectEqual(@as(i32, 0), c.chmod(pin_fp, 0o644));
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("gguf/w.bin", true));
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(pin_fp, &dst));
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), dst.st_mode & 0o777);
     try std.testing.expect(st.copyIntoCache(nested, 0, &[_]u8{0} ** 32));
     const meta_sub = try st.cacheSubPath(&db, "meta", "gguf");
     try std.testing.expectEqual(@as(i32, 0), sys.statPath(meta_sub, &dst));
     try std.testing.expectEqual(@as(c.mode_t, 0o700), dst.st_mode & 0o777);
+    const meta_fp = try st.cacheMetaPath(&db, "gguf/w.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(meta_fp, &dst));
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), dst.st_mode & 0o777);
+    try std.testing.expectEqual(@as(i32, 0), c.chmod(meta_fp, 0o644));
+    nested.mu.lockUncancelable(std.testing.io);
+    try std.testing.expect(st.saveBits(nested, false));
+    nested.mu.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(meta_fp, &dst));
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), dst.st_mode & 0o777);
 }
 
 test "loadBits refuses a symlink planted at the sidecar path" {

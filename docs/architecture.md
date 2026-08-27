@@ -46,7 +46,7 @@ One piece, one source. Misses block the read until that hole is filled. No full-
 | `192.168.0.100:/export/models` | ZFS NFS export |
 | `/net/192.168.0.100/models` | NFS origin on sparks, **no `fsc`** |
 | `/models` | FUSE (sparks). Empty local dir, uid 1000 |
-| `/var/cache/modelfs` | pieces (`data/` 0600 files under 0700 dirs, `meta/*.pieces`, `pin/`, `status.json` 0600) |
+| `/var/cache/modelfs` | pieces (`data/` 0600 files under 0700 dirs, leftover 0755 dirs tightened at layout; `meta/*.pieces` and `pin/` 0600; `status.json` 0600) |
 | `:18080` | peer HTTP, bound on all interfaces; non-loopback IPv4 advertised in the lease (127.0.0.1 if none) |
 
 Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run `modelfs` there.
