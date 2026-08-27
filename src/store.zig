@@ -21,11 +21,13 @@ pub const status_file = "status.json";
 /// `.cluster` is a sibling policy (`discover.relIsCluster`), not part of
 /// this gate: a leading-dot component is a legal model name.
 /// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
-/// Unicode line separators, bidi and zero-width format controls, variation
-/// selectors, and BOM), the same discover.printable applies before echoing
-/// a lease name. Non-control text above that set (NFC/NFD spellings, astral
-/// emoji without a selector, names that are not valid UTF-8 at all) passes
-/// byte-exact; identity is byte equality all the way down.
+/// and UTF-8 Default_Ignorable_Code_Point including line separators, bidi
+/// and zero-width format controls, variation selectors, BOM, soft hyphen,
+/// CGJ, Hangul fillers, and tags), the same discover.printable applies
+/// before echoing a lease name. Non-control text above that set (NFC/NFD
+/// spellings, astral emoji without a selector, names that are not valid
+/// UTF-8 at all) passes byte-exact; identity is byte equality all the way
+/// down.
 pub fn relOk(rel: []const u8) bool {
     if (rel.len == 0 or rel[0] == '/') return false;
     if (proto.containsControl(rel)) return false;
@@ -2719,6 +2721,14 @@ test "relOk rejects traversal and absolute paths" {
     // passes below; U+FE0F or a leading U+FEFF is an invisible extra.
     try std.testing.expect(!relOk("\u{1f512}\u{fe0f}locked.bin"));
     try std.testing.expect(!relOk("\u{feff}model.bin"));
+    // Remaining Default_Ignorable: `gguf/model\u{ad}.bin` and
+    // `a\u{e0100}.bin` render as the unadorned names.
+    try std.testing.expect(!relOk("gguf/model\u{ad}.bin"));
+    try std.testing.expect(!relOk("a\u{34f}b.bin"));
+    try std.testing.expect(!relOk("a\u{180b}b.bin"));
+    try std.testing.expect(!relOk("a\u{3164}b.bin"));
+    try std.testing.expect(!relOk("a\u{e0020}b.bin"));
+    try std.testing.expect(!relOk("a\u{e0100}b.bin"));
 }
 
 test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
@@ -2749,9 +2759,17 @@ test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
     try std.testing.expect(relOk("a\xef.bin"));
     try std.testing.expect(relOk("a\xef\xb8.bin"));
     try std.testing.expect(relOk("a\xef\xbb.bin"));
+    try std.testing.expect(relOk("a\xcd.bin"));
+    try std.testing.expect(relOk("a\xe1\xa0.bin"));
+    try std.testing.expect(relOk("a\xf3.bin"));
+    try std.testing.expect(relOk("a\xf3\xa0.bin"));
+    try std.testing.expect(relOk("a\xf3\xa0\x84.bin"));
     // U+2010 hyphen sits between ZWSP and U+2028 in the same lead-byte run
     // and is visible punctuation, not a format control.
     try std.testing.expect(relOk("a\u{2010}b.bin"));
+    try std.testing.expect(relOk("a\u{ac}b.bin"));
+    try std.testing.expect(relOk("a\u{180a}b.bin"));
+    try std.testing.expect(relOk("a\u{fffc}b.bin"));
 }
 
 const seed_rel_model = fuzzcorpus.entry("gguf/a.gguf");
@@ -2771,6 +2789,9 @@ const seed_rel_bidi = fuzzcorpus.entry("gguf/a\u{202e}gnp.bin");
 const seed_rel_zwsp = fuzzcorpus.entry("gguf/model\u{200b}.bin");
 const seed_rel_vs = fuzzcorpus.entry("a\u{fe0f}.bin");
 const seed_rel_bom = fuzzcorpus.entry("\u{feff}model.bin");
+const seed_rel_shy = fuzzcorpus.entry("gguf/model\u{ad}.bin");
+const seed_rel_vs17 = fuzzcorpus.entry("a\u{e0100}.bin");
+const seed_rel_tag = fuzzcorpus.entry("a\u{e007f}.bin");
 const seed_rel_nbsp = fuzzcorpus.entry("model\u{a0}v2.bin");
 const seed_rel_lone_c1byte = fuzzcorpus.entry("a\x9bb.bin");
 const seed_rel_trailing_c2 = fuzzcorpus.entry("foo\xc2");
@@ -2794,6 +2815,9 @@ const fuzz_rel_corpus = [_][]const u8{
     &seed_rel_zwsp,
     &seed_rel_vs,
     &seed_rel_bom,
+    &seed_rel_shy,
+    &seed_rel_vs17,
+    &seed_rel_tag,
     &seed_rel_nbsp,
     &seed_rel_lone_c1byte,
     &seed_rel_trailing_c2,
@@ -2801,8 +2825,8 @@ const fuzz_rel_corpus = [_][]const u8{
 };
 
 /// Independent restatement of relOk: empty/absolute refuse, C0/DEL, and
-/// proto.utf8FormatControlAt's set (C1, line separators, bidi/zero-width
-/// format controls, variation selectors, BOM) refuse, "." / ".." components refuse,
+/// proto.utf8FormatControlAt's set (C1 and Default_Ignorable, including
+/// variation selectors, tags, soft hyphen) refuse, "." / ".." components refuse,
 /// empty components (double slash, trailing slash) do not. Walks segments
 /// by index instead of splitScalar so a corrupted splitter cannot self-confirm.
 fn refRelOk(rel: []const u8) bool {

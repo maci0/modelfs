@@ -189,14 +189,13 @@ pub fn bearerOk(got: []const u8, want: []const u8) bool {
     return std.crypto.timing_safe.eql([32]u8, ha, hb);
 }
 
-/// True when s holds a C0 byte, DEL, a UTF-8 C1 pair (U+0080..U+009F), a
-/// Unicode line/paragraph separator (U+2028/U+2029), a bidi format
-/// control (U+061C, U+200E/U+200F, U+202A..U+202E, U+2066..U+2069), a
-/// zero-width format control (U+200B/U+200C/U+200D, U+2060..U+2064,
-/// U+206A..U+206F), a variation selector (U+FE00..U+FE0F), or BOM
-/// (U+FEFF). store.relOk and discover.printable share this set so a
-/// planted name cannot inject into logs or terminals, or spoof an
-/// identity, through only one of the two gates. Incomplete UTF-8
+/// True when s holds a C0 byte, DEL, a UTF-8 C1 pair (U+0080..U+009F), or
+/// a UTF-8 Default_Ignorable_Code_Point: line/paragraph separators, bidi
+/// and zero-width format controls, variation selectors (BMP, Mongolian
+/// FVS, VS17-256), BOM, soft hyphen, CGJ, Hangul fillers, tags, and the
+/// rest of that Unicode property. store.relOk and discover.printable share
+/// this set so a planted name cannot inject into logs or terminals, or spoof
+/// an identity, through only one of the two gates. Incomplete UTF-8
 /// encodings are display noise, not controls.
 pub fn containsControl(s: []const u8) bool {
     var i: usize = 0;
@@ -208,14 +207,31 @@ pub fn containsControl(s: []const u8) bool {
     return false;
 }
 
-/// UTF-8 format controls refused in identity-bearing input. Incomplete
-/// sequences (truncated C1, ALM, E2, or EF prefixes) are not controls.
+/// UTF-8 C1 and Default_Ignorable sequences refused in identity-bearing
+/// input. Incomplete sequences (truncated prefixes of any matched block)
+/// are not controls.
 pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
     const ch = s[i];
     // C1 (U+0080..U+009F) as UTF-8: some terminals still honor 8-bit CSI/OSC.
-    if (ch == 0xc2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9f) return true;
+    // U+00AD SOFT HYPHEN shares the C2 lead and is Default_Ignorable.
+    if (ch == 0xc2 and i + 1 < s.len) {
+        const b = s[i + 1];
+        if ((b >= 0x80 and b <= 0x9f) or b == 0xad) return true;
+    }
+    // U+034F COMBINING GRAPHEME JOINER.
+    if (ch == 0xcd and i + 1 < s.len and s[i + 1] == 0x8f) return true;
     // U+061C ARABIC LETTER MARK: a bidi control that is not in the E2 block.
     if (ch == 0xd8 and i + 1 < s.len and s[i + 1] == 0x9c) return true;
+    if (ch == 0xe1 and i + 2 < s.len) {
+        const b = s[i + 1];
+        const c3 = s[i + 2];
+        // U+115F / U+1160 Hangul choseong/jungseong fillers.
+        if (b == 0x85 and (c3 == 0x9f or c3 == 0xa0)) return true;
+        // U+17B4 / U+17B5 Khmer inherent vowels (deprecated, invisible).
+        if (b == 0x9e and (c3 == 0xb4 or c3 == 0xb5)) return true;
+        // U+180B..U+180D Mongolian free variation selectors; U+180E MVS.
+        if (b == 0xa0 and c3 >= 0x8b and c3 <= 0x8e) return true;
+    }
     if (ch == 0xe2 and i + 2 < s.len) {
         const b = s[i + 1];
         const c3 = s[i + 2];
@@ -227,6 +243,10 @@ pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
         // run and is refused with them.
         if (b == 0x81 and c3 >= 0xa0 and c3 <= 0xaf) return true;
     }
+    if (ch == 0xe3 and i + 2 < s.len) {
+        // U+3164 HANGUL FILLER.
+        if (s[i + 1] == 0x85 and s[i + 2] == 0xa4) return true;
+    }
     if (ch == 0xef and i + 2 < s.len) {
         const b = s[i + 1];
         const c3 = s[i + 2];
@@ -236,6 +256,25 @@ pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
         // U+FEFF BOM / ZWNBSP: a leading BOM is invisible and prefixes a
         // different identity than the same name without it.
         if (b == 0xbb and c3 == 0xbf) return true;
+        // U+FFA0 HALFWIDTH HANGUL FILLER.
+        if (b == 0xbe and c3 == 0xa0) return true;
+        // U+FFF0..U+FFF8 unassigned Default_Ignorable; U+FFF9..U+FFFB
+        // interlinear annotation. U+FFFC/U+FFFD stay visible.
+        if (b == 0xbf and c3 >= 0xb0 and c3 <= 0xbb) return true;
+    }
+    if (ch == 0xf0 and i + 3 < s.len) {
+        // U+1D173..U+1D17A musical-symbol invisible format controls.
+        if (s[i + 1] == 0x9d and s[i + 2] == 0x85 and s[i + 3] >= 0xb3 and s[i + 3] <= 0xba) return true;
+    }
+    if (ch == 0xf3 and i + 3 < s.len) {
+        // U+E0000..U+E0FFF: tags, language tag, VS17-256, and the rest of
+        // that Default_Ignorable block. F3 A0 80 80 .. F3 A3 BF BF.
+        const b = s[i + 1];
+        if (b >= 0xa0 and b <= 0xa3) {
+            const c2 = s[i + 2];
+            const c3 = s[i + 3];
+            if (c2 >= 0x80 and c2 <= 0xbf and c3 >= 0x80 and c3 <= 0xbf) return true;
+        }
     }
     return false;
 }
@@ -306,9 +345,24 @@ test "containsControl covers C0 C1 line separators and format controls" {
     try std.testing.expect(!containsControl("a\xef.bin"));
     try std.testing.expect(!containsControl("a\xef\xb8.bin"));
     try std.testing.expect(!containsControl("a\xef\xbb.bin"));
+    try std.testing.expect(!containsControl("a\xcd.bin"));
+    try std.testing.expect(!containsControl("a\xe1.bin"));
+    try std.testing.expect(!containsControl("a\xe1\xa0.bin"));
+    try std.testing.expect(!containsControl("a\xe3.bin"));
+    try std.testing.expect(!containsControl("a\xef\xbe.bin"));
+    try std.testing.expect(!containsControl("a\xf0.bin"));
+    try std.testing.expect(!containsControl("a\xf0\x9d\x85.bin"));
+    try std.testing.expect(!containsControl("a\xf3.bin"));
+    try std.testing.expect(!containsControl("a\xf3\xa0.bin"));
+    try std.testing.expect(!containsControl("a\xf3\xa0\x84.bin"));
     // U+2010 hyphen sits in the E2 80 gap between ZWSP and U+2028; visible
     // punctuation in that block is not a format control.
     try std.testing.expect(!containsControl("a\u{2010}b"));
+    // Neighbours of newly refused Default_Ignorables: visible, kept.
+    try std.testing.expect(!containsControl("a\u{ac}b"));
+    try std.testing.expect(!containsControl("a\u{ae}b"));
+    try std.testing.expect(!containsControl("a\u{180a}b"));
+    try std.testing.expect(!containsControl("a\u{fffc}b"));
     try std.testing.expect(containsControl("a\nb"));
     try std.testing.expect(containsControl("a\x7fb"));
     try std.testing.expect(containsControl("a\xc2\x9bb"));
@@ -339,6 +393,20 @@ test "containsControl covers C0 C1 line separators and format controls" {
     try std.testing.expect(containsControl("a\u{fe00}b"));
     try std.testing.expect(containsControl("a\u{fe0f}b"));
     try std.testing.expect(containsControl("\u{feff}a"));
+    // Remaining Default_Ignorable_Code_Point: a path `gguf/model\u{ad}.bin`
+    // or a lease id `spark1\u{e0100}` renders as the unadorned name.
+    try std.testing.expect(containsControl("gguf/model\u{ad}.bin"));
+    try std.testing.expect(containsControl("a\u{34f}b"));
+    try std.testing.expect(containsControl("a\u{115f}b"));
+    try std.testing.expect(containsControl("a\u{180b}b"));
+    try std.testing.expect(containsControl("a\u{180e}b"));
+    try std.testing.expect(containsControl("a\u{3164}b"));
+    try std.testing.expect(containsControl("a\u{ffa0}b"));
+    try std.testing.expect(containsControl("a\u{1d173}b"));
+    try std.testing.expect(containsControl("a\u{e0020}b"));
+    try std.testing.expect(containsControl("a\u{e007f}b"));
+    try std.testing.expect(containsControl("a\u{e0100}b"));
+    try std.testing.expect(containsControl("a\u{e01ef}b"));
 }
 
 test "url encode decode" {
