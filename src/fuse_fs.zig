@@ -1649,44 +1649,56 @@ test "hydratePiece fails closed when write generation keeps discarding fills" {
             out_rc.* = hydratePiece(state, f, 0, buf);
         }
     }.run, .{ &st, file, scratch[0..], &rc });
-    defer {
-        if (holding_content) file.content_mu.unlock(st.io);
-        hydrator.join();
-    }
+    var joined = false;
+    // Reverse order: content_mu is dropped before the join, so an assertion
+    // that fires mid-scenario cannot deadlock on a parked hydrator.
+    defer if (!joined) hydrator.join();
+    defer if (holding_content) file.content_mu.unlock(st.io);
 
-    var discards: u32 = 0;
-    while (discards < 2) {
+    // Each claim records file.writes; discard #1 is the claim stamped 0 and
+    // discard #2 the retry's claim stamped 1. Polling "piece 0 is claimed"
+    // cannot tell them apart, so the old wait raced the retry's 2 ms sleep
+    // and read a lost race as a missing claim.
+    var gen: u64 = 0;
+    while (gen < 2) {
         var spins: u32 = 0;
         while (true) {
             file.mu.lockUncancelable(st.io);
-            const claimed = file.filling.contains(0);
+            const claim = file.filling.get(0);
             file.mu.unlock(st.io);
-            if (claimed) break;
+            if (claim) |g| {
+                if (g == gen) break;
+                // The hydrator is parked in completeFill on the content_mu
+                // held here with the previous claim still recorded: it needs
+                // that lock to discard and claim again.
+                file.content_mu.unlock(st.io);
+                holding_content = false;
+                std.Thread.yield() catch {};
+                file.content_mu.lockUncancelable(st.io);
+                holding_content = true;
+            } else {
+                // Sleeping between the discard and the retry's claim. Keep
+                // content_mu so the retry parks instead of filling.
+                std.Thread.yield() catch {};
+            }
             spins += 1;
             try std.testing.expect(spins < 1_000_000);
-            std.Thread.yield() catch {};
         }
         file.mu.lockUncancelable(st.io);
         file.writes +%= 1;
         file.mu.unlock(st.io);
         file.content_mu.unlock(st.io);
         holding_content = false;
-        spins = 0;
-        while (true) {
-            file.mu.lockUncancelable(st.io);
-            const claimed = file.filling.contains(0);
-            file.mu.unlock(st.io);
-            if (!claimed) break;
-            spins += 1;
-            try std.testing.expect(spins < 1_000_000);
-            std.Thread.yield() catch {};
-        }
-        discards += 1;
-        if (discards < 2) {
+        gen += 1;
+        if (gen < 2) {
             file.content_mu.lockUncancelable(st.io);
             holding_content = true;
         }
     }
+    // rc is only settled once the hydrator returns; reading it while that
+    // thread still runs reports the initial 0 as a passing fill.
+    hydrator.join();
+    joined = true;
     try std.testing.expectEqual(@as(i32, -sys.c.EIO), rc);
     try std.testing.expect(!st.store.hasPiece(file, 0, sys.monoSec(st.io)));
 }
