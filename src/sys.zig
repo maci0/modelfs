@@ -215,27 +215,6 @@ pub fn closeWrite(fd: c_int) i32 {
     return if (e == 0) -1 else -e;
 }
 
-/// Refuse core dumps for this process. The cluster PSK lives in daemon
-/// memory for the mount lifetime; a crash would otherwise write it
-/// wherever kernel.core_pattern points (often a world-readable file).
-/// Both soft and hard limits go to zero so a later setrlimit in this
-/// process cannot raise them without CAP_SYS_RESOURCE. Failure is
-/// returned so mount can refuse to keep the secret in a dumpable process.
-pub fn disableCoreDumps() !void {
-    std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch |err| {
-        std.log.err("cannot disable core dumps ({t}); a crash may write the cluster PSK", .{err});
-        return err;
-    };
-}
-
-/// Drops MODELFS_PSK_VALUE from the process environment so the
-/// auto_unmount fusermount helper (spawned from fuse_main) and
-/// /proc/<pid>/environ cannot inherit the inline secret. The daemon
-/// already holds its own copy from loadPsk.
-pub fn scrubPskEnv() void {
-    _ = c.unsetenv("MODELFS_PSK_VALUE");
-}
-
 /// `stat.st_size` is signed off_t. NFS fattr is u64, so a size of 2^63 or
 /// more shows up negative here; `@intCast` into piece/cache math panics in
 /// safe builds and wraps to a multi-exabyte length in ReleaseFast.
@@ -871,20 +850,6 @@ test "parentOf" {
 fn fdIsCloexec(fd: c_int) bool {
     const flags = c.fcntl(fd, c.F_GETFD, @as(c_int, 0));
     return flags >= 0 and (flags & c.FD_CLOEXEC) != 0;
-}
-
-test "disableCoreDumps zeros RLIMIT_CORE" {
-    try disableCoreDumps();
-    const lim = std.posix.getrlimit(.CORE) catch return error.SkipZigTest;
-    try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.cur);
-    try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.max);
-}
-
-test "scrubPskEnv removes MODELFS_PSK_VALUE" {
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv("MODELFS_PSK_VALUE", "inline-secret", 1));
-    try std.testing.expect(c.getenv("MODELFS_PSK_VALUE") != null);
-    scrubPskEnv();
-    try std.testing.expect(c.getenv("MODELFS_PSK_VALUE") == null);
 }
 
 test "open, socket, and accept are close-on-exec" {

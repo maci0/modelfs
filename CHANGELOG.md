@@ -66,6 +66,7 @@ stay in the entries below.
 
 ### Changes
 
+- **Daemon composition teardown lives on `State`**: mount shutdown used to live in `main.zig` next to CLI parsing, and tests deinit'ed the cache and catalog by hand (one even constructed `State` field-by-field and poked `Server.store`). `State.deinit` is the pair of `State.init`: it stops workers, drains inflight peer handlers, and releases the store and catalog. The libfuse session entry (`fuse_fs.run`) sits next to `ops()`, so the CLI no longer speaks libfuse types. Mount-time `disableCoreDumps` / `scrubPskEnv` moved out of `sys.zig` (syscall wrappers, no policy beyond EINTR retry) into `cmdMount`.
 - **Operator docs match intake and PSK setup:** README no longer claims GitHub private vulnerability reporting is live (SECURITY.md is the intake; that feature is off). The PSK quickstart generates once and copies the same file; regenerating per node would desync the fleet. `sys.zig` is the syscall layer (CLOEXEC, owner-only writes, core-dump disable, PSK env scrub), not "no policy beyond EINTR retry". `MODELFS_ID` is mount-only like `--id`; `modelfs pin`/`unpin` both refuse `.cluster`; `modelfs status` as another uid is EACCES, not "not running".
 
 - **A FUSE read no longer hangs when local writes keep discarding piece fills**: `hydratePiece` retried unbounded after `completeFill` dropped a claim whose write generation had moved, so a file being overwritten stalled the FUSE worker. One origin retry is recovery; a second discard returns EIO so the client retries instead of hanging or serving hole zeros.

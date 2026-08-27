@@ -2246,7 +2246,7 @@ const TestServer = struct {
         for (self.server.listen_fds.items) |fd| _ = c.shutdown(fd, c.SHUT_RDWR);
         if (self.accept_thread) |t| t.join();
         // Drain detached connection handlers before freeing what they
-        // reference (the same order as teardownMount): a handler still
+        // reference (the same order as State.deinit): a handler still
         // inside serveData/serveHave would otherwise touch State, Store,
         // and Server through the TestServer struct the destroy below
         // frees. Bounded so a wedged handler cannot hang the runner.

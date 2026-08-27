@@ -111,8 +111,8 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 | `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names |
 | `discover.zig` | Cluster leases (`walkLeases`, Catalog), `/have` probe cache, path scoring |
 | `peer.zig` | Peer HTTP server and fetch client |
-| `fuse_fs.zig` | FUSE handlers, daemon `State`, discovery/cull loops |
-| `main.zig` | CLI and mount wiring into `State.init` |
+| `fuse_fs.zig` | FUSE handlers, daemon `State` (`init`/`spawnWorkers`/`deinit`/`run`), discovery/cull loops |
+| `main.zig` | CLI and mount wiring into `State.init` / `State.deinit` |
 | `root.zig` | Test aggregator for `zig build test` |
 
 `main` → `fuse_fs` → `peer` → (`store`, `discover`) → (`piece`, `proto`, `cull`, `sys`) → `c`.

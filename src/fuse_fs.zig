@@ -1,5 +1,6 @@
 //! libfuse operation handlers: path resolution policy, read hydration,
-//! write-through cache fill, and the background discovery/cull loops.
+//! write-through cache fill, daemon `State` lifecycle, and the background
+//! discovery/cull loops.
 const std = @import("std");
 const fuse = sys.c;
 const piece = @import("piece.zig");
@@ -30,7 +31,8 @@ pub const State = struct {
     /// One constructor for the daemon composition: cache, membership, and
     /// peer HTTP share this object, and Server.store must alias the Store
     /// field rather than a copy. Callers (mount wiring, tests) never poke
-    /// that pointer themselves.
+    /// that pointer themselves. Pair with `deinit`; heap callers then
+    /// `gpa.destroy` only when no peer handler is still inflight.
     pub fn init(
         self: *State,
         gpa: std.mem.Allocator,
@@ -66,7 +68,7 @@ pub const State = struct {
     pub fn spawnWorkers(self: *State) void {
         // Reserve before spawning: an append failure after a spawn used to
         // detach that worker beyond the workers-list joins, letting it run
-        // unsupervised against State after teardown's drain gave up waiting.
+        // unsupervised against State after deinit's drain gave up waiting.
         self.workers.ensureTotalCapacity(self.gpa, 3) catch {
             std.log.err("cannot allocate worker registry; peer http, discovery, and culling disabled", .{});
             return;
@@ -85,6 +87,40 @@ pub const State = struct {
         // Capacity was reserved for every worker up front, so this cannot
         // fail and strand a spawned thread detached from shutdown joins.
         self.workers.appendAssumeCapacity(t);
+    }
+
+    /// Single shutdown path: signal workers, stop accepting, join background
+    /// loops, drain in-flight connection handlers, and only then release
+    /// what they reference. A leftover detach-then-sleep teardown used to
+    /// free State while a detached thread was still inside it. When a
+    /// handler outlives the drain, store and catalog stay allocated (the
+    /// same stuck-handler policy as Store.deinit) and the caller must not
+    /// free `self`.
+    pub fn deinit(self: *State) void {
+        self.running.store(false, .release);
+        self.server.stop();
+        // Joining the HTTP thread retires its accept loops: past this point
+        // no new connection handler can start, so the drain below cannot
+        // race a fresh accept. Handlers get 30s socket timeouts; allow a
+        // little more.
+        for (self.workers.items) |t| t.join();
+        self.workers.deinit(self.gpa);
+        var waited: u32 = 0;
+        while (self.server.http_inflight.load(.monotonic) != 0 and waited < 400) : (waited += 1) {
+            sys.sleepMs(self.io, 100);
+        }
+        if (self.server.http_inflight.load(.monotonic) != 0) {
+            // A detached handler outlived the drain (stalled peer sink
+            // resets its 30s send timeout on every chunk; an NFS-hung
+            // originPread never returns). Freeing State here hands that
+            // thread freed memory the moment its current syscall unwinds.
+            // Leak the whole tree instead, mirroring Store.deinit's
+            // stuck-handler policy; process exit reclaims it.
+            std.log.warn("shutdown: peer handler still inflight after drain; leaking mount state", .{});
+            return;
+        }
+        self.store.deinit();
+        self.catalog.deinit();
     }
 };
 
@@ -1344,6 +1380,25 @@ pub fn ops() fuse.fuse_operations {
     return o;
 }
 
+/// Enters the libfuse session with `st` as private_data. Returns libfuse's
+/// status code; the caller then `deinit`s the same State. Lives here so
+/// the CLI does not speak libfuse types.
+pub fn run(argv: []const [*c]u8, st: *State) c_int {
+    var o = ops();
+    const argc: c_int = @intCast(argv.len);
+    const cargv: [*c][*c]u8 = @ptrCast(@constCast(argv.ptr));
+    if (@hasDecl(fuse, "fuse_main_real_versioned")) {
+        var ver = fuse.libfuse_version{
+            .major = fuse.FUSE_MAJOR_VERSION,
+            .minor = fuse.FUSE_MINOR_VERSION,
+            .hotfix = fuse.FUSE_HOTFIX_VERSION,
+            .padding = 0,
+        };
+        return fuse.fuse_main_real_versioned(argc, cargv, &o, @sizeOf(fuse.fuse_operations), &ver, st);
+    }
+    return fuse.fuse_main_real(argc, cargv, &o, @sizeOf(fuse.fuse_operations), st);
+}
+
 test "fuse operations wire every supported handler" {
     const o = ops();
     // A null entry makes libfuse answer that operation with a default
@@ -1386,8 +1441,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
 
     var st: State = undefined;
     st.init(gpa, std.testing.io, "/unused", cache_d, 4096, .{}, "me", &.{}, &.{}, &.{}, "", true);
-    defer st.store.deinit();
-    defer st.catalog.deinit();
+    defer st.deinit();
     try std.testing.expectEqual(&st.store, st.server.store);
     // Two paths sharing one peer id plus one distinct peer: the published
     // count must be unique peers (2), not raw paths (3).
@@ -1484,18 +1538,9 @@ test "statusJson unlinks the staging file when rename fails" {
     const cache_d = try sys.scratchDir(&cb, "modelfs-status-tmp");
     defer sys.deleteTree(std.testing.io, cache_d);
 
-    var st = State{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .store = store_mod.Store.init(gpa, std.testing.io, "/unused", cache_d, 4096),
-        .catalog = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{}),
-        .server = undefined,
-        .direct_io = true,
-        .start_secs = sys.monoSec(std.testing.io),
-    };
-    st.server = .{ .gpa = gpa, .io = std.testing.io, .psk = "", .store = &st.store };
-    defer st.store.deinit();
-    defer st.catalog.deinit();
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, "/unused", cache_d, 4096, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
 
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const fp = try st.store.cacheStatusPath(&pbuf);
@@ -1530,8 +1575,7 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
 
     var st: State = undefined;
     st.init(gpa, std.testing.io, "/unused", cache_d, 4096, .{}, "me", &.{}, &.{}, &.{}, "", true);
-    defer st.store.deinit();
-    defer st.catalog.deinit();
+    defer st.deinit();
 
     var prev = st.store.stats.snap();
 
@@ -1578,8 +1622,7 @@ test "hydratePiece fails closed when write generation keeps discarding fills" {
 
     var st: State = undefined;
     st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
-    defer st.store.deinit();
-    defer st.catalog.deinit();
+    defer st.deinit();
     try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
 
     var tb: [192]u8 = undefined;

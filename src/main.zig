@@ -1,5 +1,5 @@
 //! CLI entry point: argument parsing, command dispatch (mount/status/peers/
-//! pin/unpin), and mount wiring into the FUSE loop plus background workers.
+//! pin/unpin), and mount wiring into State.init / fuse_fs.run.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -28,7 +28,6 @@ fn logFilter(
     std.log.defaultLog(level, scope, format, args);
 }
 
-const fuse = sys.c;
 const piece = @import("piece.zig");
 const proto = @import("proto.zig");
 const sys = @import("sys.zig");
@@ -1088,11 +1087,11 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     // The secret is in memory from here: refuse cores so a crash cannot
     // spill it, and drop MODELFS_PSK_VALUE so fuse_main's auto_unmount
     // helper cannot inherit it through the environment block.
-    sys.disableCoreDumps() catch {
+    disableCoreDumps() catch {
         std.log.err("cannot disable core dumps; refusing to start with the PSK in a dumpable process", .{});
         return 1;
     };
-    sys.scrubPskEnv();
+    scrubPskEnv();
 
     var id_buf: [256]u8 = undefined;
     const id = try gpa.dupe(u8, opts.id orelse discover.hostname(&id_buf));
@@ -1186,8 +1185,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         opts.water.bstop,                           opts.allow_other,
     });
 
-    var ops = fuse_fs.ops();
-    const rc = fuseMain(cargv.items, &ops, st);
+    const rc = fuse_fs.run(cargv.items, st);
     teardownMount(st);
     // Lifecycle closure next to the startup "mount" line: when this node
     // later shows up with an expired lease in `modelfs peers`, the journal
@@ -1198,50 +1196,37 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     return @intCast(if (rc < 0) 1 else rc);
 }
 
-/// Single shutdown path for the mount: signal workers, stop accepting, join
-/// background loops, drain in-flight connection handlers, and only then
-/// release what they reference. The previous detach-then-sleep teardown could
-/// free State while a detached thread was still inside it.
+/// Heap-State counterpart of `State.deinit`: the mount path allocates
+/// State with gpa.create, so teardown has to destroy it too, unless a
+/// stuck peer handler still holds the object (deinit already leaked the
+/// tree in that case).
 fn teardownMount(st: *fuse_fs.State) void {
-    st.running.store(false, .release);
-    st.server.stop();
-    // Joining the HTTP thread retires its accept loops: past this point no
-    // new connection handler can start, so the drain below cannot race a
-    // fresh accept. Handlers get 30s socket timeouts; allow a little more.
-    for (st.workers.items) |t| t.join();
-    st.workers.deinit(st.gpa);
-    var waited: u32 = 0;
-    while (st.server.http_inflight.load(.monotonic) != 0 and waited < 400) : (waited += 1) {
-        sys.sleepMs(st.io, 100);
-    }
-    if (st.server.http_inflight.load(.monotonic) != 0) {
-        // A detached handler outlived the drain (stalled peer sink resets
-        // its 30s send timeout on every chunk; an NFS-hung originPread never
-        // returns). Freeing State here hands that thread freed memory the
-        // moment its current syscall unwinds. Leak the whole tree instead,
-        // mirroring Store.deinit's stuck-handler policy; process exit
-        // reclaims it.
-        std.log.warn("shutdown: peer handler still inflight after drain; leaking mount state", .{});
-        return;
-    }
-    st.store.deinit();
-    st.catalog.deinit();
+    st.deinit();
+    if (st.server.http_inflight.load(.monotonic) != 0) return;
     st.gpa.destroy(st);
 }
 
-fn fuseMain(argv: []const [*c]u8, ops: *const fuse.fuse_operations, st: *fuse_fs.State) c_int {
-    const argc: c_int = @intCast(argv.len);
-    const cargv: [*c][*c]u8 = @ptrCast(@constCast(argv.ptr));
-    if (@hasDecl(fuse, "fuse_main_real_versioned")) {
-        var ver = fuse.libfuse_version{
-            .major = fuse.FUSE_MAJOR_VERSION,
-            .minor = fuse.FUSE_MINOR_VERSION,
-            .hotfix = fuse.FUSE_HOTFIX_VERSION,
-            .padding = 0,
-        };
-        return fuse.fuse_main_real_versioned(argc, cargv, ops, @sizeOf(fuse.fuse_operations), &ver, st);
-    }
-    return fuse.fuse_main_real(argc, cargv, ops, @sizeOf(fuse.fuse_operations), st);
+/// Refuse core dumps for this process. The cluster PSK lives in daemon
+/// memory for the mount lifetime; a crash would otherwise write it
+/// wherever kernel.core_pattern points (often a world-readable file).
+/// Both soft and hard limits go to zero so a later setrlimit in this
+/// process cannot raise them without CAP_SYS_RESOURCE. Failure is
+/// returned so mount can refuse to keep the secret in a dumpable process.
+/// Lives here (mount-time process policy), not in sys.zig (syscall
+/// wrappers with no policy beyond EINTR retry).
+fn disableCoreDumps() !void {
+    std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch |err| {
+        std.log.err("cannot disable core dumps ({t}); a crash may write the cluster PSK", .{err});
+        return err;
+    };
+}
+
+/// Drops MODELFS_PSK_VALUE from the process environment so the
+/// auto_unmount fusermount helper (spawned from fuse_main) and
+/// /proc/<pid>/environ cannot inherit the inline secret. The daemon
+/// already holds its own copy from loadPsk.
+fn scrubPskEnv() void {
+    _ = sys.c.unsetenv("MODELFS_PSK_VALUE");
 }
 
 /// True when the process named by pid still exists. kill(pid, 0) signals
@@ -3006,6 +2991,20 @@ test "loadPsk refuses line breaks but rides every other byte header-safe" {
         defer gpa.free(psk);
         try std.testing.expectEqualStrings("ke\xc3\xa9y \ttw\xfeice", psk);
     }
+}
+
+test "disableCoreDumps zeros RLIMIT_CORE" {
+    try disableCoreDumps();
+    const lim = std.posix.getrlimit(.CORE) catch return error.SkipZigTest;
+    try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.cur);
+    try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.max);
+}
+
+test "scrubPskEnv removes MODELFS_PSK_VALUE" {
+    try std.testing.expectEqual(@as(c_int, 0), sys.c.setenv("MODELFS_PSK_VALUE", "inline-secret", 1));
+    try std.testing.expect(sys.c.getenv("MODELFS_PSK_VALUE") != null);
+    scrubPskEnv();
+    try std.testing.expect(sys.c.getenv("MODELFS_PSK_VALUE") == null);
 }
 
 test "buildSeeds passes numeric ips through and resolves names" {
