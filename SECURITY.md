@@ -14,9 +14,13 @@ from a fixed revision.
 
 ## Reporting a vulnerability
 
-Use GitHub's private vulnerability reporting for this repository (Security tab,
-"Report a vulnerability"). Do not open a public issue for anything you suspect
-is exploitable.
+Do not open a public issue for anything you suspect is exploitable.
+
+The intended intake is GitHub private vulnerability reporting (Security tab,
+"Report a vulnerability"), which feeds the advisory-thread path under
+"What happens next". That feature is not enabled on this repository, so
+there is no private inbox until a repository admin turns it on. There is
+no other disclosed contact.
 
 Please include what you can of:
 
