@@ -480,11 +480,13 @@ pub const Catalog = struct {
             const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
             var lease_buf: [4096]u8 = undefined;
             // ENOENT is the normal race against expiry cleanup and stays
-            // unnamed; any other open failure (EACCES, ELOOP) persists across
-            // ticks and, left silent, reads exactly like a dead cluster -- so
-            // it is named like the read failures below.
+            // unnamed; any other open failure (EACCES, ELOOP from a planted
+            // symlink) persists across ticks and, left silent, reads exactly
+            // like a dead cluster -- so it is named like the read failures
+            // below. O_NOFOLLOW: a co-tenant who can plant a .json name must
+            // not redirect this read onto a crafted lease outside .cluster.
             var open_errno: i32 = 0;
-            const blob = sys.readFileBufOpenErrno(&lease_buf, fp, &open_errno) catch |err| switch (err) {
+            const blob = sys.readFileBufNoFollowOpenErrno(&lease_buf, fp, &open_errno) catch |err| switch (err) {
                 error.OpenFailed => {
                     if (open_errno != c.ENOENT)
                         std.log.warn("lease open failed for {s} (errno {d})", .{ displayName(name), open_errno });
@@ -1487,6 +1489,47 @@ test "refresh skips unreadable and corrupt leases without dropping healthy peers
 
     // Expected-path warns for both broken entries; restored on scope exit so
     // unexpected warnings from later tests still surface.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+    cat.refresh(sys.nowSec(std.testing.io));
+
+    const snap = try cat.snapshot(gpa);
+    defer Catalog.freeSnapshot(gpa, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("spark9", snap[0].peer_id);
+}
+
+test "refresh skips a planted lease symlink instead of ingesting its target" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-leasesym");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    var sbuf: [192]u8 = undefined;
+    // A valid lease sitting beside the planted name: following would ingest
+    // it as a peer. Basename target so a following open would resolve;
+    // O_NOFOLLOW must skip the link. Non-.json so refresh does not also
+    // pick the target up as its own lease file.
+    const live = "{\"id\":\"evil\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.9.9.9\",\"port\":18080,\"mbps\":0}]}";
+    const outside_fp = try std.fmt.bufPrint(&pbuf, "{s}/outside.lease", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, outside_fp), live));
+    const planted_fp = try std.fmt.bufPrint(&pbuf, "{s}/evil.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), c.symlink("outside.lease", try sys.toZ(&sbuf, planted_fp)));
+
+    const healthy_fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
+    const healthy = "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.1\",\"port\":18080,\"mbps\":0}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, healthy_fp), healthy));
+
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+
     const prev_log_level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;

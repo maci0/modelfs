@@ -1188,7 +1188,7 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         return 1;
     };
     var open_errno: i32 = 0;
-    const blob = sys.readFileAllocOpenErrno(gpa, p, 4096, &open_errno) catch |err| {
+    const blob = sys.readFileAllocNoFollowOpenErrno(gpa, p, 4096, &open_errno) catch |err| {
         // An artifact that exists but cannot be opened (EACCES for a status
         // query from another user, ELOOP on a planted link) must not read as
         // "not running (no ...)": a daemon may be live and refreshing exactly
@@ -1291,7 +1291,7 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             var fbuf: [sys.c.PATH_MAX]u8 = undefined;
             const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
             var open_errno: i32 = 0;
-            const blob = sys.readFileAllocOpenErrno(gpa, fp, 64 * 1024, &open_errno) catch |err| {
+            const blob = sys.readFileAllocNoFollowOpenErrno(gpa, fp, 64 * 1024, &open_errno) catch |err| {
                 // ENOENT is the normal race against expiry cleanup; any other
                 // failure persists across invocations and is named, matching
                 // the corrupt-lease warn below and Catalog.refresh's policy.
@@ -1834,6 +1834,21 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
         try std.testing.expectEqual(@as(i32, 0), sys.c.symlink(try sys.toZ(&zbuf, fp), try sys.toZ(&sbuf, fp)));
         try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
     }
+
+    // A planted link to a live-looking document elsewhere must not be
+    // served as this cache's status: O_NOFOLLOW fails the open (ELOOP)
+    // instead of following and printing the target.
+    {
+        var live_path_buf: [192]u8 = undefined;
+        var sbuf: [192]u8 = undefined;
+        const other = try std.fmt.bufPrint(&live_path_buf, "{s}/other.json", .{cache_d});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, other), live_doc));
+        try std.testing.expectEqual(@as(i32, 0), sys.c.unlink(try sys.toZ(&zbuf, fp)));
+        // Basename target so a following open would serve other.json as
+        // this cache's status; O_NOFOLLOW must fail the open instead.
+        try std.testing.expectEqual(@as(i32, 0), sys.c.symlink("other.json", try sys.toZ(&sbuf, fp)));
+        try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+    }
 }
 
 test "pathIsDir separates directories from files and absent paths" {
@@ -1926,6 +1941,33 @@ test "cmdPeers skips an unleasable lease entry instead of failing the listing" {
     defer captured_stdout = null;
     try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
     try std.testing.expectEqualStrings("old (until=1, expired)\nspark9 (until=4102444800, live)\n", out.items);
+}
+
+test "cmdPeers skips a planted lease symlink instead of ingesting its target" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&cb, "modelfs-peers-leasesym");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    var zbuf: [192]u8 = undefined;
+    var sbuf: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const live = "{\"id\":\"evil\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.9.9.9\",\"port\":18080,\"mbps\":0}]}";
+    const outside_fp = try std.fmt.bufPrint(&pbuf, "{s}/outside.lease", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, outside_fp), live));
+    const planted_fp = try std.fmt.bufPrint(&pbuf, "{s}/evil.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.c.symlink("outside.lease", try sys.toZ(&sbuf, planted_fp)));
+    const healthy_fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, healthy_fp), "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[]}"));
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
 }
 
 test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {

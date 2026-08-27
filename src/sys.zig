@@ -356,8 +356,23 @@ pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![
 /// readFileAlloc plus the failing open's errno written through open_errno_out
 /// (when non-null), so callers can separate ENOENT from EACCES-style
 /// conditions instead of reporting one generic cause for every open failure.
+/// Follows a final symlink: for operator-specified paths (the PSK file) that
+/// are commonly a link into a secrets volume. Daemon-owned artifacts in
+/// trees someone else can plant names in use the NoFollow form.
 pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32) ![]u8 {
-    const fd = open(path, c.O_RDONLY, 0);
+    return readFileAllocFlags(gpa, path, max, 0, open_errno_out);
+}
+
+/// readFileAllocOpenErrno for daemon-owned artifacts (cache sidecars,
+/// status.json, origin leases). O_NOFOLLOW: a planted symlink must not turn
+/// the read into an arbitrary file as the daemon user, or load a crafted
+/// sidecar/lease from outside the tree.
+pub fn readFileAllocNoFollowOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32) ![]u8 {
+    return readFileAllocFlags(gpa, path, max, c.O_NOFOLLOW, open_errno_out);
+}
+
+fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, extra_flags: c_int, open_errno_out: ?*i32) ![]u8 {
+    const fd = open(path, c.O_RDONLY | extra_flags, 0);
     if (fd < 0) {
         if (open_errno_out) |out| out.* = errno();
         return error.OpenFailed;
@@ -365,6 +380,9 @@ pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: 
     defer close(fd);
     var st: c.struct_stat = undefined;
     if (fstat(fd, &st) != 0) return error.StatFailed;
+    // st_size is signed; a negative value would panic the usize cast in
+    // safe builds instead of failing this one read.
+    if (st.st_size < 0) return error.StatFailed;
     const size: usize = @intCast(st.st_size);
     if (size > max) return error.FileTooBig;
     const buf = try gpa.alloc(u8, size);
@@ -388,8 +406,19 @@ pub fn readFileBuf(buf: []u8, path: [*:0]const u8) ![]u8 {
 /// readFileBuf plus the failing open's errno written through open_errno_out
 /// (when non-null), so callers can stay silent for the expected ENOENT race
 /// while naming every other open failure, like readFileAllocOpenErrno does.
+/// Follows a final symlink; daemon-owned artifacts use the NoFollow form.
 pub fn readFileBufOpenErrno(buf: []u8, path: [*:0]const u8, open_errno_out: ?*i32) ![]u8 {
-    const fd = open(path, c.O_RDONLY, 0);
+    return readFileBufFlags(buf, path, 0, open_errno_out);
+}
+
+/// readFileBufOpenErrno with O_NOFOLLOW: origin lease files live on shared
+/// NFS where a co-tenant can plant a symlink at a .json name.
+pub fn readFileBufNoFollowOpenErrno(buf: []u8, path: [*:0]const u8, open_errno_out: ?*i32) ![]u8 {
+    return readFileBufFlags(buf, path, c.O_NOFOLLOW, open_errno_out);
+}
+
+fn readFileBufFlags(buf: []u8, path: [*:0]const u8, extra_flags: c_int, open_errno_out: ?*i32) ![]u8 {
+    const fd = open(path, c.O_RDONLY | extra_flags, 0);
     if (fd < 0) {
         if (open_errno_out) |out| out.* = errno();
         return error.OpenFailed;
@@ -712,4 +741,41 @@ test "sendfileAll zero copy" {
     const read_n = c.read(fds[0], &buf, buf.len);
     try std.testing.expectEqual(@as(isize, @intCast(data.len)), read_n);
     try std.testing.expectEqualStrings(data, buf[0..@intCast(read_n)]);
+}
+
+test "readFile NoFollow refuses a planted symlink that the following form would ingest" {
+    const gpa = std.testing.allocator;
+    var db: [128]u8 = undefined;
+    const scratch = try scratchDir(&db, "modelfs-read-nofollow");
+    defer deleteTree(std.testing.io, scratch);
+
+    var zb: [192]u8 = undefined;
+    var tb: [192]u8 = undefined;
+    var lb: [192]u8 = undefined;
+    const target = try std.fmt.bufPrint(&tb, "{s}/secret.txt", .{scratch});
+    const link = try std.fmt.bufPrint(&lb, "{s}/planted.txt", .{scratch});
+    const target_z = try toZ(&zb, target);
+    try std.testing.expectEqual(@as(i32, 0), writeFile(target_z, "s3cret"));
+    var lz: [192]u8 = undefined;
+    // Basename target: both names sit in scratch, and a cwd-relative
+    // target would not resolve from the link's directory.
+    try std.testing.expectEqual(@as(i32, 0), c.symlink("secret.txt", try toZ(&lz, link)));
+
+    // The following form is for operator-specified paths (PSK): it must
+    // still reach the target, so a secrets-volume symlink keeps working.
+    const followed = try readFileAlloc(gpa, try toZ(&lz, link), 64);
+    defer gpa.free(followed);
+    try std.testing.expectEqualStrings("s3cret", followed);
+
+    // The artifact form must fail closed: ELOOP, never the target's bytes.
+    var open_errno: i32 = 0;
+    try std.testing.expectError(error.OpenFailed, readFileAllocNoFollowOpenErrno(gpa, try toZ(&lz, link), 64, &open_errno));
+    try std.testing.expectEqual(@as(i32, c.ELOOP), open_errno);
+
+    var rbuf: [16]u8 = undefined;
+    var buf_errno: i32 = 0;
+    try std.testing.expectError(error.OpenFailed, readFileBufNoFollowOpenErrno(&rbuf, try toZ(&lz, link), &buf_errno));
+    try std.testing.expectEqual(@as(i32, c.ELOOP), buf_errno);
+    // The planted target keeps its bytes.
+    try std.testing.expectEqualStrings("s3cret", try readFileBuf(&rbuf, target_z));
 }

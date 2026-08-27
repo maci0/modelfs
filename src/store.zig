@@ -483,7 +483,7 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = try self.cacheMetaPath(&buf, rel);
         var open_errno: i32 = 0;
-        const blob = sys.readFileAllocOpenErrno(self.gpa, p, 8 * 1024 * 1024, &open_errno) catch |err| switch (err) {
+        const blob = sys.readFileAllocNoFollowOpenErrno(self.gpa, p, 8 * 1024 * 1024, &open_errno) catch |err| switch (err) {
             // Missing sidecar is every file's first touch: start empty.
             error.OpenFailed => {
                 if (open_errno != c.ENOENT)
@@ -4080,6 +4080,46 @@ test "openCache creates owner-only data files and tightens leftovers" {
     try std.testing.expect(st.openCache(f) >= 0);
     try std.testing.expectEqual(@as(i32, 0), sys.statPath(path, &stbuf));
     try std.testing.expectEqual(@as(c.mode_t, 0o600), stbuf.st_mode & 0o777);
+}
+
+test "loadBits refuses a symlink planted at the sidecar path" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-metasym");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-metasym");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // A filled sidecar next to the artifact name: following a planted
+    // link would mark piece 0 filled over hole zeros. O_NOFOLLOW must
+    // treat the link as unreadable and start empty. Basename target so
+    // a following open would resolve (cwd-relative targets would not).
+    var bits = try piece.Bitfield.init(gpa, piece.count(16, 16));
+    defer bits.deinit(gpa);
+    bits.set(0);
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(gpa);
+    try bits.encode(16, 16, &blob, gpa);
+    var tb: [sys.c.PATH_MAX]u8 = undefined;
+    const target = try st.cacheMetaPath(&tb, "outside.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(target, blob.items));
+
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, "sym.bin");
+    try std.testing.expectEqual(@as(i32, 0), c.symlink("outside.bin.pieces", mp));
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    const f = try st.get("sym.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expect(!f.bits.get(0));
 }
 
 test "origin access refuses a symlink planted at the model path" {
