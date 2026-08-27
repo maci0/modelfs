@@ -1,7 +1,7 @@
 //! libfuse operation handlers: path resolution policy, read hydration,
 //! write-through cache fill, and the background discovery/cull loops.
 const std = @import("std");
-const fuse = @import("c.zig").c;
+const fuse = sys.c;
 const piece = @import("piece.zig");
 const sys = @import("sys.zig");
 const store_mod = @import("store.zig");

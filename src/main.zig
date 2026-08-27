@@ -28,7 +28,7 @@ fn logFilter(
     std.log.defaultLog(level, scope, format, args);
 }
 
-const fuse = @import("c.zig").c;
+const fuse = sys.c;
 const piece = @import("piece.zig");
 const proto = @import("proto.zig");
 const sys = @import("sys.zig");
