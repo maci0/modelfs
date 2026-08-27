@@ -366,6 +366,18 @@ test "bearer compare is length-independent" {
     try std.testing.expect(!bearerOk("Bearer secre", "secret"));
     try std.testing.expect(!bearerOk("Bearer secretx", "secret"));
     try std.testing.expect(!bearerOk("secret", "secret"));
+    // Scheme match is case-insensitive (RFC 9110 auth-scheme); a peer that
+    // sent "bearer" must still authenticate. The token itself is not folded.
+    try std.testing.expect(bearerOk("bearer secret", "secret"));
+    try std.testing.expect(bearerOk("BEARER secret", "secret"));
+    try std.testing.expect(!bearerOk("Bearer Secret", "secret"));
+    try std.testing.expect(!bearerOk("Basic secret", "secret"));
+    // headerGet trims the header value, but interior padding after the
+    // scheme still reaches here; surrounding space/tab on the token is trim.
+    try std.testing.expect(bearerOk("Bearer  secret", "secret"));
+    try std.testing.expect(bearerOk("Bearer secret\t", "secret"));
+    try std.testing.expect(!bearerOk("Bearer ", "secret"));
+    try std.testing.expect(!bearerOk("", "secret"));
 }
 
 test "lease json roundtrip" {

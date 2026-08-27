@@ -1047,7 +1047,13 @@ test "shouldAdvertise skips loopback and link-local" {
     try std.testing.expect(shouldAdvertise("10.0.1.1"));
     try std.testing.expect(shouldAdvertise("192.168.0.211"));
     try std.testing.expect(!shouldAdvertise("127.0.0.1"));
+    try std.testing.expect(!shouldAdvertise("127.0.0.2"));
     try std.testing.expect(!shouldAdvertise("169.254.1.1"));
+    try std.testing.expect(!shouldAdvertise("169.254.0.1"));
+    // parseV4 miss: a hostname or truncated quad must not be published.
+    try std.testing.expect(!shouldAdvertise("spark1"));
+    try std.testing.expect(!shouldAdvertise("10.0.1"));
+    try std.testing.expect(!shouldAdvertise(""));
 }
 
 test "parseV4 validation" {
@@ -1204,7 +1210,12 @@ test "pathTieLess orders by ip then port" {
 
 test "same /24 is zero hops" {
     try std.testing.expectEqual(@as(u32, 0), hopsBetween("192.168.100.1", "192.168.100.2"));
+    try std.testing.expectEqual(@as(u32, 0), hopsBetween("192.168.100.1", "192.168.100.1"));
     try std.testing.expectEqual(@as(u32, 1), hopsBetween("192.168.100.1", "192.168.0.11"));
+    // Unparseable addresses are treated as routed, never as a same-subnet
+    // shortcut that would make a garbage lease look like L2.
+    try std.testing.expectEqual(@as(u32, 1), hopsBetween("not-an-ip", "192.168.100.1"));
+    try std.testing.expectEqual(@as(u32, 1), hopsBetween("192.168.100.1", "256.0.0.1"));
 }
 
 test "shortName strips domain" {

@@ -62,7 +62,16 @@ fi
 
 echo "=== Test Case 3: Peer Discovery Listing ==="
 # Lists leases from origin/.cluster; expired ones are marked, not served.
-"${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}" > /dev/null
-echo "✓ Peer discovery command succeeded"
+mkdir -p "${ORIGIN_DIR}/.cluster"
+printf '%s\n' '{"id":"spark9","until":4102444800,"addrs":[]}' > "${ORIGIN_DIR}/.cluster/spark9.json"
+printf '%s\n' '{"id":"old","until":1,"addrs":[]}' > "${ORIGIN_DIR}/.cluster/old.json"
+PEERS_OUT="$("${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}")"
+if grep -q 'spark9 (until=4102444800, live)' <<< "${PEERS_OUT}" \
+    && grep -q 'old (until=1, expired)' <<< "${PEERS_OUT}"; then
+    echo "✓ Peer listing shows live and expired leases"
+else
+    echo "Error: unexpected peers output: ${PEERS_OUT}"
+    exit 1
+fi
 
 echo "=== All E2E Integration Tests Passed Successfully ==="

@@ -1383,8 +1383,12 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
 
     // Idle tick: no movement since the snapshot, no log line. The summary
     // must stay quiet on an idle node or it is exactly the noise it exists
-    // to prevent.
+    // to prevent. A stale prev that is *ahead* of current would also yield
+    // a zero saturating delta; the snapshot still has to catch up or a
+    // later real increment is swallowed as 0 forever.
+    prev.fills_origin = 99;
     logStatsTick(&st, &prev);
+    try std.testing.expectEqual(@as(u64, 0), prev.fills_origin);
     try std.testing.expect(std.meta.eql(prev, st.store.stats.snap()));
 
     // Activity since the last tick: the delta line carries per-interval
@@ -1398,4 +1402,5 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
     defer std.testing.log_level = prev_log_level;
     logStatsTick(&st, &prev);
     try std.testing.expectEqual(@as(u64, 1), prev.fills_origin);
+    try std.testing.expectEqual(@as(u64, 4096), prev.bytes_from_origin);
 }

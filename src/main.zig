@@ -189,11 +189,18 @@ pub fn main(init: std.process.Init) !u8 {
 /// consumer is gone either way.
 fn writeOut(io: std.Io, bytes: []const u8) void {
     // Under test, stdout is the runner's IPC channel (--listen=-): raw data
-    // written there corrupts the protocol and wedges the run. Every other
-    // user-facing print in this file carries the same guard.
-    if (builtin.is_test) return;
+    // written there corrupts the protocol and wedges the run. A test that
+    // needs the operator-facing bytes installs a buffer on captured_stdout.
+    if (builtin.is_test) {
+        if (captured_stdout) |buf| {
+            buf.appendSlice(std.testing.allocator, bytes) catch {};
+        }
+        return;
+    }
     std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
 }
+
+var captured_stdout: ?*std.ArrayList(u8) = null;
 
 fn printOut(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
@@ -1731,9 +1738,16 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     var live_buf: [160]u8 = undefined;
     const live_doc = try std.fmt.bufPrint(&live_buf, "{{\"id\":\"me\",\"pid\":{d},\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"stats\":{{}}}}\n", .{std.os.linux.getpid()});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live_doc));
-    // The live pid must read as running (exit 0); the stale-document cases
-    // below pin the exit-1 side, so only this branch pins success.
-    try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+    // The live pid must read as running (exit 0) and the document must
+    // reach stdout unchanged; the stale-document cases below pin exit 1.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        captured_stdout = &out;
+        defer captured_stdout = null;
+        try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expectEqualStrings(live_doc, out.items);
+    }
 
     // The same path after the daemon died without cleanup (crash, kill -9):
     // the leftover names an exited pid and must read as not running, exit 1,
@@ -1757,7 +1771,12 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
         var fresh_buf: [128]u8 = undefined;
         const fresh_doc = try std.fmt.bufPrint(&fresh_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), fresh_doc));
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        captured_stdout = &out;
+        defer captured_stdout = null;
         try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expectEqualStrings(fresh_doc, out.items);
     }
 
     // NTP step / admin clock set: wall time and monotonic disagree. Prefer
@@ -1834,8 +1853,17 @@ test "cmdPeers separates unreachable origins from empty clusters" {
     defer sys.deleteTree(std.testing.io, origin_d);
 
     // An existing origin with no .cluster dir yet is a fresh cluster:
-    // listing succeeds with empty output.
-    try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
+    // listing succeeds and names the missing dir, never a fabricated peer.
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        captured_stdout = &out;
+        defer captured_stdout = null;
+        try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "no cluster leases") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, discover.cluster_dir) != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.items, "spark") == null);
+    }
 
     // A typo'd/unreachable path must not read as "no leases": same exit-1
     // verdict mount gives an unreachable --origin.
@@ -1873,6 +1901,10 @@ test "cmdPeers skips an unleasable lease entry instead of failing the listing" {
     try std.testing.expectEqual(@as(i32, 0), sys.c.symlink(try sys.toZ(&zbuf, poison_fp), try sys.toZ(&sbuf, poison_fp)));
     const live_fp = try std.fmt.bufPrint(&pbuf, "{s}/spark9.json", .{cluster_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, live_fp), "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[]}"));
+    // Expired leases stay in the listing, marked, so an operator can tell
+    // a dead node from a missing one. Sorted by filename, this row leads.
+    const old_fp = try std.fmt.bufPrint(&pbuf, "{s}/old.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, old_fp), "{\"id\":\"old\",\"until\":1,\"addrs\":[]}"));
 
     // Expected-path warning from the cannot-open branch; keep it off the
     // runner's stderr like sibling fault-tolerance tests.
@@ -1880,7 +1912,12 @@ test "cmdPeers skips an unleasable lease entry instead of failing the listing" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
     try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
+    try std.testing.expectEqualStrings("old (until=1, expired)\nspark9 (until=4102444800, live)\n", out.items);
 }
 
 test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
