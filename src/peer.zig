@@ -2907,6 +2907,11 @@ const seed_reply_bad_ps = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1
 const seed_reply_short_body = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n1234");
 const seed_reply_garbage = fuzzcorpus.entry("HTTP/1.0 500 oops\r\n\r\n");
 const seed_reply_dup_header = fuzzcorpus.entry("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nCONTENT-LENGTH: 99999999999\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nok");
+const seed_reply_206_cr = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/16\r\nConnection: close\r\n\r\nhi");
+const seed_reply_206_cr_mismatch = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 8-9/16\r\nConnection: close\r\n\r\nhi");
+const seed_reply_206_cr_star = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/*\r\nConnection: close\r\n\r\nhi");
+const seed_reply_206_cr_inverted = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 10-1/16\r\nConnection: close\r\n\r\nhi");
+const seed_reply_206_cr_eq = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes=0-1/16\r\nConnection: close\r\n\r\nhi");
 
 const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_ok,
@@ -2917,6 +2922,11 @@ const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_short_body,
     &seed_reply_garbage,
     &seed_reply_dup_header,
+    &seed_reply_206_cr,
+    &seed_reply_206_cr_mismatch,
+    &seed_reply_206_cr_star,
+    &seed_reply_206_cr_inverted,
+    &seed_reply_206_cr_eq,
 };
 
 /// Connected socketpair with `wire` already written into fds[0]: a
@@ -2927,6 +2937,55 @@ fn stageWire(wire: []const u8, out: *[2]c_int) bool {
     const staged = sys.writeAll(out[0], wire) == @as(isize, @intCast(wire.len));
     sys.close(out[0]);
     return staged;
+}
+
+fn refDigitsU64(s: []const u8) ?u64 {
+    if (s.len == 0 or s.len > 20) return null;
+    for (s) |ch| {
+        if (ch < '0' or ch > '9') return null;
+    }
+    return std.fmt.parseInt(u64, s, 10) catch null;
+}
+
+/// Independent restatement of checkRangeReply: 206 required, first
+/// Content-Range header parsed with parseInt (not parseU64Fast), start must
+/// equal the request, advertised end must sit in [start, request end].
+fn refCheckRangeReply(head: []const u8, start: u64, end: u64) !void {
+    const status_end = std.mem.indexOf(u8, head, "\r\n") orelse return error.BadHttp;
+    if (!std.mem.startsWith(u8, head[0..status_end], "HTTP/1.1 206")) return error.HttpStatus;
+    const cr = blk: {
+        var pos: usize = status_end + 2;
+        while (pos <= head.len) {
+            const rel_end = std.mem.indexOf(u8, head[pos..], "\r\n") orelse head.len - pos;
+            const line = head[pos .. pos + rel_end];
+            if (line.len == 0) break;
+            if (std.mem.findScalar(u8, line, ':')) |colon| {
+                if (colon == "Content-Range".len and std.ascii.eqlIgnoreCase(line[0..colon], "Content-Range")) {
+                    var v = line[colon + 1 ..];
+                    while (v.len > 0 and (v[0] == ' ' or v[0] == '\t')) v = v[1..];
+                    while (v.len > 0 and (v[v.len - 1] == ' ' or v[v.len - 1] == '\t')) v = v[0 .. v.len - 1];
+                    break :blk v;
+                }
+            }
+            pos += rel_end + 2;
+        }
+        return error.MissingContentRange;
+    };
+    const s = std.mem.trim(u8, cr, " \t");
+    const prefix = "bytes ";
+    if (!std.mem.startsWith(u8, s, prefix)) return error.BadContentRange;
+    const body = s[prefix.len..];
+    const dash = std.mem.indexOfScalar(u8, body, '-') orelse return error.BadContentRange;
+    const rest = body[dash + 1 ..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.BadContentRange;
+    const a = refDigitsU64(body[0..dash]) orelse return error.BadContentRange;
+    const b = refDigitsU64(rest[0..slash]) orelse return error.BadContentRange;
+    if (b < a) return error.BadContentRange;
+    const complete_s = rest[slash + 1 ..];
+    if (!(complete_s.len == 1 and complete_s[0] == '*')) {
+        _ = refDigitsU64(complete_s) orelse return error.BadContentRange;
+    }
+    if (a != start or b < start or b > end) return error.RangeMismatch;
 }
 
 fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
@@ -2974,6 +3033,20 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
             var dest_total: usize = 0;
             if (readHeadFull(std.testing.io, dest_fds[1], &dest_head_buf, &dest_head_len, &dest_total)) |_| {
                 const dest_head = dest_head_buf[0..dest_head_len];
+                // Content-Range binding is the /data trust boundary:
+                // checkRangeReply decides whether fetched bytes may be
+                // marked filled. The body-reader assertions below stay
+                // independent of it.
+                {
+                    const start = smith.value(u64);
+                    const extra = smith.value(u64) % 256;
+                    const end = start +| extra;
+                    if (checkRangeReply(dest_head, start, end)) |_| {
+                        try refCheckRangeReply(dest_head, start, end);
+                    } else |err| {
+                        try std.testing.expectError(err, refCheckRangeReply(dest_head, start, end));
+                    }
+                }
                 const status_end = std.mem.find(u8, dest_head, "\r\n") orelse return;
                 const status_ok = std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 200") or
                     std.mem.startsWith(u8, dest_head[0..status_end], "HTTP/1.1 206");
@@ -3027,6 +3100,7 @@ const seed_req_max_range = fuzzcorpus.entry("GET /data?path=a HTTP/1.1\r\nAuthor
 const seed_req_control_path = fuzzcorpus.entry("GET /have?path=%00%1b%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_inverted_range = fuzzcorpus.entry("GET /data?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=10-5\r\n\r\n");
 const seed_req_no_path = fuzzcorpus.entry("GET /have HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_c1_path = fuzzcorpus.entry("GET /have?path=%C2%9B%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 
 const fuzz_request_corpus = [_][]const u8{
     &seed_req_have_ok,
@@ -3036,6 +3110,7 @@ const fuzz_request_corpus = [_][]const u8{
     &seed_req_control_path,
     &seed_req_inverted_range,
     &seed_req_no_path,
+    &seed_req_c1_path,
 };
 
 fn refBearerOk(got: []const u8, want: []const u8) bool {
@@ -3059,6 +3134,7 @@ fn refRelOk(rel: []const u8) bool {
     while (i <= rel.len) : (i += 1) {
         if (i != rel.len and rel[i] != '/') {
             if (rel[i] < 0x20 or rel[i] == 0x7f) return false;
+            if (rel[i] == 0xc2 and i + 1 < rel.len and rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f) return false;
             continue;
         }
         const seg = rel[seg_start..i];

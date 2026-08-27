@@ -579,16 +579,18 @@ test "fuzz url codec round-trips across the peer trust boundary" {
     try std.testing.fuzz({}, fuzzUrlCodecOne, .{ .corpus = &fuzz_codec_corpus });
 }
 
-// headerGet, queryGet, and parseRange are the extraction layer every
-// untrusted-byte decision rides: Authorization on both server and client,
-// Content-Length and X-Piece-Size sizing the bitmap allocation, the path=
-// query parameter feeding the relOk gate, and the Range clamp before origin
-// reads. The harnesses above execute them on every input but read their
-// expectations back through these same functions -- a drift there (returning
-// the last duplicate instead of the first, matching a prefix of the name,
-// trimming more than OWS, wrapping a 21-digit value) would reconfirm itself
-// in every assertion and ship silently. These oracles restate each contract
-// independently so the fuzzer sees the difference.
+// headerGet, queryGet, parseRange, and parseContentRange are the extraction
+// layer every untrusted-byte decision rides: Authorization on both server
+// and client, Content-Length and X-Piece-Size sizing the bitmap allocation,
+// the path= query parameter feeding the relOk gate, the Range clamp before
+// origin reads, and Content-Range binding a 206 body to the offset the
+// fetch asked for. The harnesses above execute them on every input but
+// read their expectations back through these same functions -- a drift
+// there (returning the last duplicate instead of the first, matching a
+// prefix of the name, trimming more than OWS, wrapping a 21-digit value)
+// would reconfirm itself in every assertion and ship silently. These
+// oracles restate each contract independently so the fuzzer sees the
+// difference.
 
 fn refHeaderGet(head: []const u8, name: []const u8) ?[]const u8 {
     // Manual offset walk instead of splitSequence: skip the status/request
@@ -653,18 +655,38 @@ fn refParseRange(h: []const u8) ?Range {
     return .{ .start = start, .end = end };
 }
 
-/// Four framed slices per corpus entry: the raw head, the header name to
-/// look up in it, the request target queryGet scans, and the Range value
-/// parsed alongside them.
+fn refParseContentRange(h: []const u8) ?ContentRange {
+    const s = std.mem.trim(u8, h, " \t");
+    const prefix = "bytes ";
+    if (!std.mem.startsWith(u8, s, prefix)) return null;
+    const body = s[prefix.len..];
+    const dash = std.mem.indexOfScalar(u8, body, '-') orelse return null;
+    const rest = body[dash + 1 ..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const start = refDigitsU64(body[0..dash]) orelse return null;
+    const end = refDigitsU64(rest[0..slash]) orelse return null;
+    if (end < start) return null;
+    const complete_s = rest[slash + 1 ..];
+    const complete: u64 = if (complete_s.len == 1 and complete_s[0] == '*')
+        std.math.maxInt(u64)
+    else
+        refDigitsU64(complete_s) orelse return null;
+    return .{ .start = start, .end = end, .complete = complete };
+}
+
+/// Five framed slices per corpus entry: the raw head, the header name to
+/// look up in it, the request target queryGet scans, the Range value, and
+/// the Content-Range value the fetch client binds a 206 body against.
 fn extractEntry(
     comptime head: []const u8,
     comptime name: []const u8,
     comptime target: []const u8,
     comptime range: []const u8,
-) [16 + head.len + name.len + target.len + range.len]u8 {
-    var out: [16 + head.len + name.len + target.len + range.len]u8 = undefined;
+    comptime crange: []const u8,
+) [20 + head.len + name.len + target.len + range.len + crange.len]u8 {
+    var out: [20 + head.len + name.len + target.len + range.len + crange.len]u8 = undefined;
     comptime var off: usize = 0;
-    inline for (.{ head, name, target, range }) |part| {
+    inline for (.{ head, name, target, range, crange }) |part| {
         std.mem.writeInt(u32, out[off..][0..4], @intCast(part.len), .little);
         @memcpy(out[off + 4 ..][0..part.len], part);
         off += 4 + part.len;
@@ -677,43 +699,85 @@ const seed_extract_ok = extractEntry(
     "Authorization",
     "/have?path=gguf%2Fmodel.gguf&x=1",
     "bytes=0-1023",
+    "bytes 0-1023/4096",
 );
 const seed_extract_dup_cl = extractEntry(
     "HTTP/1.1 200 OK\r\nContent-Length: 3\r\ncontent-length: 999\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nabc",
     "Content-Length",
     "/data?path=a.bin",
     "bytes=536870912-536870913",
+    "bytes 0-1/16",
 );
 const seed_extract_prefix_name = extractEntry(
     "HTTP/1.1 200 OK\r\nX-Piece-Size-Extra: 9\r\nX-Piece-Size: 16\r\n\r\n",
     "X-Piece-SIZE",
     "?path=%2F..%2Fetc",
     "bytes=10-",
+    "bytes 10-15/*",
 );
 const seed_extract_lf_only = extractEntry(
     "GET / HTTP/1.1\nAuthorization: Bearer x\n",
     "authorization",
     "/have?path",
     "bytes=-",
+    "bytes -5/10",
 );
 const seed_extract_odd_lines = extractEntry(
     "H: v\r\nno-colon\r\nA:\r\n \t spaced \t\r\n",
     "A",
     "?a=b=c&path=z=9",
     "BYTES=0-1",
+    "BYTES 0-1/2",
 );
 const seed_extract_space_before_colon = extractEntry(
     "S\r\na: 1\r\nA : 2\r\nAuthorization: B\r\n\r\n",
     "A",
     "//?=&path",
     "bytes=18446744073709551615-18446744073709551615",
+    "bytes 18446744073709551615-18446744073709551615/18446744073709551615",
 );
-const seed_extract_empty = extractEntry("", "", "", "");
+const seed_extract_empty = extractEntry("", "", "", "", "");
 const seed_extract_bad_range = extractEntry(
     "%zz\r\nRange: bytes=x-\r\n",
     "Range",
     "no-question-mark",
     "bytes=99999999999999999999-1",
+    "bytes 99999999999999999999-1/1",
+);
+const seed_extract_cr_ok = extractEntry(
+    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 16-31/48\r\nContent-Length: 16\r\n\r\n",
+    "Content-Range",
+    "/data?path=a.bin",
+    "bytes=16-31",
+    "bytes 16-31/48",
+);
+const seed_extract_cr_star = extractEntry(
+    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/*\r\n\r\n",
+    "Content-Range",
+    "/data?path=x",
+    "bytes=0-7",
+    "bytes 0-7/*",
+);
+const seed_extract_cr_inverted = extractEntry(
+    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-1/20\r\n\r\n",
+    "Content-Range",
+    "/data",
+    "bytes=10-1",
+    "bytes 10-1/20",
+);
+const seed_extract_cr_eq = extractEntry(
+    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes=0-7/8\r\n\r\n",
+    "Content-Range",
+    "/data?path=y",
+    "bytes=0-7",
+    "bytes=0-7/8",
+);
+const seed_extract_cr_ows = extractEntry(
+    "HTTP/1.1 206 Partial Content\r\nContent-Range:   bytes 8-15/16\t\r\n\r\n",
+    "content-range",
+    "/data?path=z",
+    "bytes=8-15",
+    "  bytes 8-15/16\t",
 );
 
 const fuzz_extract_corpus = [_][]const u8{
@@ -725,14 +789,20 @@ const fuzz_extract_corpus = [_][]const u8{
     &seed_extract_space_before_colon,
     &seed_extract_empty,
     &seed_extract_bad_range,
+    &seed_extract_cr_ok,
+    &seed_extract_cr_star,
+    &seed_extract_cr_inverted,
+    &seed_extract_cr_eq,
+    &seed_extract_cr_ows,
 };
 
 /// Asserts each extractor against its independent oracle on arbitrary bytes:
-/// identical accept/reject and identical values for headerGet, queryGet, and
-/// parseRange; a canonically reformatted accepted range reparses to the same
-/// bounds; and the first-match-wins property the wire depends on holds for
-/// duplicated headers and repeated query keys (synthesized only when the
-/// fuzzed name/key cannot corrupt the frame itself).
+/// identical accept/reject and identical values for headerGet, queryGet,
+/// parseRange, and parseContentRange; a canonically reformatted accepted
+/// range or Content-Range reparses to the same bounds; and the
+/// first-match-wins property the wire depends on holds for duplicated
+/// headers and repeated query keys (synthesized only when the fuzzed
+/// name/key cannot corrupt the frame itself).
 fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var head_buf: [512]u8 = undefined;
     const head = head_buf[0..smith.slice(&head_buf)];
@@ -774,6 +844,29 @@ fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
         } else try std.testing.expect(got == null);
     }
 
+    var cr_buf: [96]u8 = undefined;
+    const cr_val = cr_buf[0..smith.slice(&cr_buf)];
+    {
+        const got = parseContentRange(cr_val);
+        const want = refParseContentRange(cr_val);
+        if (want) |w| {
+            const g = got orelse return error.ContentRangeOracleMismatch;
+            try std.testing.expectEqual(w.start, g.start);
+            try std.testing.expectEqual(w.end, g.end);
+            try std.testing.expectEqual(w.complete, g.complete);
+            try std.testing.expect(g.end >= g.start);
+            var canon: [96]u8 = undefined;
+            const rt = if (g.complete == std.math.maxInt(u64))
+                try std.fmt.bufPrint(&canon, "bytes {d}-{d}/*", .{ g.start, g.end })
+            else
+                try std.fmt.bufPrint(&canon, "bytes {d}-{d}/{d}", .{ g.start, g.end, g.complete });
+            const reparsed = parseContentRange(rt) orelse return error.ContentRangeRoundTripFailed;
+            try std.testing.expectEqual(g.start, reparsed.start);
+            try std.testing.expectEqual(g.end, reparsed.end);
+            try std.testing.expectEqual(g.complete, reparsed.complete);
+        } else try std.testing.expect(got == null);
+    }
+
     // First match wins on both extraction layers, spelled out because the
     // reply-side allocation sizes ride exactly the first Content-Length a
     // peer sends. Synthesis needs a name/key free of frame bytes; hostile
@@ -798,6 +891,6 @@ fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
     }
 }
 
-test "fuzz header query and range extraction match an independent scan" {
+test "fuzz header query range and content-range extraction match an independent scan" {
     try std.testing.fuzz({}, fuzzExtractorsOne, .{ .corpus = &fuzz_extract_corpus });
 }

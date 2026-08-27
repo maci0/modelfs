@@ -4,6 +4,7 @@ const std = @import("std");
 const piece = @import("piece.zig");
 const cull = @import("cull.zig");
 const sys = @import("sys.zig");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 const c = sys.c;
 
 /// Daemon liveness artifact at the cache root; the discovery tick writes it
@@ -1852,7 +1853,7 @@ test "cold get persists a stale-sidecar wipe so a restart cannot reload stale ma
         var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
         defer st.deinit();
         try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
-        const f = try st.get("cold.bin", 64, sys.monoSec());
+        const f = try st.get("cold.bin", 64, sys.monoSec(std.testing.io));
         defer st.releaseFile(f);
         f.mu.lockUncancelable(std.testing.io);
         f.bits.set(0);
@@ -1872,7 +1873,7 @@ test "cold get persists a stale-sidecar wipe so a restart cannot reload stale ma
         defer st.deinit();
         // Restart: no live entry. The create-truncate shape stats a
         // zero-length origin through get.
-        const g = try st.get("cold.bin", 0, sys.monoSec());
+        const g = try st.get("cold.bin", 0, sys.monoSec(std.testing.io));
         defer st.releaseFile(g);
         try std.testing.expectEqual(@as(u64, 0), g.size);
         const mp = try st.cacheMetaPath(&mb, "cold.bin");
@@ -1888,7 +1889,7 @@ test "cold get persists a stale-sidecar wipe so a restart cannot reload stale ma
         defer st.deinit();
         // File back at the old length: a leftover pre-wipe sidecar would
         // decode as two filled pieces. The persisted wipe must still hold.
-        const h = try st.get("cold.bin", 64, sys.monoSec());
+        const h = try st.get("cold.bin", 64, sys.monoSec(std.testing.io));
         defer st.releaseFile(h);
         h.mu.lockUncancelable(std.testing.io);
         try std.testing.expectEqual(@as(u32, 0), h.bits.filled());
@@ -2057,6 +2058,101 @@ test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
     // NBSP is U+00A0: same 0xC2 lead byte as the rejected C1 controls but a
     // continuation above their range, so the C1 gate must not swallow it.
     try std.testing.expect(relOk("model\u{a0}v2.bin"));
+}
+
+const seed_rel_model = fuzzcorpus.entry("gguf/a.gguf");
+const seed_rel_dotdot = fuzzcorpus.entry("../etc/passwd");
+const seed_rel_inner_dotdot = fuzzcorpus.entry("a/../b");
+const seed_rel_dot_seg = fuzzcorpus.entry("a/./b");
+const seed_rel_dot_name = fuzzcorpus.entry("...");
+const seed_rel_absolute = fuzzcorpus.entry("/etc/passwd");
+const seed_rel_empty = fuzzcorpus.entry("");
+const seed_rel_double_slash = fuzzcorpus.entry("gguf//a.gguf");
+const seed_rel_trailing_slash = fuzzcorpus.entry("gguf/");
+const seed_rel_control = fuzzcorpus.entry("a\x1b[31mb\x7f");
+const seed_rel_nul = fuzzcorpus.entry("a\x00b");
+const seed_rel_c1 = fuzzcorpus.entry("a\xc2\x9bb.bin");
+const seed_rel_nbsp = fuzzcorpus.entry("model\u{a0}v2.bin");
+const seed_rel_lone_c1byte = fuzzcorpus.entry("a\x9bb.bin");
+const seed_rel_trailing_c2 = fuzzcorpus.entry("foo\xc2");
+const seed_rel_unicode = fuzzcorpus.entry("权重/mödel.gguf");
+
+const fuzz_rel_corpus = [_][]const u8{
+    &seed_rel_model,
+    &seed_rel_dotdot,
+    &seed_rel_inner_dotdot,
+    &seed_rel_dot_seg,
+    &seed_rel_dot_name,
+    &seed_rel_absolute,
+    &seed_rel_empty,
+    &seed_rel_double_slash,
+    &seed_rel_trailing_slash,
+    &seed_rel_control,
+    &seed_rel_nul,
+    &seed_rel_c1,
+    &seed_rel_nbsp,
+    &seed_rel_lone_c1byte,
+    &seed_rel_trailing_c2,
+    &seed_rel_unicode,
+};
+
+/// Independent restatement of relOk: empty/absolute refuse, C0/DEL and the
+/// UTF-8 C1 pair refuse, "." / ".." components refuse, empty components
+/// (double slash, trailing slash) do not. Walks segments by index instead
+/// of splitScalar so a corrupted splitter cannot self-confirm.
+fn refRelOk(rel: []const u8) bool {
+    if (rel.len == 0 or rel[0] == '/') return false;
+    var seg_start: usize = 0;
+    var i: usize = 0;
+    while (i <= rel.len) : (i += 1) {
+        if (i != rel.len and rel[i] != '/') {
+            if (rel[i] < 0x20 or rel[i] == 0x7f) return false;
+            if (rel[i] == 0xc2 and i + 1 < rel.len and rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f) return false;
+            continue;
+        }
+        const seg = rel[seg_start..i];
+        if (seg.len != 0 and seg[0] == '.' and (seg.len == 1 or (seg.len == 2 and seg[1] == '.'))) return false;
+        seg_start = i + 1;
+    }
+    return true;
+}
+
+/// relOk is the only path-safety gate at every external boundary (FUSE after
+/// the leading slash is stripped, peer HTTP after URL decode, CLI pin). The
+/// FUSE and request-head harnesses call it as a downstream check; this one
+/// drives it as the parser under test, against an independent oracle, on
+/// every byte string including C1 spellings, lone high bytes, and empty
+/// components the unit tests pin by example.
+fn fuzzRelOkOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const rel = buf[0..smith.slice(&buf)];
+
+    const got = relOk(rel);
+    try std.testing.expectEqual(refRelOk(rel), got);
+    try std.testing.expectEqual(got, relOk(rel));
+
+    if (!got) return;
+    try std.testing.expect(rel.len > 0);
+    try std.testing.expect(rel[0] != '/');
+    var i: usize = 0;
+    while (i < rel.len) : (i += 1) {
+        try std.testing.expect(rel[i] >= 0x20 and rel[i] != 0x7f);
+        if (rel[i] == 0xc2 and i + 1 < rel.len) {
+            try std.testing.expect(!(rel[i + 1] >= 0x80 and rel[i + 1] <= 0x9f));
+        }
+    }
+    var seg_start: usize = 0;
+    var j: usize = 0;
+    while (j <= rel.len) : (j += 1) {
+        if (j != rel.len and rel[j] != '/') continue;
+        const seg = rel[seg_start..j];
+        try std.testing.expect(!(std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")));
+        seg_start = j + 1;
+    }
+}
+
+test "fuzz relOk denies traversal controls and C1 spellings for every input" {
+    try std.testing.fuzz({}, fuzzRelOkOne, .{ .corpus = &fuzz_rel_corpus });
 }
 
 test "store get file size update and pin" {
