@@ -764,7 +764,7 @@ Resolved by the shipped code and recorded in section 13 (not re-decided here):
 
 Status values: **Accepted** (still in force), **Partial** (part shipped), **Superseded** (replaced; the cell names what replaced it), **Not shipped** (never implemented). What runs is [architecture.md](architecture.md).
 
-| Decision | Choice | Why | Status (2026-08-28) |
+| Decision | Choice | Why | Status (2026-08-29) |
 |---|---|---|---|
 | Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partial: POSIX piece cache shipped; no content-addressed store (path-keyed) |
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Accepted |
@@ -841,9 +841,9 @@ wire. That reuses Level 1's digests as-is, dedups fills (not storage), and
 is an incremental index -- but even it should wait for the telemetry below.
 
 **Telemetry gate:** `modelfs dupes <rel>...` compares piece-hash manifests
-across paths (the manifest store on the origin is already a duplicate-
-content index) and reports identical files, aligned overlap, and shifted
-overlap. If that number is near zero in a real fleet -- the expectation for
+across paths and `modelfs dupes --all` scans the whole manifest store (the
+manifest store on the origin is already a duplicate-content index),
+reporting identical files, aligned overlap, and shifted overlap. If that number is near zero in a real fleet -- the expectation for
 "ingest once, read everywhere" -- Level 2 stays shelved and the fill-time
 content hit is not worth building either.
 

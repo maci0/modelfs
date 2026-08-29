@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### `modelfs dupes --all`, verify reporting, doc dates - 2026-08-29
+- **`modelfs dupes --all --origin PATH` scans the whole manifest store**
+  (no positional paths): total manifests/pieces, byte-identical pairs, and
+  pairs sharing any digest -- the aggregate duplicate telemetry the dedup
+  decision needs without naming files (manifests are keyed by
+  `blake3(rel)` hex). Missing manifests dir is an empty scan, not an error;
+  `--all` is refused on every other command.
+- **`modelfs verify` now says when there was nothing to verify against**:
+  a marked file with no trusted hashes reports "(no trusted hashes: no
+  manifest or nothing cached)" instead of silently printing zero checked.
+
 ## [0.3.1] - 2026-08-29
 
 Patch release on top of 0.3.0: a piece that fails at-rest verification now

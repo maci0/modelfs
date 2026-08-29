@@ -220,7 +220,9 @@ It is a count, not a log flood; investigate when it climbs.
 
 Dedup decisions are measured, not guessed: `modelfs dupes <rel>... --origin
 <origin>` compares piece-hash manifests and reports aligned/shared/shifted
-overlap. Run it before deciding whether duplicate models cost disk worth
-engineering for (design.md section 14).
+overlap, and `modelfs dupes --all --origin <origin>` scans the whole
+manifest store for byte-identical and digest-sharing pairs. Run either
+before deciding whether duplicate models cost disk worth engineering for
+(design.md section 14).
 
 Durability caveat kept as-is on purpose: `sharenfs="rw,async"` lets the NAS acknowledge writes before stable storage (bounded by the txg interval), so a crash can lose writes clients saw succeed; the `soft` client mounts turn NAS trouble into `EIO` after 2 retrans instead of hanging. Synced exports would trade ingest throughput for that window; not changed here.

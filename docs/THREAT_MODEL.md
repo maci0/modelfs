@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Living document; describes `src/` as of the date below |
-| Last reviewed | 2026-08-28 |
+| Last reviewed | 2026-08-29 |
 | Covers | modelfs daemon (`mount`) and CLI, peer HTTP protocol, lease discovery, FUSE surface |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |

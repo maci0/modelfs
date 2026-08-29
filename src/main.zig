@@ -183,6 +183,13 @@ pub fn main(init: std.process.Init) !u8 {
         return cmdVerify(init.io, gpa, parsed.opts, parsed.rest[0]);
     }
     if (std.mem.eql(u8, parsed.cmd, "dupes")) {
+        if (parsed.opts.all) {
+            if (parsed.rest.len != 0) {
+                std.debug.print("dupes --all takes no paths (see 'modelfs help')\n", .{});
+                return 2;
+            }
+            return cmdDupesAll(init.io, gpa, parsed.opts);
+        }
         if (parsed.rest.len == 0) {
             std.debug.print("dupes takes at least one path relative to the mount (see 'modelfs help')\n", .{});
             return 2;
@@ -235,6 +242,9 @@ fn printOut(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: 
 const Opts = struct {
     origin: ?[]const u8 = null,
     cache: []const u8 = "/var/cache/modelfs",
+    /// dupes-only: scan every manifest under origin/.cluster/manifests
+    /// instead of a positional rel list (aggregate duplicate telemetry).
+    all: bool = false,
     id: ?[]const u8 = null,
     psk_file: []const u8 = "/etc/modelfs.psk",
     psk_value: ?[]const u8 = null,
@@ -643,6 +653,15 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             opts.origin = try takeValue(args, flag, &i, inline_val);
         } else if (std.mem.eql(u8, flag, "--cache")) {
             opts.cache = try takeValue(args, flag, &i, inline_val);
+        } else if (std.mem.eql(u8, flag, "--all")) {
+            // dupes-only: the other commands have no whole-store scan, and
+            // an accepted-and-ignored --all would read as a working knob.
+            if (!std.mem.eql(u8, cmd, "dupes")) {
+                if (!builtin.is_test) std.debug.print("--all only applies to modelfs dupes\n", .{});
+                return error.FlagOutsideCommand;
+            }
+            try rejectInlineValue(flag, inline_val);
+            opts.all = true;
         } else if (std.mem.eql(u8, flag, "--id")) {
             try rejectOutsideMount(cmd, flag);
             opts.id = try takeValue(args, flag, &i, inline_val);
@@ -1672,7 +1691,15 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         store.healPiece(file, i);
     }
     std.log.info("verified {s}: {d} piece(s) checked, {d} mismatch(es) cleared", .{ rel, checked, mismatches });
-    if (!printOut(io, gpa, "verified {s}: {d} piece(s) checked, {d} mismatch(es) cleared\n", .{ rel, checked, mismatches })) return 1;
+    if (!printOut(io, gpa, "verified {s}: {d} piece(s) checked, {d} mismatch(es) cleared{s}\n", .{
+        rel,
+        checked,
+        mismatches,
+        // A marked file with nothing checked means no trusted hash existed
+        // (no manifest, or no origin fill this session): there was no
+        // reference to compare against, which the operator should hear.
+        if (checked == 0 and nbits > 0) " (no trusted hashes: no manifest or nothing cached)" else "",
+    })) return 1;
     return if (mismatches == 0) 0 else 1;
 }
 
@@ -2560,6 +2587,83 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     try std.testing.expectEqual(@as(u8, 2), try cmdVerify(std.testing.io, gpa, .{ .cache = cache_d, .piece = 16 }, "m.bin"));
 }
 
+/// Whole-store duplicate telemetry: scans every piece-hash manifest under
+/// origin/.cluster/manifests and reports aggregate overlap -- total
+/// manifests, total pieces, byte-identical pairs, and pairs sharing any
+/// digest. Manifests are keyed by `blake3(rel)` hex, so the scan cannot
+/// name the files behind them; the aggregates are what the dedup decision
+/// needs (design.md section 14), and the per-path form `modelfs dupes
+/// <rel>...` names specific pairs. Reads manifests only, never model
+/// bytes. A missing manifests dir is an empty scan, not an error.
+fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
+    const origin = opts.origin orelse {
+        std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
+        return 2;
+    };
+    var dbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const dirz = sys.joinZ(&dbuf, origin, store_mod.Store.manifests_dir) catch {
+        if (!builtin.is_test) std.log.err("manifest dir path too long at {s}", .{origin});
+        return 1;
+    };
+    // O_NOFOLLOW like lease walks: a planted .cluster/manifests symlink
+    // must not list or parse names under its target.
+    const dir = sys.opendirNoFollow(dirz) orelse {
+        if (!printOut(io, gpa, "no manifests to compare\n", .{})) return 1;
+        return 0;
+    };
+    defer sys.closedir(dir);
+
+    var manifests: std.ArrayList(piece.Manifest) = .empty;
+    defer {
+        for (manifests.items) |m| gpa.free(m.entries);
+        manifests.deinit(gpa);
+    }
+    var total_pieces: u64 = 0;
+    while (sys.readdir(dir)) |ent| {
+        const name = sys.dirName(ent);
+        if (name.len == 0 or name[0] == '.') continue;
+        var fbuf: [sys.c.PATH_MAX]u8 = undefined;
+        const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
+        var open_errno: i32 = 0;
+        const blob = sys.readFileAllocNoFollowOpenErrno(gpa, fp, store_mod.Store.max_manifest_bytes, &open_errno) catch |err| switch (err) {
+            error.OpenFailed => {
+                if (open_errno != sys.c.ENOENT)
+                    if (!builtin.is_test) std.log.warn("manifest open failed for {s} (errno {d}); skipping", .{ name, open_errno });
+                continue;
+            },
+            else => {
+                if (!builtin.is_test) std.log.warn("manifest read failed for {s}: {t}; skipping", .{ name, err });
+                continue;
+            },
+        };
+        defer gpa.free(blob);
+        const m = piece.manifestDecode(gpa, blob) catch {
+            if (!builtin.is_test) std.log.warn("corrupt piece-hash manifest {s}; skipping", .{name});
+            continue;
+        } orelse continue;
+        total_pieces += m.entries.len;
+        manifests.append(gpa, m) catch return 1;
+    }
+
+    if (manifests.items.len == 0) {
+        if (!printOut(io, gpa, "no manifests to compare\n", .{})) return 1;
+        return 0;
+    }
+    var identical_pairs: u64 = 0;
+    var shared_pairs: u64 = 0;
+    for (manifests.items, 0..) |a, ai| {
+        for (manifests.items[ai + 1 ..]) |b| {
+            const ov = manifestOverlap(gpa, a, b);
+            if (ov.identical) identical_pairs += 1;
+            if (ov.shared > 0) shared_pairs += 1;
+        }
+    }
+    if (!printOut(io, gpa, "scanned {d} manifest(s), {d} piece(s) total\n", .{ manifests.items.len, total_pieces })) return 1;
+    if (!printOut(io, gpa, "byte-identical pairs: {d}\n", .{identical_pairs})) return 1;
+    if (!printOut(io, gpa, "pairs sharing any digest: {d}\n", .{shared_pairs})) return 1;
+    return 0;
+}
+
 /// The dedup-telemetry command: compares piece-hash manifests across
 /// paths and reports how much content they share. The manifest store on
 /// the origin (`.cluster/manifests/<hex>`) is already a duplicate-content
@@ -2834,6 +2938,57 @@ fn writeManifestForTest(gpa: std.mem.Allocator, origin: []const u8, rel: []const
     defer gpa.free(blob);
     const enc = try piece.manifestEncode(ps, fs, entries, blob);
     try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(try sys.toZ(&zb, fp), enc));
+}
+
+test "cmdDupesAll scans the manifest store and --all is dupes-only" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-dupes-all");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    const h0 = [_]u8{0x11} ** piece.digest_len;
+    const h1 = [_]u8{0x22} ** piece.digest_len;
+    const h2 = [_]u8{0x33} ** piece.digest_len;
+    var a_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h1 },
+    };
+    var c_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h2 },
+        .{ .idx = 1, .hash = h1 },
+    };
+    try writeManifestForTest(gpa, origin_d, "a.bin", 16, 32, &a_entries);
+    try writeManifestForTest(gpa, origin_d, "b.bin", 16, 32, &a_entries); // byte-identical to a
+    try writeManifestForTest(gpa, origin_d, "c.bin", 16, 32, &c_entries); // shares one digest with a/b
+
+    const opts = Opts{ .origin = origin_d };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, opts));
+    const report = out.items;
+    try std.testing.expect(std.mem.indexOf(u8, report, "scanned 3 manifest(s), 6 piece(s) total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "byte-identical pairs: 1") != null);
+    // a-b (identical + shared), a-c (shared), b-c (shared) = 3 shared pairs.
+    try std.testing.expect(std.mem.indexOf(u8, report, "pairs sharing any digest: 3") != null);
+
+    // A missing manifests dir is an empty scan, not an error.
+    var nb: [128]u8 = undefined;
+    const empty_origin = try sys.scratchDir(&nb, "modelfs-o-dupes-empty");
+    defer sys.deleteTree(std.testing.io, empty_origin);
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, .{ .origin = empty_origin }));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "no manifests to compare") != null);
+
+    // --all parses on dupes and is refused anywhere else.
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const parsed_ok = try parseArgs(gpa, &env, &.{ "dupes", "--all", "--origin", origin_d });
+    freeParsed(parsed_ok, gpa);
+    try std.testing.expect(parsed_ok.opts.all);
+    try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &env, &.{ "peers", "--all", "--origin", origin_d }));
+    try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &env, &.{ "verify", "--all", "--origin", origin_d, "m.bin" }));
 }
 
 fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {

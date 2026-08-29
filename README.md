@@ -85,6 +85,7 @@ modelfs pin gguf/foo.gguf                         # keep a file out of the cull
 modelfs unpin gguf/foo.gguf
 modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models  # rehash cached pieces against the origin manifest, clear mismatches
 modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models  # compare piece-hash manifests: how much do two files share?
+modelfs dupes --all --origin /net/192.168.0.100/models  # whole-store duplicate scan
 ```
 
 Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin/verify), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount (surrounding whitespace is trimmed like the PSK file; a whitespace-only value is refused); an explicit flag wins and an empty environment value counts as unset. `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.

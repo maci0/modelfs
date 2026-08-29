@@ -295,8 +295,9 @@ Canonical status is [design.md](design.md) sections 2.1 (G1–G10) and 13 (key d
   staged data plane (design.md section 15) made Level 2's headline win
   (transfer dedup) moot, and the path-keyed integrity layer conflicts with
   a CAS rewrite. The decision is telemetry-gated: `modelfs dupes` compares
-  piece-hash manifests across paths (aligned/shared/shifted overlap) and
-  answers "do we want dedup?" with a number; see design.md section 14.
+  piece-hash manifests across paths (`--all` scans the whole manifest
+  store; aligned/shared/shifted overlap) and answers "do we want dedup?"
+  with a number; see design.md section 14.
   Shipped instead is Level 1 -- per-piece blake3 digests for integrity
   (`verifyRange`/`expectedHash`), the origin piece-hash manifest,
   verify-before-admit, and `modelfs verify`; see the Piece integrity
