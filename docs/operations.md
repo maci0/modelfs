@@ -185,7 +185,42 @@ One node downloads a repo at a time. Docker/enroot: `-e` those vars, bind `/mode
 | cannot write | not uid 1000, or sudo-created files |
 | `nobody:nobody` | idmap; disable nfs4 idmapping |
 | NAS down | `soft` → `EIO`; automount waits ≤15s |
+| `serve_verify_fail` climbing | cached pieces failing their blake3 digest (bit rot, hole zeros, local tamper); see Integrity runbook below |
+| `fill_err_verify` climbing | peer fills rejected by digest verification (a hostile or corrupt peer, or a stale manifest after a same-size rewrite) |
 
 Deleted or corrupted models, a dead pool, a dead NAS: [recovery.md](recovery.md) owns backups and restores.
+
+### Integrity runbook
+
+`modelfs` verifies pieces twice: **at admit** (a peer fill must match the
+trusted digest from the origin manifest, an origin fill, or this node's own
+write -- mismatches are discarded and refilled from origin, counted in
+`fill_err_verify`) and **before every `/data` or `/stage` serve** (cached
+bytes are rehashed; a mismatch is refused with 500, counted in
+`serve_verify_fail`, and the piece's mark is **healed** -- cleared so the
+next fill re-hydrates from origin instead of failing forever).
+
+When `serve_verify_fail` moves on the tick line:
+
+1. Expect the refusal: the fetching peer(s) fell through to another path or
+   the origin, so a serve failure is a visibility event, not a fleet outage.
+2. The serving node already healed the marked pieces (a subsequent serve of
+   the same piece re-hydrates and re-verifies from origin). If the counter
+   keeps climbing, the corruption is ongoing (failing disk, or a hostile
+   local writer): run `modelfs verify <rel> --origin <origin>` for the
+   affected files to audit the whole cache and clear every mismatched mark
+   in one pass.
+3. Local reads are not verified per-read (only peer serves are), so a piece
+   that is corrupt but never served to a peer is not auto-detected: cron
+   `modelfs verify` for the files that matter, or after any disk event.
+
+`fill_err_verify` is the fleet's view of a hostile or broken peer (or a
+stale manifest after a same-size rewrite, which origin fills converge).
+It is a count, not a log flood; investigate when it climbs.
+
+Dedup decisions are measured, not guessed: `modelfs dupes <rel>... --origin
+<origin>` compares piece-hash manifests and reports aligned/shared/shifted
+overlap. Run it before deciding whether duplicate models cost disk worth
+engineering for (design.md section 14).
 
 Durability caveat kept as-is on purpose: `sharenfs="rw,async"` lets the NAS acknowledge writes before stable storage (bounded by the txg interval), so a crash can lose writes clients saw succeed; the `soft` client mounts turn NAS trouble into `EIO` after 2 retrans instead of hanging. Synced exports would trade ingest throughput for that window; not changed here.

@@ -234,12 +234,15 @@ trust root, and a peer fill is only admitted when a trusted digest exists
 to verify it against (`hydratePiece` in src/fuse_fs.zig; `expectedHash` in
 src/store.zig). Fetched bytes that fail verification are discarded unmarked
 and the piece refills from origin (`fill_err_verify` counter). Cached bytes
-are re-verified against their digest before every `/data` serve
-(`verifyRange` in src/peer.zig; a mismatch drops the transfer with a 500 and
-counts `serve_verify_fail`, so a node whose cache is silently corrupt shows
-up in status.json instead of poisoning the fleet). `modelfs verify <rel>`
-rehashes a whole file's cached pieces against the manifest and clears
-mismatched marks.
+are re-verified against their digest before every `/data` and `/stage`
+serve (`verifyRange`/`serveStage` in src/peer.zig; a mismatch drops the
+transfer with a 500, counts `serve_verify_fail`, and **self-heals** --
+`Store.healPiece` clears the piece's mark so the next fill re-hydrates
+from origin instead of failing every serve of that piece). `modelfs verify
+<rel>` rehashes a whole file's cached pieces against the manifest and
+clears mismatched marks the same way. Local (FUSE) reads are not re-verified
+per-read; a piece corrupt but never served to a peer waits for `modelfs
+verify` (operations.md Integrity runbook).
 
 The trusted digests come from two places:
 

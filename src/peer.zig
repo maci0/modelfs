@@ -571,8 +571,10 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, target: []cons
         if (!std.mem.eql(u8, &digest, &e)) {
             // The cached bytes no longer match their trusted digest; they
             // must not be staged (the fetching peer would mark them filled).
+            // Heal like verifyRange: the next fill re-hydrates from origin.
             _ = self.store.stats.serve_verify_fail.fetchAdd(1, .monotonic);
-            std.log.warn("piece {s} {d} failed at-rest verification; refusing to stage", .{ file.rel, idx });
+            std.log.warn("piece {s} {d} failed at-rest verification; refusing to stage and healing", .{ file.rel, idx });
+            self.store.healPiece(file, idx);
             replyStatus(self, fd, "500 Internal Server Error");
             return;
         }
@@ -847,7 +849,10 @@ fn verifyRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
         piece.digest(pbuf.?[0..ln], &h);
         if (!std.mem.eql(u8, &h, &expect)) {
             _ = self.store.stats.serve_verify_fail.fetchAdd(1, .monotonic);
-            std.log.warn("piece {s} {d} failed at-rest verification; refusing to serve", .{ file.rel, pi });
+            std.log.warn("piece {s} {d} failed at-rest verification; refusing to serve and healing", .{ file.rel, pi });
+            // Self-heal: clear the mark so the next fill re-hydrates from
+            // origin instead of failing every serve of this piece.
+            self.store.healPiece(file, pi);
             replyStatus(self, fd, "500 Internal Server Error");
             return false;
         }
@@ -1538,14 +1543,19 @@ fn fetchFromCands(
         const range: proto.Range = .{ .start = start, .end = start +| out.len -| 1 };
         const t0 = sys.monoNs(cat.io);
         // Staged (RDMA) fetch first, only when the have line says this
-        // peer advertises the data plane: a fleet without verbs never pays
-        // the /stage probe. Any staged failure (peer cannot stage, backend
-        // read failed) falls through to the HTTP /data path below -- the
-        // staged plane is best-effort by construction.
-        const staged_ok = if (cat.haveStage(rel, win.ip, win.port, sys.monoMs(cat.io)) == true)
-            fetchPieceStaged(gpa, cat.io, psk, win.ip, win.port, rel, idx, out)
-        else
-            false;
+        // peer advertises the data plane and its staging has not failed
+        // recently: a fleet without verbs never pays the /stage probe, and
+        // a peer whose backend broke is skipped until the backoff expires.
+        // Any staged failure falls through to the HTTP /data path below --
+        // the staged plane is best-effort by construction.
+        const now_ms = sys.monoMs(cat.io);
+        const can_stage = cat.haveStage(rel, win.ip, win.port, now_ms) == true and
+            !cat.stageDown(win.ip, win.port, now_ms);
+        const staged_ok = if (can_stage) blk: {
+            const ok = fetchPieceStaged(gpa, cat.io, psk, win.ip, win.port, rel, idx, out);
+            if (!ok) cat.noteStageDown(win.ip, win.port, sys.monoMs(cat.io));
+            break :blk ok;
+        } else false;
         if (staged_ok) {
             _ = cat.inflight(win.ip, win.port, -1);
             const dt = sys.monoNs(cat.io) - t0;
@@ -3420,6 +3430,65 @@ test "fillFromPeers fetches staged pieces when the peer advertises X-Stage" {
     try std.testing.expectEqual(@as(?bool, true), cat.haveStage("one.bin", "127.0.0.1", port, sys.monoMs(cat.io)));
 }
 
+test "fillFromPeers backs off /stage after a staged fetch fails" {
+    // A peer that advertises X-Stage but fails every /stage (broken backend)
+    // must not cost an extra round trip per piece: the first failure marks
+    // the address down for the TTL, and later pieces go straight to /data.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-ffp-backoff-o");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-ffp-backoff-c");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // 32-byte file: two 16-byte pieces.
+    var pattern: [32]u8 = undefined;
+    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 37);
+    var fbuf: [192]u8 = undefined;
+    var fz: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fbuf, "{s}/two.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
+
+    const saved = rdma.backend;
+    rdma.backend = .{ .kind = .fake, .gpa = gpa, .fake_cap = 0 };
+    defer {
+        rdma.backend.staged.deinit(gpa);
+        rdma.backend = saved;
+    }
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+    const port = srv.port();
+    // Warm both pieces through the server's own /data path.
+    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "two.bin", 0, 31);
+    gpa.free(warm);
+
+    var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    try cat.paths.append(gpa, .{
+        .peer_id = "full",
+        .ip = "127.0.0.1",
+        .port = port,
+        .ewma_bps = 1e9,
+        .hops = 0,
+    });
+
+    var out: [16]u8 = undefined;
+    try fillFromPeers(gpa, "secret", &cat, "two.bin", 0, 16, &out, &srv.store.stats);
+    try std.testing.expectEqualSlices(u8, pattern[0..16], &out);
+    try std.testing.expectEqual(@as(u64, 0), rdma.backend.reads_done);
+    // Piece 0's /stage attempt failed and marked the address down.
+    try std.testing.expectEqual(@as(u64, 1), rdma.backend.stage_calls);
+    const now_ms = sys.monoMs(cat.io);
+    try std.testing.expect(cat.stageDown("127.0.0.1", port, now_ms));
+    // Piece 1 skips /stage entirely (backoff): bytes still land via /data.
+    try fillFromPeers(gpa, "secret", &cat, "two.bin", 1, 16, &out, &srv.store.stats);
+    try std.testing.expectEqualSlices(u8, pattern[16..32], &out);
+    try std.testing.expectEqual(@as(u64, 1), rdma.backend.stage_calls);
+    try std.testing.expectEqual(@as(u64, 0), rdma.backend.reads_done);
+}
+
 test "fillFromPeers falls back to /data when staging is advertised but unavailable" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
@@ -4561,6 +4630,11 @@ test "serveData verifies cached pieces against their trusted digest before strea
     }
     try std.testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", rbuf[0..got_len]);
     try std.testing.expectEqual(before + 1, fixture.st.stats.serve_verify_fail.load(.monotonic));
+    // Self-heal: the refused piece's mark is cleared for an origin refill.
+    file.mu.lockUncancelable(std.testing.io);
+    const healed = !file.bits.get(0);
+    file.mu.unlock(std.testing.io);
+    try std.testing.expect(healed);
 }
 
 /// One-shot /data request against the fixture server, asserting a 206 whose

@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Serve-verify self-heal, staged-fetch backoff, integrity runbook - 2026-08-28
+- **A piece that fails at-rest verification now self-heals.** `verifyRange`
+  and `serveStage` used to refuse the serve (500 + `serve_verify_fail`) and
+  leave the corrupt bytes marked, so every later serve of that piece failed
+  until a cull or a manual `modelfs verify`. They now also clear the mark
+  (`Store.healPiece`): the next fill re-hydrates from origin and re-verifies,
+  so a node with bit rot or hole zeros converges on its own instead of
+  failing forever. `modelfs verify` uses the same heal path.
+- **A peer whose staging plane fails is backed off, not re-probed.** A peer
+  that advertises `X-Stage` and then fails `/stage` cost one extra round
+  trip per piece for the whole have TTL. The address is now marked down
+  (`Catalog.noteStageDown`/`stageDown`, bounded like the have cache, expiry
+  after the TTL so a recovered backend is retried) and later pieces go
+  straight to `/data`.
+- **Integrity operations runbook** (docs/operations.md "Integrity runbook"):
+  what `serve_verify_fail` and `fill_err_verify` mean, what the daemon
+  heals automatically, when to run `modelfs verify` (local-only corruption
+  is not per-read verified), and `modelfs dupes` for dedup decisions.
+- **The fake RDMA backend is thread-safe** (pool guarded by a mutex, like
+  the real verbs pool must be) and counts stage attempts, which is how the
+  backoff is tested.
+
 ## [0.3.0] - 2026-08-28
 
 Third tagged release. Piece integrity ships and closes threat-model gap R2:

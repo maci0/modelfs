@@ -1669,10 +1669,7 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         if (std.mem.eql(u8, &h, &expect)) continue;
         mismatches += 1;
         if (!builtin.is_test) std.log.warn("verify mismatch for {s} piece {d}; clearing cached mark", .{ rel, i });
-        file.mu.lockUncancelable(dummy_io.io());
-        file.bits.clear(i);
-        file.mu.unlock(dummy_io.io());
-        _ = store.saveBits(file, false);
+        store.healPiece(file, i);
     }
     std.log.info("verified {s}: {d} piece(s) checked, {d} mismatch(es) cleared", .{ rel, checked, mismatches });
     if (!printOut(io, gpa, "verified {s}: {d} piece(s) checked, {d} mismatch(es) cleared\n", .{ rel, checked, mismatches })) return 1;

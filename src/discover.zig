@@ -280,6 +280,12 @@ pub const Catalog = struct {
     arena: std.heap.ArenaAllocator,
     have_mu: std.Io.Mutex = .init,
     have_cache: std.ArrayList(HaveEntry) = .empty,
+    /// Addresses whose staged (RDMA) data plane failed a fetch recently,
+    /// keyed by (ip, port) and guarded by have_mu like the have cache. A
+    /// peer that advertises X-Stage and then fails /stage must not cost an
+    /// extra round trip per piece for the whole TTL; the entry expires so a
+    /// recovered backend is retried.
+    stage_down: std.ArrayList(StageDown) = .empty,
 
     /// /have answers from recent probes, keyed by (rel, ip, port).
     /// fillFromPeers runs once per piece; without this cache a sequential
@@ -293,6 +299,14 @@ pub const Catalog = struct {
     /// the next piece.
     const have_ttl_ms: i64 = 2000;
     const have_cache_cap: usize = 32;
+
+    const stage_down_cap: usize = 32;
+
+    const StageDown = struct {
+        ip: []u8,
+        port: u16,
+        expires_ms: i64,
+    };
 
     const HaveEntry = struct {
         rel: []u8,
@@ -385,6 +399,51 @@ pub const Catalog = struct {
         defer self.have_mu.unlock(self.io);
         const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
         return e.stage;
+    }
+
+    /// True when a recent staged fetch from (ip, port) failed, so the
+    /// caller should skip /stage and go straight to /data for the TTL. The
+    /// entry expires: a peer whose backend recovered is retried.
+    pub fn stageDown(self: *Catalog, ip: []const u8, port: u16, now_ms: i64) bool {
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (self.stage_down.items) |e| {
+            if (e.port == port and std.mem.eql(u8, e.ip, ip) and now_ms < e.expires_ms) return true;
+        }
+        return false;
+    }
+
+    /// Records a failed staged fetch from (ip, port), refreshing any
+    /// existing entry's expiry (a persistently failing peer stays down, a
+    /// one-off failure clears after the TTL). Bounded like the have cache:
+    /// an entry that cannot fit evicts an expired one, else is dropped --
+    /// worst case the peer gets one /stage retry, which falls back anyway.
+    pub fn noteStageDown(self: *Catalog, ip: []const u8, port: u16, now_ms: i64) void {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (self.stage_down.items) |*e| {
+            if (e.port != port or !std.mem.eql(u8, e.ip, ip)) continue;
+            e.expires_ms = now_ms +| have_ttl_ms;
+            return;
+        }
+        if (self.stage_down.items.len >= stage_down_cap) {
+            var victim: ?usize = null;
+            for (self.stage_down.items, 0..) |e, i| {
+                if (now_ms >= e.expires_ms) {
+                    victim = i;
+                    break;
+                }
+            }
+            if (victim) |vi| {
+                gpa.free(self.stage_down.items[vi].ip);
+                _ = self.stage_down.orderedRemove(vi);
+            } else return;
+        }
+        const ip_own = gpa.dupe(u8, ip) catch return;
+        self.stage_down.append(gpa, .{ .ip = ip_own, .port = port, .expires_ms = now_ms +| have_ttl_ms }) catch {
+            gpa.free(ip_own);
+        };
     }
 
     pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, stage: bool, now_ms: i64) void {
@@ -531,6 +590,8 @@ pub const Catalog = struct {
     pub fn deinit(self: *Catalog) void {
         for (self.have_cache.items) |e| freeHaveEntry(self.gpa, e);
         self.have_cache.deinit(self.gpa);
+        for (self.stage_down.items) |e| self.gpa.free(e.ip);
+        self.stage_down.deinit(self.gpa);
         self.paths.deinit(self.gpa);
         self.arena.deinit();
     }
@@ -2370,4 +2431,25 @@ test "refresh snapshot order is membership, not readdir or lease addrs order" {
     try std.testing.expectEqualStrings("10.1.0.1", snap[2].ip);
     try std.testing.expectEqualStrings("zzz", snap[3].peer_id);
     try std.testing.expectEqualStrings("10.1.0.9", snap[3].ip);
+}
+
+test "stageDown tracks a failed staged fetch for the have TTL" {
+    const gpa = std.testing.allocator;
+    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    const t0: i64 = 1000;
+    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0));
+    cat.noteStageDown("10.0.0.9", 18080, t0);
+    try std.testing.expect(cat.stageDown("10.0.0.9", 18080, t0));
+    // Same address, different port: not down.
+    try std.testing.expect(!cat.stageDown("10.0.0.9", 19090, t0));
+    // Different address: not down.
+    try std.testing.expect(!cat.stageDown("10.0.0.8", 18080, t0));
+    // Expiry: a recovered backend is retried after the TTL.
+    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms));
+    // A refresh extends the entry (persistent failure stays down).
+    cat.noteStageDown("10.0.0.9", 18080, t0);
+    cat.noteStageDown("10.0.0.9", 18080, t0 + 100);
+    try std.testing.expect(cat.stageDown("10.0.0.9", 18080, t0 + 100));
+    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms + 100));
 }

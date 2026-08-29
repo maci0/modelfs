@@ -82,6 +82,14 @@ pub const Backend = struct {
     /// Fake-only: successful window reads (the staged-fetch path), so
     /// tests can tell a staged fetch from the HTTP fallback.
     reads_done: u64 = 0,
+    /// Fake-only: stage() attempts, so tests can observe the stage-failure
+    /// backoff (a downed peer must stop costing /stage round trips).
+    stage_calls: u64 = 0,
+    /// Serializes the fake's pool: the serving thread stages while the
+    /// fetching thread reads in the e2e tests, and the real verbs pool
+    /// must be thread-safe for the same reason. std.atomic.Mutex (not the
+    /// Io-cancelable one) because the backend interface carries no io.
+    lock: std.atomic.Mutex = .unlocked,
 
     /// Whether this backend can stage right now (a verbs device is open,
     /// or the fake is wired). /have advertises X-Stage only when true.
@@ -99,6 +107,9 @@ pub const Backend = struct {
         switch (self.kind) {
             .none => return null,
             .fake => {
+                lockOrYield(&self.lock);
+                defer self.lock.unlock();
+                self.stage_calls += 1;
                 if (self.staged.items.len >= self.fake_cap) return null;
                 const own = self.gpa.dupe(u8, data) catch return null;
                 self.staged.append(self.gpa, own) catch {
@@ -123,11 +134,13 @@ pub const Backend = struct {
         switch (self.kind) {
             .none => return false,
             .fake => {
+                lockOrYield(&self.lock);
+                defer self.lock.unlock();
                 if (window.addr >= self.staged.items.len) return false;
                 const buf = self.staged.items[@intCast(window.addr)];
                 if (buf.len != out.len or window.len != out.len) return false;
                 @memcpy(out, buf);
-                self.release(window);
+                self.releaseLocked(window);
                 self.reads_done += 1;
                 return true;
             },
@@ -144,15 +157,29 @@ pub const Backend = struct {
         switch (self.kind) {
             .none => {},
             .fake => {
-                if (window.addr >= self.staged.items.len) return;
-                const buf = self.staged.items[@intCast(window.addr)];
-                if (buf.len == 0) return;
-                self.staged.items[@intCast(window.addr)] = &.{};
-                self.gpa.free(buf);
+                lockOrYield(&self.lock);
+                defer self.lock.unlock();
+                self.releaseLocked(window);
             },
         }
     }
+
+    /// Caller holds self.lock.
+    fn releaseLocked(self: *Backend, window: Window) void {
+        if (window.addr >= self.staged.items.len) return;
+        const buf = self.staged.items[@intCast(window.addr)];
+        if (buf.len == 0) return;
+        self.staged.items[@intCast(window.addr)] = &.{};
+        self.gpa.free(buf);
+    }
 };
+
+/// Blocking lock over std.atomic.Mutex's tryLock: the fake pool is
+/// contended by the serving and fetching threads in the e2e tests, and
+/// std.atomic.Mutex exposes no blocking lock by design.
+fn lockOrYield(m: *std.atomic.Mutex) void {
+    while (!m.tryLock()) std.Thread.yield() catch {};
+}
 
 /// The daemon's data-plane backend. `.none` until a verbs backend ships;
 /// set once at State.init (before any peer/fill thread that reads it

@@ -1354,6 +1354,26 @@ pub const Store = struct {
         if (file.manifest_dirty) file.manifest_dirty = false;
     }
 
+    /// Clears a piece's mark after its cached bytes failed at-rest
+    /// verification (verifyRange/serveStage), so the next fill re-hydrates
+    /// from origin -- the serving node self-heals instead of failing every
+    /// serve of the piece until a cull or `modelfs verify`. The bytes are
+    /// left in place (no punch): the trusted digest is kept as the refill's
+    /// expectation, and the fetching node's own verify-before-admit
+    /// (hydratePiece) rejects any torn bytes a concurrent refill could
+    /// introduce into an in-flight send. Same lock discipline as
+    /// punchPiece: content_mu then file.mu.
+    pub fn healPiece(self: *Store, file: *Cached, idx: u32) void {
+        file.content_mu.lockUncancelable(self.io);
+        defer file.content_mu.unlock(self.io);
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        if (file.dead.load(.acquire)) return;
+        if (!file.bits.get(idx)) return;
+        file.bits.clear(idx);
+        _ = self.saveBits(file, false);
+    }
+
     /// Drops every trusted hash and the manifest-load state: a size change
     /// (reconcileSize, cacheFill shrink), distrust, or forget means the old
     /// digests describe bytes that no longer exist and would reject the
