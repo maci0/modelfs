@@ -258,9 +258,11 @@ The trusted digests come from two places:
   src/fuse_fs.zig), so an ingested file gets a manifest from its writer,
   and a legacy file with no manifest gets one from the first node that
   fully origin-reads it. Readers load the manifest lazily, once per entry
-  size (`expectedHash`), and verify peer fills against it; a manifest whose
-  grid or size disagrees with the reader's is ignored (origin fills, no
-  peer verification). A file with no manifest anywhere has no trust
+  size (`expectedHash`), and verify peer fills against it; a transient
+  load failure (an NFS negative cache hiding the writer's just-published
+  manifest) is retried after a few seconds instead of disabling peer fills
+  for the entry's lifetime, and a manifest whose grid or size disagrees
+  with the reader's is ignored (origin fills, no peer verification). A file with no manifest anywhere has no trust
   reference, so its fills stay origin-only -- the cost of never serving
   unverified bytes (THREAT_MODEL.md, former gap R2).
 

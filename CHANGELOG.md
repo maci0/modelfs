@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### 4-VM cluster e2e and a manifest-load retry fix - 2026-08-29
+- **`scripts/run_vm_cluster_e2e.sh` boots a real cluster: one NFS server VM
+  plus three modelfs client VMs** on libvirt/KVM (the topology the 9-node
+  loopback test cannot exercise). It builds modelfs inside the NFS VM
+  against Ubuntu 24.04's libfuse3 (a host-built binary links the host's
+  soname), exports the origin over NFS, and verifies the full story across
+  a real network: leases on the NFS origin, peers discovery, client 1
+  origin-fills and publishes the piece-hash manifest, clients 2-3
+  peer-fill verified against it, `modelfs verify` clean, `dupes --all`
+  scans the manifest, integrity counters zero, cache bounds held. Needs
+  sudo, /dev/kvm, and cloud-image-utils; run locally like the 9-node
+  suite (CONTRIBUTING "End-to-end suites").
+- **A reader that missed a freshly published manifest now retries.** A
+  transient manifest-load failure (an NFS negative cache can hide the
+  writer's just-published manifest, or a torn publish is being rewritten)
+  used to disable peer fills for the entry's lifetime -- the reader
+  origin-filled everything. `Store` now retries a transient absence after
+  `manifest_retry_ms` (3 s; a field, shrunk in tests), which the VM e2e
+  surfaced and now pins.
+
 ### `modelfs dupes --all`, verify reporting, doc dates - 2026-08-29
 - **`modelfs dupes --all --origin PATH` scans the whole manifest store**
   (no positional paths): total manifests/pieces, byte-identical pairs, and

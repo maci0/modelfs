@@ -241,6 +241,11 @@ pub const Store = struct {
     /// sample the epoch before loadBits and discard the build when it
     /// changed before the insert window.
     purge_epoch: u64 = 0,
+    /// How long a transient manifest-load failure waits before the next
+    /// attempt (a field so tests shrink it; 3 s in production). Cheap:
+    /// expectedHash consults the timestamp per miss, so the origin is
+    /// re-read at most once per interval while fills are active.
+    manifest_retry_ms: i64 = 3000,
 
     pub const Cached = struct {
         rel: []u8,
@@ -293,10 +298,16 @@ pub const Store = struct {
         /// refill must meet), so a culled piece refills verified.
         hashes: std.AutoHashMap(u32, [piece.digest_len]u8),
         /// file.size at the last manifest load attempt. null = never
-        /// attempted for the current size; a manifest whose recorded
-        /// file_size differs from the entry's is stale and contributes
-        /// nothing. Read/written under file.mu.
+        /// successfully loaded for the current size; a manifest whose
+        /// recorded file_size differs from the entry's is stale and
+        /// contributes nothing. Read/written under file.mu.
         manifest_size: ?u64 = null,
+        /// Monotonic-ms instant after which a failed manifest load may be
+        /// retried. A transient failure (absent file, stale NFS negative
+        /// cache, torn write) must not disable peer fills for the entry's
+        /// whole lifetime: the writer publishes at close, which can be
+        /// moments after this node's first fill. Read/written under file.mu.
+        manifest_retry_at: i64 = 0,
         /// Trusted hashes changed since the last origin publish (admit,
         /// write-through, or a size-change wipe). mf_release publishes when
         /// set. Read/written under file.mu.
@@ -1188,8 +1199,12 @@ pub const Store = struct {
             file.mu.unlock(self.io);
             return h;
         }
+        // A failed load is retried after manifest_retry_ms: the writer
+        // publishes the manifest at close, which may land after this node's
+        // first fill (and an NFS negative cache can hide it briefly).
+        const due = file.manifest_retry_at <= sys.monoMs(self.io);
         file.mu.unlock(self.io);
-        self.tryLoadManifest(file);
+        if (due) self.tryLoadManifest(file);
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
         return file.hashes.get(idx);
@@ -1215,15 +1230,20 @@ pub const Store = struct {
             error.OpenFailed => {
                 // ENOENT is the normal "not yet published" reading and stays
                 // silent; any other open failure is an origin problem this
-                // node will hit again and deserves a line.
+                // node will hit again and deserves a line. Both are
+                // transient: the writer's close may publish moments later,
+                // so retry after manifest_retry_ms instead of remembering
+                // the absence for the entry's lifetime.
                 if (open_errno != c.ENOENT)
                     std.log.warn("piece manifest open failed for {s} (errno {d}); peer fills unverified", .{ file.rel, open_errno });
                 file.mu.lockUncancelable(self.io);
-                file.manifest_size = file.size;
+                file.manifest_retry_at = sys.monoMs(self.io) + self.manifest_retry_ms;
                 file.mu.unlock(self.io);
                 return;
             },
             error.FileTooBig => {
+                // An oversized artifact will not shrink; remembering it is
+                // correct and avoids a 64 MiB read every retry interval.
                 std.log.warn("piece manifest oversized for {s}; peer fills unverified", .{file.rel});
                 file.mu.lockUncancelable(self.io);
                 file.manifest_size = file.size;
@@ -1233,24 +1253,25 @@ pub const Store = struct {
             else => {
                 std.log.warn("piece manifest read failed for {s}: {t}; peer fills unverified", .{ file.rel, err });
                 file.mu.lockUncancelable(self.io);
-                file.manifest_size = file.size;
+                file.manifest_retry_at = sys.monoMs(self.io) + self.manifest_retry_ms;
                 file.mu.unlock(self.io);
                 return;
             },
         };
         defer self.gpa.free(blob);
         const m = piece.manifestDecode(self.gpa, blob) catch {
+            // A torn publish heals when the writer retries; retry too.
             std.log.warn("corrupt piece manifest for {s}; peer fills unverified", .{file.rel});
             file.mu.lockUncancelable(self.io);
-            file.manifest_size = file.size;
+            file.manifest_retry_at = sys.monoMs(self.io) + self.manifest_retry_ms;
             file.mu.unlock(self.io);
             return;
         };
         if (m == null) {
-            // The name exists but is not a manifest: an artifact this node
-            // cannot use. Remember the attempt like the other failures.
+            // The name exists but is not a manifest; retry in case a real
+            // manifest lands on the next publish.
             file.mu.lockUncancelable(self.io);
-            file.manifest_size = file.size;
+            file.manifest_retry_at = sys.monoMs(self.io) + self.manifest_retry_ms;
             file.mu.unlock(self.io);
             return;
         }
@@ -1384,6 +1405,7 @@ pub const Store = struct {
     pub fn clearHashes(_: *Store, file: *Cached) void {
         file.hashes.clearRetainingCapacity();
         file.manifest_size = null;
+        file.manifest_retry_at = 0;
         file.manifest_dirty = true;
     }
 
@@ -5462,4 +5484,44 @@ test "reconcileSize drops every trusted hash with the old marks" {
     f2.mu.lockUncancelable(std.testing.io);
     try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
     f2.mu.unlock(std.testing.io);
+}
+
+test "a transient manifest absence is retried and picked up after publication" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-manifest-retry");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-manifest-retry");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // Reader misses first (the writer has not published yet). The absence
+    // must be transient: an NFS negative cache can hide the manifest for a
+    // moment after the writer's close, and remembering it would disable
+    // peer fills for the whole entry lifetime.
+    var reader = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(i32, 0), reader.ensureLayout());
+    reader.manifest_retry_ms = 1;
+    const rf = try reader.get("m.bin", 32, sys.monoSec(std.testing.io));
+    defer reader.releaseFile(rf);
+    try std.testing.expect(reader.expectedHash(rf, 0) == null);
+
+    // The writer publishes its manifest (as its release would).
+    var writer = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer writer.deinit();
+    try std.testing.expectEqual(@as(i32, 0), writer.ensureLayout());
+    const wf = try writer.get("m.bin", 32, sys.monoSec(std.testing.io));
+    defer writer.releaseFile(wf);
+    var h0: [piece.digest_len]u8 = undefined;
+    piece.digest("0123456789abcdef", &h0);
+    try std.testing.expectEqual(@as(u32, 16), (try writer.beginFill(wf, 0, sys.monoSec(std.testing.io))).len);
+    try std.testing.expectEqual(@as(i32, 0), writer.completeFill(wf, 0, "0123456789abcdef", h0, sys.monoSec(std.testing.io)));
+    writer.publishManifest(wf);
+
+    // After the retry interval the reader picks the manifest up and can
+    // verify peer fills.
+    sys.sleepMs(std.testing.io, 10);
+    const got = reader.expectedHash(rf, 0).?;
+    try std.testing.expectEqualSlices(u8, &h0, &got);
 }

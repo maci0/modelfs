@@ -17,7 +17,10 @@ Python tooling is pinned and type-checked against 3.12
 a bump updates the check job). uv itself is `[tool.uv] required-version`
 in [pyproject.toml](pyproject.toml) (the field setup-uv installs from).
 The 9-node cluster suite also needs the FUSE helper (`fuse3` / `fuse`,
-providing `/dev/fuse` and `fusermount3`). Install the lock with uv:
+providing `/dev/fuse` and `fusermount3`); the 4-VM cluster suite needs
+libvirt + KVM + sudo (it boots an NFS server VM and three client VMs, so
+it exercises a real NFS origin and real network piece exchange -- see
+run_vm_cluster_e2e.sh). Install the lock with uv:
 
 ```bash
 uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
@@ -70,6 +73,7 @@ a PIE with full RELRO, BIND_NOW, and a non-executable stack.
 ```bash
 ./scripts/run_e2e_tests.sh             # CLI and peer protocol; no FUSE mount needed
 ./scripts/run_cluster_e2e_9nodes.sh    # mounts 9 FUSE filesystems: needs /dev/fuse and fusermount3 (fuse3 / fuse)
+./scripts/run_vm_cluster_e2e.sh        # 4 VMs (NFS server + 3 clients) on libvirt/KVM: needs sudo, /dev/kvm, cloud-image-utils
 ./scripts/test_fault_tolerance.sh      # peer loss and lease expiry; some checks skip loudly without a live peer
 ./scripts/test_dr_restore_drill.sh     # restore drill against stub zfs; also run by check.sh
 ./scripts/check_drill_log.sh           # fail if the monthly drill log is missing or stale
