@@ -286,6 +286,10 @@ pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
 pub const HaveBits = struct {
     bits: []u8,
     piece_size: u32,
+    /// Whether the peer advertised X-Stage: a staged (RDMA) data plane for
+    /// piece fetches. Fetchers only attempt /stage when the have line says
+    /// the peer can stage, so a fleet without verbs never pays the probe.
+    stage: bool = false,
 
     /// True when bit `idx` is set on a grid compatible with `local_piece_size`.
     /// A mismatched advertised grid is treated as no-answer at this index

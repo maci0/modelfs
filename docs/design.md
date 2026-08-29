@@ -696,11 +696,11 @@ Kill-risk is step 4 with real llama.cpp and a real vLLM directory. If that is wr
 
 Threat model: trusted LAN cluster, untrusted origin possible (public S3, Hub).
 
-The table below is the original sketch. Only three of its mitigations have any shipped counterpart: path-traversal pinning and mode preservation (via the origin create), plus peer authentication as a static shared token only (bearer PSK over plaintext HTTP; mTLS did not ship). No content hashing exists anywhere: pieces fetched from peers are cached and re-served unverified, and origin bytes are trusted as-is. The current threat model, including what these gaps cost, is [THREAT_MODEL.md](THREAT_MODEL.md); do not cite rows below as shipped posture.
+The table below is the original sketch. Only three of its mitigations had a shipped counterpart when this note was first written; as of the 0.2.x integrity work, per-piece content hashing ships in Level 1 form (below and in architecture.md "Piece integrity"): peer fills verify against a trusted digest before admit, cached bytes verify before every /data serve, and `modelfs verify` audits the cache on demand. mTLS still did not ship (bearer PSK over plaintext HTTP), origin tampering is still outside the trust model (the manifest trusts the origin exactly as the file bytes do), and local cache-artifact tampering is still THREAT_MODEL.md R7. The current threat model is [THREAT_MODEL.md](THREAT_MODEL.md); do not cite rows below as shipped posture.
 
 | Risk | Mitigation (sketch) | Shipped? |
 |---|---|---|
-| Corrupt piece from a peer | blake3 on every chunk before CAS admit; never serve unverified bytes | No. No hashes at all; see THREAT_MODEL.md gap R2 |
+| Corrupt piece from a peer | blake3 on every chunk before CAS admit; never serve unverified bytes | Level 1: per-piece blake3 digests, verify-before-admit on peer fills and verify-before-serve on /data (src/fuse_fs.zig `hydratePiece`, src/peer.zig `verifyRange`); see architecture.md "Piece integrity" |
 | Namespace spoofing | Authenticate peers (shared token or mTLS on the QUIC/HTTP port) | Partially: bearer PSK on every endpoint (src/peer.zig), plaintext TCP, no mTLS |
 | Origin tampering | Same hashes; origin is untrusted for integrity | No. Origin bytes are served and cached without verification |
 | Path traversal in FUSE | Pin the tree to the namespace; no `..` out of mount | Yes: `relOk` gate at every external path boundary (src/store.zig `relOk`) |
@@ -714,7 +714,7 @@ v1 auth: static shared secret or mTLS. No anonymous P2P on a public interface. S
 
 ## 10. Observability
 
-Original sketch minimum. Shipped signals (tick line, `status.json`) are in [architecture.md](architecture.md); there is no per-file digest, hydrate %, or replicate-lag view, and no verify-fail counter (no hashes).
+Original sketch minimum. Shipped signals (tick line, `status.json`) are in [architecture.md](architecture.md); there is no per-file digest, hydrate %, or replicate-lag view, but verification failures DO have counters now: `fill_err_verify` (peer fills rejected at admit) and `serve_verify_fail` (at-rest mismatches refused before serving) ride the tick line and status.json.
 
 Minimum:
 
@@ -764,13 +764,13 @@ Resolved by the shipped code and recorded in section 13 (not re-decided here):
 
 Status values: **Accepted** (still in force), **Partial** (part shipped), **Superseded** (replaced; the cell names what replaced it), **Not shipped** (never implemented). What runs is [architecture.md](architecture.md).
 
-| Decision | Choice | Why | Status (2026-08-27) |
+| Decision | Choice | Why | Status (2026-08-28) |
 |---|---|---|---|
 | Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partial: POSIX piece cache shipped; no content-addressed store (path-keyed) |
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Accepted |
 | Frontend | Sparse-file hydrate, then leave the I/O path | mmap for llama.cpp / vLLM | Superseded: FUSE read path with `direct_io`; agent stays in the I/O path (UMA OOM; reverses section 4.8 rule 6) |
 | Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partial: fixed 16 MiB transfer pieces; chunks/CDC absent |
-| Hash | blake3 | Fast, enough collision resistance for this | Not shipped |
+| Hash | blake3 | Fast, enough collision resistance for this | Partial: Level 1 shipped (per-piece digests, manifests, verify); content-addressed storage and wire-level identity did not (section 14.5) |
 | Two-node | Embedded metadata, RF=2 | No extra store | Not shipped (origin-less RF=2). Membership is origin `.cluster/<id>.json` leases (see Origin) |
 | Origin | Optional peer that never evicts | Same protocol | Superseded: origin is required (POSIX dir); "never evicts" holds |
 | Transport | QUIC or HTTP/2 Have/Want/Piece | One port; inspectable | Superseded: plaintext HTTP/1.1 `GET /ping`, `/have`, `/data` (see architecture.md) |
@@ -780,9 +780,157 @@ Status values: **Accepted** (still in force), **Partial** (part shipped), **Supe
 | v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 16 MiB pieces (`--piece` overrides); no chunking |
 | Kubernetes | Not required for v1 | Two-node first | Accepted: no Kubernetes; one foreground binary, systemd `Type=simple` |
 
+## 14. Content identity: shipped Level 1; Levels 2-3 shelved pending telemetry
+
+`architecture.md` "Piece integrity" is shipped behavior; this section is the
+roadmap the design reserved (C.3/C.4) expressed as three levels, and the
+status of each. The motivating question is dedup: "second copy of a model:
+new path" costs disk and origin reads, and a same-snapshot-under-two-names
+(or a re-export that edits a few tensors) stores the same bytes twice. The
+answer is content identity, and Level 1 already builds the primitive every
+higher level needs: a blake3 digest per piece, with the origin as the trust
+reference.
+
+### Level 1 -- content identity at rest (shipped)
+
+Per-piece blake3 digests recorded at admit (origin fills, write-throughs,
+verified peer fills); published to the origin as a piece-hash manifest at
+close (`mf_release`); loaded lazily by readers as the trust reference for
+peer fills; verified again before every `/data` serve; auditable with
+`modelfs verify <rel>`. This is an integrity mechanism first (closes
+THREAT_MODEL.md R2) and a dedup foundation second: the digest is the
+identity a future CAS can key on, and the manifest is the "file = ordered
+chunk hashes" object of section 4.3 without the CAS storage behind it.
+
+What Level 1 deliberately does NOT do:
+
+- No content-addressed storage: cache `data/` files stay path-keyed, so
+  the same bytes under two paths still occupy disk twice.
+- No wire change: `/have` and `/data` still name `(path, range)`, and the
+  peer protocol, `X-Piece-Size` handshake, and 2 s probe cache are
+  untouched.
+- No CDC: dedup granularity is the fixed 16 MiB grid, so only pieces that
+  are byte-identical whole (same grid, same size, same content regions)
+  share an identity.
+
+### Level 2 -- content identity on the wire (shelved)
+
+Make the hash the transfer key, not the path: `/have`/`/data` keyed by
+digest, one blob per digest (`cas/<ab>/<cd>/<hash>` per C.4) with
+refcounts, `data/<rel>` as an optional materialization, cull by blob
+refcount, pins by digest.
+
+**Shelved, not merely unbuilt.** The 2026-08 staged (RDMA) data plane
+(design.md section 15) collapsed Level 2's headline value: its main win was
+"fetch once per digest, not once per path," and at 200 Gbps with staged
+registration a piece transfer is ~640 us of wire time -- transfer
+duplication is no longer a cost worth engineering away. The remaining value
+(cache-disk dedup for same-snapshot-under-two-names) is real but narrow:
+Q4/Q8/FP16 variants share ~0% bytes (section 4.3), and multi-TB local disks
+with cull watermarks already absorb a few duplicated models. Meanwhile the
+full CAS rewrite actively fights what now matters: staging wants a
+zero-copy read path (blob lookup + materialization would add indirection
+to it), and Level 1's trust machinery is per-(rel, piece) -- a CAS would
+need per-blob manifests, digest-keyed pins, and refcount cull, a second
+rewrite of the integrity layer, not an extension.
+
+The one cheap residual is a **fill-time content hit**: when a fill is about
+to fetch piece k of path B, check whether a resident piece under another
+path already holds the same digest and copy locally instead of crossing the
+wire. That reuses Level 1's digests as-is, dedups fills (not storage), and
+is an incremental index -- but even it should wait for the telemetry below.
+
+**Telemetry gate:** `modelfs dupes <rel>...` compares piece-hash manifests
+across paths (the manifest store on the origin is already a duplicate-
+content index) and reports identical files, aligned overlap, and shifted
+overlap. If that number is near zero in a real fleet -- the expectation for
+"ingest once, read everywhere" -- Level 2 stays shelved and the fill-time
+content hit is not worth building either.
+
+### Level 3 -- CDC inside pieces (dormant)
+
+Content-defined chunking (FastCDC/gearhash, or safetensors/GGUF
+tensor-boundary splitting first, per section 4.3) inside the 16 MiB
+window, so re-exports that shift alignment (a changed tensor grows the
+file) still share the unchanged interior. Requires the Level 2 blob store
+plus a per-file chunk manifest instead of the fixed-grid sidecar; the
+design reserved this by keeping the manifest schema able to hold
+variable-length chunks. Q4/Q8/FP16 variants of the same net share ~0%
+bytes (section 4.3), so CDC must target re-exports, not quantizations.
+**Dormant:** its trigger is the same `modelfs dupes` telemetry -- if
+shifted overlap ever shows up at meaningful volume, CDC becomes
+justifiable; until then it is designed, not planned.
+
+## 15. Peer data transport: HTTP today, the staged (RDMA) plane designed
+
+The control plane is HTTP/1.1 + bearer PSK (`/ping`, `/have`, `/stage`,
+`/data`); the data plane moves 16 MiB pieces. This section is the roadmap
+the transport seam reserves: a staged plane where a piece is registered
+into pinned memory on the serving node and pulled with an RDMA Read at
+fabric speed, with HTTP remaining the negotiation and fallback channel.
+
+### Shipped: the seam, the protocol, and the fallback (Level 0)
+
+`src/rdma.zig` is the seam between the two planes. The `/stage` endpoint
+(`serveStage` in src/peer.zig) hydrates and at-rest-verifies one piece
+(the same `hydrateRange`/`expectedHash` pipeline as `serveData`), reads it
+into a staging buffer, and -- only after verification -- hands it to the
+data-plane backend (`rdma.Backend.stage`), which replies with a 52-byte
+window: `len u64 + rkey u32 + addr u64 + digest [32]`, the opaque address
+of the piece in registered memory plus its digest (advisory: the fetching
+node verifies the landed bytes against its own trusted digest, never
+against the serving node's claim). A node whose backend cannot stage
+answers 501 and never advertises `X-Stage` on `/have`, so fetchers never
+probe `/stage` against it. The fetch side (`fetchPieceStaged` in
+src/peer.zig) issues `/stage` only when the have-cache line carries the
+capability, reads the window through the backend, and falls back to the
+existing `/data` path on any failure -- per-piece, per-peer, exactly like
+the existing next-path fallback. The shipped backend is the null one
+(`rdma.backend = .none`), so production behavior is byte-identical to the
+HTTP-only tree; the in-memory fake exists so the whole pipeline runs under
+`zig build test` without verbs hardware.
+
+### Not shipped: the verbs tail
+
+The actual RDMA transport -- `libibverbs`/`rdma_cm` QP setup, `ibv_reg_mr`
+of the staging buffers, the RDMA Read, and the buffer-release handshake --
+is deliberately not written as untestable C interop. The design it will
+fill in:
+
+- **Transport split**: HTTP stays the control channel (auth, routing,
+  `/have` capability, `/stage` negotiation); the data plane is one-sided
+  RDMA Read per piece, driven by the fetching node like `fetchRangeInto`
+  is today. RDMA Read matches the pull model; the `/stage` window IS the
+  (addr, rkey, len) the Read needs.
+- **Registered buffers**: a pool of 16 piece-sized buffers per node
+  (matching `Server.max_inflight`; 256 MiB at 16 MiB pieces), registered
+  once at mount with `IBV_ACCESS_REMOTE_READ` and nothing else -- a
+  window grants exactly one piece's bytes, no broader memory access. The
+  fake backend's bounded pool is this pool's in-memory stand-in.
+- **Release handshake**: one-sided Read gives the server no completion,
+  so the fetching node ACKs over the control channel and the server
+  returns the buffer to the pool; a window is single-use on both sides.
+- **Failure modes**: any `/stage` failure (no backend, pool exhausted,
+  read error, malformed reply) falls back to `/data` on the same peer;
+  a mixed fleet (some nodes staging, some not) degrades per-piece like
+  mixed piece grids degrade to origin today.
+- **Fabric reality**: 200 Gbit/s is 25 GB/s. The fabric stops being the
+  constraint; per-node throughput becomes `min(NVMe aggregate, blake3
+  verification throughput, line rate)`. The staging path already reads
+  each piece once and hashes it there (no separate verify read), and the
+  16 handlers give 16-way hashing parallelism; a node needs >=2 Gen4 or 1
+  Gen5 NVMe to feed 200G. RoCEv2 additionally requires PFC/ECN/DCQCN
+  tuning or lossless RoCE collapses under congestion.
+- **Security**: the PSK gates the control channel; the window is read-only
+  into one verified piece (the same bytes `/data` already serves with
+  auth), so no new disclosure. `verify-before-stage` means only verified
+  bytes are ever exposed through registered memory.
+
 ---
 
-## 14. References
+## 16. References
+
+
 
 - JuiceFS cache groups (Enterprise) and Community cache docs: local cache, no P2P in Community.
 - Nydus + EROFS over fscache, Dragonfly P2P.

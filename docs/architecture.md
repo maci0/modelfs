@@ -43,7 +43,7 @@ One piece, one source. Misses block the read until that hole is filled. If the l
 
 | Path | What |
 |---|---|
-| `192.168.0.100:/export/models` | ZFS NFS export |
+| `192.168.0.100:/export/models` | ZFS NFS export; `.cluster/` holds leases (`<id>.json`) and piece-hash manifests (`manifests/<hex>`, see Piece integrity) |
 | `/net/192.168.0.100/models` | NFS origin on sparks, **no `fsc`** |
 | `/models` | FUSE (sparks). Empty local dir, uid 1000 |
 | `/var/cache/modelfs` | pieces (`data/` 0600 files under 0700 dirs, leftover 0755 dirs tightened at layout; `meta/*.pieces` and `pin/` 0600; `status.json` 0600) |
@@ -73,13 +73,14 @@ umask 077; openssl rand -hex 32 | sudo tee /etc/modelfs.psk
   --psk /etc/modelfs.psk
 ```
 
-Foreground (systemd `Type=simple`). Per-event logs are failure-only: unauthorized peer requests, failed piece fetches (with `ip:port` and error), origin/cache errors, and cache-filesystem statvfs failures (which suspend culling until the next successful sample; recovery logs `culling resumed`, the watermarks themselves are validated once at flag parse). FUSE origin I/O outages (EIO/ESTALE/ETIMEDOUT on getattr/open/stat, write, or origin pread during fill / cache-fallback / peer `/data` hydration, not ENOENT) are edge-triggered: the first failure logs path and errno, later ones ride the counters, and recovery logs `origin recovered`. A busy read storm must not flood the journal the way per-piece origin fills are allowed to. Accept-loop errors are the same shape (one `accept failed` line, then `accept recovered`). Steady state is summarized instead: one `tick:` line per discovery interval while any counter moved (reads, writes, fills by source, fill errors, MiB served and fetched, culled, httpok/401/5xx), so an idle node logs nothing. Membership changes log `cluster peers N -> M` even when counters are idle, so losing the fleet is in the journal without waiting for the next fill. The tick line also carries the only latency signal: `rd_us`/`wr_us` are the average wall time of a FUSE read/write over the interval, `http_us` the average `/have`+`/data` handler time, and `fill_ms peer/nfs` the average per-piece hydration stall by tier (a miss blocks the reader for one whole piece, so these numbers are how "reads got slow" is diagnosed from the journal). `reads_warm` counts fully-cached FUSE reads (hit rate is `reads_warm / reads_ok`). `probe_err` counts `/have` probes that failed for reasons other than a healthy 404 miss (dead peer, PSK drift, malformed reply): the signature of a cluster silently degraded to NFS-only; `httpok`/`serve_mib` are accepted `/have` 200 and `/data` 206 replies and their Content-Length, so a node serving pieces is distinguishable from an idle one; `httpbad` counts connections whose request head never completed; `httpdrop` counts connections closed because all inflight slots were taken (the server refusing work under saturation). Pin and unpin actions land one info line each, so "why is this file never culled" is answerable from the journal.
+Foreground (systemd `Type=simple`). Per-event logs are failure-only: unauthorized peer requests, failed piece fetches (with `ip:port` and error), origin/cache errors, and cache-filesystem statvfs failures (which suspend culling until the next successful sample; recovery logs `culling resumed`, the watermarks themselves are validated once at flag parse). FUSE origin I/O outages (EIO/ESTALE/ETIMEDOUT on getattr/open/stat, write, or origin pread during fill / cache-fallback / peer `/data` hydration, not ENOENT) are edge-triggered: the first failure logs path and errno, later ones ride the counters, and recovery logs `origin recovered`. A busy read storm must not flood the journal the way per-piece origin fills are allowed to. Accept-loop errors are the same shape (one `accept failed` line, then `accept recovered`). Steady state is summarized instead: one `tick:` line per discovery interval while any counter moved (reads, writes, fills by source, fill errors including digest-verification rejections, MiB served and fetched, culled, httpok/401/5xx, `serve_verify_fail`), so an idle node logs nothing. Membership changes log `cluster peers N -> M` even when counters are idle, so losing the fleet is in the journal without waiting for the next fill. The tick line also carries the only latency signal: `rd_us`/`wr_us` are the average wall time of a FUSE read/write over the interval, `http_us` the average `/have`+`/data` handler time, and `fill_ms peer/nfs` the average per-piece hydration stall by tier (a miss blocks the reader for one whole piece, so these numbers are how "reads got slow" is diagnosed from the journal). `reads_warm` counts fully-cached FUSE reads (hit rate is `reads_warm / reads_ok`). `probe_err` counts `/have` probes that failed for reasons other than a healthy 404 miss (dead peer, PSK drift, malformed reply): the signature of a cluster silently degraded to NFS-only; `httpok`/`serve_mib` are accepted `/have` 200 and `/data` 206 replies and their Content-Length, so a node serving pieces is distinguishable from an idle one; `httpbad` counts connections whose request head never completed; `httpdrop` counts connections closed because all inflight slots were taken (the server refusing work under saturation). Pin and unpin actions land one info line each, so "why is this file never culled" is answerable from the journal.
 
 ```
 modelfs status
 modelfs peers --origin /net/192.168.0.100/models
 modelfs pin gguf/foo.gguf
 modelfs unpin gguf/foo.gguf
+modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models
 ```
 
 `status` prints the daemon's `status.json` from the cache dir (0600, so another uid gets EACCES rather than a live/dead verdict). A missing file means the mount is not running, and so does a leftover naming an exited pid (the crash case) or one whose heartbeat is more than 120 s old (the wedged case: a hung daemon keeps its pid but stops rewriting the artifact; 120 s tolerates eleven missed 10 s ticks). Age prefers `mono_s` (CLOCK_MONOTONIC, comparable across processes on this machine) so an NTP step or admin clock set cannot flip the verdict; a leftover from the previous boot (`mono_s` ahead of now, CLOCK_MONOTONIC having reset) is stale even when pid reuse keeps the pid check green; artifacts from older builds fall back to wall-clock `now_s`. It carries liveness (`id`, `pid`, `uptime_s`, `now_s`, `mono_s`), topology (`peers`, `piece`, `inflight` HTTP handlers), saturation (`cache_free_pct`, the same sample culling runs on; `-1` when statvfs fails, i.e. culling suspended), origin health (`origin_down`, 1 while an EIO/ESTALE/ETIMEDOUT getattr/open/stat, write, or origin pread has not yet recovered), and lifetime counters (`stats`: reads/writes with errors, warm-cache reads (`reads_warm`), cumulative read, write, and peer-HTTP (`http_nanos`) durations in nanoseconds, piece fills by source (peer vs origin) with byte totals including accepted peer-reply Content-Length (`bytes_to_peer`), fill failures per tier -- including origin hydrations done to serve a peer, not only local FUSE reads -- failed `/have` probes (`probe_err`, healthy 404 misses excluded), pieces culled, accepted peer replies (`http_ok`), rejected auths, 5xx replies, malformed request heads, connections dropped at the inflight cap). `peers` lists every lease in `origin/.cluster` with its addresses and whether it is still live, using the same `walkLeases` walk Catalog.refresh uses (dot-prefixed names skipped, O_NOFOLLOW, corrupt entries skipped); rows are sorted by lease file name and each row's addresses by ip then port (`addrTieLess` in src/discover.zig), so NFS readdir and a mixed-fleet document's getifaddrs order cannot change the listing. An unreachable `--origin` fails with exit 1 (the same gate `mount` applies), while an existing origin without a `.cluster` dir yet lists as empty and exits 0.
@@ -110,12 +111,13 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 | `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
 | `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names |
 | `discover.zig` | Cluster leases (`walkLeases`, Catalog), `/have` probe cache, path scoring |
+| `rdma.zig` | RDMA data-plane transport seam: `/stage` window codec and the backend interface (null until the verbs tail; see design.md section 15) |
 | `peer.zig` | Peer HTTP server and fetch client |
 | `fuse_fs.zig` | FUSE handlers, daemon `State` (`init`/`spawnWorkers`/`deinit`/`run`), discovery/cull loops |
 | `main.zig` | CLI and mount wiring into `State.init` / `State.deinit` |
 | `root.zig` | Test aggregator for `zig build test` |
 
-`main` → `fuse_fs` → `peer` → (`store`, `discover`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
+`main` → `fuse_fs` → `peer` → (`store`, `discover`, `rdma`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
 
 ---
 
@@ -167,10 +169,22 @@ Same secret on every spark: `/etc/modelfs.psk` mode 0600, or `MODELFS_PSK_VALUE`
 ```
 GET /ping
 GET /have?path=<url-encoded rel>
+GET /stage?path=...&piece=N
 GET /data?path=...
 Range: bytes=start-end
 Authorization: Bearer <psk>
 ```
+
+`/stage` is the negotiated entry to the staged (RDMA) data plane: a node
+whose backend can stage advertises `X-Stage: 1` on `/have`, and a fetching
+node then stages one piece at a time -- hydrate, at-rest verify, register
+the bytes, and reply with a 52-byte window (`len`/`rkey`/`addr` plus the
+piece digest, advisory) that its backend reads. Any `/stage` failure (501
+= this node cannot stage, malformed reply, backend read error) falls back
+to the existing `/data` path on the same peer; a fleet without verbs never
+pays the probe because the capability rides the have-cache line. The
+shipped backend is null, so this plane is protocol-and-pipeline only until
+the verbs tail lands (design.md section 15).
 
 `/have` replies carry `X-Piece-Size: <n>`, the piece grid the bitmap's bits are indexed against; a fetcher running a different `--piece` treats that peer's answer as no-answer instead of routing fills by bits that cover different byte ranges (a fleet should still run one piece size; mixed grids degrade to origin traffic, never to wrong data). Peers older than this header read as unknown and are assumed aligned. An advertised `0` is not unknown: `--piece 0` is refused at mount, so a zero on the wire fails the probe like any other malformed grid. The bitmap body itself stays raw bits: one byte per eight pieces, bit i naming piece i least-significant-bit first, `ceil(pieces / 8)` bytes long. `piece.count` clamps at 2^32-1 pieces (`trackedEnd` in src/piece.zig); bytes past that have no bit, and FUSE/peer reads take them from the origin rather than treating an empty `cover` as a cache hit (a sparse pread of the hole would otherwise return zeros).
 
@@ -178,14 +192,15 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 
 | Status | When |
 |---|---|
-| 200 | `/ping` (`text/plain`, body `ok`) or `/have` (`application/octet-stream` bitmap + `X-Piece-Size`) |
+| 200 | `/ping` (`text/plain`, body `ok`), `/have` (`application/octet-stream` bitmap + `X-Piece-Size`), or `/stage` (52-byte window body, see design.md section 15) |
 | 206 | `/data` partial content (`Content-Range`, `application/octet-stream`) |
 | 400 | Missing, empty, undecodable, or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
 | 401 | Missing or wrong bearer token (`WWW-Authenticate: Bearer`), including on non-GET |
 | 404 | Unknown path, a `.cluster` control path, or the origin has no regular file at `path` |
 | 405 | Authenticated request whose method is not GET (`Allow: GET`) |
 | 416 | `/data` range start at/after EOF, with `Content-Range: bytes */<size>` naming the complete length (an over-long end clamps to EOF instead) |
-| 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write) |
+| 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write, staging verify failure) |
+| 501 | `/stage` only: this node has no data-plane backend (its `/have` does not advertise `X-Stage`); the fetching peer falls back to `/data` |
 | 502 | The origin is unreachable or failed (stat/pread error, or a size that does not fit `off_t`), i.e. retry another peer |
 
 A `/data` end past EOF clamps to it and `bytes=N-` means through EOF (RFC 9110); suffix ranges (`bytes=-N`) are rejected. Wire integers (`Range`, `Content-Range`, `Content-Length`, `X-Piece-Size`) are unsigned decimal digits only: a leading sign or interior underscore is malformed, the same rule RFC 9110 uses for Content-Length. Status lines are `HTTP/1.1` plus a 3-digit code: `2000` is not 200, and `4040` is not a healthy miss. The fetching peer requires `206` plus a `Content-Range` whose start matches the request, whose end is at most the request end (EOF clamp), and whose selected length equals `Content-Length` (a shorter body under a matching window is refused rather than cached). `v0.1.0` servers already send that header on every 206, so a mixed fleet still fills. Errors carry no body: both peers of a conversation parse only the status line.
@@ -210,9 +225,56 @@ Culling punches piece-sized holes (default 16 MiB, `FALLOC_FL_PUNCH_HOLE`), clea
 
 ---
 
+## Piece integrity (blake3, Level 1)
+
+Every piece that lands in the cache carries a blake3 digest of its bytes
+(`piece.digest` in src/piece.zig, `Store.Cached.hashes` in src/store.zig),
+recorded at admit: origin fills and this node's own write-throughs are the
+trust root, and a peer fill is only admitted when a trusted digest exists
+to verify it against (`hydratePiece` in src/fuse_fs.zig; `expectedHash` in
+src/store.zig). Fetched bytes that fail verification are discarded unmarked
+and the piece refills from origin (`fill_err_verify` counter). Cached bytes
+are re-verified against their digest before every `/data` serve
+(`verifyRange` in src/peer.zig; a mismatch drops the transfer with a 500 and
+counts `serve_verify_fail`, so a node whose cache is silently corrupt shows
+up in status.json instead of poisoning the fleet). `modelfs verify <rel>`
+rehashes a whole file's cached pieces against the manifest and clears
+mismatched marks.
+
+The trusted digests come from two places:
+
+- **Origin fills and write-throughs** (this node's own). The origin is the
+  write authority, so bytes read from it (or written to it by this node)
+  are trusted, and their digest becomes the reference for every later fill
+  of that piece -- including refills after a cull.
+- **The piece-hash manifest** (`Store.publishManifest` in src/store.zig),
+  published on the origin at `.cluster/manifests/<hex>` where `<hex>` is
+  `blake3(rel)` hex (`piece.manifestName`): a deterministic flat name, so
+  no nested directories and no traversal risk. Any node that wrote or
+  filled a file publishes its digests at close (`mf_release` in
+  src/fuse_fs.zig), so an ingested file gets a manifest from its writer,
+  and a legacy file with no manifest gets one from the first node that
+  fully origin-reads it. Readers load the manifest lazily, once per entry
+  size (`expectedHash`), and verify peer fills against it; a manifest whose
+  grid or size disagrees with the reader's is ignored (origin fills, no
+  peer verification). A file with no manifest anywhere has no trust
+  reference, so its fills stay origin-only -- the cost of never serving
+  unverified bytes (THREAT_MODEL.md, former gap R2).
+
+Digests survive a punch (they are the expectation a refill must meet) and
+are dropped together with the marks on size change, distrust, and forget
+(`Store.clearHashes`). The sidecar bitfield format is unchanged: hashes
+ride in memory and in the manifest, not in `meta/*.pieces`. Manifest blobs
+are bounded (64 MiB, `Store.max_manifest_bytes`), parsed by a fuzzed
+codec (`piece.manifestDecode`), and published atomically (tmp + rename,
+lazy mkdir of `.cluster/manifests` like lease publish); lease walks and
+sweeps skip them (no `.json`/`.tmp` names).
+
+---
+
 ## Writes and races
 
-Write is NFS 1:1, then a copy into this node's cache. If NFS fails, the write fails. `originPwrite` (and FUSE create/truncate, lease/status/sidecar `writeFile*`) treat a failed close after a successful write as failure: NFS reports delayed write errors there. No write-back buffer. `create` / `mkdir` / `chmod` apply the caller's permission bits only (`clientCreateMode` in src/fuse_fs.zig): setuid, setgid, and sticky are stripped so a mount writer cannot plant a daemon-owned special-bit executable. `Store.copyIntoCache` bumps a per-entry write generation unless the copy already fully covers marked pieces (a FUSE retry of the same write-through); `Store.completeFill` drops an in-flight fill whose generation no longer matches, and `Store.finishPiece` re-checks that generation after the cache write so a truncate, size reconcile, or distrust that landed during the pwrite cannot mark the fill's pre-mutation bytes. If the cache copy itself fails, overlapping piece marks drop (and the sidecar is saved) so this node's reads and `/have` answers cannot serve pre-write bytes; those pieces refill from origin. `Store.punchPiece` takes the same content lock as the copy so a cull cannot hole a piece between the write-through pwrite and its mark. Further misses on the writing node take the origin (`hydratePiece` in `src/fuse_fs.zig`): a fill discarded by a concurrent write-through retries once from origin, then fails the read with EIO rather than spinning while writers keep landing. `Store.truncateCacheFd` refuses to cut a live cache descriptor while a peer `/data` send (`Cached.xfer`) is streaming from it.
+Write is NFS 1:1, then a copy into this node's cache. If NFS fails, the write fails. `originPwrite` (and FUSE create/truncate, lease/status/sidecar `writeFile*`) treat a failed close after a successful write as failure: NFS reports delayed write errors there. No write-back buffer. `create` / `mkdir` / `chmod` apply the caller's permission bits only (`clientCreateMode` in src/fuse_fs.zig): setuid, setgid, and sticky are stripped so a mount writer cannot plant a daemon-owned special-bit executable. `Store.copyIntoCache` bumps a per-entry write generation unless the copy already fully covers marked pieces (a FUSE retry of the same write-through) and records blake3 digests for the fully covered pieces from the write buffer (boundary pieces drop their old digest: their bytes are now a mix); `Store.completeFill` drops an in-flight fill whose generation no longer matches, and `Store.finishPiece` re-checks that generation after the cache write so a truncate, size reconcile, or distrust that landed during the pwrite cannot mark the fill's pre-mutation bytes. If the cache copy itself fails, overlapping piece marks drop (and the sidecar is saved) so this node's reads and `/have` answers cannot serve pre-write bytes; those pieces refill from origin. `Store.punchPiece` takes the same content lock as the copy so a cull cannot hole a piece between the write-through pwrite and its mark. Further misses on the writing node take the origin (`hydratePiece` in `src/fuse_fs.zig`): a fill discarded by a concurrent write-through retries once from origin, then fails the read with EIO rather than spinning while writers keep landing. `Store.truncateCacheFd` refuses to cut a live cache descriptor while a peer `/data` send (`Cached.xfer`) is streaming from it.
 
 Two writers on the same path: last `pwrite` on NFS wins. No cluster lock. The other node's cache can keep stale pieces until cull or size change. Ingest on one node; everyone else reads. Second copy of a model: new path.
 
@@ -225,7 +287,17 @@ UMA: kernel page cache is off (`direct_io`). mmap of FUSE files will fail; engin
 Canonical status is [design.md](design.md) sections 2.1 (G1–G10) and 13 (key decisions):
 
 - Origin-less two-node (no shared dir)
-- Content-addressed dedup / blake3 chunks
+- Content-addressed dedup as a blob store (Level 2) and CDC chunking
+  inside pieces (Level 3) are **shelved/dormant**, not merely unbuilt: the
+  staged data plane (design.md section 15) made Level 2's headline win
+  (transfer dedup) moot, and the path-keyed integrity layer conflicts with
+  a CAS rewrite. The decision is telemetry-gated: `modelfs dupes` compares
+  piece-hash manifests across paths (aligned/shared/shifted overlap) and
+  answers "do we want dedup?" with a number; see design.md section 14.
+  Shipped instead is Level 1 -- per-piece blake3 digests for integrity
+  (`verifyRange`/`expectedHash`), the origin piece-hash manifest,
+  verify-before-admit, and `modelfs verify`; see the Piece integrity
+  section above.
 - Full-file background stripe
 - Sparse-file hydrate / FUSE passthrough (the agent stays in the I/O path; `direct_io` is the default)
 - cachefilesd stacked on FUSE (FUSE is not an FS-Cache client)

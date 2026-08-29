@@ -46,6 +46,7 @@ const usage =
     \\  modelfs peers --origin PATH
     \\  modelfs pin <relpath> [--cache PATH]
     \\  modelfs unpin <relpath> [--cache PATH]
+    \\  modelfs verify <relpath> --origin PATH [--cache PATH]
     \\  modelfs version
     \\  modelfs help
     \\
@@ -71,11 +72,11 @@ const usage =
     \\  --detach              Background after mount
     \\  -f, --foreground      Stay in the foreground (default)
     \\
-    \\mount/status/peers/pin/unpin:
+    \\mount/status/peers/pin/unpin/verify:
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
     \\
-    \\status/peers/pin/unpin take only the flags shown on their Usage line plus
-    \\the shared --origin/--cache/--psk/--log values; mount-only
+    \\status/peers/pin/unpin/verify take only the flags shown on their Usage
+    \\line plus the shared --origin/--cache/--psk/--log values; mount-only
     \\options are refused elsewhere. Every command also accepts -h/--help,
     \\and -V/--version prints the release. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
@@ -92,6 +93,7 @@ const usage =
     \\  modelfs mount /models --origin /net/192.168.0.100/models
     \\  modelfs status | jq -r .id
     \\  modelfs pin gguf/foo.gguf
+    \\  modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models
     \\
     \\Cluster leases live on the origin at .cluster/<id>.json, not under the
     \\FUSE mount. Same PSK on every node. Desktop can stay on plain NFS.
@@ -111,7 +113,7 @@ pub fn main(init: std.process.Init) !u8 {
         // command: dumping the help blob here made `modelfs` with no args
         // the only usage error that printed the full text instead of
         // naming what was missing.
-        std.debug.print("missing command (want mount, status, peers, pin, unpin, version, help)\n", .{});
+        std.debug.print("missing command (want mount, status, peers, pin, unpin, verify, dupes, version, help)\n", .{});
         return 2;
     }
     // Bare global forms live at position 0, where parseArgs sees a command
@@ -172,6 +174,20 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         }
         return cmdPin(init.io, gpa, parsed.opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
+    }
+    if (std.mem.eql(u8, parsed.cmd, "verify")) {
+        if (parsed.rest.len != 1) {
+            std.debug.print("verify takes exactly one path relative to the mount (see 'modelfs help')\n", .{});
+            return 2;
+        }
+        return cmdVerify(init.io, gpa, parsed.opts, parsed.rest[0]);
+    }
+    if (std.mem.eql(u8, parsed.cmd, "dupes")) {
+        if (parsed.rest.len == 0) {
+            std.debug.print("dupes takes at least one path relative to the mount (see 'modelfs help')\n", .{});
+            return 2;
+        }
+        return cmdDupes(init.io, gpa, parsed.opts, parsed.rest);
     }
     // parseArgs refuses anything outside the commands dispatched above, so
     // this point is unreachable unless the knownCommand list and this
@@ -529,7 +545,7 @@ fn parsePercent(flag: []const u8, raw: []const u8) !u32 {
 /// command missing from it fails loudly everywhere instead of slipping past
 /// this gate into the help answer below.
 fn knownCommand(cmd: []const u8) bool {
-    inline for (.{ "mount", "status", "peers", "pin", "unpin" }) |c| {
+    inline for (.{ "mount", "status", "peers", "pin", "unpin", "verify", "dupes" }) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
     return false;
@@ -545,7 +561,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // reached before -h/-V get their turn.
     if (!knownCommand(cmd)) {
         if (!builtin.is_test)
-            std.debug.print("unknown command \"{s}\" (want mount, status, peers, pin, unpin, version, help)\n", .{cmd});
+            std.debug.print("unknown command \"{s}\" (want mount, status, peers, pin, unpin, verify, dupes, version, help)\n", .{cmd});
         return error.UnknownCommand;
     }
     var opts = Opts{};
@@ -1523,6 +1539,146 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     return if (printOut(io, gpa, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel })) 0 else 1;
 }
 
+/// Verifies the cached pieces of one path against their trusted digests
+/// (the origin piece-hash manifest, or hashes learned from origin fills and
+/// write-throughs during a live daemon's run): every marked piece is read
+/// back from the cache, rehashed, and compared. A piece whose bytes no
+/// longer match (hole zeros from a crashed punch, bit rot, local tamper,
+/// or a pre-upgrade poisoned cache) has its mark cleared so it refills from
+/// a verified source instead of serving corrupt bytes. Daemon-less, like
+/// pin: safe to run while the daemon is down; racy-but-harmless alongside
+/// it (the daemon rebuilds entries from the sidecar, and a lost wipe only
+/// costs a refill). The manifest it verifies against is the writer's
+/// publication on the origin, so a file with no manifest (written outside
+/// modelfs, or a pre-upgrade cache) reports "no trusted hashes" rather than
+/// clearing anything: without a reference there is nothing to compare
+/// against.
+fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !u8 {
+    const origin = opts.origin orelse {
+        std.debug.print("verify needs --origin (or MODELFS_ORIGIN)\n", .{});
+        return 2;
+    };
+    const cache = opts.cache;
+    if (cache.len == 0) {
+        std.debug.print("verify needs --cache (or MODELFS_CACHE)\n", .{});
+        return 2;
+    }
+    var rel = path;
+    if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
+    if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
+    if (!store_mod.relOk(rel)) {
+        if (!builtin.is_test) {
+            if (rel.len == 0)
+                std.debug.print("verify: empty path (need a path relative to the mount, not /models itself)\n", .{})
+            else
+                std.debug.print("verify: refusing path outside the mount root\n", .{});
+        }
+        return 1;
+    }
+    if (discover.relIsCluster(rel)) {
+        if (!builtin.is_test) std.debug.print("verify: refusing cluster control path\n", .{});
+        return 1;
+    }
+    // The piece grid comes from the cache's own sidecar header, not a flag:
+    // the daemon that wrote the marks chose the grid, and verifying against
+    // a different one would misread every mark (a mismatched grid decodes as
+    // an empty field, so verify would report nothing checked). A missing or
+    // unreadable sidecar falls back to the default grid -- there is nothing
+    // cached to verify anyway.
+    var piece_size = opts.piece;
+    {
+        var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+        var mid: [sys.c.PATH_MAX]u8 = undefined;
+        if (sys.joinZ(&mid, cache, "meta")) |md| {
+            if (sys.joinZ(&mbuf, std.mem.span(md), rel)) |mp| {
+                var ext: [sys.c.PATH_MAX]u8 = undefined;
+                if (sys.appendExt(&ext, mp, ".pieces")) |z| {
+                    const fd = sys.open(z, sys.c.O_RDONLY | sys.c.O_NOFOLLOW, 0);
+                    if (fd >= 0) {
+                        defer sys.close(fd);
+                        var hdr: [8]u8 = undefined;
+                        if (sys.preadAll(fd, &hdr, 0) == 8 and std.mem.eql(u8, hdr[0..4], piece.magic)) {
+                            const ps = std.mem.readInt(u32, hdr[4..8], .little);
+                            if (ps != 0) piece_size = ps;
+                        }
+                    }
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+    }
+    var dummy_io = std.Io.Threaded.init(gpa, .{});
+    defer dummy_io.deinit();
+    var store = store_mod.Store.init(gpa, dummy_io.io(), origin, cache, piece_size);
+    defer store.deinit();
+    const layout_rc = store.ensureLayout();
+    if (layout_rc != 0) {
+        if (!builtin.is_test) std.log.err("cannot create cache dirs under {s} (errno {d})", .{ cache, -layout_rc });
+        return 1;
+    }
+    // The piece grid and file size come from the same origin stat the daemon
+    // reconciles against; a path that is not a regular origin file has no
+    // cache identity to verify.
+    var st: sys.c.struct_stat = undefined;
+    const sstat = store.statOrigin(rel, &st);
+    if (sstat != 0) {
+        if (!builtin.is_test) std.log.err("origin stat failed for {s} (errno {d})", .{ rel, -sstat });
+        return 1;
+    }
+    if ((st.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) {
+        if (!builtin.is_test) std.debug.print("verify: {s} is not a regular file\n", .{rel});
+        return 1;
+    }
+    const size = sys.sizeFromStat(st.st_size) orelse {
+        if (!builtin.is_test) std.log.err("origin size unusable for {s}", .{rel});
+        return 1;
+    };
+    const file = store.get(rel, size, sys.monoSec(dummy_io.io())) catch |err| {
+        if (!builtin.is_test) std.log.err("cache entry open failed for {s} ({t})", .{ rel, err });
+        return 1;
+    };
+    defer store.releaseFile(file);
+
+    var checked: u64 = 0;
+    var mismatches: u64 = 0;
+    const buf = gpa.alloc(u8, piece_size) catch {
+        if (!builtin.is_test) std.log.err("verify buffer alloc failed for {s}", .{rel});
+        return 1;
+    };
+    defer gpa.free(buf);
+    const nbits = piece.count(size, piece_size);
+    var i: u32 = 0;
+    while (i < nbits) : (i += 1) {
+        file.mu.lockUncancelable(dummy_io.io());
+        const marked = file.bits.get(i);
+        file.mu.unlock(dummy_io.io());
+        if (!marked) continue;
+        // expectedHash loads the origin manifest lazily; with no manifest
+        // and no hashes learned from a live daemon, there is no reference
+        // and nothing to verify (reported in the summary, not an error).
+        const expect = store.expectedHash(file, i) orelse continue;
+        const ln = piece.len(size, i, piece_size);
+        if (ln == 0) continue;
+        const n = store.readCache(file, buf[0..ln], piece.offset(i, piece_size), sys.monoSec(dummy_io.io()));
+        if (n < 0 or @as(u64, @intCast(n)) != ln) {
+            if (!builtin.is_test) std.log.warn("verify read failed for {s} piece {d}; leaving mark", .{ rel, i });
+            continue;
+        }
+        var h: [piece.digest_len]u8 = undefined;
+        piece.digest(buf[0..ln], &h);
+        checked += 1;
+        if (std.mem.eql(u8, &h, &expect)) continue;
+        mismatches += 1;
+        if (!builtin.is_test) std.log.warn("verify mismatch for {s} piece {d}; clearing cached mark", .{ rel, i });
+        file.mu.lockUncancelable(dummy_io.io());
+        file.bits.clear(i);
+        file.mu.unlock(dummy_io.io());
+        _ = store.saveBits(file, false);
+    }
+    std.log.info("verified {s}: {d} piece(s) checked, {d} mismatch(es) cleared", .{ rel, checked, mismatches });
+    if (!printOut(io, gpa, "verified {s}: {d} piece(s) checked, {d} mismatch(es) cleared\n", .{ rel, checked, mismatches })) return 1;
+    return if (mismatches == 0) 0 else 1;
+}
+
 test "badIdLine renders refused ids through the displayName echo gate" {
     // MODELFS_ID and --id can arrive from environments this process does not
     // control, so the refusal line must never echo the raw value: ESC (OSC
@@ -2344,6 +2500,343 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     // Unpin removes the artifact so the file becomes cullable again.
     try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "gguf/big.gguf", false));
     try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf) != 0);
+}
+
+test "cmdVerify checks cached pieces against the origin manifest and clears mismatches" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-verify");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-verify");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var zb: [256]u8 = undefined;
+    var pbuf: [256]u8 = undefined;
+    const origin_fp = try std.fmt.bufPrint(&pbuf, "{s}/m.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, origin_fp), "0123456789abcdef"));
+    const opts = Opts{ .origin = origin_d, .cache = cache_d, .piece = 16 };
+
+    // Without a manifest there is no trusted reference: nothing to clear,
+    // and the summary reports zero checked pieces (exit 0).
+    try std.testing.expectEqual(@as(u8, 0), try cmdVerify(std.testing.io, gpa, opts, "m.bin"));
+
+    // Publish the manifest the way a writer's release does: fill the cache
+    // from origin, then publish the learned hashes.
+    {
+        var dummy_io = std.Io.Threaded.init(gpa, .{});
+        defer dummy_io.deinit();
+        var store = store_mod.Store.init(gpa, dummy_io.io(), origin_d, cache_d, 16);
+        defer store.deinit();
+        try std.testing.expectEqual(@as(i32, 0), store.ensureLayout());
+        const f = try store.get("m.bin", 16, sys.monoSec(dummy_io.io()));
+        defer store.releaseFile(f);
+        var h: [piece.digest_len]u8 = undefined;
+        piece.digest("0123456789abcdef", &h);
+        try std.testing.expectEqual(@as(u32, 16), (try store.beginFill(f, 0, sys.monoSec(dummy_io.io()))).len);
+        try std.testing.expectEqual(@as(i32, 0), store.completeFill(f, 0, "0123456789abcdef", h, sys.monoSec(dummy_io.io())));
+        store.publishManifest(f);
+    }
+
+    // Intact cache: verified, zero mismatches, exit 0.
+    try std.testing.expectEqual(@as(u8, 0), try cmdVerify(std.testing.io, gpa, opts, "m.bin"));
+
+    // Corrupt the cached piece; verify must find the mismatch, clear the
+    // mark, and exit 1 so scripts can react.
+    var dpb: [256]u8 = undefined;
+    const dp = try std.fmt.bufPrint(&dpb, "{s}/data/m.bin", .{cache_d});
+    const cfd = sys.open(try sys.toZ(&zb, dp), sys.c.O_WRONLY, 0);
+    try std.testing.expect(cfd >= 0);
+    defer sys.close(cfd);
+    const junk = [_]u8{0xAA} ** 16;
+    try std.testing.expectEqual(@as(isize, 16), sys.pwriteAll(cfd, &junk, 0));
+    try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, opts, "m.bin"));
+
+    // The cleared mark persisted: a second verify finds nothing to check
+    // (the piece refills from a verified source on the next read).
+    try std.testing.expectEqual(@as(u8, 0), try cmdVerify(std.testing.io, gpa, opts, "m.bin"));
+
+    // Path gates match pin's: escapes and control-plane names are refused
+    // before any cache or origin I/O.
+    try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, opts, "../escape.bin"));
+    try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, opts, ".cluster/spark1.json"));
+    try std.testing.expectEqual(@as(u8, 2), try cmdVerify(std.testing.io, gpa, .{ .cache = cache_d, .piece = 16 }, "m.bin"));
+}
+
+/// The dedup-telemetry command: compares piece-hash manifests across
+/// paths and reports how much content they share. The manifest store on
+/// the origin (`.cluster/manifests/<hex>`) is already a duplicate-content
+/// index -- every ingested file's piece digests live there -- so this scan
+/// reads manifests only, never the model bytes, and is cheap even for
+/// hundreds of GB of files. This is the measured answer to "do we want
+/// dedup?" (design.md section 14): aligned overlap is what a same-size
+/// re-export would share, shifted overlap is what only CDC could recover,
+/// and byte-identical files are outright duplicates. A path with no
+/// manifest (never ingested through modelfs, or never fully hashed) is
+/// reported as such and contributes nothing.
+fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []const u8) !u8 {
+    const origin = opts.origin orelse {
+        std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
+        return 2;
+    };
+    // Gate every rel before any origin I/O (same refusals as verify): a
+    // bad path must not create cache dirs or read anything.
+    for (paths) |path| {
+        var rel = path;
+        if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
+        if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
+        if (!store_mod.relOk(rel)) {
+            if (!builtin.is_test) {
+                if (rel.len == 0)
+                    std.debug.print("dupes: empty path (need a path relative to the mount, not /models itself)\n", .{})
+                else
+                    std.debug.print("dupes: refusing path outside the mount root\n", .{});
+            }
+            return 1;
+        }
+        if (discover.relIsCluster(rel)) {
+            if (!builtin.is_test) std.debug.print("dupes: refusing cluster control path\n", .{});
+            return 1;
+        }
+    }
+
+    const File = struct {
+        rel: []const u8,
+        manifest: piece.Manifest,
+    };
+    var files: std.ArrayList(File) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f.manifest.entries);
+        files.deinit(gpa);
+    }
+    for (paths) |path| {
+        var rel = path;
+        if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
+        if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
+        var mname: [2 * piece.digest_len]u8 = undefined;
+        const name = piece.manifestName(rel, &mname);
+        var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+        var mid: [sys.c.PATH_MAX]u8 = undefined;
+        const mdir = sys.joinZ(&mid, origin, store_mod.Store.manifests_dir) catch {
+            if (!builtin.is_test) std.log.err("manifest dir path too long at {s}", .{origin});
+            return 1;
+        };
+        const mp = sys.joinZ(&mbuf, std.mem.span(mdir), name) catch {
+            if (!builtin.is_test) std.log.err("manifest path too long for {s}", .{rel});
+            return 1;
+        };
+        var open_errno: i32 = 0;
+        const blob = sys.readFileAllocNoFollowOpenErrno(gpa, mp, store_mod.Store.max_manifest_bytes, &open_errno) catch |err| switch (err) {
+            error.OpenFailed => {
+                if (open_errno == sys.c.ENOENT) {
+                    if (!builtin.is_test)
+                        std.debug.print("{s}: no piece-hash manifest (not ingested through modelfs, or never fully hashed)\n", .{rel});
+                } else {
+                    if (!builtin.is_test) std.log.err("manifest open failed for {s} (errno {d})", .{ rel, open_errno });
+                }
+                continue;
+            },
+            else => {
+                if (!builtin.is_test) std.log.err("manifest read failed for {s}: {t}", .{ rel, err });
+                continue;
+            },
+        };
+        defer gpa.free(blob);
+        const m = piece.manifestDecode(gpa, blob) catch {
+            if (!builtin.is_test) std.log.err("corrupt piece-hash manifest for {s}", .{rel});
+            continue;
+        } orelse {
+            if (!builtin.is_test) std.log.err("unusable piece-hash manifest for {s}", .{rel});
+            continue;
+        };
+        files.append(gpa, .{ .rel = rel, .manifest = m }) catch return 1;
+    }
+
+    if (files.items.len == 0) {
+        if (!builtin.is_test) std.debug.print("no manifests to compare\n", .{});
+        return 0;
+    }
+    for (files.items) |f| {
+        if (!printOut(io, gpa, "{s}: {d} piece(s), {d} grid, {d} bytes\n", .{
+            f.rel,
+            f.manifest.entries.len,
+            f.manifest.piece_size,
+            f.manifest.file_size,
+        })) return 1;
+    }
+    for (files.items, 0..) |a, ai| {
+        for (files.items[ai + 1 ..]) |b| {
+            const ov = manifestOverlap(gpa, a.manifest, b.manifest);
+            // Shifted = digests shared outside the aligned positions: the
+            // only overlap CDC (Level 3) could recover.
+            const shifted = ov.shared -| ov.aligned;
+            if (!printOut(io, gpa, "overlap {s} vs {s}: {d}/{d} aligned, {d} shared digest(s), {d} shifted{s}\n", .{
+                a.rel,
+                b.rel,
+                ov.aligned,
+                @min(a.manifest.entries.len, b.manifest.entries.len),
+                ov.shared,
+                shifted,
+                if (ov.identical) " -- byte-identical" else "",
+            })) return 1;
+        }
+    }
+    return 0;
+}
+
+/// Shared-content summary between two manifests.
+const Overlap = struct {
+    /// Piece indexes both files hash identically (same idx, same digest):
+    /// what a same-size re-export would share under the fixed grid.
+    aligned: u64 = 0,
+    /// Distinct digests present in both files, whatever the index: content
+    /// shared somewhere in the file.
+    shared: u64 = 0,
+    /// True when the files have the same size and every piece matches:
+    /// an outright duplicate (same bytes, possibly different path).
+    identical: bool = false,
+};
+
+/// Compares two manifests' entries (both sorted by idx, as decode
+/// guarantees). Aligned counts same-index same-digest pairs; shared counts
+/// distinct digests in both (a merge over digest-sorted copies); identical
+/// is same file size plus every piece matching.
+fn manifestOverlap(gpa: std.mem.Allocator, a: piece.Manifest, b: piece.Manifest) Overlap {
+    var ov = Overlap{};
+    // Aligned pass: both entry lists are ascending by idx.
+    {
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < a.entries.len and j < b.entries.len) {
+            if (a.entries[i].idx == b.entries[j].idx) {
+                if (std.mem.eql(u8, &a.entries[i].hash, &b.entries[j].hash)) ov.aligned += 1;
+                i += 1;
+                j += 1;
+            } else if (a.entries[i].idx < b.entries[j].idx) {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+    }
+    ov.identical = a.file_size == b.file_size and
+        a.entries.len == b.entries.len and
+        ov.aligned == a.entries.len;
+    // Shared pass: sort digest copies (entries are idx-ordered, not
+    // digest-ordered) and merge-intersect.
+    const ca = gpa.dupe(piece.ManifestEntry, a.entries) catch return ov;
+    defer gpa.free(ca);
+    const cb = gpa.dupe(piece.ManifestEntry, b.entries) catch return ov;
+    defer gpa.free(cb);
+    std.mem.sort(piece.ManifestEntry, ca, {}, struct {
+        fn lessThan(_: void, x: piece.ManifestEntry, y: piece.ManifestEntry) bool {
+            return std.mem.order(u8, &x.hash, &y.hash) == .lt;
+        }
+    }.lessThan);
+    std.mem.sort(piece.ManifestEntry, cb, {}, struct {
+        fn lessThan(_: void, x: piece.ManifestEntry, y: piece.ManifestEntry) bool {
+            return std.mem.order(u8, &x.hash, &y.hash) == .lt;
+        }
+    }.lessThan);
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < ca.len and j < cb.len) {
+        switch (std.mem.order(u8, &ca[i].hash, &cb[j].hash)) {
+            .lt => i += 1,
+            .gt => j += 1,
+            .eq => {
+                ov.shared += 1;
+                i += 1;
+                j += 1;
+            },
+        }
+    }
+    return ov;
+}
+
+test "manifestOverlap counts aligned, shared, and identical content" {
+    const h0 = [_]u8{0x11} ** piece.digest_len;
+    const h1 = [_]u8{0x22} ** piece.digest_len;
+    const h2 = [_]u8{0x33} ** piece.digest_len;
+    var a_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h1 },
+    };
+    var b_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h2 },
+    };
+    var c_entries = [_]piece.ManifestEntry{
+        .{ .idx = 1, .hash = h0 },
+        .{ .idx = 2, .hash = h1 },
+    };
+    const A = piece.Manifest{ .piece_size = 16, .file_size = 32, .entries = &a_entries };
+    // Same bytes at index 0, different at index 1: aligned 1, shared 1.
+    const B = piece.Manifest{ .piece_size = 16, .file_size = 32, .entries = &b_entries };
+    const ab = manifestOverlap(std.testing.allocator, A, B);
+    try std.testing.expectEqual(@as(u64, 1), ab.aligned);
+    try std.testing.expectEqual(@as(u64, 1), ab.shared);
+    try std.testing.expect(!ab.identical);
+    // The same content at a shifted index: shared but not aligned (only
+    // CDC could recover this -- the telemetry Level 3 waits on).
+    const C = piece.Manifest{ .piece_size = 16, .file_size = 48, .entries = &c_entries };
+    const ac = manifestOverlap(std.testing.allocator, A, C);
+    try std.testing.expectEqual(@as(u64, 0), ac.aligned);
+    try std.testing.expectEqual(@as(u64, 2), ac.shared);
+    try std.testing.expect(!ac.identical);
+    // Byte-identical manifests: every piece matches.
+    const ad = manifestOverlap(std.testing.allocator, A, A);
+    try std.testing.expectEqual(@as(u64, 2), ad.aligned);
+    try std.testing.expectEqual(@as(u64, 2), ad.shared);
+    try std.testing.expect(ad.identical);
+}
+
+test "cmdDupes reports manifest overlap and gates its paths" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-dupes");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    const h0 = [_]u8{0x11} ** piece.digest_len;
+    const h1 = [_]u8{0x22} ** piece.digest_len;
+    var a_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h1 },
+    };
+    var b_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h1 },
+    };
+    // Two manifests sharing every digest: a byte-identical pair under two
+    // names -- exactly the duplicate the telemetry exists to surface.
+    try writeManifestForTest(gpa, origin_d, "a.bin", 16, 32, &a_entries);
+    try writeManifestForTest(gpa, origin_d, "b.bin", 16, 32, &b_entries);
+    const opts = Opts{ .origin = origin_d };
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupes(std.testing.io, gpa, opts, &.{ "a.bin", "b.bin" }));
+    // A path with no manifest is reported, not an error.
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupes(std.testing.io, gpa, opts, &.{ "a.bin", "missing.bin" }));
+    // Path gates match verify's; a missing origin is a usage error.
+    try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{"../escape.bin"}));
+    try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{".cluster/spark1.json"}));
+    try std.testing.expectEqual(@as(u8, 2), try cmdDupes(std.testing.io, gpa, .{}, &.{"a.bin"}));
+}
+
+/// Writes a piece-hash manifest for rel directly under origin's
+/// .cluster/manifests/, the way a writer's release would (test helper).
+fn writeManifestForTest(gpa: std.mem.Allocator, origin: []const u8, rel: []const u8, ps: u32, fs: u64, entries: []const piece.ManifestEntry) !void {
+    var mname: [2 * piece.digest_len]u8 = undefined;
+    const name = piece.manifestName(rel, &mname);
+    var mb: [256]u8 = undefined;
+    var tb: [256]u8 = undefined;
+    var zb: [256]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&mb, "{s}/.cluster/manifests", .{origin});
+    _ = sys.mkdirAll(dir, 0o755);
+    const fp = try std.fmt.bufPrint(&tb, "{s}/{s}", .{ dir, name });
+    const need = piece.manifestLen(entries.len);
+    const blob = try gpa.alloc(u8, need);
+    defer gpa.free(blob);
+    const enc = try piece.manifestEncode(ps, fs, entries, blob);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(try sys.toZ(&zb, fp), enc));
 }
 
 fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {

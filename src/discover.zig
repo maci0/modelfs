@@ -304,6 +304,10 @@ pub const Catalog = struct {
         /// peer; cached so a TTL hit carries the same alignment context a
         /// fresh probe would.
         piece_size: u32 = 0,
+        /// Whether the peer advertised X-Stage (a staged/RDMA data plane
+        /// for piece fetches). Cached like the bits so a TTL hit decides
+        /// the fetch path without a fresh probe.
+        stage: bool = false,
     };
 
     fn freeHaveEntry(gpa: std.mem.Allocator, e: HaveEntry) void {
@@ -351,7 +355,7 @@ pub const Catalog = struct {
         defer self.have_mu.unlock(self.io);
         const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
         const bits = gpa.dupe(u8, e.bits) catch return null;
-        return .{ .bits = bits, .piece_size = e.piece_size };
+        return .{ .bits = bits, .piece_size = e.piece_size, .stage = e.stage };
     }
 
     /// Whether piece `idx` is present in an unexpired (rel, ip, port) line
@@ -373,7 +377,17 @@ pub const Catalog = struct {
     /// peer that already said it has nothing. Connection failures must not
     /// reach here; a down peer is retried on the next piece. `now_ms` is
     /// the caller's monotonic-ms instant (see haveGet).
-    pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, now_ms: i64) void {
+    /// Whether an unexpired (rel, ip, port) line advertises the staged
+    /// data plane. Null means no usable line (probe first); false means
+    /// the peer answered /have without X-Stage.
+    pub fn haveStage(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, now_ms: i64) ?bool {
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
+        return e.stage;
+    }
+
+    pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, stage: bool, now_ms: i64) void {
         const gpa = self.gpa;
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
@@ -388,6 +402,7 @@ pub const Catalog = struct {
             self.have_cache.items[i].bits = b;
             self.have_cache.items[i].expires_ms = now_ms +| have_ttl_ms;
             self.have_cache.items[i].piece_size = piece_size;
+            self.have_cache.items[i].stage = stage;
             return;
         }
         if (self.have_cache.items.len >= have_cache_cap) {
@@ -418,6 +433,7 @@ pub const Catalog = struct {
             .rel = rel_own,
             .ip = ip_own,
             .port = port,
+            .stage = stage,
             .bits = bits_own,
             .expires_ms = now_ms +| have_ttl_ms,
             .piece_size = piece_size,
@@ -1064,7 +1080,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
 
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0) == null);
 
-    cat.havePut("a.bin", "10.0.0.1", 18080, &.{ 1, 2 }, 4096, t0);
+    cat.havePut("a.bin", "10.0.0.1", 18080, &.{ 1, 2 }, 4096, false, t0);
     {
         const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0).?;
         defer gpa.free(got.bits);
@@ -1088,7 +1104,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.2", 18080, t0) == null);
 
     // Same key replaces in place instead of growing the table.
-    cat.havePut("a.bin", "10.0.0.1", 18080, &.{3}, 8192, t0);
+    cat.havePut("a.bin", "10.0.0.1", 18080, &.{3}, 8192, false, t0);
     {
         const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0).?;
         defer gpa.free(got.bits);
@@ -1118,7 +1134,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
         var name_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "f{d}.bin", .{i});
         const put_at = t0 - @as(i64, @intCast(Catalog.have_cache_cap - i));
-        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0, put_at);
+        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0, false, put_at);
     }
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
     // f31's insert evicted soonest-to-expire f0, not the newest entry.
@@ -1126,7 +1142,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     if (cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0)) |fresh| {
         gpa.free(fresh.bits);
     } else return error.TestUnexpectedResult;
-    cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0}, 0, t0);
+    cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0}, 0, false, t0);
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
     // The next spill drains the next-soonest expiry in sequence.
     try std.testing.expect(cat.haveGet(gpa, "f1.bin", "10.1.0.1", 18080, t0) == null);
@@ -1143,14 +1159,14 @@ test "have cache evicts equal-TTL ties by key, never by insert order" {
 
     const Fill = struct {
         fn toCap(cat: *Catalog, first: []const []const u8) void {
-            for (first) |name| cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, t0);
+            for (first) |name| cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, false, t0);
             var i: usize = first.len;
             while (i < Catalog.have_cache_cap) : (i += 1) {
                 var name_buf: [32]u8 = undefined;
                 const name = std.fmt.bufPrint(&name_buf, "n{d:0>2}.bin", .{i}) catch unreachable;
-                cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, t0);
+                cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, false, t0);
             }
-            cat.havePut("spill.bin", "10.0.0.1", 18080, &.{1}, 0, t0);
+            cat.havePut("spill.bin", "10.0.0.1", 18080, &.{1}, 0, false, t0);
         }
     };
 
@@ -1195,12 +1211,12 @@ test "collectCachedCands answers from the have cache and skips incomplete cluste
     try std.testing.expect(cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf) == null);
 
     // One peer answered; the other is still unknown.
-    cat.havePut("m.bin", "10.0.0.1", 1, &.{0b0000_0001}, 4096, t0);
+    cat.havePut("m.bin", "10.0.0.1", 1, &.{0b0000_0001}, 4096, false, t0);
     try std.testing.expect(cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf) == null);
 
     // A healthy 404 is an empty bitmap: both peers have now answered, and
     // the miss peer's addresses all inherit that group's !have bit.
-    cat.havePut("m.bin", "10.1.0.1", 1, &.{}, 0, t0);
+    cat.havePut("m.bin", "10.1.0.1", 1, &.{}, 0, false, t0);
     const cands = cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf).?;
     try std.testing.expectEqual(@as(usize, 3), cands.len);
     try std.testing.expect(cands[0].have);

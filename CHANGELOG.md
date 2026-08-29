@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-28
+
+Third tagged release. Piece integrity ships and closes threat-model gap R2:
+every admitted piece records a blake3 digest, peer fills verify before
+admit, cached bytes verify before every `/data` serve, and piece-hash
+manifests on the origin make the fleet's peer fills verifiable (`modelfs
+verify` audits the cache on demand). The peer transport grows a negotiated
+staged (RDMA) data-plane seam (`/stage` + `X-Stage`, backend-gated and
+HTTP-fallback by construction), and `modelfs dupes` turns the dedup
+roadmap into measured telemetry. Upgrading from `v0.2.0`: start at
+**Upgrade from v0.2.0** below.
+
+### Upgrade from v0.2.0 - 2026-08-28
+- **Files without a piece-hash manifest now fill from origin only.** The R2
+  fix refuses unverifiable peer fills: a file written before this version
+  (or outside modelfs) has no manifest, so its fills stay origin-only until
+  one exists -- the first node that fully origin-reads it publishes one on
+  close. Re-ingest (rewrite once) to restore P2P immediately; manifest-
+  bearing files are unaffected.
+- **The peer wire is additive; a mixed fleet interoperates.** The new
+  `/stage` endpoint and `X-Stage` header are additive: v0.2.0 nodes answer
+  `/stage` with 404 (unknown route) and never advertise `X-Stage`, so
+  v0.3.0 fetchers fall back to `/data` exactly as designed.
+- **status.json stats gain `fill_err_verify` and `serve_verify_fail`.**
+  Additive keys; consumers that print the stats object pick them up
+  automatically.
+- **Serving nodes rehash cached pieces before every `/data` reply**
+  (verify-before-serve). The serving node's per-piece CPU cost rises by one
+  blake3 pass; the tick line's `serve_verify_fail` names any piece refused.
+- **New commands:** `modelfs verify <rel> --origin PATH` (at-rest cache
+  audit) and `modelfs dupes <rel>... --origin PATH` (manifest overlap
+  scan). No on-disk format change: the piece sidecar is untouched.
+
+### Piece integrity: blake3 verify-before-admit and -serve, origin piece-hash manifests, `modelfs verify` - 2026-08-28
+- **Peer-served bytes are now verified before they enter the cache (closes threat-model gap R2).** Every admitted piece -- origin fill, write-through, or peer fill -- records a blake3 digest (`Store.Cached.hashes`); a peer fill is only attempted when a trusted digest exists (origin manifest, origin fill, or this node's own write), and fetched bytes that fail verification are discarded unmarked and refilled from origin (`hydratePiece` src/fuse_fs.zig, new `fill_err_verify` counter). A node that wrote or fully read a file publishes its digests as a piece-hash manifest on the origin at close (`mf_release` + `Store.publishManifest`, under `.cluster/manifests/<blake3(rel)>`), and readers load it lazily as the trust reference (`expectedHash`); the manifest codec is a fuzzed hand parser like the sidecar.
+- **Cached bytes are re-verified before every `/data` serve.** `verifyRange` in src/peer.zig hashes each covered piece from the cache and refuses to stream a mismatch (500 + new `serve_verify_fail` counter), so at-rest corruption (hole zeros, bit rot) is caught at the fleet-propagation point instead of being re-served; `modelfs verify <rel> --origin PATH` rehashes a whole file's cached pieces against the manifest and clears mismatched marks, daemon-less like `pin`.
+- **Digests ride the tick line and status.json** (`fill_err_verify`, `serve_verify_fail`), and are dropped together with the marks on size change, distrust, and forget (`Store.clearHashes`). The sidecar bitfield format is unchanged; no wire or on-disk format break. Files with no manifest (written outside modelfs, or pre-upgrade caches) fill from origin only, and their legacy cached pieces serve unverified until a manifest exists -- the documented residual (docs/THREAT_MODEL.md, docs/design.md §14).
+
+### Staged (RDMA) peer data plane: transport seam and /stage protocol - 2026-08-28
+- **The peer transport grows a negotiated data-plane seam** (`src/rdma.zig`, design.md §15): a node whose backend can stage advertises `X-Stage: 1` on `/have`, and a fetching node then stages one piece at a time via `GET /stage?path=..&piece=N` -- the serving side hydrates, at-rest-verifies, registers the bytes, and replies with a 52-byte window (`len`/`rkey`/`addr` + advisory digest) that the fetching side's backend reads. Any `/stage` failure falls back to the existing `/data` path on the same peer, and a fleet without verbs never pays the probe (the capability rides the have-cache line, `Catalog.haveStage`).
+- **The shipped backend is null**: production behavior is byte-identical to the HTTP-only tree; the in-memory fake backend exists so the full pipeline (staging, window codec, staged fetch, per-piece fallback) runs under `zig build test`. The verbs tail (libibverbs QP setup, `ibv_reg_mr`, the RDMA Read, the buffer-release handshake, RoCE fabric tuning) is deliberately not written as untestable C interop -- the interface it fills is `rdma.Backend.stage/read/release`, and the design, failure modes, and the 200G NVMe/verification ceilings are in design.md §15.
+- **The dedup roadmap is now telemetry-gated, and the telemetry ships as `modelfs dupes`.** `modelfs dupes <rel>... --origin PATH` compares piece-hash manifests across paths (it reads manifests only, never model bytes) and reports aligned overlap (what a same-size re-export would share), shared digests, shifted overlap (the only overlap CDC could recover), and byte-identical pairs. design.md §14 now marks Level 2 (CAS blob store) **shelved** -- the staged data plane made transfer dedup moot, and a CAS rewrite would fight the path-keyed integrity layer -- and Level 3 (CDC) **dormant** with the same telemetry as its trigger.
+
 ## [0.2.0] - 2026-08-27
 
 Second tagged release. Recovery gets fail-closed alarms (hourly snapshot
@@ -380,6 +423,7 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/maci0/modelfs/releases/tag/v0.3.0
 [0.2.0]: https://github.com/maci0/modelfs/releases/tag/v0.2.0
 [0.1.0]: https://github.com/maci0/modelfs/releases/tag/v0.1.0

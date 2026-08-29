@@ -2,6 +2,7 @@
 //! A new src/*.zig file is invisible to `zig build test` until imported here.
 test {
     _ = @import("piece.zig");
+    _ = @import("rdma.zig");
     _ = @import("proto.zig");
     _ = @import("sys.zig");
     _ = @import("cull.zig");

@@ -40,7 +40,7 @@ A read that misses blocks until that one piece is filled from a single source. T
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
 
-Releases: `v0.2.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since then is under `[Unreleased]` and a build from this tree still prints `0.2.0` until the next tag. Upgrading a running node or a script written against the tag: start at **Upgrade from v0.1.0** in that file (CLI exit codes, peer status codes, origin layout). How to report a security issue: [SECURITY.md](SECURITY.md).
+Releases: `v0.3.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since then is under `[Unreleased]` and a build from this tree still prints `0.3.0` until the next tag. Upgrading a running node or a script written against the tag: start at **Upgrade from v0.2.0** in that file (origin-only fills for files without piece-hash manifests, new `/stage` peer endpoint, new `verify`/`dupes` commands). How to report a security issue: [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -83,9 +83,11 @@ modelfs status                                    # liveness, peers, origin_down
 modelfs peers --origin /net/192.168.0.100/models  # cluster leases, each marked live or expired
 modelfs pin gguf/foo.gguf                         # keep a file out of the cull
 modelfs unpin gguf/foo.gguf
+modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models  # rehash cached pieces against the origin manifest, clear mismatches
+modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models  # compare piece-hash manifests: how much do two files share?
 ```
 
-Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount (surrounding whitespace is trimmed like the PSK file; a whitespace-only value is refused); an explicit flag wins and an empty environment value counts as unset. `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
+Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin/verify), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount (surrounding whitespace is trimmed like the PSK file; a whitespace-only value is refused); an explicit flag wins and an empty environment value counts as unset. `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
 
 Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS ([docs/operations.md](docs/operations.md)).
 

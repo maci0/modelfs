@@ -530,7 +530,7 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
 fn originFillBuf(st: *State, file: *store_mod.Store.Cached, idx: u32, buf: []u8) i32 {
     const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
     if (n == @as(isize, @intCast(buf.len))) return 0;
-    st.store.finishPiece(file, idx, false, sys.monoSec(st.io));
+    st.store.finishPiece(file, idx, false, null, sys.monoSec(st.io));
     _ = st.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
     // The reader sees EIO and nothing else names the cause; keep the
     // same sender-side trace serveData's hydration branch does,
@@ -588,16 +588,48 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
         std.debug.assert(piece_len <= scratch.len);
         const buf = scratch[0..piece_len];
         from_peer = !prefer_origin;
+        var expect: ?[piece.digest_len]u8 = null;
+        if (from_peer) {
+            // R2: a peer fill is only admissible when a trusted digest exists
+            // to verify it against (learned from the origin manifest, a prior
+            // origin fill, or this node's own write-through). Without one the
+            // bytes are unverifiable, so the piece hydrates from origin -- the
+            // trust root -- instead of accepting peer bytes blindly. expectedHash
+            // loads the manifest lazily (one origin read per entry size), so a
+            // cold entry can verify peer fills from the start.
+            expect = st.store.expectedHash(file, idx);
+            if (expect == null) from_peer = false;
+        }
         if (from_peer) {
             peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
                 from_peer = false;
             };
         }
+        var filled_digest: [piece.digest_len]u8 = undefined;
+        if (from_peer) {
+            // Verify before admit: the fetched bytes must match the trusted
+            // digest or they are discarded unmarked (a hostile peer, an
+            // on-path rewriter, or a peer serving its own corrupt cache), and
+            // the piece refills from origin -- whose bytes are authoritative
+            // and get a fresh digest recorded at admit.
+            piece.digest(buf, &filled_digest);
+            const exp = expect.?;
+            if (!std.mem.eql(u8, &filled_digest, &exp)) {
+                _ = st.store.stats.fill_err_verify.fetchAdd(1, .monotonic);
+                std.log.warn("piece {s} {d} failed digest verification; refilling from origin", .{ file.rel, idx });
+                from_peer = false;
+            }
+        }
         if (!from_peer) {
             const oe = originFillBuf(st, file, idx, buf);
             if (oe != 0) return oe;
+            // Origin bytes are the trust root: their digest is the trusted
+            // reference for every later fill of this piece, recorded at admit
+            // with the bit. Not compared against `expect` -- a rewrite with
+            // the same size legitimately changes bytes, and origin wins.
+            piece.digest(buf, &filled_digest);
         }
-        const rc = st.store.completeFill(file, idx, buf, sys.monoSec(st.io));
+        const rc = st.store.completeFill(file, idx, buf, filled_digest, sys.monoSec(st.io));
         if (rc != 0) {
             // Hydrated bytes the cache fs refused: the piece stays unmarked and
             // the reader gets EIO, so name the refusal like serveData's twin
@@ -857,6 +889,26 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     return @intCast(n);
 }
 
+export fn mf_release(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+    _ = fi;
+    const st = statePtr();
+    var rel: []const u8 = "";
+    // Same lookup-shaped denial as every other op: a release on a hidden
+    // `.cluster` name must not publish anything.
+    const rerr = resolveRel(cPath(path), 0, &rel);
+    if (rerr != 0 or rel.len == 0) return 0;
+    if (st.store.lookupRef(rel)) |file| {
+        defer st.store.releaseFile(file);
+        // Close-to-open (design.md 4.4): the close of a file this node wrote
+        // or filled is the natural moment to publish the piece-hash manifest
+        // that makes the fleet's peer fills verifiable. publishManifest
+        // no-ops unless hashes changed since the last publish; read-only
+        // releases and unchanged entries cost one lock + map-count probe.
+        st.store.publishManifest(file);
+    }
+    return 0;
+}
+
 export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
@@ -906,6 +958,7 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
             // holds xfer and is reading this fd without file.mu.
             @memset(file.bits.bytes, 0);
             file.writes += 1;
+            st.store.clearHashes(file);
             if (new_size < file.size) file.size = new_size;
             _ = st.store.saveBits(file, false);
             store_mod.Store.truncateCacheFd(file, file.size);
@@ -916,6 +969,9 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
         file.size = new_size;
         file.bits = nb;
         file.writes += 1;
+        // Digests described the pre-truncate bytes; the refills that follow
+        // record fresh ones against the new size.
+        st.store.clearHashes(file);
         // Save while the new bits are still under the lock: saveBits encodes
         // size/bits and must never race the swap below (or another thread's
         // encode) on freed storage. The fd truncate shares this window so
@@ -1255,8 +1311,8 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
         // the journal line and the machine artifact share one vocabulary and
         // no key collides ("err" used to name both read and write failures).
         "tick: reads_ok={d} reads_err={d} reads_warm={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d} wr_us={d}" ++
-            " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache={d}/{d}/{d}" ++
-            " probe_err={d} peer_mib={d} origin_mib={d} serve_mib={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http_us={d}",
+            " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache/verify={d}/{d}/{d}/{d}" ++
+            " probe_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http_us={d}",
         .{
             d.reads_ok,
             d.reads_err,
@@ -1274,10 +1330,12 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.fill_err_peer,
             d.fill_err_origin,
             d.fill_err_cache,
+            d.fill_err_verify,
             d.probe_err,
             @divTrunc(d.bytes_from_peer, mib),
             @divTrunc(d.bytes_from_origin, mib),
             @divTrunc(d.bytes_to_peer, mib),
+            d.serve_verify_fail,
             d.pieces_culled,
             d.http_ok,
             d.http_unauthorized,
@@ -1367,6 +1425,7 @@ pub fn ops() fuse.fuse_operations {
     o.create = mf_create;
     o.read = mf_read;
     o.write = mf_write;
+    o.release = mf_release;
     o.truncate = mf_truncate;
     o.unlink = mf_unlink;
     o.mkdir = mf_mkdir;
@@ -1410,6 +1469,7 @@ test "fuse operations wire every supported handler" {
     try std.testing.expectEqual(&mf_create, o.create);
     try std.testing.expectEqual(&mf_read, o.read);
     try std.testing.expectEqual(&mf_write, o.write);
+    try std.testing.expectEqual(&mf_release, o.release);
     try std.testing.expectEqual(&mf_truncate, o.truncate);
     try std.testing.expectEqual(&mf_unlink, o.unlink);
     try std.testing.expectEqual(&mf_mkdir, o.mkdir);

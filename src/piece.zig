@@ -278,6 +278,201 @@ pub const Bitfield = struct {
     }
 };
 
+/// Content identity: the blake3 digest of one piece's bytes. Every piece
+/// that lands in the cache is hashed at admit; the digest is the trust
+/// reference peer fills verify against and the unit of at-rest integrity.
+/// blake3 (not SHA-256) per design.md C.3: fast enough to hash a 16 MiB
+/// piece on the fill path, and std ships it.
+pub const digest_len: usize = 32;
+
+pub fn digest(data: []const u8, out: *[digest_len]u8) void {
+    std.crypto.hash.Blake3.hash(data, out, .{});
+}
+
+/// Lowercase hex of a digest, for manifest names and operator output.
+pub fn digestHex(h: [digest_len]u8) [2 * digest_len]u8 {
+    return std.fmt.bytesToHex(h, .lower);
+}
+
+/// One entry in a piece-hash manifest: piece index and its digest.
+pub const ManifestEntry = struct {
+    idx: u32,
+    hash: [digest_len]u8,
+};
+
+/// A decoded piece-hash manifest from shared storage (untrusted input, like
+/// lease JSON): the grid its hashes index against, the file size those
+/// pieces belong to, and the entries in strictly ascending idx order.
+/// `entries` is owned by the caller (gpa.free). The blob is NOT owned.
+pub const Manifest = struct {
+    piece_size: u32,
+    file_size: u64,
+    entries: []ManifestEntry,
+};
+
+pub const manifest_magic = "MFSM";
+
+/// Serialized length of a manifest with n entries.
+pub fn manifestLen(n: usize) usize {
+    return 4 + 4 + 8 + 4 + n * (4 + digest_len);
+}
+
+/// Encodes a manifest. `entries` must already be sorted by idx ascending:
+/// the codec's own invariant, which decode enforces, so a manifest round
+/// trip always re-decodes.
+pub fn manifestEncode(piece_size: u32, file_size: u64, entries: []const ManifestEntry, out: []u8) ![]u8 {
+    const need = manifestLen(entries.len);
+    if (out.len < need) return error.NoSpaceLeft;
+    @memcpy(out[0..4], manifest_magic);
+    std.mem.writeInt(u32, out[4..8], piece_size, .little);
+    std.mem.writeInt(u64, out[8..16], file_size, .little);
+    std.mem.writeInt(u32, out[16..20], @intCast(entries.len), .little);
+    var o: usize = 20;
+    for (entries) |e| {
+        std.mem.writeInt(u32, out[o..][0..4], e.idx, .little);
+        @memcpy(out[o + 4 ..][0..digest_len], &e.hash);
+        o += 4 + digest_len;
+    }
+    return out[0..need];
+}
+
+/// Decodes a manifest blob. null when the magic is absent (the name is not
+/// a manifest, e.g. a deleted or pre-upgrade artifact); error.BadManifest
+/// for a present-but-corrupt blob. Every structural claim the blob makes
+/// (length, count, ordering, index range) is validated: this parser is the
+/// gate between shared storage and the trust decisions downstream, and it
+/// is fuzzed like the other shared-storage codecs.
+pub fn manifestDecode(gpa: std.mem.Allocator, blob: []const u8) !?Manifest {
+    // Magic first: anything that does not name a manifest (an absent artifact
+    // read as a short or foreign blob) is "not a manifest", while a present
+    // magic with a torn body is corruption. The two readings drive different
+    // caller behavior (no verification vs. distrust the artifact).
+    if (blob.len < 4) return null;
+    if (!std.mem.eql(u8, blob[0..4], manifest_magic)) return null;
+    if (blob.len < 20) return error.BadManifest;
+    const ps = std.mem.readInt(u32, blob[4..8], .little);
+    const fs = std.mem.readInt(u64, blob[8..16], .little);
+    const n = std.mem.readInt(u32, blob[16..20], .little);
+    if (ps == 0) return error.BadManifest;
+    // Exact length: a torn write (crash mid-publish) or a hostile blob must
+    // not decode half its entries.
+    if (manifestLen(n) != blob.len) return error.BadManifest;
+    const entries = try gpa.alloc(ManifestEntry, n);
+    errdefer gpa.free(entries);
+    var o: usize = 20;
+    var prev: ?u32 = null;
+    const max_idx = count(fs, ps);
+    for (entries) |*e| {
+        e.idx = std.mem.readInt(u32, blob[o..][0..4], .little);
+        @memcpy(&e.hash, blob[o + 4 ..][0..digest_len]);
+        o += 4 + digest_len;
+        // Strictly ascending: duplicate or out-of-order indices are corrupt
+        // (publish sorts; a reader must not trust a blob violating the
+        // codec's own invariant).
+        if (prev) |p| {
+            if (e.idx <= p) return error.BadManifest;
+        }
+        // An index the grid cannot name names bytes that do not exist.
+        if (e.idx >= max_idx) return error.BadManifest;
+        prev = e.idx;
+    }
+    return .{ .piece_size = ps, .file_size = fs, .entries = entries };
+}
+
+/// Deterministic origin manifest name for a rel: lowercase hex of
+/// blake3(rel). Flat (no slashes), fixed length, collision-free, so the
+/// manifest needs no nested directories on the origin and cannot escape
+/// `.cluster/manifests/` no matter what rel names. `modelfs verify` and the
+/// daemon derive the same name from the same rel, so they always agree.
+pub fn manifestName(rel: []const u8, out: *[2 * digest_len]u8) []const u8 {
+    var h: [digest_len]u8 = undefined;
+    digest(rel, &h);
+    const hexed = digestHex(h);
+    @memcpy(out, &hexed);
+    return out[0..hexed.len];
+}
+
+test "digest matches published blake3 vectors" {
+    var out: [digest_len]u8 = undefined;
+    digest("", &out);
+    try std.testing.expectEqualStrings("af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262", &digestHex(out));
+    digest("abc", &out);
+    try std.testing.expectEqualStrings("6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85", &digestHex(out));
+}
+
+test "manifest encode decode round trip" {
+    const gpa = std.testing.allocator;
+    const entries = [_]ManifestEntry{
+        .{ .idx = 0, .hash = [_]u8{0x11} ** digest_len },
+        .{ .idx = 3, .hash = [_]u8{0x22} ** digest_len },
+        .{ .idx = 7, .hash = [_]u8{0x33} ** digest_len },
+    };
+    var buf: [256]u8 = undefined;
+    const blob = try manifestEncode(4096, 40960, &entries, &buf);
+    var m = (try manifestDecode(gpa, blob)).?;
+    defer gpa.free(m.entries);
+    try std.testing.expectEqual(@as(u32, 4096), m.piece_size);
+    try std.testing.expectEqual(@as(u64, 40960), m.file_size);
+    try std.testing.expectEqual(@as(usize, 3), m.entries.len);
+    try std.testing.expectEqual(@as(u32, 0), m.entries[0].idx);
+    try std.testing.expectEqual(@as(u32, 3), m.entries[1].idx);
+    try std.testing.expectEqual(@as(u32, 7), m.entries[2].idx);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0x33} ** digest_len), &m.entries[2].hash);
+    // encode must reject an undersized buffer without a partial write.
+    try std.testing.expectError(error.NoSpaceLeft, manifestEncode(4096, 40960, &entries, buf[0..10]));
+}
+
+test "manifest decode rejects corrupt and non-manifest blobs" {
+    const gpa = std.testing.allocator;
+    // Wrong magic: not a manifest (deleted/pre-upgrade artifact reading).
+    try std.testing.expect((try manifestDecode(gpa, "NOPE1234")) == null);
+    try std.testing.expect((try manifestDecode(gpa, "")) == null);
+    // Present magic with a short body: torn publish.
+    try std.testing.expectError(error.BadManifest, manifestDecode(gpa, "MFSM\x00\x10\x00\x00" ++ "\x00" ** 8));
+    // Duplicate indices.
+    {
+        const entries = [_]ManifestEntry{
+            .{ .idx = 1, .hash = [_]u8{0x11} ** digest_len },
+            .{ .idx = 1, .hash = [_]u8{0x22} ** digest_len },
+        };
+        var buf: [256]u8 = undefined;
+        const blob = try manifestEncode(1, 8, &entries, &buf);
+        try std.testing.expectError(error.BadManifest, manifestDecode(gpa, blob));
+    }
+    // Index past the grid's piece count.
+    {
+        const entries = [_]ManifestEntry{.{ .idx = 9, .hash = [_]u8{0x11} ** digest_len }};
+        var buf: [256]u8 = undefined;
+        const blob = try manifestEncode(1, 8, &entries, &buf);
+        try std.testing.expectError(error.BadManifest, manifestDecode(gpa, blob));
+    }
+    // Zero piece size is refused even with a valid body shape.
+    {
+        const entries = [_]ManifestEntry{.{ .idx = 0, .hash = [_]u8{0x11} ** digest_len }};
+        var buf: [256]u8 = undefined;
+        const blob = try manifestEncode(1, 8, &entries, &buf);
+        std.mem.writeInt(u32, blob[4..8], 0, .little);
+        try std.testing.expectError(error.BadManifest, manifestDecode(gpa, blob));
+    }
+}
+
+test "manifestName is flat, fixed-length, and deterministic" {
+    var oa: [2 * digest_len]u8 = undefined;
+    var ob: [2 * digest_len]u8 = undefined;
+    var oc: [2 * digest_len]u8 = undefined;
+    const a = manifestName("gguf/model.gguf", &oa);
+    const b = manifestName("gguf/model.gguf", &ob);
+    const c = manifestName("other.bin", &oc);
+    try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect(!std.mem.eql(u8, a, c));
+    try std.testing.expectEqual(@as(usize, 64), a.len);
+    // No slash or dot can survive the mapping: the name stays flat under
+    // .cluster/manifests/ and never collides with lease names.
+    try std.testing.expect(std.mem.indexOfScalar(u8, a, '/') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, a, '.') == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, a, 'a') != null);
+}
+
 test "tailValidBits survives the max-clamped final word" {
     const max = std.math.maxInt(u32);
     // The final word of a max-clamped field: `lo + 64 > nbits`, the form
@@ -735,4 +930,62 @@ fn fuzzBitfieldPersistOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
 test "fuzz bitfield persist cycle reproduces the shadow model exactly" {
     try std.testing.fuzz({}, fuzzBitfieldPersistOne, .{ .corpus = &fuzz_persist_corpus });
+}
+
+fn manifestSeed(ps: u32, fs: u64, entries: []const ManifestEntry) [manifestLen(entries.len)]u8 {
+    var b: [manifestLen(entries.len)]u8 = undefined;
+    _ = manifestEncode(ps, fs, entries, &b) catch unreachable;
+    return b;
+}
+
+const seed_manifest_clean = manifestSeed(1, 8, &.{
+    .{ .idx = 0, .hash = [_]u8{0x11} ** digest_len },
+    .{ .idx = 2, .hash = [_]u8{0x22} ** digest_len },
+});
+const seed_manifest_empty = manifestSeed(1, 8, &.{});
+const seed_manifest_corrupt_magic = blk: {
+    var b = manifestSeed(1, 8, &.{.{ .idx = 0, .hash = [_]u8{0x11} ** digest_len }});
+    b[0] = 'X';
+    break :blk b;
+};
+const seed_manifest_truncated: [20]u8 = blk: {
+    var b = manifestSeed(1, 8, &.{
+        .{ .idx = 0, .hash = [_]u8{0x11} ** digest_len },
+        .{ .idx = 1, .hash = [_]u8{0x22} ** digest_len },
+    });
+    break :blk b[0..20].*;
+};
+
+/// Manifests ride on shared storage like sidecars, and a corrupt or hostile
+/// one must never yield a trust reference: the harness asserts the codec's
+/// full oracle -- null for a non-manifest, BadManifest for structural
+/// corruption, and, for a clean decode, strictly ascending in-grid indices
+/// with an exact-length body -- not just crash-freedom.
+fn fuzzManifestDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var blob_buf: [160]u8 = undefined;
+    const blob = blob_buf[0..smith.slice(&blob_buf)];
+
+    const m = manifestDecode(gpa, blob) catch return;
+    if (m == null) return;
+    defer gpa.free(m.?.entries);
+
+    try std.testing.expect(m.?.piece_size != 0);
+    const max_idx = count(m.?.file_size, m.?.piece_size);
+    try std.testing.expectEqual(manifestLen(m.?.entries.len), blob.len);
+    var prev: ?u32 = null;
+    for (m.?.entries) |e| {
+        if (prev) |p| try std.testing.expect(e.idx > p);
+        try std.testing.expect(e.idx < max_idx);
+        prev = e.idx;
+    }
+}
+
+test "fuzz manifest decode honors the codec oracle" {
+    try std.testing.fuzz({}, fuzzManifestDecodeOne, .{ .corpus = &.{
+        &seed_manifest_clean,
+        &seed_manifest_corrupt_magic,
+        &seed_manifest_truncated,
+        &seed_manifest_empty,
+    } });
 }
