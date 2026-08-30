@@ -9,8 +9,8 @@ and an NFS origin as the write authority. Linux only.
 | Path | Contents |
 |---|---|
 | `src/*.zig` | The daemon. Tests live beside the code they cover; a new file is invisible to `zig build test` until `root.zig` imports it |
-| `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once; import via `c.zig` / `sys.c`, never `@cImport` |
-| `scripts/` | Gates and harnesses. `lib.sh` is sourced by every shell script for `ROOT_DIR`, `SCRIPTS_DIR`, `SCRATCH_DIR` |
+| `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once; import via `c.zig` / `sys.zig`, never `@cImport` |
+| `scripts/` | Gates and harnesses. `lib.sh` defines `ROOT_DIR`/`SCRATCH_DIR`/`SCRIPTS_DIR`; harnesses source it |
 | `docs/` | `README.md` indexes them. `architecture.md` is shipped behavior; `design.md` is history |
 | `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files, `SHA256SUMS`, NOTICE, and copyright. `build.zig` and `scripts/extract_fuse3_arm64.sh` verify the digests; extract writes under `.scratch/fuse3-arm64/`; `check.sh` checks them too |
 
