@@ -135,7 +135,7 @@ pub fn parseRange(h: []const u8) ?Range {
     return .{ .start = a, .end = b };
 }
 
-pub const ContentRange = struct { start: u64, end: u64, complete: u64 };
+const ContentRange = struct { start: u64, end: u64, complete: u64 };
 
 /// Parses an HTTP Content-Range header value ("bytes start-end/complete").
 /// End is inclusive. An unknown complete length ("bytes start-end/*") is

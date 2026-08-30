@@ -290,7 +290,7 @@ pub fn digest(data: []const u8, out: *[digest_len]u8) void {
 }
 
 /// Lowercase hex of a digest, for manifest names and operator output.
-pub fn digestHex(h: [digest_len]u8) [2 * digest_len]u8 {
+fn digestHex(h: [digest_len]u8) [2 * digest_len]u8 {
     return std.fmt.bytesToHex(h, .lower);
 }
 
@@ -310,7 +310,7 @@ pub const Manifest = struct {
     entries: []ManifestEntry,
 };
 
-pub const manifest_magic = "MFSM";
+const manifest_magic = "MFSM";
 
 /// Serialized length of a manifest with n entries.
 pub fn manifestLen(n: usize) usize {

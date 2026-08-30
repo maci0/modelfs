@@ -203,7 +203,7 @@ pub fn validId(s: []const u8) bool {
 /// Outcome of opening origin/.cluster for a lease walk. Callers interpret
 /// missing_dir themselves: Catalog.refresh keeps the previous peer list;
 /// `modelfs peers` lists as empty.
-pub const LeaseWalk = enum { ok, path_too_long, missing_dir };
+const LeaseWalk = enum { ok, path_too_long, missing_dir };
 
 /// Cap on a lease document read from origin/.cluster. formatLease writes
 /// into 2048 bytes; this is twice that so a slightly larger co-tenant

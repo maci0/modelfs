@@ -323,7 +323,7 @@ pub fn statvfsPath(path: [*:0]const u8, vs: *c.struct_statvfs) i32 {
     return 0;
 }
 
-pub fn fstatvfs(fd: c_int, vs: *c.struct_statvfs) i32 {
+fn fstatvfs(fd: c_int, vs: *c.struct_statvfs) i32 {
     if (c.fstatvfs(fd, vs) != 0) return negErrno();
     return 0;
 }
@@ -501,13 +501,6 @@ pub fn writeFile(path: [*:0]const u8, data: []const u8) i32 {
 /// data/meta/pin and `status.json` use the owner-only helpers.
 pub fn writeFileNoFollow(path: [*:0]const u8, data: []const u8) i32 {
     return writeFileFull(path, data, c.O_NOFOLLOW, false, 0o644);
-}
-
-/// writeFileNoFollow plus fsync-before-close: for 0644 artifact writes
-/// whose durability orders them against a later destructive step on the
-/// same key. Cache sidecars use writeFileOwnerOnlyDurable.
-pub fn writeFileDurable(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFull(path, data, c.O_NOFOLLOW, true, 0o644);
 }
 
 /// writeFileNoFollow at 0600. For cache-root artifacts that sit next to a
