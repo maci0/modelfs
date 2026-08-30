@@ -2931,6 +2931,62 @@ test "completeFill does not overwrite a racing write-through" {
     try std.testing.expectEqualSlices(u8, &fresh, &rd);
 }
 
+test "a retried fill leaves bits, bytes, and sidecar identical to one run" {
+    // The fill path is the daemon's most retried operation: fetchFromCands
+    // walks candidate peers after a timeout or lost reply, and a crash
+    // between a fill and its sidecar save re-fills the same piece. This
+    // pins the idempotency those retries depend on: a second fill of the
+    // same piece must leave the cache exactly as one run did.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-dupfill");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-dupfill");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("dupfill.bin", 16, sys.monoSec(std.testing.io));
+    var data: [16]u8 = undefined;
+    for (0..data.len) |i| data[i] = @intCast(i);
+    var hash: [piece.digest_len]u8 = undefined;
+    piece.digest(&data, &hash);
+
+    // Run 1: hydrate the piece like a peer or origin fetch would.
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, &data, hash, sys.monoSec(std.testing.io)));
+    try std.testing.expect(st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+
+    // Run 2: the redelivered fetch. beginFill must report .filled instead
+    // of double-claiming, and a blind completeFill of the same bytes must
+    // be a no-op rather than re-writing or re-marking the piece.
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .filled);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, &data, hash, sys.monoSec(std.testing.io)));
+
+    // Identical state: the bit is still set, the bytes are unchanged, and
+    // the trusted hash recorded at the first fill still matches.
+    try std.testing.expect(st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+    var rd: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqualSlices(u8, &data, &rd);
+    const rec = st.expectedHash(f, 0);
+    try std.testing.expect(rec != null);
+    if (rec) |h| try std.testing.expectEqualSlices(u8, &hash, &h);
+
+    // The persisted sidecar is equally unaffected: a fresh entry (the
+    // crash-restart shape) reloads the same marks and bytes.
+    st.releaseFile(f);
+    const f2 = try st.get("dupfill.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f2);
+    try std.testing.expect(st.hasPiece(f2, 0, sys.monoSec(std.testing.io)));
+    var rd2: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 16), st.readCache(f2, &rd2, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqualSlices(u8, &data, &rd2);
+}
+
 test "completeFill drops a stale peer buffer after a partial write-through" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
