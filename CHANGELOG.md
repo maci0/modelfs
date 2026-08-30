@@ -8,6 +8,16 @@
   `modelfs dupes --all`'s empty-store report, so a pipe sees the result;
   the per-path "no piece-hash manifest" diagnostics stay on stderr.
 
+### Peer probe failures log the failing peer - 2026-08-30
+- **A `/have` probe failure now names the peer.** Probe failures (dead
+  peer, PSK drift, timeout, malformed reply) used to bump only the
+  `probe_err` tick counter, so a cluster silently degrading to NFS-only
+  left no journal line explaining which peer was down. `Catalog` tracks
+  probe-down peers and the first failure since the peer answered logs
+  `peer <ip>:<port> /have probe failed ... with the error class; the next
+  success (a healthy 404 counts) logs recovery, and repeats ride the
+  counter -- a dead fleet cannot flood the journal.
+
 ### 4-VM cluster e2e and a manifest-load retry fix - 2026-08-29
 - **`scripts/run_vm_cluster_e2e.sh` boots a real cluster: one NFS server VM
   plus three modelfs client VMs** on libvirt/KVM (the topology the 9-node

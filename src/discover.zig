@@ -287,6 +287,15 @@ pub const Catalog = struct {
     /// recovered backend is retried.
     stage_down: std.ArrayList(StageDown) = .empty,
 
+    /// Addresses whose /have probe has failed since the peer last answered,
+    /// keyed by (ip, port) and guarded by have_mu like the have cache. The
+    /// first failure per outage logs peer address plus error class so the
+    /// operator pivoting from a climbing probe_err has a journal line naming
+    /// the down, PSK-drifted, or wedged node; repeats ride the counter and a
+    /// success clears the entry and logs recovery. No TTL: a peer that stays
+    /// down logs exactly once until it answers again. Bounded like stage_down.
+    probe_down: std.ArrayList(ProbeDown) = .empty,
+
     /// /have answers from recent probes, keyed by (rel, ip, port).
     /// fillFromPeers runs once per piece; without this cache a sequential
     /// read of one large model re-probes the whole cluster for every piece
@@ -306,6 +315,13 @@ pub const Catalog = struct {
         ip: []u8,
         port: u16,
         expires_ms: i64,
+    };
+
+    const probe_down_cap: usize = 32;
+
+    const ProbeDown = struct {
+        ip: []u8,
+        port: u16,
     };
 
     const HaveEntry = struct {
@@ -444,6 +460,51 @@ pub const Catalog = struct {
         self.stage_down.append(gpa, .{ .ip = ip_own, .port = port, .expires_ms = now_ms +| have_ttl_ms }) catch {
             gpa.free(ip_own);
         };
+    }
+
+    /// Records a failed /have probe from (ip, port). True only for the first
+    /// failure since the peer last answered (the caller logs that one with
+    /// address and error class); later failures return false and ride the
+    /// probe_err counter, so a dead fleet cannot flood the journal the way
+    /// per-piece fetch logs would. Bounded like stage_down: an entry that
+    /// cannot fit evicts another, else is dropped -- worst case a still-down
+    /// peer logs once more when the eviction clears its entry.
+    pub fn noteProbeDown(self: *Catalog, ip: []const u8, port: u16) bool {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (self.probe_down.items) |e| {
+            if (e.port == port and std.mem.eql(u8, e.ip, ip)) return false;
+        }
+        if (self.probe_down.items.len >= probe_down_cap) {
+            if (self.probe_down.items.len > 0) {
+                gpa.free(self.probe_down.items[0].ip);
+                _ = self.probe_down.orderedRemove(0);
+            } else return false;
+        }
+        const ip_own = gpa.dupe(u8, ip) catch return false;
+        self.probe_down.append(gpa, .{ .ip = ip_own, .port = port }) catch {
+            gpa.free(ip_own);
+            return false;
+        };
+        return true;
+    }
+
+    /// Clears a /have probe failure for (ip, port) after the peer answered
+    /// (a 200 bitmap or a healthy 404). True when an entry was removed: the
+    /// caller logs the recovery so a returning peer is visible in the journal
+    /// without anyone watching counters.
+    pub fn clearProbeDown(self: *Catalog, ip: []const u8, port: u16) bool {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (self.probe_down.items, 0..) |e, i| {
+            if (e.port != port or !std.mem.eql(u8, e.ip, ip)) continue;
+            gpa.free(self.probe_down.items[i].ip);
+            _ = self.probe_down.orderedRemove(i);
+            return true;
+        }
+        return false;
     }
 
     pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, stage: bool, now_ms: i64) void {
@@ -592,6 +653,8 @@ pub const Catalog = struct {
         self.have_cache.deinit(self.gpa);
         for (self.stage_down.items) |e| self.gpa.free(e.ip);
         self.stage_down.deinit(self.gpa);
+        for (self.probe_down.items) |e| self.gpa.free(e.ip);
+        self.probe_down.deinit(self.gpa);
         self.paths.deinit(self.gpa);
         self.arena.deinit();
     }
@@ -2452,4 +2515,22 @@ test "stageDown tracks a failed staged fetch for the have TTL" {
     cat.noteStageDown("10.0.0.9", 18080, t0 + 100);
     try std.testing.expect(cat.stageDown("10.0.0.9", 18080, t0 + 100));
     try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms + 100));
+}
+
+test "probeDown edge-triggers /have failures and clears on recovery" {
+    const gpa = std.testing.allocator;
+    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    // First failure logs (true); repeats ride the counter (false).
+    try std.testing.expect(cat.noteProbeDown("10.0.0.9", 18080));
+    try std.testing.expect(!cat.noteProbeDown("10.0.0.9", 18080));
+    // Same address, different port: independent.
+    try std.testing.expect(cat.noteProbeDown("10.0.0.9", 19090));
+    // Different address: independent.
+    try std.testing.expect(cat.noteProbeDown("10.0.0.8", 18080));
+    // Recovery clears only the matching entry and logs once.
+    try std.testing.expect(cat.clearProbeDown("10.0.0.9", 18080));
+    try std.testing.expect(!cat.clearProbeDown("10.0.0.9", 18080));
+    // Cleared peer can fail again (new outage logs again).
+    try std.testing.expect(cat.noteProbeDown("10.0.0.9", 18080));
 }

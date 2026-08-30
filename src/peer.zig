@@ -1316,14 +1316,28 @@ fn probeWorker(ctx: *ProbeCtx) void {
                     // Healthy miss: cache as empty so the next piece of
                     // this file does not re-dial a peer that already said
                     // it has nothing. Connection failures stay uncached.
+                    // A 404 proves the peer is reachable again, so it also
+                    // clears any probe-down state from earlier failures.
                     ctx.cat.havePut(ctx.rel, p.ip, p.port, &.{}, 0, false, ctx.now_ms);
+                    if (ctx.cat.clearProbeDown(p.ip, p.port))
+                        std.log.info("peer {s}:{d} /have probe recovered", .{ p.ip, p.port });
                     ctx.slots[gi] = false;
                     break;
                 }
                 if (ctx.stats) |s| _ = s.probe_err.fetchAdd(1, .monotonic);
+                // Edge-triggered like the origin-outage journal: the first
+                // failure since the peer answered names address and error
+                // class, later ones ride the counter, and a success below
+                // logs recovery. Without it a climbing probe_err has no log
+                // line explaining which peer is down, PSK-drifted, or wedged
+                // -- the read silently degrades to the origin tier.
+                if (ctx.cat.noteProbeDown(p.ip, p.port))
+                    std.log.warn("peer {s}:{d} /have probe failed for {s}: {t}; fills fall back to origin", .{ p.ip, p.port, ctx.rel, err });
                 continue;
             };
             defer ctx.gpa.free(rep.bits);
+            if (ctx.cat.clearProbeDown(p.ip, p.port))
+                std.log.info("peer {s}:{d} /have probe recovered", .{ p.ip, p.port });
             ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size, rep.stage, ctx.now_ms);
             ctx.slots[gi] = rep.hasPiece(ctx.idx, ctx.local_piece_size);
             break;
