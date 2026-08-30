@@ -390,7 +390,10 @@ while :; do
                 "/home/ubuntu/modelfs status --cache /home/ubuntu/cache 2>/dev/null || echo 'no status'; echo '--- log ---'; tail -20 /home/ubuntu/modelfs.log 2>/dev/null; echo '--- cache ---'; du -sk /home/ubuntu/cache 2>/dev/null || true" 2>&1
         done
         echo "--- client 1 /have bitmap for big.gguf ---"
-        have_cmd="curl -s -D - -o /dev/null -H 'Authorization: Bearer ${PSK_VALUE}' 'http://127.0.0.1:18080/have?path=big.gguf' | head -8; echo; curl -s -H 'Authorization: Bearer ${PSK_VALUE}' 'http://127.0.0.1:18080/have?path=big.gguf' | xxd | head -5"
+        # Read the token from the PSK file on the remote host instead of
+        # interpolating it here: an ssh command string is this harness's
+        # argv, and /proc/<pid>/cmdline is world-readable.
+        have_cmd="auth=\"Authorization: Bearer \$(cat /home/ubuntu/modelfs.psk)\"; curl -s -D - -o /dev/null -H \"\$auth\" 'http://127.0.0.1:18080/have?path=big.gguf' | head -8; echo; curl -s -H \"\$auth\" 'http://127.0.0.1:18080/have?path=big.gguf' | xxd | head -5"
         ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${C1_IP}" "${have_cmd}" 2>&1
         exit 1
     fi
