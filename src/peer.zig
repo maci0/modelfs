@@ -4040,7 +4040,8 @@ fn refRelOk(rel: []const u8) bool {
             continue;
         }
         const seg = rel[seg_start..i];
-        if (seg.len != 0 and seg[0] == '.' and (seg.len == 1 or (seg.len == 2 and seg[1] == '.'))) return false;
+        if (seg.len == 0) return false;
+        if (seg[0] == '.' and (seg.len == 1 or (seg.len == 2 and seg[1] == '.'))) return false;
         seg_start = i + 1;
     }
     return true;

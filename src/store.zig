@@ -14,7 +14,12 @@ const c = sys.c;
 pub const status_file = "status.json";
 
 /// True when rel is a safe origin-relative path at a trust boundary: not
-/// empty, not absolute, no "." or ".." component, no control character.
+/// empty, not absolute, no "." or ".." component, no empty component
+/// (a doubled or trailing slash), no control character. Empty components
+/// are refused because the kernel collapses `//` during path resolution
+/// while cache keys are byte-exact: `"a//b"` and `"a/b"` are distinct keys
+/// that name the same data/meta/pin artifacts, and a fill or cull through
+/// one would alias the other's marks onto shared bytes.
 /// Applied to every externally supplied path before it joins a root (FUSE,
 /// peer HTTP, CLI pin); without it a peer request can escape the origin/cache
 /// trees or forge multi-line entries in operator logs via \n in a path.
@@ -33,7 +38,7 @@ pub fn relOk(rel: []const u8) bool {
     if (proto.containsControl(rel)) return false;
     var it = std.mem.splitScalar(u8, rel, '/');
     while (it.next()) |seg| {
-        if (seg.len == 0) continue;
+        if (seg.len == 0) return false;
         if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
     }
     return true;
@@ -1318,11 +1323,18 @@ pub const Store = struct {
         const max_idx = piece.count(fsize, self.piece_size);
         var entries: std.ArrayList(piece.ManifestEntry) = .empty;
         defer entries.deinit(self.gpa);
+        // Hash count at snapshot time. The final clear below only drops the
+        // dirty flag when the count is unchanged: a digest recorded during
+        // the origin write (finishPiece, copyIntoCache) raised the count, so
+        // the just-written blob does not hold it and the flag must stay set
+        // for the next release to publish it.
+        var snap_count: usize = 0;
         file.mu.lockUncancelable(self.io);
         {
             defer file.mu.unlock(self.io);
             if (file.dead.load(.acquire)) return;
             if (!file.manifest_dirty) return;
+            snap_count = file.hashes.count();
             var it = file.hashes.iterator();
             while (it.next()) |e| {
                 if (e.key_ptr.* >= max_idx) continue;
@@ -1369,10 +1381,12 @@ pub const Store = struct {
         }
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
-        // Clear the flag only when it is still set: a hash recorded during
-        // our origin write stays dirty and rides the next release.
+        // Clear the flag only when the hash set is exactly what we just
+        // published: a digest recorded during the origin write (snap_count
+        // rose) is not in the blob and must ride the next release, so it
+        // leaves the flag set instead of being lost forever.
         if (file.dead.load(.acquire)) return;
-        if (file.manifest_dirty) file.manifest_dirty = false;
+        if (file.manifest_dirty and file.hashes.count() == snap_count) file.manifest_dirty = false;
     }
 
     /// Clears a piece's mark after its cached bytes failed at-rest
@@ -3100,6 +3114,12 @@ test "relOk rejects traversal and absolute paths" {
     // absolute and empty
     try std.testing.expect(!relOk("/etc/passwd"));
     try std.testing.expect(!relOk(""));
+    // doubled and trailing slashes alias a distinct byte key onto the same
+    // on-disk artifacts (`a//b` and `a/b` name the same data/meta/pin file
+    // once the kernel collapses the run), so they must refuse like "." / ".."
+    try std.testing.expect(!relOk("a//b"));
+    try std.testing.expect(!relOk("a/"));
+    try std.testing.expect(!relOk("gguf/"));
     // NUL would truncate the path at the syscall boundary
     try std.testing.expect(!relOk("a\x00b"));
     // CR/LF/ESC must not reach log sinks: a peer-supplied path could forge
@@ -3244,8 +3264,10 @@ const fuzz_rel_corpus = [_][]const u8{
 /// Independent restatement of relOk: empty/absolute refuse, C0/DEL, and
 /// proto.utf8FormatControlAt's set (C1 and Default_Ignorable, including
 /// variation selectors, tags, soft hyphen) refuse, "." / ".." components refuse,
-/// empty components (double slash, trailing slash) do not. Walks segments
-/// by index instead of splitScalar so a corrupted splitter cannot self-confirm.
+/// empty components (double slash, trailing slash) refuse too -- a doubled
+/// or trailing slash aliases a distinct byte key onto the same on-disk
+/// artifacts. Walks segments by index instead of splitScalar so a corrupted
+/// splitter cannot self-confirm.
 fn refRelOk(rel: []const u8) bool {
     if (rel.len == 0 or rel[0] == '/') return false;
     var seg_start: usize = 0;
@@ -3258,7 +3280,8 @@ fn refRelOk(rel: []const u8) bool {
             continue;
         }
         const seg = rel[seg_start..i];
-        if (seg.len != 0 and seg[0] == '.' and (seg.len == 1 or (seg.len == 2 and seg[1] == '.'))) return false;
+        if (seg.len == 0) return false;
+        if (seg[0] == '.' and (seg.len == 1 or (seg.len == 2 and seg[1] == '.'))) return false;
         seg_start = i + 1;
     }
     return true;
