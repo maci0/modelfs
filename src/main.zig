@@ -55,7 +55,7 @@ const usage =
     \\  --origin PATH         Existing NFS/dir origin (required). Writes go here.
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
     \\  --id NAME             Override node id (default: short hostname)
-    \\  --listen [IP:]PORT    Peer HTTP port (default 18080, 1-65535); binds all interfaces
+    \\  --listen [IP:]PORT    Peer HTTP port (default {d}, 1-65535); binds all interfaces
     \\  --advertise ADDRS     Lease addresses IP[:PORT], comma separated
     \\                        (replaces auto-detect; a defaulted port follows
     \\                        --listen; default: every local IPv4 except
@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !u8 {
     // command also accepts -h/--help" instead of dying as a positional error.
     switch (classifyMeta(argv.items)) {
         .none => {},
-        .help => return if (writeOut(init.io, usage)) 0 else 1,
+        .help => return if (printOut(init.io, init.gpa, usage, .{proto.default_port})) 0 else 1,
         .version => return if (printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
         .bad => {
             const what: []const u8 = if (isHelpTok(argv.items[0])) "help" else "version";
@@ -136,7 +136,7 @@ pub fn main(init: std.process.Init) !u8 {
         },
     }
     const parsed = parseArgs(gpa, init.environ_map, argv.items) catch |err| switch (err) {
-        error.Help => return if (writeOut(init.io, usage)) 0 else 1,
+        error.Help => return if (printOut(init.io, init.gpa, usage, .{proto.default_port})) 0 else 1,
         error.Version => return if (printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
         // Usage errors exit 2, like every other bad invocation in this CLI
         // (missing subcommand argument, unknown command). Each one is named

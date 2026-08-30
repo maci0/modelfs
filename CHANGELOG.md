@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### CLI help derives the default peer port from the shared constant - 2026-08-30
+- **`modelfs help` no longer hardcodes 18080 in the `--listen` line.** The
+  usage text formats the default from `proto.default_port` -- the same
+  constant every parse path reads -- so a future port change cannot leave
+  the help text describing a default the daemon no longer uses.
+
 ### Env docs: MODELFS_ID mount-only scope, log-ceiling coverage - 2026-08-30
 - **`modelfs help` now marks `MODELFS_ID` as mount only**, like `--id`
   (outside mount the env var is deliberately ignored while the flag is
