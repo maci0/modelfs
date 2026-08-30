@@ -2758,7 +2758,10 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
     }
 
     if (files.items.len == 0) {
-        if (!builtin.is_test) std.debug.print("no manifests to compare\n", .{});
+        // Same empty-report result as cmdDupesAll: the "nothing to compare"
+        // line is the report, so it rides stdout where a pipe sees it, not
+        // stderr beside the per-path diagnostics.
+        if (!printOut(io, gpa, "no manifests to compare\n", .{})) return 1;
         return 0;
     }
     for (files.items) |f| {
@@ -2920,6 +2923,14 @@ test "cmdDupes reports manifest overlap and gates its paths" {
     try std.testing.expectEqual(@as(u8, 0), try cmdDupes(std.testing.io, gpa, opts, &.{ "a.bin", "b.bin" }));
     // A path with no manifest is reported, not an error.
     try std.testing.expectEqual(@as(u8, 0), try cmdDupes(std.testing.io, gpa, opts, &.{ "a.bin", "missing.bin" }));
+    // All paths missing is the same empty report as --all: the line lands on
+    // stdout (a pipe sees it), not stderr beside the diagnostics.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupes(std.testing.io, gpa, opts, &.{"missing.bin"}));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "no manifests to compare") != null);
     // Path gates match verify's; a missing origin is a usage error.
     try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{"../escape.bin"}));
     try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{".cluster/spark1.json"}));

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### `modelfs dupes` empty report rides stdout like `--all` - 2026-08-30
+- **`modelfs dupes <relpath>...` now prints "no manifests to compare" on
+  stdout** when no listed path has a piece-hash manifest, matching
+  `modelfs dupes --all`'s empty-store report, so a pipe sees the result;
+  the per-path "no piece-hash manifest" diagnostics stay on stderr.
+
 ### 4-VM cluster e2e and a manifest-load retry fix - 2026-08-29
 - **`scripts/run_vm_cluster_e2e.sh` boots a real cluster: one NFS server VM
   plus three modelfs client VMs** on libvirt/KVM (the topology the 9-node
