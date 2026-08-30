@@ -47,6 +47,8 @@ const usage =
     \\  modelfs pin <relpath> [--cache PATH]
     \\  modelfs unpin <relpath> [--cache PATH]
     \\  modelfs verify <relpath> --origin PATH [--cache PATH]
+    \\  modelfs dupes <relpath>... --origin PATH
+    \\  modelfs dupes --all --origin PATH
     \\  modelfs version
     \\  modelfs help
     \\
@@ -72,11 +74,12 @@ const usage =
     \\  --detach              Background after mount
     \\  -f, --foreground      Stay in the foreground (default)
     \\
-    \\mount/status/peers/pin/unpin/verify:
+    \\mount/status/peers/pin/unpin/verify/dupes:
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
+    \\  --all                 dupes only: compare every origin piece-hash manifest
     \\
-    \\status/peers/pin/unpin/verify take only the flags shown on their Usage
-    \\line plus the shared --origin/--cache/--psk/--log values; mount-only
+    \\status/peers/pin/unpin/verify/dupes take only the flags shown on their
+    \\Usage line plus the shared --origin/--cache/--psk/--log values; mount-only
     \\options are refused elsewhere. Every command also accepts -h/--help,
     \\and -V/--version prints the release. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
@@ -94,6 +97,7 @@ const usage =
     \\  modelfs status | jq -r .id
     \\  modelfs pin gguf/foo.gguf
     \\  modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models
+    \\  modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models
     \\
     \\Cluster leases live on the origin at .cluster/<id>.json, not under the
     \\FUSE mount. Same PSK on every node. Desktop can stay on plain NFS.

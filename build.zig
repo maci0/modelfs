@@ -243,7 +243,16 @@ pub fn build(b: *std.Build) void {
     // absolute build paths (DW_AT_comp_dir), which is what makes two builds
     // of the same tree from different directories produce different bytes.
     exe_mod.stack_protector = true;
-    exe_mod.stack_check = true;
+    // Zig 0.16 implements stack probing on x86_64; on aarch64 it rejects the
+    // request ("the selected target does not support stack checking"), which
+    // fails the documented aarch64 cross-build (CI cross-aarch64 job and
+    // scripts/ci.sh). x86_64 and aarch64 are the only supported deployment
+    // arches, so enable it on the one the toolchain can; stack canaries
+    // above still cover aarch64.
+    switch (target.result.cpu.arch) {
+        .x86_64 => exe_mod.stack_check = true,
+        else => {},
+    }
     if (optimize != .Debug) {
         exe_mod.strip = true;
     }

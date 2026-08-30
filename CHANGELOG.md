@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### aarch64 cross-build works on Zig 0.16 - 2026-08-30
+- **The aarch64 ReleaseFast cross-build no longer requests stack probing**,
+  which Zig 0.16 rejects on that target ("the selected target does not
+  support stack checking") and which previously failed the cross-aarch64 CI
+  job and `scripts/ci.sh` at the compile step. Stack canaries still protect
+  aarch64; stack probes stay enabled where the toolchain implements them
+  (x86_64).
+
 ### 4-VM cluster e2e and a manifest-load retry fix - 2026-08-29
 - **`scripts/run_vm_cluster_e2e.sh` boots a real cluster: one NFS server VM
   plus three modelfs client VMs** on libvirt/KVM (the topology the 9-node
