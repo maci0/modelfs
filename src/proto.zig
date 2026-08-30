@@ -413,6 +413,111 @@ test "containsControl covers C0 C1 line separators and format controls" {
     try std.testing.expect(containsControl("a\u{e01ef}b"));
 }
 
+/// Independent restatement of the refused set as Unicode scalar ranges instead
+/// of UTF-8 byte patterns, decoded with std.unicode. C0/DEL are checked here
+/// too so refContainsControl is a complete oracle for containsControl.
+fn isControlScalar(cp: u21) bool {
+    if (cp < 0x20 or cp == 0x7f) return true;
+    if (cp >= 0x80 and cp <= 0x9f) return true;
+    switch (cp) {
+        0x00ad, 0x034f, 0x061c, 0x115f, 0x1160, 0x17b4, 0x17b5, 0x3164, 0xfeff, 0xffa0 => return true,
+        else => {},
+    }
+    if (cp >= 0x180b and cp <= 0x180e) return true;
+    if (cp >= 0x200b and cp <= 0x200f) return true;
+    if (cp >= 0x2028 and cp <= 0x202e) return true;
+    if (cp >= 0x2060 and cp <= 0x206f) return true;
+    if (cp >= 0xfe00 and cp <= 0xfe0f) return true;
+    if (cp >= 0xfff0 and cp <= 0xfffb) return true;
+    if (cp >= 0x1d173 and cp <= 0x1d17a) return true;
+    if (cp >= 0xe0000 and cp <= 0xe0fff) return true;
+    return false;
+}
+
+/// Oracle for containsControl: a C0/DEL byte, or a valid multi-byte scalar in
+/// the refused set, refuses. Invalid and truncated sequences are display
+/// noise, never controls -- the same contract the byte walker documents.
+fn refContainsControl(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const ch = s[i];
+        if (ch < 0x20 or ch == 0x7f) return true;
+        const seq_len = std.unicode.utf8ByteSequenceLength(ch) catch continue;
+        if (seq_len == 1 or i + seq_len > s.len) continue;
+        const cp = std.unicode.utf8Decode(s[i..][0..@intCast(seq_len)]) catch continue;
+        if (isControlScalar(cp)) return true;
+    }
+    return false;
+}
+
+/// Per-position oracle for utf8FormatControlAt: the scalar starting at i must
+/// be a refused C1 or Default_Ignorable control. C0/DEL are not this
+/// function's job in either implementation.
+fn refFormatControlAt(s: []const u8, i: usize) bool {
+    if (i >= s.len) return false;
+    const seq_len = std.unicode.utf8ByteSequenceLength(s[i]) catch return false;
+    if (seq_len == 1 or i + seq_len > s.len) return false;
+    const cp = std.unicode.utf8Decode(s[i..][0..@intCast(seq_len)]) catch return false;
+    return isControlScalar(cp) and cp >= 0x80;
+}
+
+const seed_ctl_clean = fuzzcorpus.entry("gguf/model.gguf");
+const seed_ctl_c0 = fuzzcorpus.entry("a\x00b");
+const seed_ctl_lf = fuzzcorpus.entry("a\nb");
+const seed_ctl_del = fuzzcorpus.entry("a\x7fb");
+const seed_ctl_c1 = fuzzcorpus.entry("a\xc2\x9bb");
+const seed_ctl_soft_hyphen = fuzzcorpus.entry("a\xc2\xadb");
+const seed_ctl_bidi = fuzzcorpus.entry("gguf/a\xe2\x80\xaegnp.bin");
+const seed_ctl_zwsp = fuzzcorpus.entry("a\xe2\x80\x8bb");
+const seed_ctl_invisible_op = fuzzcorpus.entry("a\xe2\x81\xafb");
+const seed_ctl_bom = fuzzcorpus.entry("a\xef\xbb\xbfb");
+const seed_ctl_tag = fuzzcorpus.entry("a\xf3\xa0\x80\x80b");
+const seed_ctl_musical = fuzzcorpus.entry("a\xf0\x9d\x85\xb3b");
+const seed_ctl_truncated_2 = fuzzcorpus.entry("a\xc2");
+const seed_ctl_truncated_3 = fuzzcorpus.entry("a\xe2\x80");
+const seed_ctl_invalid_byte = fuzzcorpus.entry("a\xffb");
+const seed_ctl_nbsp = fuzzcorpus.entry("model\xa0v2.bin");
+const seed_ctl_surrogate = fuzzcorpus.entry("a\xed\xa0\x80b");
+
+const fuzz_control_corpus = [_][]const u8{
+    &seed_ctl_clean,
+    &seed_ctl_c0,
+    &seed_ctl_lf,
+    &seed_ctl_del,
+    &seed_ctl_c1,
+    &seed_ctl_soft_hyphen,
+    &seed_ctl_bidi,
+    &seed_ctl_zwsp,
+    &seed_ctl_invisible_op,
+    &seed_ctl_bom,
+    &seed_ctl_tag,
+    &seed_ctl_musical,
+    &seed_ctl_truncated_2,
+    &seed_ctl_truncated_3,
+    &seed_ctl_invalid_byte,
+    &seed_ctl_nbsp,
+    &seed_ctl_surrogate,
+};
+
+/// The byte-walker control detector gates every external path (store.relOk,
+/// discover.printable, the FUSE and peer path gates) but its only oracle so
+/// far was itself: refRelOk calls proto.utf8FormatControlAt, so a bug shared
+/// by both is invisible. This harness restates the set from Unicode scalar
+/// values instead of byte patterns, so the two cannot drift together.
+fn fuzzControlOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [256]u8 = undefined;
+    const s = buf[0..smith.slice(&buf)];
+
+    try std.testing.expectEqual(refContainsControl(s), containsControl(s));
+    for (s, 0..) |_, i| {
+        try std.testing.expectEqual(refFormatControlAt(s, i), utf8FormatControlAt(s, i));
+    }
+}
+
+test "fuzz control-char detection matches an independent unicode scalar oracle" {
+    try std.testing.fuzz({}, fuzzControlOne, .{ .corpus = &fuzz_control_corpus });
+}
+
 test "url encode decode" {
     var ebuf: [64]u8 = undefined;
     var dbuf: [64]u8 = undefined;
