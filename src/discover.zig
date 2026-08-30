@@ -1742,6 +1742,38 @@ test "shouldAdvertise skips loopback and link-local" {
     try std.testing.expect(!shouldAdvertise(""));
 }
 
+test "localIpv4 returns only advertiseable sorted deduped addresses" {
+    // The advertised-address list feeds the cluster lease (leaseAddrs), so
+    // whatever this host's NIC set looks like, the function's contract is
+    // fixed: every entry must pass the same shouldAdvertise gate the lease
+    // path trusts, sorted ascending with no duplicates. A loopback-only
+    // host (CI container) legitimately gets an empty list.
+    const gpa = std.testing.allocator;
+    const ips = localIpv4(gpa) catch return error.SkipZigTest;
+    defer {
+        for (ips) |s| gpa.free(s);
+        gpa.free(ips);
+    }
+    var prev: ?[]const u8 = null;
+    for (ips) |ip| {
+        try std.testing.expect(shouldAdvertise(ip));
+        if (prev) |p| {
+            // Ascending dotted-quad string order: the lease document must be
+            // a function of the NIC set alone, never of getifaddrs
+            // enumeration order (the dedup below keeps this strict).
+            try std.testing.expect(std.mem.order(u8, p, ip) == .lt);
+        }
+        prev = ip;
+    }
+    // The same address can sit on several interfaces (bonding, aliases);
+    // each may be published once.
+    for (ips, 0..) |ip, i| {
+        for (ips[i + 1 ..]) |later| {
+            try std.testing.expect(!std.mem.eql(u8, ip, later));
+        }
+    }
+}
+
 test "isDialableHost refuses unspecified and limited broadcast" {
     try std.testing.expect(isDialableHost(&.{ 10, 0, 0, 1 }));
     try std.testing.expect(isDialableHost(&.{ 127, 0, 0, 1 }));
