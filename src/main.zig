@@ -1,5 +1,5 @@
 //! CLI entry point: argument parsing, command dispatch (mount/status/peers/
-//! pin/unpin), and mount wiring into State.init / fuse_fs.run.
+//! pin/unpin/verify/dupes), and mount wiring into State.init / fuse_fs.run.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -47,6 +47,7 @@ const usage =
     \\  modelfs pin <relpath> [--cache PATH]
     \\  modelfs unpin <relpath> [--cache PATH]
     \\  modelfs verify <relpath> --origin PATH [--cache PATH]
+    \\  modelfs dupes <relpath>... [--all] --origin PATH
     \\  modelfs version
     \\  modelfs help
     \\
@@ -72,12 +73,14 @@ const usage =
     \\  --detach              Background after mount
     \\  -f, --foreground      Stay in the foreground (default)
     \\
-    \\mount/status/peers/pin/unpin/verify:
+    \\mount/status/peers/pin/unpin/verify/dupes:
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
     \\
-    \\status/peers/pin/unpin/verify take only the flags shown on their Usage
-    \\line plus the shared --origin/--cache/--psk/--log values; mount-only
-    \\options are refused elsewhere. Every command also accepts -h/--help,
+    \\status/peers/pin/unpin/verify/dupes take only the flags shown on their
+    \\Usage line plus the shared --origin/--cache/--psk/--log values; dupes
+    \\adds --all (scan every manifest on the origin instead of a path list)
+    \\and refuses it elsewhere; mount-only options are refused on the rest.
+    \\Every command also accepts -h/--help,
     \\and -V/--version prints the release. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
     \\accept --name VALUE or --name=VALUE.
@@ -94,6 +97,7 @@ const usage =
     \\  modelfs status | jq -r .id
     \\  modelfs pin gguf/foo.gguf
     \\  modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models
+    \\  modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models
     \\
     \\Cluster leases live on the origin at .cluster/<id>.json, not under the
     \\FUSE mount. Same PSK on every node. Desktop can stay on plain NFS.

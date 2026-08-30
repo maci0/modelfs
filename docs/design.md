@@ -770,7 +770,7 @@ Status values: **Accepted** (still in force), **Partial** (part shipped), **Supe
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Accepted |
 | Frontend | Sparse-file hydrate, then leave the I/O path | mmap for llama.cpp / vLLM | Superseded: FUSE read path with `direct_io`; agent stays in the I/O path (UMA OOM; reverses section 4.8 rule 6) |
 | Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partial: fixed 16 MiB transfer pieces; chunks/CDC absent |
-| Hash | blake3 | Fast, enough collision resistance for this | Partial: Level 1 shipped (per-piece digests, manifests, verify); content-addressed storage and wire-level identity did not (section 14.5) |
+| Hash | blake3 | Fast, enough collision resistance for this | Partial: Level 1 shipped (per-piece digests, manifests, verify); content-addressed storage and wire-level identity did not (section 14, Levels 2-3) |
 | Two-node | Embedded metadata, RF=2 | No extra store | Not shipped (origin-less RF=2). Membership is origin `.cluster/<id>.json` leases (see Origin) |
 | Origin | Optional peer that never evicts | Same protocol | Superseded: origin is required (POSIX dir); "never evicts" holds |
 | Transport | QUIC or HTTP/2 Have/Want/Piece | One port; inspectable | Superseded: plaintext HTTP/1.1 `GET /ping`, `/have`, `/data` (see architecture.md) |

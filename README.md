@@ -88,7 +88,7 @@ modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models  # comp
 modelfs dupes --all --origin /net/192.168.0.100/models  # whole-store duplicate scan
 ```
 
-Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin/verify), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount (surrounding whitespace is trimmed like the PSK file; a whitespace-only value is refused); an explicit flag wins and an empty environment value counts as unset. `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
+Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin/verify/dupes), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount (surrounding whitespace is trimmed like the PSK file; a whitespace-only value is refused); an explicit flag wins and an empty environment value counts as unset. `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
 
 Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS ([docs/operations.md](docs/operations.md)).
 
@@ -149,6 +149,7 @@ Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); instal
 | `peer.zig` | peer HTTP server (`/ping`, `/have`, `/data`) and fetch client |
 | `proto.zig` | wire helpers: sizes, ranges, URL codec, bearer auth |
 | `discover.zig` | origin-side lease files, `/have` probe cache, path scoring |
+| `rdma.zig` | RDMA data-plane seam: `/stage` window codec and backend interface (null until the verbs tail) |
 | `cull.zig` | cache eviction watermarks |
 | `sys.zig` | syscall wrappers |
 | `c.zig` | the single door to libfuse3/libc |
