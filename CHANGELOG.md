@@ -157,7 +157,7 @@ usage errors that name what is missing. Upgrading from `v0.1.0`: start at
 - **A missed monthly drill is a daily alarm.** "Alert when the log ages past 35 days" was prose. `scripts/check_drill_log.sh` fails on a missing, empty, unparseable, future, or too-old log stamp; `modelfs-drill-log.timer` runs it. The drill now fails before clone if the artifact log is unwritable, uses `MF_DRILL_MAX_REPLICA_AGE` (default 36 h) so a daily syncoid is not a 25 h false alarm, and runs from `/usr/local/sbin` without the repo (scratch falls back to `/var/tmp/modelfs-drill`).
 - **operations.md's NAS setup now requires the recovery timers.** Scrub and smartd were the only scheduled NAS jobs in the ops runbook, so a reader who never opened recovery.md brought up an origin with no snapshot.
 
-### Upgrade from v0.1.0
+### Upgrade from v0.1.0 - 2026-08-27
 
 CLI, peer-wire, FUSE, and on-disk changes that will surprise a node still
 running the tagged binary, or a script written against it. A mixed
