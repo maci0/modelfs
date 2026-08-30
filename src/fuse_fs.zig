@@ -601,7 +601,13 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
             if (expect == null) from_peer = false;
         }
         if (from_peer) {
-            peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch {
+            peer.fillFromPeers(st.gpa, st.server.psk, &st.catalog, file.rel, idx, st.store.piece_size, buf, &st.store.stats) catch |err| {
+                // NoPeer is the expected fleet-wide miss (already warned per
+                // candidate inside fetchFromCands); anything else -- an
+                // allocation failure while probing, say -- must not read as
+                // a healthy fallback.
+                if (err != error.NoPeer)
+                    std.log.warn("peer fill failed for {s} piece {d} ({t}); refilling from origin", .{ file.rel, idx, err });
                 from_peer = false;
             };
         }

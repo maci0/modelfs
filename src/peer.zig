@@ -654,12 +654,17 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, target: []cons
         replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
-    if (sys.writeAll(fd, h) < 0) return;
+    if (sys.writeAll(fd, h) < 0) {
+        rdma.backend.release(win);
+        std.log.warn("stage head send failed for {s} piece {d}; dropping peer transfer", .{ file.rel, idx });
+        return;
+    }
     // Counted like serveHave/serveData: a node staging pieces must be
     // visible in status.json even when every transfer succeeds.
     _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
     _ = self.store.stats.bytes_to_peer.fetchAdd(win.len, .monotonic);
     if (sys.writeAll(fd, enc) < 0) {
+        rdma.backend.release(win);
         std.log.warn("stage window send failed for {s} piece {d}; dropping peer transfer", .{ file.rel, idx });
     }
 }
@@ -1144,7 +1149,13 @@ fn fetchPieceStaged(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []c
     // pipelined body bytes at head_buf[head_len..] past the head.
     _ = finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, &body, null) catch return false;
     const win = rdma.decodeWindow(&body) orelse return false;
-    if (win.len != out.len) return false;
+    if (win.len != out.len) {
+        // A window we cannot use still holds a staged slot on the serving
+        // node; consume it so the pool is not leaked (same release contract
+        // as serveStage's send failures).
+        rdma.backend.release(win);
+        return false;
+    }
     return rdma.backend.read(win, out);
 }
 

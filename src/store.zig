@@ -1045,7 +1045,9 @@ pub const Store = struct {
                     // reader's readCache gets its own stamp in.
                     file.last_access.store(now_sec, .monotonic);
                     if (hash) |h| {
-                        file.hashes.put(idx, h) catch {};
+                        file.hashes.put(idx, h) catch |err| {
+                            std.log.warn("cannot record trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, idx, err });
+                        };
                         file.manifest_dirty = true;
                     }
                 }
@@ -1296,7 +1298,9 @@ pub const Store = struct {
         // Manifest entries are expectations, not local admits: they must
         // not mark the entry dirty (they already exist on origin) and they
         // are overwritten by any local origin fill of the same piece.
-        for (mf.entries) |e| file.hashes.put(e.idx, e.hash) catch {};
+        for (mf.entries) |e| file.hashes.put(e.idx, e.hash) catch |err| {
+            std.log.warn("cannot load trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, e.idx, err });
+        };
         file.manifest_size = file.size;
     }
 
@@ -1338,7 +1342,10 @@ pub const Store = struct {
             var it = file.hashes.iterator();
             while (it.next()) |e| {
                 if (e.key_ptr.* >= max_idx) continue;
-                entries.append(self.gpa, .{ .idx = e.key_ptr.*, .hash = e.value_ptr.* }) catch return;
+                entries.append(self.gpa, .{ .idx = e.key_ptr.*, .hash = e.value_ptr.* }) catch |err| {
+                    std.log.warn("piece manifest build failed for {s} ({t}); retried on next close", .{ file.rel, err });
+                    return;
+                };
             }
         }
         if (entries.items.len == 0) return;
@@ -1348,14 +1355,26 @@ pub const Store = struct {
             }
         }.lessThan);
         const need = piece.manifestLen(entries.items.len);
-        const blob = self.gpa.alloc(u8, need) catch return;
+        const blob = self.gpa.alloc(u8, need) catch |err| {
+            std.log.warn("piece manifest build failed for {s} ({t}); retried on next close", .{ file.rel, err });
+            return;
+        };
         defer self.gpa.free(blob);
-        const enc = piece.manifestEncode(self.piece_size, fsize, entries.items, blob) catch return;
+        const enc = piece.manifestEncode(self.piece_size, fsize, entries.items, blob) catch |err| {
+            std.log.warn("piece manifest build failed for {s} ({t}); retried on next close", .{ file.rel, err });
+            return;
+        };
 
         var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const p = self.manifestPath(&pbuf, file.rel) catch return;
+        const p = self.manifestPath(&pbuf, file.rel) catch {
+            std.log.warn("piece manifest publish failed for {s}; path does not fit; retried on next close", .{file.rel});
+            return;
+        };
         var tbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const ztmp = sys.appendExt(&tbuf, p, ".tmp") catch return;
+        const ztmp = sys.appendExt(&tbuf, p, ".tmp") catch {
+            std.log.warn("piece manifest publish failed for {s}; temp path does not fit; retried on next close", .{file.rel});
+            return;
+        };
         var w = sys.writeFileNoFollow(ztmp, enc);
         if (w == -c.ENOENT) {
             // First publish for this file (or after an operator wiped
@@ -1745,7 +1764,9 @@ pub const Store = struct {
                 const in_data = piece.offset(i, self.piece_size) - off;
                 var h: [piece.digest_len]u8 = undefined;
                 piece.digest(data[@intCast(in_data)..][0..self.piece_size], &h);
-                file.hashes.put(i, h) catch {};
+                file.hashes.put(i, h) catch |err| {
+                    std.log.warn("cannot record trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, i, err });
+                };
                 file.manifest_dirty = true;
             }
             i = span.start;
