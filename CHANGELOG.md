@@ -94,8 +94,7 @@ than re-probed per piece, and operations gains an integrity runbook. No
 wire, on-disk, or CLI changes; upgrading from v0.3.0 is a rebuild and
 restart.
 
-### Serve-verify self-heal, staged-fetch backoff, integrity runbook - 2026-08-28
-## [0.3.0] - 2026-08-28
+## [0.3.0] - 2026-08-29
 
 Third tagged release. Piece integrity ships and closes threat-model gap R2:
 every admitted piece records a blake3 digest, peer fills verify before
