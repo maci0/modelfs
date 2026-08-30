@@ -4,6 +4,11 @@ set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+fail() {
+    echo "FAIL: $1" >&2
+    exit 1
+}
+
 usage_no_args "$@" <<'EOF'
 Usage: ./scripts/run_vm_cluster_e2e.sh
 
