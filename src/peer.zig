@@ -551,6 +551,15 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, target: []cons
         return;
     }
     const start = piece.offset(idx, ps);
+    // Capability gate before the hydration: a node with no data-plane
+    // backend can only answer 501, so answer it before paying for a
+    // full-piece hydration (origin read plus cache write) the request can
+    // never use. Same predicate serveHave gates the X-Stage advertisement
+    // on, and every request-level failure (400/404/502) still answers first.
+    if (!rdma.backend.available()) {
+        replyStatus(self, fd, "501 Not Implemented");
+        return;
+    }
     if (!hydrateRange(self, fd, file, start, ln, size)) return;
     const expect = self.store.expectedHash(file, idx);
     const buf = self.gpa.alloc(u8, ln) catch {
@@ -4676,10 +4685,16 @@ test "serveStage answers 501 without a staging backend and gates its params" {
     defer rdma.backend = saved;
 
     // No backend: /have never advertises X-Stage and /stage refuses cleanly
-    // (the fetching peer falls back to /data).
+    // (the fetching peer falls back to /data). The 501 is a capability
+    // answer: it must not have hydrated the piece first.
     var resp_buf: [4096]u8 = undefined;
     var resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
     try std.testing.expectEqualStrings("HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", resp);
+    // The 501 is a capability answer, not a hydration side effect: the piece
+    // must not have been filled from the origin just to say "no backend".
+    const f = try fixture.srv.store.get("m.bin", data_file_size, 0);
+    defer fixture.srv.store.releaseFile(f);
+    try std.testing.expect(!fixture.srv.store.hasPiece(f, 0, 0));
     resp = try stageRequest(&fixture.srv, "GET /have?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
     try std.testing.expect(std.mem.indexOf(u8, resp, "X-Stage: 1") == null);
 
