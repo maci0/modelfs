@@ -20,9 +20,11 @@ network -- including piece-hash manifest publishing, verified peer fills,
 modelfs verify, and the dupes scan.
 
 Needs: passwordless sudo (libvirt system daemon), /dev/kvm (four VMs under
-TCG are impractically slow), cloud-image-utils (cloud-localds), ssh, and
-outbound internet (cloud image download plus in-VM apt for
-nfs-kernel-server / fuse3 / nfs-common). ~4 GB disk, ~6-10 minutes.
+TCG are impractically slow), an x86_64 host (the pinned cloud image and
+in-guest Zig toolchain are amd64/x86_64 only), cloud-image-utils
+(cloud-localds), ssh, and outbound internet (cloud image download plus
+in-VM apt for nfs-kernel-server / fuse3 / nfs-common). ~4 GB disk,
+~6-10 minutes.
 Run locally, not in CI (same as run_cluster_e2e_9nodes.sh).
 EOF
 
@@ -37,6 +39,13 @@ done
 sudo -n true 2>/dev/null || fail "passwordless sudo required (libvirt system daemon)"
 if [[ ! -e /dev/kvm ]]; then
     fail "/dev/kvm not present: four VMs need KVM acceleration (TCG is impractically slow)"
+fi
+# The cloud image and the in-guest Zig toolchain below are pinned by
+# digest to the amd64/x86_64 artifacts; an amd64 guest cannot boot on an
+# aarch64 host, so refuse up front instead of failing ten minutes in.
+HOST_ARCH="$(uname -m)"
+if [[ "${HOST_ARCH}" != "x86_64" ]]; then
+    fail "x86_64 host required: the pinned cloud image and Zig toolchain are amd64/x86_64 only"
 fi
 
 # --- topology ----------------------------------------------------------
