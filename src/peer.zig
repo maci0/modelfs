@@ -39,6 +39,7 @@ pub const Server = struct {
     /// request; the CAS in handleConn caps the journal rate at one line per
     /// auth_warn_min_gap_ms while http_unauthorized keeps the exact count.
     last_auth_warn_ms: std.atomic.Value(i64) = .init(0),
+    last_method_warn_ms: std.atomic.Value(i64) = .init(0),
 
     pub fn bindAll(self: *Server, specs: []const proto.LeaseAddr) !void {
         var seen_port: std.AutoHashMap(u16, void) = std.AutoHashMap(u16, void).init(self.gpa);
@@ -194,6 +195,12 @@ fn claimAuthWarn(self: *Server, now_ms: i64) bool {
     const prev = self.last_auth_warn_ms.load(.monotonic);
     return now_ms -| prev >= auth_warn_min_gap_ms and
         self.last_auth_warn_ms.cmpxchgStrong(prev, now_ms, .monotonic, .monotonic) == null;
+}
+
+fn claimMethodWarn(self: *Server, now_ms: i64) bool {
+    const prev = self.last_method_warn_ms.load(.monotonic);
+    return now_ms -| prev >= auth_warn_min_gap_ms and
+        self.last_method_warn_ms.cmpxchgStrong(prev, now_ms, .monotonic, .monotonic) == null;
 }
 
 test "claimAuthWarn allows one line per gap window" {
@@ -426,7 +433,6 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         const t0 = sys.monoNs(self.io);
         defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
         reply(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
-        _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
         return;
     }
     // Route before touching the query string: an unknown path is 404 no
@@ -1245,7 +1251,7 @@ fn dial(io: std.Io, ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     sys.setSockBuffers(fd, sock_buf_bytes);
     // Bounded connect: SO_RCVTIMEO does not cover the dial itself, and a
     // blocking connect to a dead address stalls the fill path for minutes.
-    const rc = sys.connectIn(fd, &addr, budget_ms);
+    const rc = sys.connectInWithIo(io, fd, &addr, budget_ms);
     if (rc != 0) {
         sys.close(fd);
         // Same split as readHeadFullDeadline: a spent or elapsed budget is

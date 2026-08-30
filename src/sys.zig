@@ -58,9 +58,10 @@ pub fn sleepMs(io: std.Io, ms: u32) void {
     std.Io.sleep(io, .fromMilliseconds(ms), .awake) catch {};
 }
 
-/// Kernel CLOCK_MONOTONIC nanoseconds for syscall wrappers that implement
-/// their own timeout (connectIn). Policy clocks go through nowSec/monoSec
-/// and `io`; this is the I/O primitive, not a decision instant.
+/// Kernel CLOCK_MONOTONIC nanoseconds (kept for non-simulated callers).
+/// Policy dial timeouts go through `connectInWithIo` on the injected
+/// `std.Io` clock (`sys.monoMs`) so a simulator drives expiry; only
+/// scratch-dir naming and direct `connectIn` tests reach this helper.
 fn monoNsRaw() i128 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
@@ -614,6 +615,10 @@ pub fn setSockTimeout(fd: c_int, ms: u32) void {
 /// socket is flipped non-blocking for the dial and restored afterwards.
 /// Returns 0 on success or a negative errno (-ETIMEDOUT when ms elapses).
 pub fn connectIn(fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
+    return connectInWithIo(std.testing.io, fd, addr, ms);
+}
+
+pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
     const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
     if (fl < 0) return negErrno();
     if (c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK) < 0) return negErrno();
@@ -626,10 +631,10 @@ pub fn connectIn(fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
     if (e0 != c.EINPROGRESS) return -e0;
     // EINTR during poll must not fail the dial: retry against the original
     // deadline, like the read/write loops retry their syscalls.
-    const deadline = monoNsRaw() + @as(i128, ms) * std.time.ns_per_ms;
+    const deadline_ms = monoMs(io) + @as(i64, ms);
     while (true) {
         var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
-        const remain_ms = @divTrunc(deadline - monoNsRaw(), std.time.ns_per_ms);
+        const remain_ms: i64 = deadline_ms -| monoMs(io);
         if (remain_ms <= 0) return -c.ETIMEDOUT;
         const wait: c_int = @intCast(@min(remain_ms, @as(i128, std.math.maxInt(c_int))));
         const prc = c.poll(@ptrCast(&pfd), 1, wait);
