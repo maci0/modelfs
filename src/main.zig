@@ -2618,9 +2618,12 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     defer sys.closedir(dir);
 
     var manifests: std.ArrayList(piece.Manifest) = .empty;
+    var sorted: std.ArrayList([]piece.ManifestEntry) = .empty;
     defer {
         for (manifests.items) |m| gpa.free(m.entries);
         manifests.deinit(gpa);
+        for (sorted.items) |s| gpa.free(s);
+        sorted.deinit(gpa);
     }
     var total_pieces: u64 = 0;
     while (sys.readdir(dir)) |ent| {
@@ -2647,6 +2650,7 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         } orelse continue;
         total_pieces += m.entries.len;
         manifests.append(gpa, m) catch return 1;
+        sorted.append(gpa, digestSorted(gpa, m.entries) catch return 1) catch return 1;
     }
 
     if (manifests.items.len == 0) {
@@ -2656,8 +2660,8 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var identical_pairs: u64 = 0;
     var shared_pairs: u64 = 0;
     for (manifests.items, 0..) |a, ai| {
-        for (manifests.items[ai + 1 ..]) |b| {
-            const ov = manifestOverlap(gpa, a, b);
+        for (manifests.items[ai + 1 ..], 0..) |b, bj| {
+            const ov = manifestOverlapPrepared(a, b, sorted.items[ai], sorted.items[ai + 1 + bj]);
             if (ov.identical) identical_pairs += 1;
             if (ov.shared > 0) shared_pairs += 1;
         }
@@ -2708,10 +2712,16 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
     const File = struct {
         rel: []const u8,
         manifest: piece.Manifest,
+        /// Digest-sorted copy of manifest.entries, built once per file so
+        /// the pair scan below does not re-sort per pair.
+        by_digest: []piece.ManifestEntry,
     };
     var files: std.ArrayList(File) = .empty;
     defer {
-        for (files.items) |f| gpa.free(f.manifest.entries);
+        for (files.items) |f| {
+            gpa.free(f.by_digest);
+            gpa.free(f.manifest.entries);
+        }
         files.deinit(gpa);
     }
     for (paths) |path| {
@@ -2754,7 +2764,11 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
             if (!builtin.is_test) std.log.err("unusable piece-hash manifest for {s}", .{rel});
             continue;
         };
-        files.append(gpa, .{ .rel = rel, .manifest = m }) catch return 1;
+        files.append(gpa, .{
+            .rel = rel,
+            .manifest = m,
+            .by_digest = digestSorted(gpa, m.entries) catch return 1,
+        }) catch return 1;
     }
 
     if (files.items.len == 0) {
@@ -2774,7 +2788,7 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
     }
     for (files.items, 0..) |a, ai| {
         for (files.items[ai + 1 ..]) |b| {
-            const ov = manifestOverlap(gpa, a.manifest, b.manifest);
+            const ov = manifestOverlapPrepared(a.manifest, b.manifest, a.by_digest, b.by_digest);
             // Shifted = digests shared outside the aligned positions: the
             // only overlap CDC (Level 3) could recover.
             const shifted = ov.shared -| ov.aligned;
@@ -2805,11 +2819,32 @@ const Overlap = struct {
     identical: bool = false,
 };
 
+/// Digest ordering for the shared-content merge.
+fn digestLess(_: void, x: piece.ManifestEntry, y: piece.ManifestEntry) bool {
+    return std.mem.order(u8, &x.hash, &y.hash) == .lt;
+}
+
+/// Owned digest-sorted copy of `entries`. The pair scan sorts each manifest
+/// once up front and reuses the copy across every pair, instead of
+/// duplicating and sorting both entry arrays per pair (2K² allocs and sorts
+/// for K manifests).
+fn digestSorted(gpa: std.mem.Allocator, entries: []const piece.ManifestEntry) ![]piece.ManifestEntry {
+    const copy = try gpa.dupe(piece.ManifestEntry, entries);
+    std.mem.sort(piece.ManifestEntry, copy, {}, digestLess);
+    return copy;
+}
+
 /// Compares two manifests' entries (both sorted by idx, as decode
 /// guarantees). Aligned counts same-index same-digest pairs; shared counts
-/// distinct digests in both (a merge over digest-sorted copies); identical
-/// is same file size plus every piece matching.
-fn manifestOverlap(gpa: std.mem.Allocator, a: piece.Manifest, b: piece.Manifest) Overlap {
+/// distinct digests in both (a merge over the caller's digest-sorted copies
+/// `a_dig`/`b_dig`, built once per manifest); identical is same file size
+/// plus every piece matching.
+fn manifestOverlapPrepared(
+    a: piece.Manifest,
+    b: piece.Manifest,
+    a_dig: []const piece.ManifestEntry,
+    b_dig: []const piece.ManifestEntry,
+) Overlap {
     var ov = Overlap{};
     // Aligned pass: both entry lists are ascending by idx.
     {
@@ -2830,26 +2865,11 @@ fn manifestOverlap(gpa: std.mem.Allocator, a: piece.Manifest, b: piece.Manifest)
     ov.identical = a.file_size == b.file_size and
         a.entries.len == b.entries.len and
         ov.aligned == a.entries.len;
-    // Shared pass: sort digest copies (entries are idx-ordered, not
-    // digest-ordered) and merge-intersect.
-    const ca = gpa.dupe(piece.ManifestEntry, a.entries) catch return ov;
-    defer gpa.free(ca);
-    const cb = gpa.dupe(piece.ManifestEntry, b.entries) catch return ov;
-    defer gpa.free(cb);
-    std.mem.sort(piece.ManifestEntry, ca, {}, struct {
-        fn lessThan(_: void, x: piece.ManifestEntry, y: piece.ManifestEntry) bool {
-            return std.mem.order(u8, &x.hash, &y.hash) == .lt;
-        }
-    }.lessThan);
-    std.mem.sort(piece.ManifestEntry, cb, {}, struct {
-        fn lessThan(_: void, x: piece.ManifestEntry, y: piece.ManifestEntry) bool {
-            return std.mem.order(u8, &x.hash, &y.hash) == .lt;
-        }
-    }.lessThan);
+    // Shared pass: merge-intersect the digest-sorted copies.
     var i: usize = 0;
     var j: usize = 0;
-    while (i < ca.len and j < cb.len) {
-        switch (std.mem.order(u8, &ca[i].hash, &cb[j].hash)) {
+    while (i < a_dig.len and j < b_dig.len) {
+        switch (std.mem.order(u8, &a_dig[i].hash, &b_dig[j].hash)) {
             .lt => i += 1,
             .gt => j += 1,
             .eq => {
@@ -2860,6 +2880,17 @@ fn manifestOverlap(gpa: std.mem.Allocator, a: piece.Manifest, b: piece.Manifest)
         }
     }
     return ov;
+}
+
+/// Single-pair convenience wrapper (tests): builds the digest-sorted copies
+/// itself. Pair scans should build them once per manifest and call
+/// `manifestOverlapPrepared` instead.
+fn manifestOverlap(gpa: std.mem.Allocator, a: piece.Manifest, b: piece.Manifest) Overlap {
+    const ca = digestSorted(gpa, a.entries) catch return Overlap{};
+    defer gpa.free(ca);
+    const cb = digestSorted(gpa, b.entries) catch return Overlap{};
+    defer gpa.free(cb);
+    return manifestOverlapPrepared(a, b, ca, cb);
 }
 
 test "manifestOverlap counts aligned, shared, and identical content" {
