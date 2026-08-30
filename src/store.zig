@@ -285,12 +285,13 @@ pub const Store = struct {
         /// the final releaser to decide destruction.
         dead: std.atomic.Value(bool) = .init(false),
         /// Peer transfers currently streaming through this entry (the whole
-        /// /data span: hydration plus send). punchPiece refuses to hole a
+        /// /data span: hydration plus send) and cache reads in flight (the
+        /// FUSE warm-read path, readCache). punchPiece refuses to hole a
         /// piece while this is nonzero: bytes in flight are read straight
-        /// from the pages a punch would cut, and the fetching peer would
-        /// mark the resulting hole zeros filled. Recency stamping alone
-        /// cannot provide this -- a single stalled sendfile chunk can block
-        /// far longer than recency_secs.
+        /// from the pages a punch would cut, and the fetching peer (or the
+        /// warm reader) would get hole zeros. Recency stamping alone
+        /// cannot provide this -- a single stalled sendfile chunk or pread
+        /// can block far longer than recency_secs.
         xfer: std.atomic.Value(u32) = .init(0),
         /// Trusted per-piece content digests (blake3 of the piece bytes),
         /// keyed by piece index. Sources: the origin piece-hash manifest
@@ -1472,6 +1473,15 @@ pub const Store = struct {
     }
 
     pub fn readCache(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64) isize {
+        // Same in-flight protection serveData gives peer sends: punchPiece
+        // must not hole a piece while bytes are being read from the cache fd
+        // (the FUSE warm-read path), or the pread lands on the fresh hole and
+        // serves zeros behind bits the caller already trusted. The claim is
+        // taken before openCache so a read parked on file.mu behind the
+        // punch's critical section is already visible to punchPiece's
+        // post-save re-check instead of slipping under the hole cut.
+        _ = file.xfer.fetchAdd(1, .monotonic);
+        defer _ = file.xfer.fetchSub(1, .monotonic);
         const fd = self.openCache(file);
         if (fd < 0) return fd;
         file.last_access.store(now_sec, .monotonic);
@@ -1875,6 +1885,17 @@ pub const Store = struct {
         file.bits.clear(idx);
         if (!self.saveBits(file, true)) {
             // The on-disk sidecar still says filled; keep bytes and mark.
+            file.bits.set(idx);
+            _ = self.saveBits(file, false);
+            return false;
+        }
+        // A cache read (FUSE warm read) that started while the durable save
+        // ran is now visible via xfer: the recency re-check at the top of
+        // this function predates the save (which can stall on fsync), and a
+        // read landing during it would otherwise pread the hole about to be
+        // cut here. The cut is deferred, not lost: the read's drop lets the
+        // next cull round finish the job.
+        if (file.xfer.load(.monotonic) != 0) {
             file.bits.set(idx);
             _ = self.saveBits(file, false);
             return false;
@@ -3770,6 +3791,41 @@ test "punchPiece refuses while a peer transfer is inflight" {
     _ = f.xfer.fetchSub(1, .monotonic);
     try std.testing.expect(st.punchPiece(f, 0, t0 + 3600));
     try std.testing.expect(!st.hasPiece(f, 0, t0 + 3600));
+}
+
+test "readCache holds xfer for the read and restores it" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-rdxfer");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-rdxfer");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const content = "0123456789abcdef";
+    const f = try st.get("warm.bin", 64, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, content, null, sys.monoSec(std.testing.io)));
+
+    // The warm-read path holds xfer across the pread (the same in-flight
+    // claim a peer send carries), so a concurrent punchPiece cannot cut the
+    // hole under the read; the count must be balanced once the read returns.
+    try std.testing.expectEqual(@as(u32, 0), f.xfer.load(.monotonic));
+    var dbuf: [content.len]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, content.len), st.readCache(f, &dbuf, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqualSlices(u8, content, &dbuf);
+    try std.testing.expectEqual(@as(u32, 0), f.xfer.load(.monotonic));
+
+    // With no read in flight the same idle piece still culls normally: the
+    // claim gates the punch window, it does not block culling.
+    const idle = sys.monoSec(std.testing.io) + 3600;
+    try std.testing.expect(st.punchPiece(f, 0, idle));
+    try std.testing.expect(!st.hasPiece(f, 0, idle));
 }
 
 test "fill completion and piece probes refresh the cull recency window" {
