@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-30
+
+Feature release on top of 0.3.1: a 4-VM libvirt cluster e2e harness, peer
+`/have` probe failures now name the failing peer in the journal, `modelfs
+dupes <relpath>...` reports an empty result on stdout like `--all` does,
+and the aarch64 cross-build compiles again. Docs gain a DR async-export
+window, the offsite freshness procedure, and corrected env-var scopes. No
+wire or on-disk changes; upgrading from v0.3.1 is a rebuild and restart.
+
 ### CLI help derives the default peer port from the shared constant - 2026-08-30
 - **`modelfs help` no longer hardcodes 18080 in the `--listen` line.** The
   usage text formats the default from `proto.default_port` -- the same
@@ -515,7 +524,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/maci0/modelfs/releases/tag/v0.4.0
 [0.3.1]: https://github.com/maci0/modelfs/releases/tag/v0.3.1
 [0.3.0]: https://github.com/maci0/modelfs/releases/tag/v0.3.0
 [0.2.0]: https://github.com/maci0/modelfs/releases/tag/v0.2.0
