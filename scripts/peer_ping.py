@@ -27,7 +27,7 @@ def open_http(req: urllib.request.Request, timeout: float) -> HTTPResponse:
     if not url.startswith(("http://", "https://")):
         sys.exit(f"refusing non-http URL {url!r}")
     # Bandit S310 flags every urlopen; the scheme gate above is the audit.
-    resp = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310
+    resp = urllib.request.urlopen(req, timeout=timeout)  # noqa: S310 -- http(s)-only scheme gate above is the audit
     if not isinstance(resp, HTTPResponse):
         sys.exit(f"expected HTTPResponse, got {type(resp).__name__}")
     return resp
