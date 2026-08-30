@@ -32,7 +32,9 @@ uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
 `scripts/check.sh` requires `.venv` and puts it on PATH, so you never
 need to activate it. If `zig build` stops with "libfuse3 headers not found",
 install the package it names (or point `-Dfuse-include=<dir>` at a
-non-default location). `./scripts/check.sh --help` lists the contributor
+non-default location); on Debian/Ubuntu, `./scripts/install_libfuse3_dev.sh`
+runs that apt install exactly as CI does (it needs passwordless `sudo -n`
+and `apt-get`). `./scripts/check.sh --help` lists the contributor
 commands; each listed script answers `--help` instead of starting work.
 `zig build --help` lists the `check`/`ci`/`fmt`/`test` steps.
 
