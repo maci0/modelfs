@@ -433,6 +433,8 @@ test "rename flag passthrough keeps NOREPLACE and EXCHANGE semantics" {
 export fn mf_getattr(path: [*c]const u8, stbuf: ?*fuse.struct_stat, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
+    const getattr_t0 = sys.monoNs(st.io);
+    defer _ = st.store.stats.getattr_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - getattr_t0, 0)), .monotonic);
     const p = cPath(path);
     var rel: []const u8 = "";
     const rerr = resolveRel(p, -sys.c.ENOENT, &rel);
@@ -456,6 +458,8 @@ fn cachedFor(st: *State, rel: []const u8) ?*store_mod.Store.Cached {
 export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
+    const open_t0 = sys.monoNs(st.io);
+    defer _ = st.store.stats.open_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - open_t0, 0)), .monotonic);
     const p = cPath(path);
     var rel: []const u8 = "";
     const rerr = resolveRel(p, -sys.c.ENOENT, &rel);

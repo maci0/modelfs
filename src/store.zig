@@ -74,6 +74,12 @@ pub const Stats = struct {
     /// only signal that origin writes stalled (NFS), the write-side twin of
     /// read_nanos.
     write_nanos: std.atomic.Value(u64) = .init(0),
+    /// Metadata operation latencies: getattr, open, statfs (ns).
+    /// Every FUSE request traverses getattr; without these the tick line
+    /// only answers "data reads got slow" while metadata storms stay invisible.
+    getattr_nanos: std.atomic.Value(u64) = .init(0),
+    open_nanos: std.atomic.Value(u64) = .init(0),
+    statfs_nanos: std.atomic.Value(u64) = .init(0),
     /// Piece hydration outcomes by source: peer fetch vs origin pread.
     fills_peer: std.atomic.Value(u64) = .init(0),
     fills_origin: std.atomic.Value(u64) = .init(0),
@@ -126,6 +132,9 @@ pub const Stats = struct {
     /// Without the count a saturated server is indistinguishable from a
     /// quiet one -- fetchers time out and nothing on this node says why.
     http_dropped: std.atomic.Value(u64) = .init(0),
+    /// Unsupported HTTP methods (non-GET). Deduplicated at warn level; every
+    /// occurrence still counts here so a probing campaign is not silent.
+    http_405: std.atomic.Value(u64) = .init(0),
     /// Cumulative wall time inside /have and /data handlers. http_us on the
     /// tick line is the serving-side twin of rd_us: without it a node whose
     /// peer replies are slow looks healthy (http_ok climbing, inflight low
@@ -148,6 +157,9 @@ pub const Stats = struct {
         writes_err: u64 = 0,
         bytes_written: u64 = 0,
         write_nanos: u64 = 0,
+        getattr_nanos: u64 = 0,
+        open_nanos: u64 = 0,
+        statfs_nanos: u64 = 0,
         fills_peer: u64 = 0,
         fills_origin: u64 = 0,
         bytes_from_peer: u64 = 0,
@@ -167,6 +179,7 @@ pub const Stats = struct {
         http_5xx: u64 = 0,
         http_malformed: u64 = 0,
         http_dropped: u64 = 0,
+        http_405: u64 = 0,
         http_nanos: u64 = 0,
     };
 

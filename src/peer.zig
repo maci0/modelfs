@@ -407,6 +407,11 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         return;
     }
     if (!std.mem.eql(u8, method, "GET")) {
+        _ = self.store.stats.http_405.fetchAdd(1, .monotonic);
+        if (claimMethodWarn(self, sys.monoMs(self.io))) {
+            var abuf: [64]u8 = undefined;
+            std.log.warn("peer http: rejected unsupported {s} from {s}", .{ method, peerAddrText(peer, &abuf) });
+        }
         // RFC 9110 §15.5.5: a 405 must name the methods the resource
         // supports, so a probing client can discover the shape of the API.
         reply(fd, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -414,7 +419,14 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
     }
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) {
+        // Liveness probe: what health checks, load balancers, and monitoring
+        // poll to know the process is alive and answering on its listen port.
+        // Untamed would be invisible to the error rate: http_ok only counts
+        // data-plane replies, but a fleet that can only ping is still degraded.
+        const t0 = sys.monoNs(self.io);
+        defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
         reply(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
         return;
     }
     // Route before touching the query string: an unknown path is 404 no
