@@ -1738,7 +1738,12 @@ pub const Store = struct {
             // rewriting the sidecar is a mutation a punch round could observe.
             // Partial writes (empty fullCover) still bump: they must invalidate
             // an in-flight fill of the overlapping piece so it cannot overwrite
-            // the patch with stale whole-piece bytes.
+            // the patch with stale whole-piece bytes. But "all marked" cannot
+            // tell a retry from a same-size rewrite: re-hash the in-hand
+            // buffer against the recorded digests. Unchanged keeps the fast
+            // path; changed falls through so the writes bump, the fresh
+            // digests, the boundary-hash removal, and the sidecar save below
+            // describe the bytes actually in the cache fd.
             if (cov.start < cov.end) {
                 var already = true;
                 var i = cov.start;
@@ -1748,7 +1753,25 @@ pub const Store = struct {
                         break;
                     }
                 }
-                if (already) return true;
+                if (already) {
+                    var changed = false;
+                    i = cov.start;
+                    while (i < cov.end) : (i += 1) {
+                        const in_data = piece.offset(i, self.piece_size) - off;
+                        var h: [piece.digest_len]u8 = undefined;
+                        piece.digest(data[@intCast(in_data)..][0..self.piece_size], &h);
+                        if (file.hashes.get(i)) |old| {
+                            if (!std.mem.eql(u8, &h, &old)) {
+                                changed = true;
+                                break;
+                            }
+                        } else {
+                            changed = true;
+                            break;
+                        }
+                    }
+                    if (!changed) return true;
+                }
             }
             file.writes += 1;
             // Trusted hashes for the fully-covered pieces: the write buffer
@@ -3944,6 +3967,21 @@ test "write-through overwrite of a marked piece still lands the new bytes" {
     var rd: [16]u8 = undefined;
     try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
     try std.testing.expectEqualSlices(u8, &next, &rd);
+
+    // The overwrite is a content change, not a retry: writes must bump so
+    // wroteLocally() keeps peer fills off the path (a fleet peer could
+    // still hold the pre-rewrite bytes), and the recorded digest must name
+    // the new bytes so verification and the manifest publish describe what
+    // the cache fd actually holds.
+    f.mu.lockUncancelable(std.testing.io);
+    const w = f.writes;
+    f.mu.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 2), w);
+    const expect = st.expectedHash(f, 0);
+    var want: [piece.digest_len]u8 = undefined;
+    piece.digest(&next, &want);
+    try std.testing.expect(expect != null);
+    try std.testing.expectEqualSlices(u8, &want, &expect.?);
 }
 
 // A destructive job run twice in quick succession must change nothing the

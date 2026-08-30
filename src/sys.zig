@@ -579,9 +579,13 @@ pub fn readFileBuf(buf: []u8, path: [*:0]const u8) ![]u8 {
 /// a co-tenant can plant a symlink at a .json name. The failing open's
 /// errno is written through open_errno_out (when non-null) so callers can
 /// stay silent for the expected ENOENT race while naming every other open
-/// failure, like readFileAllocOpenErrno does.
+/// failure, like readFileAllocOpenErrno does. O_NONBLOCK, like the lease
+/// walk's opendirNoFollow: a FIFO planted at a .json name must not block
+/// open(2) forever and wedge the discovery thread -- the flag is ignored on
+/// regular files and turns a FIFO open into an immediate zero-byte read,
+/// which the lease parser rejects as corrupt.
 pub fn readFileBufNoFollowOpenErrno(buf: []u8, path: [*:0]const u8, open_errno_out: ?*i32) ![]u8 {
-    return readFileBufFlags(buf, path, c.O_NOFOLLOW, open_errno_out);
+    return readFileBufFlags(buf, path, c.O_NOFOLLOW | c.O_NONBLOCK, open_errno_out);
 }
 
 fn readFileBufFlags(buf: []u8, path: [*:0]const u8, extra_flags: c_int, open_errno_out: ?*i32) ![]u8 {
