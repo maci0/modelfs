@@ -226,6 +226,9 @@ pub fn build(b: *std.Build) void {
     tc.defineCMacro("_GNU_SOURCE", "1");
     tc.defineCMacro("FUSE_USE_VERSION", "31");
     tc.defineCMacro("_FILE_OFFSET_BITS", "64");
+    // FORTIFY_SOURCE=2: buffer-overflow checks for string/memory functions in the C interop layer.
+    // Harmless on targets where it's a no-op; required for the networked daemon threat model.
+    tc.defineCMacro("_FORTIFY_SOURCE", "2");
     tc.addIncludePath(.{ .cwd_relative = fuse_inc });
     const c_mod = tc.createModule();
 
