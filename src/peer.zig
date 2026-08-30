@@ -32,6 +32,12 @@ pub const Server = struct {
     /// so a test can assert serve() joined every loop it started instead of
     /// stranding one past shutdown.
     accept_loops: std.atomic.Value(u32) = .init(0),
+    /// Monotonic ms of the last journal line for a rejected bearer. The
+    /// inflight cap bounds *concurrent* 401 handlers, but a scanner that
+    /// serially opens and drops connections can still drive one warn per
+    /// request; the CAS in handleConn caps the journal rate at one line per
+    /// auth_warn_min_gap_ms while http_unauthorized keeps the exact count.
+    last_auth_warn_ms: std.atomic.Value(i64) = .init(0),
 
     pub fn bindAll(self: *Server, specs: []const proto.LeaseAddr) !void {
         var seen_port: std.AutoHashMap(u16, void) = std.AutoHashMap(u16, void).init(self.gpa);
@@ -172,6 +178,36 @@ fn acceptLoop(self: *Server, fd: c_int) void {
 /// afterwards, or a dribbled head leaves body streaming a millisecond-scale
 /// send ceiling and piece transfers die mid-flight.
 const sock_timeout_ms: u32 = 30_000;
+
+/// Minimum gap between journal lines for rejected bearer requests (ms).
+/// Every rejection still bumps http_unauthorized; the line is the audit
+/// trail, not the counter, so one per second keeps the journal bounded
+/// without hiding a probing campaign.
+const auth_warn_min_gap_ms: i64 = 1000;
+
+/// True when a 401 journal line may be emitted for `now_ms`: at most one
+/// per auth_warn_min_gap_ms, claimed with a CAS so concurrent handlers
+/// cannot pile up lines in the same window. The rejection itself is always
+/// counted; only the line is throttled.
+fn claimAuthWarn(self: *Server, now_ms: i64) bool {
+    const prev = self.last_auth_warn_ms.load(.monotonic);
+    return now_ms -| prev >= auth_warn_min_gap_ms and
+        self.last_auth_warn_ms.cmpxchgStrong(prev, now_ms, .monotonic, .monotonic) == null;
+}
+
+test "claimAuthWarn allows one line per gap window" {
+    var srv = Server{ .gpa = std.testing.allocator, .io = std.testing.io, .psk = "x", .store = undefined };
+    // First rejection in a fresh server may always log.
+    try std.testing.expect(claimAuthWarn(&srv, 1_000));
+    // A second rejection inside the window is throttled, even from a
+    // different "thread" (a new CAS attempt).
+    try std.testing.expect(!claimAuthWarn(&srv, 1_500));
+    // Exactly at the gap boundary the window is open again.
+    try std.testing.expect(!claimAuthWarn(&srv, 1_999));
+    try std.testing.expect(claimAuthWarn(&srv, 2_000));
+    // A stale sample must not re-open the window once it is closed.
+    try std.testing.expect(!claimAuthWarn(&srv, 2_500));
+}
 
 /// SO_RCVBUF/SO_SNDBUF for every peer socket. The server accept path and the
 /// outbound dial must agree: a lopsided pair turns throughput into the small
@@ -351,13 +387,19 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         // Security-relevant event: without this line a wrong-PSK node or an
         // unauthenticated prober is invisible to the operator, and without
         // the source address a probing campaign leaves nothing to
-        // investigate after the fact. Bounded by the accept loop's inflight
-        // cap, so it cannot flood faster than 16/s. Auth runs before the
-        // method gate so an unauthenticated POST cannot learn that GET is
-        // the only verb this listener accepts.
-        var abuf: [64]u8 = undefined;
-        std.log.warn("peer http: rejected unauthorized request from {s}", .{peerAddrText(peer, &abuf)});
+        // investigate after the fact. The counter below stays exact on every
+        // rejection for status.json; the journal line is capped to one per
+        // auth_warn_min_gap_ms because the inflight cap only bounds
+        // *concurrent* 401s -- a scanner that serially opens and drops
+        // connections can otherwise fill the operator's log volume one warn
+        // per request. Auth runs before the method gate so an
+        // unauthenticated POST cannot learn that GET is the only verb this
+        // listener accepts.
         _ = self.store.stats.http_unauthorized.fetchAdd(1, .monotonic);
+        if (claimAuthWarn(self, sys.monoMs(self.io))) {
+            var abuf: [64]u8 = undefined;
+            std.log.warn("peer http: rejected unauthorized request from {s}", .{peerAddrText(peer, &abuf)});
+        }
         // RFC 9110 §15.5.2: a 401 must carry a challenge naming the scheme
         // a client should retry with; same empty-body framing as replyStatus.
         reply(fd, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
