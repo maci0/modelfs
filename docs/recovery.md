@@ -32,6 +32,8 @@ Verifiably safe to ignore in any backup plan: caches (next read re-hydrates; cul
 | NAS host dead | **total** | any ZFS box becomes the NAS from the replica |
 | site loss (fire, theft, ransomware) | **total** | offsite copy |
 
+One acknowledged-but-not-durable window exists that no snapshot closes: the NAS export is `async` ([operations.md](operations.md)), so the server replies to NFS writes before stable storage, and a NAS crash can lose the last few seconds of writes clients already saw succeed. The hourly snapshot protects what was persisted; it cannot recover bytes that never reached stable storage. A synced export would close the window at ingest-throughput cost; that trade is kept as-is on purpose (operations.md).
+
 Realistic worst case is the third row of the first column, not hardware: one wrong `rm -rf` through `/models` deletes at disk speed and POSIX has no trash can. Snapshots are the soft-delete window.
 
 ## 3. Backups (set up once on the NAS)
@@ -69,7 +71,7 @@ systemctl enable --now modelfs-drill.timer modelfs-snap-age.timer
 
 `ExecStartPost` in that unit runs [`scripts/hold_monthlies.sh`](../scripts/hold_monthlies.sh) (`modelfs-hold-monthlies`) to `zfs hold` every `*_monthly` snapshot (`modelfs-dr`) so a recursive destroy cannot take them without an explicit `zfs release`. Already-held is success (yesterday's pull tagged it). Any other hold failure fails the unit: a green pull with no hold is not a replica that survives a fat-finger `zfs destroy -r`. Root on the replica host can still release-and-destroy; a second person or a key that cannot `zfs release` is the remaining control, and is not in this repo. `TimeoutStartSec=infinity` is set on the syncoid and drill services so a host whose systemd still times out Type=oneshot at 90 s cannot kill a multi-hour recv or a `diff -rq` of the live tree.
 
-Offsite: rotate a disk out weekly, or `syncoid` to a hosted ZFS box. The dataset is private; encrypt the transport or the target.
+Offsite: rotate a disk out weekly, or `syncoid` to a hosted ZFS box. The dataset is private; encrypt the transport or the target. Verify the copy's freshness on the same cadence — `zfs list -t snapshot -o name,creation tank/models` on the rotated disk or hosted box, comparing the newest creation to the RPO column. Unlike the local and replica layers, this one has no timer or age alarm in this repo; a stopped rotation is silent until the next site-loss review (section 8).
 
 Failure visibility: a green timer only proves it fired. `OnFailure=notify-admin@%n.service` sits on the **services** (`sanoid.service`, `sanoid-prune.service`, `syncoid-models.service`, `modelfs-drill.service`, `modelfs-drill-log.service`, `modelfs-snap-age.service`), not the timers. A drop-in on `sanoid.timer` would stay green while `sanoid.service` failed to snapshot. Disabling `sanoid.timer` never fails `sanoid.service` at all, so `modelfs-snap-age.timer` (hourly) runs `modelfs-restore-drill --age-only`: newest snapshot older than `MF_DRILL_MAX_SNAP_AGE` (default 25 h) is the alarm. `notify-admin@.service` logs to syslog (`modelfs-backup`); replace ExecStart with the site mailer or webhook when one exists.
 
@@ -153,6 +155,8 @@ New hardware, then section C end to end, feeding `zfs recv` from the offsite cop
 | NAS host death | replica + any ZFS box | <= 24 h | hours |
 | site loss | offsite rotation | <= rotation period | days |
 
+The async-export window (section 2) is not a row here: it is a NAS crash losing acknowledged writes up to the txg interval, and no snapshot RPO recovers bytes that never reached stable storage.
+
 Without section 3 installed and enabled (not merely present in this repo), every row below the first is: RPO unbounded, RTO equals re-download time, and custom-trained adapters and conversions are gone permanently.
 
 ## 6. Prove it: monthly restore drill
@@ -188,3 +192,4 @@ If those keys exist only on the dead NAS, procedure C is blocked. Copy the repli
 * Whether anything outside this repo backs up the NAS itself; if so, reconcile retention with sanoid's.
 * Timed pool-loss RTO (`syncoid` wall time at current dataset size). `clone_s` in the drill log is not that number.
 * Whether `notify-admin@.service` has been replaced with a mailer, or still only writes syslog.
+* Offsite-copy freshness: the local (snap-age) and replica (`MF_DRILL_REPLICA`) layers alarm on staleness, but the offsite rotation has no equivalent check in this repo; whether anything outside it alarms on a stopped rotation.

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### DR docs: async-export window and offsite freshness - 2026-08-30
+- **`docs/recovery.md` now discloses the one acknowledged-but-not-durable
+  window the posture claims were missing.** The NAS export is `async`, so
+  a NAS crash can lose acknowledged writes up to the txg interval, and no
+  snapshot RPO recovers bytes that never reached stable storage; the note
+  cross-references the kept-as-is caveat in operations.md.
+- **The offsite layer gets a freshness procedure and an explicit gap.**
+  Section 3 adds the `zfs list -t snapshot` check for the rotated disk or
+  hosted box, and section 8 records that the offsite rotation -- unlike
+  the local and replica layers -- has no timer or age alarm in this repo.
+
 ### `modelfs dupes` empty report rides stdout like `--all` - 2026-08-30
 - **`modelfs dupes <relpath>...` now prints "no manifests to compare" on
   stdout** when no listed path has a piece-hash manifest, matching
