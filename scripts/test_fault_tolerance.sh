@@ -21,7 +21,7 @@ zig build
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"
 
 mkdir -p "${SCRATCH_DIR}"
-TEMP_DIR="$(mktemp -d "${SCRATCH_DIR}/fault-XXXXXX")"
+TEMP_DIR="$(mktemp -d "$SCRATCH_DIR" "${SCRATCH_DIR}/fault-XXXXXX")"
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "${TEMP_DIR}"' EXIT
 
 ORIGIN_DIR="${TEMP_DIR}/origin"
