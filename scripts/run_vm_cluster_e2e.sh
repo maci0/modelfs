@@ -225,10 +225,11 @@ echo "=== building modelfs inside the NFS VM (matches Ubuntu 24.04 fuse3) ==="
 # Arch/CachyOS), which Ubuntu 24.04's libfuse3-3 (.so.3) does not provide.
 # Build inside the VM against noble's libfuse3-dev instead: the e2e then
 # exercises the same binary configuration the production sparks run.
-# Ship the source (no run artifacts), fetch zig 0.16, build.
+# Ship the source (no run artifacts), fetch zig 0.16 (sha256-verified, the
+# same check the cloud image gets above), build.
 tar --exclude=.git --exclude=.scratch --exclude=zig-out --exclude=.venv -czf - -C "${ROOT_DIR}" . \
     | ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "mkdir -p /home/ubuntu/src && tar xzf - -C /home/ubuntu/src"
-zig_cmd="test -x /home/ubuntu/zig/zig || { mkdir -p /home/ubuntu/zig && curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz | tar -xJ --strip-components=1 -C /home/ubuntu/zig; }"
+zig_cmd="test -x /home/ubuntu/zig/zig || { mkdir -p /home/ubuntu/zig && curl -fSL -o /home/ubuntu/zig/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz && echo '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /home/ubuntu/zig/zig.tar.xz' | sha256sum -c - && tar -xJ --strip-components=1 -f /home/ubuntu/zig/zig.tar.xz -C /home/ubuntu/zig && rm /home/ubuntu/zig/zig.tar.xz; }"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${zig_cmd}"; then
     echo "Error: could not fetch zig 0.16.0 into the NFS VM"
     exit 1
