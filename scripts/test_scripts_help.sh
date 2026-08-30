@@ -24,36 +24,19 @@ fail() {
 
 command -v timeout >/dev/null 2>&1 || fail "timeout not found on PATH (coreutils)"
 
-# Scripts listed by ./scripts/check.sh --help, plus extract/install, the
-# Python CLIs (including the peer_ping library's direct-invocation
-# handler), the restore drill, and this file. --help must start with
-# "Usage:" on stdout with empty stderr; unknown arguments must exit 2
-# with Usage: on stderr so a missing handler that happens to finish
-# inside the timeout still fails.
-scripts=(
-    scripts/check.sh
-    scripts/check_drill_log.sh
-    scripts/ci.sh
-    scripts/cluster_verify.py
-    scripts/cross_aarch64.sh
-    scripts/dr_restore_drill.sh
-    scripts/extract_fuse3_arm64.sh
-    scripts/hold_monthlies.sh
-    scripts/install_libfuse3_dev.sh
-    scripts/install_nas_backup.sh
-    scripts/peer_auth_probe.py
-    scripts/peer_ping.py
-    scripts/repro_check.sh
-    scripts/run_benchmarks_and_plots.py
-    scripts/run_cluster_e2e_9nodes.sh
-    scripts/run_e2e_tests.sh
-    scripts/run_vm_cluster_e2e.sh
-    scripts/sbom.py
-    scripts/test_dr_restore_drill.sh
-    scripts/test_extract_fuse3_arm64.sh
-    scripts/test_fault_tolerance.sh
-    scripts/test_scripts_help.sh
-)
+# Every top-level scripts/*.sh and scripts/*.py is a contributor command
+# and must answer --help. Discovered by glob so a new script is covered the
+# moment it lands instead of needing its name added to a list that can be
+# forgotten; lib.sh is the one exception (a sourced library, not a command).
+# --help must start with "Usage:" on stdout with empty stderr; unknown
+# arguments must exit 2 with Usage: on stderr so a missing handler that
+# happens to finish inside the timeout still fails.
+scripts=()
+for s in scripts/*.sh scripts/*.py; do
+    if [[ "${s}" != "scripts/lib.sh" ]]; then
+        scripts+=("${s}")
+    fi
+done
 
 mkdir -p "${SCRATCH_DIR}"
 help_out="${SCRATCH_DIR}/scripts-help.out"
