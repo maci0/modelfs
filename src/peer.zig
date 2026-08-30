@@ -28,6 +28,10 @@ pub const Server = struct {
     fds_mu: std.Io.Mutex = .init,
     running: std.atomic.Value(bool) = .init(true),
     http_inflight: std.atomic.Value(u32) = .init(0),
+    /// Accept loops still running: incremented on entry, decremented on exit,
+    /// so a test can assert serve() joined every loop it started instead of
+    /// stranding one past shutdown.
+    accept_loops: std.atomic.Value(u32) = .init(0),
 
     pub fn bindAll(self: *Server, specs: []const proto.LeaseAddr) !void {
         var seen_port: std.AutoHashMap(u16, void) = std.AutoHashMap(u16, void).init(self.gpa);
@@ -109,6 +113,8 @@ pub const Server = struct {
 };
 
 fn acceptLoop(self: *Server, fd: c_int) void {
+    _ = self.accept_loops.fetchAdd(1, .monotonic);
+    defer _ = self.accept_loops.fetchSub(1, .monotonic);
     var failing = false;
     while (self.running.load(.acquire)) {
         // The accepted address rides along so security-relevant events can
@@ -2896,6 +2902,11 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
 }
 
 test "serveData replies 500 when the cache refuses hydrated bytes" {
+    // The failure is staged with a 0444 cache file: root's DAC_OVERRIDE
+    // bypasses the mode bits, so the O_RDWR open succeeds, the fill lands,
+    // and the reply is 206 -- the test fails spuriously. Not stageable as
+    // root; skip instead of flaking in a root container or VM.
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;
@@ -2974,6 +2985,11 @@ test "serve joins its accept loops once stop shuts the listeners down" {
     const t = try std.Thread.spawn(.{}, Server.serve, .{&server});
     server.stop();
     t.join();
+    // Every accept loop serve() started must be gone now, not merely joined
+    // from serve's own bookkeeping: the regression this guards (an append
+    // failure stranding a loop beyond the join-all) used to leave serve's
+    // return and this join both clean while the loop kept running.
+    try std.testing.expectEqual(@as(u32, 0), server.accept_loops.load(.monotonic));
 }
 
 test "acceptLoop exits instead of spinning when the listen fd is unusable" {
