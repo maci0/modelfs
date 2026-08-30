@@ -140,6 +140,10 @@ fn checkHardenedElf(exe: *std.Build.Step.Compile) *std.Build.Step {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Zig 0.16 implements stack probing only for the x86 family; requesting
+    // it on aarch64 (the Sparks' deploy ABI) fails the compile, so gate on
+    // the arch rather than forcing every target through an unsupported flag.
+    const stack_check_supported = target.result.cpu.arch == .x86 or target.result.cpu.arch == .x86_64;
 
     // Registered before the libfuse3 preflight so `zig build --help`,
     // `zig build fmt`, and the check/ci wrappers still work on a machine
@@ -242,8 +246,14 @@ pub fn build(b: *std.Build) void {
     // development but is stripped from anything shippable: DWARF records
     // absolute build paths (DW_AT_comp_dir), which is what makes two builds
     // of the same tree from different directories produce different bytes.
+    // Stack probing exists only for the x86 family in 0.16: aarch64 and
+    // other targets reject -fstack-check, and the Sparks deploy as aarch64,
+    // so the cross-build must not request it. Canaries are supported
+    // wherever libc is present, so they stay on for every target.
     exe_mod.stack_protector = true;
-    exe_mod.stack_check = true;
+    if (stack_check_supported) {
+        exe_mod.stack_check = true;
+    }
     if (optimize != .Debug) {
         exe_mod.strip = true;
     }
@@ -276,7 +286,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         // Exercise the same canary- and probe-instrumented code the executable ships.
         .stack_protector = true,
-        .stack_check = true,
+        .stack_check = stack_check_supported,
     });
     linkFuse(test_mod, fuse_lib);
     test_mod.addIncludePath(.{ .cwd_relative = fuse_inc });

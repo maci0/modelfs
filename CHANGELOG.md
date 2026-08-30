@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### aarch64 cross-build compiles again - 2026-08-30
+- **The `-Dtarget=aarch64-linux-gnu.2.39` deploy build no longer fails.**
+  `build.zig` requested stack probing (`stack_check`) unconditionally, but
+  Zig 0.16 implements it only for the x86 family, so every aarch64
+  cross-compile died with "the selected target does not support stack
+  checking" -- the exact ABI the Sparks deploy. Stack canaries stay on for
+  every target; probes now follow the compiler's supported set, so native
+  x86_64 ships unchanged and the cross build is green again.
+
 ### DR docs: async-export window and offsite freshness - 2026-08-30
 - **`docs/recovery.md` now discloses the one acknowledged-but-not-durable
   window the posture claims were missing.** The NAS export is `async`, so
