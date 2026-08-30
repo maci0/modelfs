@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Status | Historical design. Goals (section 2.1) and decisions (section 13) carry ship status. Shipped behavior is [architecture.md](architecture.md) |
-| Date | 2026-08-27 (goals/decisions/security rows and overview/targets/path notes re-verified against `src/`) |
+| Date | 2026-08-30 (goals/decisions/security rows and overview/targets/path notes re-verified against `src/`) |
 | Audience | Implementation |
 
-Original architecture notes. Several items here did not ship: origin-less two-node, CAS/blake3 chunks, S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rule 6 in section 4.8 (rationale: UMA OOM, see architecture.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
+Original architecture notes. Several items here did not ship: origin-less two-node, CAS/blake3 chunks, S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rule 6 in section 4.8 (rationale: UMA OOM, see architecture.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`, `/stage`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
 
 ModelFS is a POSIX mount for LLM weights. Nodes see a normal directory. llama.cpp, vLLM, and SGLang open files. Bytes come from a local NVMe cache, from peers over a piece protocol, or from a network origin.
 
@@ -696,7 +696,7 @@ Kill-risk is step 4 with real llama.cpp and a real vLLM directory. If that is wr
 
 Threat model: trusted LAN cluster, untrusted origin possible (public S3, Hub).
 
-The table below is the original sketch. Only three of its mitigations had a shipped counterpart when this note was first written; as of the 0.2.x integrity work, per-piece content hashing ships in Level 1 form (below and in architecture.md "Piece integrity"): peer fills verify against a trusted digest before admit, cached bytes verify before every /data serve, and `modelfs verify` audits the cache on demand. mTLS still did not ship (bearer PSK over plaintext HTTP), origin tampering is still outside the trust model (the manifest trusts the origin exactly as the file bytes do), and local cache-artifact tampering is still THREAT_MODEL.md R7. The current threat model is [THREAT_MODEL.md](THREAT_MODEL.md); do not cite rows below as shipped posture.
+The table below is the original sketch. Only three of its mitigations had a shipped counterpart when this note was first written; as of the 0.3.x integrity work, per-piece content hashing ships in Level 1 form (below and in architecture.md "Piece integrity"): peer fills verify against a trusted digest before admit, cached bytes verify before every /data serve, and `modelfs verify` audits the cache on demand. mTLS still did not ship (bearer PSK over plaintext HTTP), origin tampering is still outside the trust model (the manifest trusts the origin exactly as the file bytes do), and local cache-artifact tampering is still THREAT_MODEL.md R7. The current threat model is [THREAT_MODEL.md](THREAT_MODEL.md); do not cite rows below as shipped posture.
 
 | Risk | Mitigation (sketch) | Shipped? |
 |---|---|---|
