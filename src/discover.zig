@@ -769,10 +769,10 @@ pub const Catalog = struct {
             std.log.warn("lease publish failed at {s} (errno {d})", .{ zpath, -w });
             return;
         }
-        if (std.c.rename(ztmp, zpath) != 0) {
-            const e = sys.errno();
+        const re = sys.rename(ztmp, zpath);
+        if (re != 0) {
             _ = c.unlink(ztmp);
-            std.log.warn("lease publish rename failed at {s} (errno {d})", .{ zpath, e });
+            std.log.warn("lease publish rename failed at {s} (errno {d})", .{ zpath, -re });
         }
     }
 

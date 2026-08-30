@@ -1392,10 +1392,10 @@ pub const Store = struct {
             std.log.warn("piece manifest publish failed for {s} (errno {d}); retried on next close", .{ file.rel, -w });
             return;
         }
-        if (std.c.rename(ztmp, p) != 0) {
-            const e = sys.errno();
+        const re = sys.rename(ztmp, p);
+        if (re != 0) {
             _ = c.unlink(ztmp);
-            std.log.warn("piece manifest rename failed for {s} (errno {d}); retried on next close", .{ file.rel, e });
+            std.log.warn("piece manifest rename failed for {s} (errno {d}); retried on next close", .{ file.rel, -re });
             return;
         }
         file.mu.lockUncancelable(self.io);
