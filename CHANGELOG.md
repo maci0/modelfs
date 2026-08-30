@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Env docs: MODELFS_ID mount-only scope, log-ceiling coverage - 2026-08-30
+- **`modelfs help` now marks `MODELFS_ID` as mount only**, like `--id`
+  (outside mount the env var is deliberately ignored while the flag is
+  refused, and the help's "set the same values as their flags" read as if
+  they shared one scope).
+- **architecture.md now lists verify and dupes among the commands
+  `MODELFS_LOG` / `--log` move the ceiling for** -- the shared argument
+  parser applies both knobs on every command, and README already named all
+  seven; the env paragraph said only mount, status, peers, pin, and unpin.
+
 ### aarch64 cross-build compiles again - 2026-08-30
 - **The `-Dtarget=aarch64-linux-gnu.2.39` deploy build no longer fails.**
   `build.zig` requested stack probing (`stack_check`) unconditionally, but

@@ -86,11 +86,11 @@ const usage =
     \\accept --name VALUE or --name=VALUE.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
-    \\MODELFS_ID MODELFS_LOG set the same values as their flags; an explicit
-    \\flag wins. MODELFS_PSK_VALUE cannot be combined with --psk or
-    \\MODELFS_PSK on mount. A PSK file or MODELFS_PSK_VALUE is trimmed of
-    \\surrounding whitespace. An empty environment value counts as unset
-    \\(defaults apply).
+    \\MODELFS_ID (mount only, like --id) MODELFS_LOG set the same values
+    \\as their flags; an explicit flag wins. MODELFS_PSK_VALUE cannot be
+    \\combined with --psk or MODELFS_PSK on mount. A PSK file or
+    \\MODELFS_PSK_VALUE is trimmed of surrounding whitespace. An empty
+    \\environment value counts as unset (defaults apply).
     \\
     \\Examples:
     \\  modelfs mount /models --origin /net/192.168.0.100/models
