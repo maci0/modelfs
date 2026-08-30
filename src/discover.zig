@@ -296,6 +296,16 @@ pub const Catalog = struct {
     /// down logs exactly once until it answers again. Bounded like stage_down.
     probe_down: std.ArrayList(ProbeDown) = .empty,
 
+    /// Addresses whose /data (HTTP) piece fetch failed since the peer last
+    /// served a piece, keyed by (ip, port) and guarded by have_mu like the
+    /// have cache. Same edge-triggered contract as probe_down: the first
+    /// failure per outage logs peer address and error, later failures ride
+    /// the fill_err_peer counter, and a successful fetch clears the entry
+    /// and logs recovery. A peer that answers /have but fails every /data
+    /// (broken cache backend, flaky transfer) would otherwise flood the
+    /// journal with one warn per piece. Bounded like probe_down.
+    fetch_down: std.ArrayList(FetchDown) = .empty,
+
     /// /have answers from recent probes, keyed by (rel, ip, port).
     /// fillFromPeers runs once per piece; without this cache a sequential
     /// read of one large model re-probes the whole cluster for every piece
@@ -320,6 +330,13 @@ pub const Catalog = struct {
     const probe_down_cap: usize = 32;
 
     const ProbeDown = struct {
+        ip: []u8,
+        port: u16,
+    };
+
+    const fetch_down_cap: usize = 32;
+
+    const FetchDown = struct {
         ip: []u8,
         port: u16,
     };
@@ -507,6 +524,52 @@ pub const Catalog = struct {
         return false;
     }
 
+    /// Records a failed /data (HTTP) piece fetch from (ip, port). True only
+    /// for the first failure since the peer last served a piece (the caller
+    /// logs that one with address and error); later failures return false
+    /// and ride the fill_err_peer counter, so a peer that answers /have but
+    /// fails every /data cannot flood the journal the way per-piece fetch
+    /// logs would. Bounded like probe_down: an entry that cannot fit evicts
+    /// another, else is dropped -- worst case a still-failing peer logs once
+    /// more when the eviction clears its entry.
+    pub fn noteFetchDown(self: *Catalog, ip: []const u8, port: u16) bool {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (self.fetch_down.items) |e| {
+            if (e.port == port and std.mem.eql(u8, e.ip, ip)) return false;
+        }
+        if (self.fetch_down.items.len >= fetch_down_cap) {
+            if (self.fetch_down.items.len > 0) {
+                gpa.free(self.fetch_down.items[0].ip);
+                _ = self.fetch_down.orderedRemove(0);
+            } else return false;
+        }
+        const ip_own = gpa.dupe(u8, ip) catch return false;
+        self.fetch_down.append(gpa, .{ .ip = ip_own, .port = port }) catch {
+            gpa.free(ip_own);
+            return false;
+        };
+        return true;
+    }
+
+    /// Clears a /data fetch failure for (ip, port) after a piece fetch from
+    /// that peer succeeded. True when an entry was removed: the caller logs
+    /// the recovery so a returning peer is visible in the journal without
+    /// anyone watching counters.
+    pub fn clearFetchDown(self: *Catalog, ip: []const u8, port: u16) bool {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (self.fetch_down.items, 0..) |e, i| {
+            if (e.port != port or !std.mem.eql(u8, e.ip, ip)) continue;
+            gpa.free(self.fetch_down.items[i].ip);
+            _ = self.fetch_down.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
     pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, stage: bool, now_ms: i64) void {
         const gpa = self.gpa;
         self.have_mu.lockUncancelable(self.io);
@@ -655,6 +718,8 @@ pub const Catalog = struct {
         self.stage_down.deinit(self.gpa);
         for (self.probe_down.items) |e| self.gpa.free(e.ip);
         self.probe_down.deinit(self.gpa);
+        for (self.fetch_down.items) |e| self.gpa.free(e.ip);
+        self.fetch_down.deinit(self.gpa);
         self.paths.deinit(self.gpa);
         self.arena.deinit();
     }
@@ -2565,4 +2630,22 @@ test "probeDown edge-triggers /have failures and clears on recovery" {
     try std.testing.expect(!cat.clearProbeDown("10.0.0.9", 18080));
     // Cleared peer can fail again (new outage logs again).
     try std.testing.expect(cat.noteProbeDown("10.0.0.9", 18080));
+}
+
+test "fetchDown edge-triggers /data fetch failures and clears on recovery" {
+    const gpa = std.testing.allocator;
+    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    // First failure logs (true); repeats ride the fill_err_peer counter.
+    try std.testing.expect(cat.noteFetchDown("10.0.0.9", 18080));
+    try std.testing.expect(!cat.noteFetchDown("10.0.0.9", 18080));
+    // Same address, different port: independent.
+    try std.testing.expect(cat.noteFetchDown("10.0.0.9", 19090));
+    // Different address: independent.
+    try std.testing.expect(cat.noteFetchDown("10.0.0.8", 18080));
+    // Recovery clears only the matching entry and logs once.
+    try std.testing.expect(cat.clearFetchDown("10.0.0.9", 18080));
+    try std.testing.expect(!cat.clearFetchDown("10.0.0.9", 18080));
+    // Cleared peer can fail again (new outage logs again).
+    try std.testing.expect(cat.noteFetchDown("10.0.0.9", 18080));
 }

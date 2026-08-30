@@ -1643,6 +1643,8 @@ fn fetchFromCands(
             _ = cat.inflight(win.ip, win.port, -1);
             const dt = sys.monoNs(cat.io) - t0;
             cat.updateGoodput(win.ip, win.port, rangeBps(out.len, dt));
+            if (cat.clearFetchDown(win.ip, win.port))
+                std.log.info("peer {s}:{d} piece fetch recovered", .{ win.ip, win.port });
             return;
         }
         // Stream the body straight into out: no piece-sized allocation or
@@ -1654,8 +1656,13 @@ fn fetchFromCands(
             // simply come back slow from NFS with no trace of the peer that
             // should have served it. Counted here rather than at the caller
             // so "nobody had the piece" (NoPeer with no attempt made) stays
-            // out of the failure counters.
-            std.log.warn("piece fetch failed on {s}:{d} for {s} piece {d}: {t}", .{ win.ip, win.port, rel, idx, err });
+            // out of the failure counters. Edge-triggered like probe_down:
+            // the first failure per outage names the peer, later failures
+            // ride the fill_err_peer counter so one wedged peer (answering
+            // /have but failing every /data) cannot flood the journal with
+            // a warn per piece.
+            if (cat.noteFetchDown(win.ip, win.port))
+                std.log.warn("piece fetch failed on {s}:{d} for {s} piece {d}: {t}", .{ win.ip, win.port, rel, idx, err });
             if (stats) |s| _ = s.fill_err_peer.fetchAdd(1, .monotonic);
             _ = cat.inflight(win.ip, win.port, -1);
             remaining[bi].have = false;
@@ -1664,6 +1671,8 @@ fn fetchFromCands(
         _ = cat.inflight(win.ip, win.port, -1);
         const dt = sys.monoNs(cat.io) - t0;
         cat.updateGoodput(win.ip, win.port, rangeBps(out.len, dt));
+        if (cat.clearFetchDown(win.ip, win.port))
+            std.log.info("peer {s}:{d} piece fetch recovered", .{ win.ip, win.port });
         return;
     }
     return error.NoPeer;
