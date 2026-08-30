@@ -764,16 +764,16 @@ Resolved by the shipped code and recorded in section 13 (not re-decided here):
 
 Status values: **Accepted** (still in force), **Partial** (part shipped), **Superseded** (replaced; the cell names what replaced it), **Not shipped** (never implemented). What runs is [architecture.md](architecture.md).
 
-| Decision | Choice | Why | Status (2026-08-29) |
+| Decision | Choice | Why | Status (2026-08-30) |
 |---|---|---|---|
 | Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partial: POSIX piece cache shipped; no content-addressed store (path-keyed) |
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Accepted |
 | Frontend | Sparse-file hydrate, then leave the I/O path | mmap for llama.cpp / vLLM | Superseded: FUSE read path with `direct_io`; agent stays in the I/O path (UMA OOM; reverses section 4.8 rule 6) |
 | Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partial: fixed 16 MiB transfer pieces; chunks/CDC absent |
-| Hash | blake3 | Fast, enough collision resistance for this | Partial: Level 1 shipped (per-piece digests, manifests, verify); content-addressed storage and wire-level identity did not (section 14, Levels 2-3) |
-| Two-node | Embedded metadata, RF=2 | No extra store | Not shipped (origin-less RF=2). Membership is origin `.cluster/<id>.json` leases (see Origin) |
+| Hash | blake3 | Fast, enough collision resistance for this | Accepted: Level 1 shipped (per-piece digests, manifests, verify); content-addressed storage and wire-level identity did not (section 14, Levels 2-3) |
+| Two-node | Embedded metadata, RF=2 | No extra store | Not shipped (origin-less RF=2). Membership is origin `.cluster/<id>.json` leases (see Origin row) |
 | Origin | Optional peer that never evicts | Same protocol | Superseded: origin is required (POSIX dir); "never evicts" holds |
-| Transport | QUIC or HTTP/2 Have/Want/Piece | One port; inspectable | Superseded: plaintext HTTP/1.1 `GET /ping`, `/have`, `/data` (see architecture.md) |
+| Transport | QUIC or HTTP/2 Have/Want/Piece | One port; inspectable | Superseded: plaintext HTTP/1.1 `GET /ping`, `/have`, `/data`, `/stage` (see architecture.md) |
 | Auth | static shared secret or mTLS | No anonymous P2P | Partial: bearer PSK on plaintext HTTP; mTLS did not ship (section 9) |
 | Engines | POSIX directory | No plugins | Accepted |
 | v1 language | Go | Protocol/state bound, not CPU bound | Superseded: Zig |
