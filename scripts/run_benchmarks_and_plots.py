@@ -173,15 +173,15 @@ def build_modelfs() -> str:
 
 def make_origin_and_psk(temp_dir: str) -> tuple[str, str]:
     """Fresh empty origin dir plus a 0600 PSK file for one benchmark run."""
-    origin_dir = os.path.join(temp_dir, "origin")
-    psk_file = os.path.join(temp_dir, "modelfs.psk")
-    os.makedirs(origin_dir, exist_ok=True)
+    origin_dir = Path(temp_dir) / "origin"
+    psk_file = Path(temp_dir) / "modelfs.psk"
+    origin_dir.mkdir(parents=True, exist_ok=True)
     # UTF-8 named: this file is the daemon's --psk input, read back byte-exact
     # by the verifier and trimmed to " \t\r\n" on both sides.
-    with open(psk_file, "w", encoding="utf-8") as f:
+    with psk_file.open("w", encoding="utf-8") as f:
         f.write(BENCH_PSK + "\n")
-    os.chmod(psk_file, 0o600)
-    return origin_dir, psk_file
+    psk_file.chmod(0o600)
+    return os.fspath(origin_dir), os.fspath(psk_file)
 
 
 def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]]:
@@ -196,22 +196,28 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
 
         procs = []
         # The guard opens before the first daemon spawns: a failure partway
-        # through the loop (makedirs/Popen raising) must still tear down every
+        # through the loop (mkdir/Popen raising) must still tear down every
         # daemon already started, not orphan it with its FUSE mount and port.
         try:
             for i in range(1, 10):
-                cache_dir = os.path.join(temp_dir, f"cache_{i}")
-                mount_dir = os.path.join(temp_dir, f"mount_{i}")
-                os.makedirs(cache_dir, exist_ok=True)
-                os.makedirs(mount_dir, exist_ok=True)
+                cache_dir = Path(temp_dir) / f"cache_{i}"
+                mount_dir = Path(temp_dir) / f"mount_{i}"
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                mount_dir.mkdir(parents=True, exist_ok=True)
                 port = 19100 + i
                 p = start_mount(
                     bin_path,
                     origin_dir,
                     psk_file,
-                    _MountSpec(mount_dir, cache_dir, f"node_{i}", port, "4M"),
+                    _MountSpec(
+                        os.fspath(mount_dir),
+                        os.fspath(cache_dir),
+                        f"node_{i}",
+                        port,
+                        "4M",
+                    ),
                 )
-                procs.append((p, port, mount_dir))
+                procs.append((p, port, os.fspath(mount_dir)))
 
             # Every listener must be up before the timed sweep: poll instead
             # of a fixed sleep, whose guess would otherwise surface inside
@@ -237,8 +243,8 @@ def run_cluster_latency_benchmark(bin_path: str) -> tuple[list[int], list[float]
         finally:
             # Every spawned mount daemon must die even when a spawn or probe
             # raises; otherwise orphans hold ports and stale FUSE mounts.
-            for p, _, mount_dir in procs:
-                stop_mount(p, mount_dir)
+            for p, _, mount_dir_str in procs:
+                stop_mount(p, mount_dir_str)
 
         return node_counts, latencies_ms
     finally:
@@ -269,22 +275,28 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
 
         for idx, (label, bytes_len) in enumerate(chunk_configs):
             test_file = f"test_{label}.bin"
-            file_path = os.path.join(origin_dir, test_file)
+            file_path = Path(origin_dir) / test_file
 
             data = os.urandom(bytes_len)
-            with open(file_path, "wb") as f:
+            with file_path.open("wb") as f:
                 f.write(data)
 
-            cache_dir = os.path.join(temp_dir, f"cache_{idx}")
-            mount_dir = os.path.join(temp_dir, f"mount_{idx}")
-            os.makedirs(cache_dir, exist_ok=True)
-            os.makedirs(mount_dir, exist_ok=True)
+            cache_dir = Path(temp_dir) / f"cache_{idx}"
+            mount_dir = Path(temp_dir) / f"mount_{idx}"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            mount_dir.mkdir(parents=True, exist_ok=True)
             port = 19600 + idx
             p = start_mount(
                 bin_path,
                 origin_dir,
                 psk_file,
-                _MountSpec(mount_dir, cache_dir, f"node_size_{label}", port, label),
+                _MountSpec(
+                    os.fspath(mount_dir),
+                    os.fspath(cache_dir),
+                    f"node_size_{label}",
+                    port,
+                    label,
+                ),
             )
             try:
                 # The daemon must be serving before hydration and the timed
@@ -292,9 +304,9 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
                 headers = bench_headers()
                 peer_ping.wait_for_ping(port, headers, 30.0)
 
-                mount_file_path = os.path.join(mount_dir, test_file)
-                if os.path.exists(mount_file_path):
-                    with open(mount_file_path, "rb") as mf:
+                mount_file_path = mount_dir / test_file
+                if mount_file_path.exists():
+                    with mount_file_path.open("rb") as mf:
                         _ = mf.read(1024)
 
                 path_enc = urllib.parse.quote(test_file, safe="")
@@ -325,7 +337,7 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
                 # Unmount failure must not mask benchmark results; best-effort
                 # cleanup. Runs on every exit path so a failed fetch or assert
                 # cannot orphan this mount daemon.
-                stop_mount(p, mount_dir)
+                stop_mount(p, os.fspath(mount_dir))
 
         return chunk_labels, throughputs_mbps
     finally:
@@ -639,7 +651,7 @@ peer latency.
 """
     report_path = out_dir / "benchmarks.md"
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(report_path, "w", encoding="utf-8") as f:
+    with report_path.open("w", encoding="utf-8") as f:
         f.write(report_content)
     print(f"✓ Generated Benchmark Report: {report_path}")
 

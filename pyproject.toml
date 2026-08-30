@@ -18,31 +18,34 @@ target-version = "py312"
 required-version = ">=0.16,<0.17"
 
 [tool.ruff.lint]
-# Every stable group. A new prefix that lands in the pinned 0.16 line
-# starts failing this gate instead of staying off by not being listed.
+# Every group, including preview: a new prefix that lands in the pinned
+# 0.16 line starts failing this gate instead of staying off by not being
+# listed. Formatter preview stays off (it would reformat dict literals).
 # Ignores are only the exceptions this tree does not pass, each named.
+preview = true
 select = ["ALL"]
 ignore = [
     # CLI harnesses print to stdout/stderr as their interface.
     "T201",
     # Conflicts with ruff format (the formatter owns trailing commas).
     "COM812",
-    # Internal scripts, not a published library: no pydocstyle or
-    # copyright-header convention.
+    # Internal scripts, not a published library: no pydocstyle,
+    # pydoclint, or copyright-header convention.
     "D",
+    "DOC",
     "CPY",
-]
-
-[tool.ruff.lint.per-file-ignores]
-# Remaining os.path join/makedirs/open/chmod/exists in the benchmark
-# driver. Other scripts already use pathlib; these codes stay on
-# everywhere else so a new harness cannot add os.path.join unnoticed.
-"scripts/run_benchmarks_and_plots.py" = [
-    "PTH101",
-    "PTH103",
-    "PTH110",
-    "PTH118",
-    "PTH123",
+    # Preview: prefer `ruff: ignore` over `noqa`. noqa stays so a comment
+    # that also names a bandit code remains valid for both tools.
+    "RUF105",
+    # Preview nits this tree does not pass: repeated list.append,
+    # Path.write_text, too-many-locals, empty-string comparisons.
+    "FURB113",
+    "FURB103",
+    "PLR0914",
+    "PLC1901",
+    # Preview: import of subprocess is the documented spawn path (S603
+    # still flags each call; those are noqa'd with a reason).
+    "S404",
 ]
 
 [tool.ruff.format]
@@ -57,8 +60,17 @@ strict = true
 # different local interpreter must not silently check different stdlib
 # semantics than the gate does.
 python_version = "3.12"
+# Linux-only tree: pin the platform so a check on another OS cannot
+# silently skip Linux-only branches or apply Darwin/Windows stdlib.
+platform = "linux"
 # Same target set scripts/check.sh passes, so a bare `mypy` matches the gate.
 files = ["scripts"]
+# A third-party import without stubs or a py.typed marker is checked,
+# not silently typed as Any. This tree already passes it.
+follow_untyped_imports = true
+# typeshed gaps surface instead of silently becoming Any once
+# --disallow-untyped-defs is on (it is: --strict).
+warn_incomplete_stub = true
 # mypy's second bundle beyond --strict: everything under --extra-checks
 # (today overlapping the explicit error codes below; tomorrow it also picks
 # up new opt-in checks in the 2.x line instead of leaving them off).

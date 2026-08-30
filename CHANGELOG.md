@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Python gate takes preview ruff rules and leftover mypy extras - 2026-08-30
+- **ruff now enables preview so a new 0.16 defect prefix cannot stay off.** The tree already
+  passes the preview correctness and security groups; formatter preview stays off (it would
+  reformat dict literals). Named ignores cover the preview nits this tree does not pass
+  (`DOC`, `RUF105`, `FURB103`/`FURB113`, `PLR0914`, `PLC1901`, `S404`). The benchmark
+  driver uses pathlib, so the per-file PTH exceptions are gone.
+- **mypy follows untyped imports and incomplete stubs**, and pins `platform = "linux"` so a
+  missing stub cannot silently become Any and the check matches the only OS these scripts run
+  on.
+
 ## [0.4.0] - 2026-08-30
 
 Feature release on top of 0.3.1: a 4-VM libvirt cluster e2e harness, peer
