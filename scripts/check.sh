@@ -27,8 +27,10 @@ answers --help):
   zig build check                           this script
   zig build ci / ./scripts/ci.sh            every CI job (this, aarch64, repro)
   ./scripts/cross_aarch64.sh                aarch64 ReleaseFast (extracts vendored libfuse3)
+  ./scripts/install_libfuse3_dev.sh         install libfuse3-dev via apt (CI setup; see CONTRIBUTING)
   ./scripts/run_e2e_tests.sh                CLI and peer protocol; no FUSE
   ./scripts/run_cluster_e2e_9nodes.sh       9 FUSE mounts (/dev/fuse + fusermount3)
+  ./scripts/run_vm_cluster_e2e.sh           4 VMs (NFS origin + 3 clients) on libvirt/KVM
   ./scripts/test_fault_tolerance.sh         peer loss and lease expiry
   ./scripts/test_dr_restore_drill.sh        restore drill against stub zfs (also in this script)
   ./scripts/check_drill_log.sh              alarm if the monthly drill log is stale

@@ -47,6 +47,7 @@ scripts=(
     scripts/run_benchmarks_and_plots.py
     scripts/run_cluster_e2e_9nodes.sh
     scripts/run_e2e_tests.sh
+    scripts/run_vm_cluster_e2e.sh
     scripts/sbom.py
     scripts/test_dr_restore_drill.sh
     scripts/test_extract_fuse3_arm64.sh
