@@ -146,7 +146,7 @@ Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); instal
 | `fuse_fs.zig` | libfuse handlers, read hydration, write-through |
 | `store.zig` | local piece cache, persisted bitfields |
 | `piece.zig` | piece arithmetic and the bitfield itself |
-| `peer.zig` | peer HTTP server (`/ping`, `/have`, `/data`) and fetch client |
+| `peer.zig` | peer HTTP server (`/ping`, `/have`, `/data`, `/stage`) and fetch client |
 | `proto.zig` | wire helpers: sizes, ranges, URL codec, bearer auth |
 | `discover.zig` | origin-side lease files, `/have` probe cache, path scoring |
 | `rdma.zig` | RDMA data-plane seam: `/stage` window codec and backend interface (null until the verbs tail) |
