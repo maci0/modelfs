@@ -284,6 +284,12 @@ pub const Store = struct {
         /// Set when the entry is removed from the map. Read with .acquire by
         /// the final releaser to decide destruction.
         dead: std.atomic.Value(bool) = .init(false),
+        /// Set by the thread that wins destruction. The last releaseFile (dead
+        /// set, refs already 0) and forget (refs==0, dead just stamped) can
+        /// both observe their condition on the same entry when a reference is
+        /// dropped concurrently with the map removal; without a winner flag
+        /// both would deinit it. Exactly one caller swaps false->true.
+        freed: std.atomic.Value(bool) = .init(false),
         /// Peer transfers currently streaming through this entry (the whole
         /// /data span: hydration plus send) and cache reads in flight (the
         /// FUSE warm-read path, readCache). punchPiece refuses to hole a
@@ -335,7 +341,9 @@ pub const Store = struct {
     pub fn releaseFile(self: *Store, file: *Cached) void {
         if (file.refs.fetchSub(1, .acq_rel) != 1) return;
         if (!file.dead.load(.acquire)) return;
-        file.deinit(self.gpa);
+        // The last releaser and forget can both reach destruction on the same
+        // entry; only the winner deinits (see `freed`).
+        if (!file.freed.swap(true, .acq_rel)) file.deinit(self.gpa);
     }
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, origin: []const u8, cache: []const u8, piece_size: u32) Store {
@@ -392,7 +400,10 @@ pub const Store = struct {
                 std.log.warn("store shutdown: {s} still referenced; leaking entry", .{f.rel});
                 continue;
             }
-            f.deinit(self.gpa);
+            // A handler the drain gave up on may still be finishing its last
+            // releaseFile on this entry; the winner flag keeps shutdown from
+            // double-freeing with it.
+            if (!f.freed.swap(true, .acq_rel)) f.deinit(self.gpa);
         }
         self.files.deinit();
     }
@@ -546,8 +557,12 @@ pub const Store = struct {
             // purge: its insert window now sees a changed epoch and retries.
             self.purge_epoch += 1;
             // Removal above blocks new references; past this point refs only
-            // decreases. Zero means nobody holds it: free now.
-            if (file.refs.load(.acquire) == 0) file.deinit(self.gpa);
+            // decreases. Zero means nobody holds it: free now. The winner
+            // flag keeps a releaseFile that already dropped the last
+            // reference (and is between its dead.load and deinit) from
+            // double-freeing alongside this path.
+            if (file.refs.load(.acquire) == 0)
+                if (!file.freed.swap(true, .acq_rel)) file.deinit(self.gpa);
             return;
         }
         // No live entry: artifacts from an earlier run must still be purged.
@@ -5529,6 +5544,47 @@ test "late finisher on a forgotten entry does not resurrect the sidecar" {
     const dead_seen = f3.dead.load(.acquire);
     f3.mu.unlock(std.testing.io);
     try std.testing.expect(dead_seen);
+}
+
+test "forget racing the last releaseFile cannot double-free" {
+    // Regression harness for the freed-flag contract: forget's refs==0 check
+    // and the last releaseFile's dead check can both fire on the same entry
+    // when a reference is dropped concurrently with the map removal. The
+    // testing allocator aborts on any double-free of the entry, its rel
+    // copy, or its bitfield. With the winner flag the race is benign; this
+    // loop pins that the concurrent path stays allocation-safe.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-forgfree");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-forgfree");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var done = std.atomic.Value(bool).init(false);
+    const forgetter = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Store, stop: *std.atomic.Value(bool)) void {
+            var i: usize = 0;
+            while (!stop.load(.acquire)) : (i += 1) {
+                s.forget("race.bin");
+                // A fixed bound so a wedged thread cannot hang the suite; the
+                // interleaving needs the forget to land inside a release.
+                if (i > 100_000) break;
+            }
+        }
+    }.run, .{ &st, &done });
+    defer forgetter.join();
+
+    var i: usize = 0;
+    while (i < 100_000) : (i += 1) {
+        const f = try st.get("race.bin", 64, sys.monoSec(std.testing.io));
+        st.releaseFile(f);
+    }
+    done.store(true, .release);
 }
 
 test "completeFill records the trusted digest; expectedHash and clearHashes obey" {
