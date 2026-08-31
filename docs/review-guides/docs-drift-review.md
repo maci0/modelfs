@@ -13,8 +13,6 @@ Your goal is to find documented claims that have drifted from shipped behavior: 
 - Unless the user sets another budget, fix at most five distinct findings and skip any single-file fix expected to exceed 200 changed lines.
 - Spend that budget on P0 before P1, then on the smallest proven live-path fixes. Leave P2/P3 as findings unless the user explicitly requests them.
 
-First decide if this review applies. Confirm this is the modelfs mount tree: `README.md`, `CONTRIBUTING.md`, `AGENTS.md`, `.github/workflows/ci.yml`, `docs/architecture.md`, and `src/main.zig` must exist. On any miss, print the skip result and stop. The items below also depend on `docs/THREAT_MODEL.md`, `docs/operations.md`, `docs/recovery.md`, `docs/design.md`, `docs/audits.md`, and `SECURITY.md`; if one of those is absent, print that item as skipped and continue with the rest rather than skipping the whole review.
-
 ## Review the following
 
 1. Shipped-behavior claims: every statement in `docs/architecture.md` presented as current behavior (paths, defaults, limits, ports, routing rules such as what goes to origin versus cache versus peers) traces to a real symbol, flag, constant, or branch in `src/`. The finding record cites doc `path:line` and code `path:line`; the document itself names the symbol and file, not a line number (a `file.zig:123` citation in shipped docs is a finding).

@@ -13,8 +13,6 @@ Your goal is to find code that compiles clean and passes `scripts/check.sh` but 
 - Unless the user sets another budget, fix at most five distinct findings and skip any single-file fix expected to exceed 200 changed lines.
 - Spend that budget on P0 before P1, then on the smallest proven live-path fixes. Leave P2/P3 as findings unless the user explicitly requests them.
 
-First decide if this review applies. Confirm this is the modelfs mount tree: `build.zig.zon`, `scripts/check.sh`, `src/fuse_fs.zig`, `src/main.zig`, `src/proto.zig`, `src/peer.zig`, `src/store.zig`, `src/discover.zig`, and `src/sys.zig` must exist. On any miss, print the skip result and stop.
-
 ## Review the following
 
 1. Peer auth gating: in `src/peer.zig` `handleConn`, `proto.bearerOk` on the `Authorization` header returns 401 before `/ping`, `/have`, `/data`, query parsing, `decodePath`, and the method gate. Non-GET after a valid bearer returns 405 (`Allow: GET`); that is the documented authenticated method gate. Do not move 405 ahead of the 401: an unauthenticated POST must not learn that GET is the only verb. Any route reachable ahead of the 401, other than the counted malformed-head drop, is P0.
