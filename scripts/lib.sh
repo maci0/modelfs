@@ -96,10 +96,10 @@ assert_aarch64_elf() {
     local bin="$1" ident machine
     ident="$(od -An -t x1 -N 6 "${bin}")" || return 1
     ident="${ident//[[:space:]]/}"
-    ident="${ident,,}"
+    ident="$(printf '%s' "${ident}" | tr '[:upper:]' '[:lower:]')"
     machine="$(od -An -t x1 -N 2 -j 18 "${bin}")" || return 1
     machine="${machine//[[:space:]]/}"
-    machine="${machine,,}"
+    machine="$(printf '%s' "${machine}" | tr '[:upper:]' '[:lower:]')"
     if [[ "${ident}" != "7f454c460201" ]]; then
         echo "not a 64-bit little-endian ELF: ${bin} (e_ident ${ident})" >&2
         return 1

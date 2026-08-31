@@ -115,6 +115,21 @@ else
 fi
 mkdir -p "${SCRATCH_DIR}" || die "cannot create scratch dir ${SCRATCH_DIR}"
 command -v zfs >/dev/null 2>&1 || die "zfs not found; this drill runs on the NAS"
+# GNU findutils/coreutils are required for the sampler below: find -printf,
+# sort -z, and stat -c are not in BusyBox/BSD. This host (Rocky/RHEL NAS)
+# ships GNU; probe early so a different host fails with a named fix.
+if ! find / -maxdepth 0 -printf '' >/dev/null 2>&1; then
+    # shellcheck disable=SC2185
+    find_ver="$(find --version 2>/dev/null | head -1 || echo non-GNU find)"
+    die "GNU find is required (need find -printf); this host has ${find_ver}"
+fi
+sort_help="$(sort --help 2>/dev/null || true)"
+if [[ "${sort_help}" != *-z* ]]; then
+    die "GNU sort is required (need sort -z)"
+fi
+if ! stat -c %s / >/dev/null 2>&1; then
+    die "GNU stat is required (need stat -c %s)"
+fi
 
 LOG_FILE="${MF_DRILL_LOG:-/var/log/modelfs-drill.log}"
 # A restore with no writable artifact is not a drill. Fail before clone

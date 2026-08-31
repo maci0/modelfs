@@ -71,6 +71,13 @@ case "${STAMP}" in
         ;;
 esac
 
+# GNU date is required: BSD/macOS date uses -j -f instead of -d and rejects
+# %s. This host (Rocky/RHEL, Ubuntu CI) ships GNU date; probe early so a
+# different host fails with a named fix instead of a cryptic parse error.
+if ! date -u -d "1970-01-01T00:00:00Z" +%s >/dev/null 2>&1; then
+    ver="$(date --version 2>/dev/null | head -1 || echo BSD date)"
+    die "GNU date is required (need date -u -d and %s); this host has ${ver}"
+fi
 STAMP_EPOCH="$(date -u -d "${STAMP}" +%s)" || die "cannot parse stamp ${STAMP} as UTC"
 NOW="$(date -u +%s)"
 AGE=$((NOW - STAMP_EPOCH))
