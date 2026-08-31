@@ -1157,6 +1157,8 @@ const DirFiller = struct {
 
 export fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.c) c_int {
     const st = statePtr();
+    const statfs_t0 = sys.monoNs(st.io);
+    defer _ = st.store.stats.statfs_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - statfs_t0, 0)), .monotonic);
     var rel: []const u8 = "";
     // Lookup-shaped denial: /.cluster is hidden from readdir and getattr.
     const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
@@ -1316,13 +1318,17 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     const fill_origin_ms = meanPerOp(d.fill_origin_nanos, d.fills_origin, std.time.ns_per_ms);
     const http_attempted = d.http_ok + d.http_5xx;
     const http_us = meanPerOp(d.http_nanos, http_attempted, std.time.ns_per_us);
+    // Total, not a mean: the metadata handlers count wall time but not calls,
+    // and a tick fires on any counter moving. Without this field a
+    // metadata-only interval logs a line of zeros.
+    const md_us = @divTrunc(d.getattr_nanos + d.open_nanos + d.statfs_nanos, std.time.ns_per_us);
     std.log.info(
         // Field names mirror Stats.Snap's (what status.json publishes), so
         // the journal line and the machine artifact share one vocabulary and
         // no key collides ("err" used to name both read and write failures).
         "tick: reads_ok={d} reads_err={d} reads_warm={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d} wr_us={d}" ++
             " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache/verify={d}/{d}/{d}/{d}" ++
-            " probe_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http_us={d}",
+            " probe_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http405={d} http_us={d} md_us={d}",
         .{
             d.reads_ok,
             d.reads_err,
@@ -1352,7 +1358,9 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.http_5xx,
             d.http_malformed,
             d.http_dropped,
+            d.http_405,
             http_us,
+            md_us,
         },
     );
 }

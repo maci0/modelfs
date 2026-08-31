@@ -226,9 +226,11 @@ pub fn build(b: *std.Build) void {
     tc.defineCMacro("_GNU_SOURCE", "1");
     tc.defineCMacro("FUSE_USE_VERSION", "31");
     tc.defineCMacro("_FILE_OFFSET_BITS", "64");
-    // FORTIFY_SOURCE=2: buffer-overflow checks for string/memory functions in the C interop layer.
-    // Harmless on targets where it's a no-op; required for the networked daemon threat model.
-    tc.defineCMacro("_FORTIFY_SOURCE", "2");
+    // No _FORTIFY_SOURCE here: this step only translates headers to Zig, it
+    // compiles no C, so the fortify wrappers guard nothing. Defining it makes
+    // glibc expose __builtin_object_size overloads whose diagnose_if bodies
+    // translate-c reports as errors, and only at -O1 and above -- a Debug
+    // `zig build test` passes while every release build fails.
     tc.addIncludePath(.{ .cwd_relative = fuse_inc });
     const c_mod = tc.createModule();
 
