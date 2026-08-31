@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-31
+
+Observability release on top of 0.4.0: the FUSE metadata handlers and the
+`/ping` probe now carry latency counters, non-GET peer requests are counted
+and logged instead of being silently refused, and the dial timeout runs on
+the injected `std.Io` clock so a simulator can drive expiry. A
+`_FORTIFY_SOURCE` define that broke every optimized build is reverted, and
+the NAS drill scripts probe for the GNU tools they need. status.json gains five keys and the `tick:` line
+two fields; no wire or on-disk changes, so upgrading from v0.4.0 is a
+rebuild and restart. Monitors parsing the tick line by field position must
+be updated; parsing by name is unaffected.
+
+### Metadata handlers report their latency - 2026-08-31
+- **`getattr_nanos`, `open_nanos`, and `statfs_nanos` count wall time inside
+  `mf_getattr`, `mf_open`, and `mf_statfs`.** Every FUSE request traverses
+  getattr, so before this the only latency signal (`rd_us`/`wr_us`) could
+  answer "data reads got slow" while a metadata storm stayed invisible. They
+  publish in status.json through `Stats.Snap` like every other counter.
+- **The `tick:` line gains `md_us`**, the interval total (not a mean: the
+  handlers count wall time, not calls) of those three. A tick fires whenever
+  any counter moves, so without the field a metadata-only interval logged a
+  line of zeros.
+
+### Non-GET peer requests are counted and named - 2026-08-31
+- **`http_405` counts every request the peer server refuses for method**, and
+  the first one per `auth_warn_min_gap_ms` window logs the method and source
+  address. The 405 reply itself is unchanged. Deduplication mirrors the 401
+  path: the counter keeps the exact total, the journal keeps one line, so a
+  probing campaign is neither silent nor a flood.
+- **`/ping` handler time lands in `http_nanos`.** `http_ok` counts only
+  data-plane replies, so a fleet that can answer nothing but the liveness
+  probe used to look healthy in the serve-latency average.
+
+### Dial timeout runs on the injected clock - 2026-08-31
+- **`sys.connectInWithIo` takes the `std.Io` the caller already holds** and
+  measures the connect budget with `sys.monoMs` instead of a direct
+  `clock_gettime`. `peer.dial` passes its `io`, so a simulated clock drives
+  dial expiry the way it drives every other timeout here. `connectIn` stays
+  as the non-simulated wrapper.
+
+### Release builds compile again; host-tool probes - 2026-08-31
+- **`_FORTIFY_SOURCE=2` is gone from the `translate-c` step.** It broke every
+  `-Doptimize=Release*` build: the define makes glibc expose
+  `__builtin_object_size` overloads whose `diagnose_if` bodies translate-c
+  reports as errors, and only above `-O0`, so a Debug `zig build test` stayed
+  green while the release build failed. It guarded nothing either, that step
+  translates headers and compiles no C. `build.zig` carries the reason so it
+  is not re-added.
+- **`dr_restore_drill.sh` and `check_drill_log.sh` probe for GNU tools before
+  using them** (`find -printf`, `sort -z`, `stat -c`, `date -u -d` with
+  `%s`), each failing with the named requirement. On a BusyBox or BSD host
+  these used to fail deep in the drill with a parse error.
+- **`lib.sh` no longer uses `${var,,}`**, so `assert_aarch64_elf` runs under
+  a shell without bash 4 parameter-expansion case conversion.
+
 ### Python gate takes preview ruff rules and leftover mypy extras - 2026-08-30
 - **ruff now enables preview so a new 0.16 defect prefix cannot stay off.** The tree already
   passes the preview correctness and security groups; formatter preview stays off (it would
@@ -534,7 +589,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/maci0/modelfs/releases/tag/v0.5.0
 [0.4.0]: https://github.com/maci0/modelfs/releases/tag/v0.4.0
 [0.3.1]: https://github.com/maci0/modelfs/releases/tag/v0.3.1
 [0.3.0]: https://github.com/maci0/modelfs/releases/tag/v0.3.0
