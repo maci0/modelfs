@@ -4,7 +4,7 @@
 |---|---|
 | Status | Living document; describes `src/` as of the date below |
 | Last reviewed | 2026-09-02 |
-| Covers | modelfs daemon (`mount`) and CLI as of `v0.5.0`, peer HTTP protocol, lease discovery, FUSE surface |
+| Covers | modelfs daemon (`mount`) and CLI as of `v0.6.0`, peer HTTP protocol, lease discovery, FUSE surface |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
 
@@ -210,7 +210,7 @@ Trust placed in client-side enforcement: none found. The server validates path, 
 ## Response readiness (notes only)
 
 - **Audit trail:** per-node journald logs carry failure-only events, 401 and 405 with source address at most once per second (`claimAuthWarn`/`claimMethodWarn` src/peer.zig), failed fetches with ip:port, origin errors (peer HTTP per-request; FUSE origin I/O and discovery-tick lease publish/refresh edge-triggered at Store.noteOriginIo), pin/unpin state changes (persistent culling-exempt state is answerable from the journal alone, cmdPin src/main.zig), membership changes (`cluster peers N -> M`), plus the tick counters including `http_ok`/`bytes_to_peer` serving volume, `http_405` wrong-method probes, `http_us` handler time (`/have` `/data` `/stage`), `md_us` FUSE metadata time, `lease_err`/`meta_err`, and `http_dropped` saturation; status.json exposes lifetime aggregates, `origin_down`, a wall-clock `now_s` stamp, and a same-machine monotonic `mono_s` stamp the wedge gate prefers (tick summary `logStatsTick` src/fuse_fs.zig, status write src/fuse_fs.zig). Still no persistent, centralized record, and successful peer requests are counted but unattributed per client.
-- **Vulnerability-handling path:** [SECURITY.md](../SECURITY.md) names a supported-version statement (`v0.5.0` is the current release; the `0.5.x` line receives security fixes) and the intended route from "vulnerability reported" to "fix shipped" (GitHub advisory thread to fix on main to CHANGELOG entry naming affected and fixed versions). GitHub private vulnerability reporting is not enabled on the repository, so that route has no intake until a repository admin turns the feature on; there is no other disclosed contact. docs/audits.md records internal review history only, and docs/design.md §9 contains historical mitigation claims (now annotated) that should not be cited as current posture.
+- **Vulnerability-handling path:** [SECURITY.md](../SECURITY.md) names a supported-version statement (`v0.6.0` is the current release; the `0.6.x` line receives security fixes) and the intended route from "vulnerability reported" to "fix shipped" (GitHub advisory thread to fix on main to CHANGELOG entry naming affected and fixed versions). GitHub private vulnerability reporting is not enabled on the repository, so that route has no intake until a repository admin turns the feature on; there is no other disclosed contact. docs/audits.md records internal review history only, and docs/design.md §9 contains historical mitigation claims (now annotated) that should not be cited as current posture.
 - **Compromise recovery sketch that exists today:** PSK regeneration guidance lives in docs/recovery.md (regenerate and redistribute after site loss); cache wiping before remount after rollback is documented there, and post-upgrade poison can instead be found with `modelfs verify <rel>` per file once its manifest exists.
 
 ---

@@ -2,9 +2,21 @@
 
 ## [Unreleased]
 
-Work since `v0.5.0`. Upgrading a node or a script written against that tag:
-start at **Upgrade from v0.5.0** below. The binary still prints `0.5.0`
-until the next tag.
+## [0.6.0] - 2026-09-02
+
+Correctness release on top of 0.5.0. FUSE `fsync` COMMITs the origin file
+instead of returning ENOSYS (which the kernel converted to success and then
+skipped every later fsync), origin I/O failures keep their libc errno, and a
+FIFO at a model path errors instead of hanging a worker. The peer server
+gates `/stage` `piece` and the `/have` bitmap size before touching cache or
+origin, and concurrent fills of one file share a single `/have` probe rather
+than stampeding every peer once per piece. The CLI settles its exit codes:
+`verify`, `dupes`, and `peers` fail loud on an unreadable origin instead of
+printing an empty result on stdout. On the NAS side the backup drop-ins
+survive a reinstall, the timers keep cadence across DST, and replica pull
+follows child datasets. No on-disk format change and the wire is unchanged,
+so a mixed fleet with `v0.5.0` peers still fills; the CLI, monitor, and
+default-behavior breaks are listed under **Upgrade from v0.5.0** below.
 
 ### Concurrent fills of one file share one /have probe - 2026-09-02
 - **A cold or TTL-expired have cache no longer probes the cluster once per concurrent piece.** `fillFromPeers` used to call `probeCandidates` per FUSE worker per piece, so a large read covering many holes (or a 2 s TTL expiry under several workers) stampeded every peer's `/have` and filled the 16 inflight slots, after which fetches dropped to origin. `Catalog.probeTryClaim` is the same singleflight `beginFill` uses per piece: one owner walks the cluster, waiters retry the have cache. Cap overflow still probes so a many-file cold start cannot wait on a slot that will never name that rel.
@@ -873,7 +885,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/maci0/modelfs/releases/tag/v0.6.0
 [0.5.0]: https://github.com/maci0/modelfs/releases/tag/v0.5.0
 [0.4.0]: https://github.com/maci0/modelfs/releases/tag/v0.4.0
 [0.3.1]: https://github.com/maci0/modelfs/releases/tag/v0.3.1

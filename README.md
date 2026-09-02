@@ -40,7 +40,7 @@ A read that misses blocks until that one piece is filled from a single source. I
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
 
-Releases: `v0.5.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since then is under `[Unreleased]` and a build from this tree still prints `0.5.0` until the next tag. Upgrading a running node or a script written against that tag: start at **Upgrade from v0.5.0** in that file (`verify`/`dupes` origin gate, `http_5xx` no longer counts 501, origin I/O errno, `/stage` `piece` 400, FUSE `readdir` omits `relOk`-refused names, discovery skips non-`validId` lease ids). Older tags: **Upgrade from v0.2.0** (origin-only fills without manifests, `/stage`, `verify`/`dupes`) and **Upgrade from v0.1.0**. How to report a security issue: [SECURITY.md](SECURITY.md).
+Releases: `v0.6.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since then is under `[Unreleased]` and a build from this tree still prints `0.6.0` until the next tag. Upgrading a running node or a script written against that tag: start at **Upgrade from v0.5.0** in that file (`verify`/`dupes` origin gate, `http_5xx` no longer counts 501, origin I/O errno, `/stage` `piece` 400, FUSE `readdir` omits `relOk`-refused names, discovery skips non-`validId` lease ids). Older tags: **Upgrade from v0.2.0** (origin-only fills without manifests, `/stage`, `verify`/`dupes`) and **Upgrade from v0.1.0**. How to report a security issue: [SECURITY.md](SECURITY.md).
 
 ---
 
