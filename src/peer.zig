@@ -663,7 +663,7 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, idx: u32) void
         return;
     }
     if (!hydrateRange(self, fd, file, start, ln, size)) return;
-    const expect = self.store.expectedHash(file, idx);
+    const expect = self.store.expectedHash(file, idx, sys.monoMs(self.io));
     const buf = self.gpa.alloc(u8, ln) catch {
         std.log.warn("stage buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, idx });
         replyStatus(self, fd, "500 Internal Server Error");
@@ -943,12 +943,15 @@ fn verifyRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     const piece_size = self.store.piece_size;
     var pbuf: ?[]u8 = null;
     defer if (pbuf) |b| self.gpa.free(b);
+    // One monotonic-ms sample for every piece in the range: retry due/not
+    // is a function of that instant, not of how long each piece took.
+    const now_ms = sys.monoMs(self.io);
     var pi = cov.start;
     while (pi < cov.end) : (pi += 1) {
         // expectedHash may load the origin manifest once per entry size; the
         // serving node must not hold file locks across it, and this loop
         // holds none.
-        const expect = self.store.expectedHash(file, pi) orelse continue;
+        const expect = self.store.expectedHash(file, pi, now_ms) orelse continue;
         const ln = piece.len(size, pi, piece_size);
         if (ln == 0) continue;
         if (pbuf == null)
@@ -1707,7 +1710,7 @@ fn fetchFromCands(
                 // staged failure names the peer, later ones ride the
                 // TTL backoff so a broken data plane cannot flood the
                 // journal with one warn per piece.
-                if (cat.noteStageDown(win.ip, win.port, sys.monoMs(cat.io)))
+                if (cat.noteStageDown(win.ip, win.port, now_ms))
                     std.log.warn("staged fetch failed on {s}:{d} for {s} piece {d}; falling back to HTTP", .{ win.ip, win.port, rel, idx });
             }
             break :blk ok;

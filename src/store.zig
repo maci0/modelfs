@@ -311,8 +311,10 @@ pub const Store = struct {
     purge_epoch: u64 = 0,
     /// How long a transient manifest-load failure waits before the next
     /// attempt (a field so tests shrink it; 3 s in production). Cheap:
-    /// expectedHash consults the timestamp per miss, so the origin is
-    /// re-read at most once per interval while fills are active.
+    /// expectedHash consults the timestamp per miss against the caller's
+    /// monotonic-ms instant, so the origin is re-read at most once per
+    /// interval while fills are active, and a simulator drives the
+    /// interval without sleeping.
     manifest_retry_ms: i64 = 3000,
 
     pub const Cached = struct {
@@ -378,10 +380,11 @@ pub const Store = struct {
         /// contributes nothing. Read/written under file.mu.
         manifest_size: ?u64 = null,
         /// Monotonic-ms instant after which a failed manifest load may be
-        /// retried. A transient failure (absent file, stale NFS negative
-        /// cache, torn write) must not disable peer fills for the entry's
-        /// whole lifetime: the writer publishes at close, which can be
-        /// moments after this node's first fill. Read/written under file.mu.
+        /// retried, compared to the caller's `now_ms` (see expectedHash).
+        /// A transient failure (absent file, stale NFS negative cache,
+        /// torn write) must not disable peer fills for the entry's whole
+        /// lifetime: the writer publishes at close, which can be moments
+        /// after this node's first fill. Read/written under file.mu.
         manifest_retry_at: i64 = 0,
         /// Trusted hashes changed since the last origin publish (admit,
         /// write-through, or a size-change wipe). mf_release publishes when
@@ -1344,11 +1347,14 @@ pub const Store = struct {
     /// origin: without a trusted reference its bytes are unverifiable, so
     /// no peer may supply them). Loads the origin manifest lazily, once per
     /// entry size, so a cold entry can verify peer fills without a prior
-    /// origin fill. Caller must not hold file.mu (the load reads the
-    /// origin). Returns under a fresh lock; a size change that raced the
-    /// load cleared the map via clearHashes, so the lookup then
+    /// origin fill. `now_ms` is the caller's monotonic-ms instant: the
+    /// retry gate is a pure function of `manifest_retry_at` plus this
+    /// sample, so tests drive a transient miss without sleeping (the same
+    /// seam haveGet uses for TTL). Caller must not hold file.mu (the load
+    /// reads the origin). Returns under a fresh lock; a size change that
+    /// raced the load cleared the map via clearHashes, so the lookup then
     /// misses and the piece origin-fills.
-    pub fn expectedHash(self: *Store, file: *Cached, idx: u32) ?[piece.digest_len]u8 {
+    pub fn expectedHash(self: *Store, file: *Cached, idx: u32, now_ms: i64) ?[piece.digest_len]u8 {
         file.mu.lockUncancelable(self.io);
         if (file.manifest_size == file.size) {
             const h = file.hashes.get(idx);
@@ -1358,9 +1364,9 @@ pub const Store = struct {
         // A failed load is retried after manifest_retry_ms: the writer
         // publishes the manifest at close, which may land after this node's
         // first fill (and an NFS negative cache can hide it briefly).
-        const due = file.manifest_retry_at <= sys.monoMs(self.io);
+        const due = file.manifest_retry_at <= now_ms;
         file.mu.unlock(self.io);
-        if (due) self.tryLoadManifest(file);
+        if (due) self.tryLoadManifest(file, now_ms);
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
         return file.hashes.get(idx);
@@ -1373,7 +1379,7 @@ pub const Store = struct {
     /// remembered in manifest_size so a failed fetch is not retried on
     /// every miss (the entry's size or the origin artifact can change, and
     /// a fresh entry or size reconcile retries).
-    fn tryLoadManifest(self: *Store, file: *Cached) void {
+    fn tryLoadManifest(self: *Store, file: *Cached, now_ms: i64) void {
         var pbuf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.manifestPath(&pbuf, file.rel) catch {
             // Path-too-long will not shrink; remembering it avoids retrying
@@ -1397,7 +1403,7 @@ pub const Store = struct {
                 if (open_errno != c.ENOENT)
                     std.log.warn("piece manifest open failed for {s} (errno {d}); peer fills unverified", .{ file.rel, open_errno });
                 file.mu.lockUncancelable(self.io);
-                file.manifest_retry_at = sys.monoMs(self.io) + self.manifest_retry_ms;
+                file.manifest_retry_at = now_ms +| self.manifest_retry_ms;
                 file.mu.unlock(self.io);
                 return;
             },
@@ -1413,7 +1419,7 @@ pub const Store = struct {
             else => {
                 std.log.warn("piece manifest read failed for {s}: {t}; peer fills unverified", .{ file.rel, err });
                 file.mu.lockUncancelable(self.io);
-                file.manifest_retry_at = sys.monoMs(self.io) + self.manifest_retry_ms;
+                file.manifest_retry_at = now_ms +| self.manifest_retry_ms;
                 file.mu.unlock(self.io);
                 return;
             },
@@ -1423,7 +1429,7 @@ pub const Store = struct {
             // A torn publish heals when the writer retries; retry too.
             std.log.warn("corrupt piece manifest for {s}; peer fills unverified", .{file.rel});
             file.mu.lockUncancelable(self.io);
-            file.manifest_retry_at = sys.monoMs(self.io) + self.manifest_retry_ms;
+            file.manifest_retry_at = now_ms +| self.manifest_retry_ms;
             file.mu.unlock(self.io);
             return;
         };
@@ -1431,7 +1437,7 @@ pub const Store = struct {
             // The name exists but is not a manifest; retry in case a real
             // manifest lands on the next publish.
             file.mu.lockUncancelable(self.io);
-            file.manifest_retry_at = sys.monoMs(self.io) + self.manifest_retry_ms;
+            file.manifest_retry_at = now_ms +| self.manifest_retry_ms;
             file.mu.unlock(self.io);
             return;
         }
@@ -3257,7 +3263,7 @@ test "a retried fill leaves bits, bytes, and sidecar identical to one run" {
     var rd: [16]u8 = undefined;
     try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
     try std.testing.expectEqualSlices(u8, &data, &rd);
-    const rec = st.expectedHash(f, 0);
+    const rec = st.expectedHash(f, 0, 0);
     try std.testing.expect(rec != null);
     if (rec) |h| try std.testing.expectEqualSlices(u8, &hash, &h);
 
@@ -4263,7 +4269,7 @@ test "write-through overwrite of a marked piece still lands the new bytes" {
     const w = f.writes;
     f.mu.unlock(std.testing.io);
     try std.testing.expectEqual(@as(u64, 2), w);
-    const expect = st.expectedHash(f, 0);
+    const expect = st.expectedHash(f, 0, 0);
     var want: [piece.digest_len]u8 = undefined;
     piece.digest(&next, &want);
     try std.testing.expect(expect != null);
@@ -5888,15 +5894,15 @@ test "completeFill records the trusted digest; expectedHash and clearHashes obey
     defer st.releaseFile(f);
     // No manifest and no local admit: no trusted hash, so a peer fill of
     // this piece would be refused upstream (expectedHash null -> origin).
-    try std.testing.expect(st.expectedHash(f, 0) == null);
+    try std.testing.expect(st.expectedHash(f, 0, 0) == null);
     var h: [piece.digest_len]u8 = undefined;
     piece.digest("0123456789abcdef", &h);
     try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, sys.monoSec(std.testing.io))).len);
     try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", h, sys.monoSec(std.testing.io)));
-    const got = st.expectedHash(f, 0).?;
+    const got = st.expectedHash(f, 0, 0).?;
     try std.testing.expectEqualSlices(u8, &h, &got);
     // A different piece stays unknown.
-    try std.testing.expect(st.expectedHash(f, 1) == null);
+    try std.testing.expect(st.expectedHash(f, 1, 0) == null);
     // The admit also armed the manifest publish flag.
     f.mu.lockUncancelable(std.testing.io);
     try std.testing.expect(f.manifest_dirty);
@@ -5905,7 +5911,7 @@ test "completeFill records the trusted digest; expectedHash and clearHashes obey
     f.mu.lockUncancelable(std.testing.io);
     st.clearHashes(f);
     f.mu.unlock(std.testing.io);
-    try std.testing.expect(st.expectedHash(f, 0) == null);
+    try std.testing.expect(st.expectedHash(f, 0, 0) == null);
 }
 
 test "copyIntoCache records fully covered piece digests and drops boundary ones" {
@@ -5928,9 +5934,9 @@ test "copyIntoCache records fully covered piece digests and drops boundary ones"
     try std.testing.expect(st.copyIntoCache(f, 16, piece1));
     var h1: [piece.digest_len]u8 = undefined;
     piece.digest(piece1, &h1);
-    try std.testing.expectEqualSlices(u8, &h1, &st.expectedHash(f, 1).?);
+    try std.testing.expectEqualSlices(u8, &h1, &st.expectedHash(f, 1, 0).?);
     // Piece 0 was never written: no hash.
-    try std.testing.expect(st.expectedHash(f, 0) == null);
+    try std.testing.expect(st.expectedHash(f, 0, 0) == null);
 
     // A 20-byte write at 0 fully covers piece 0 and partially covers piece
     // 1: piece 0's digest is recorded (from the buffer), piece 1's old
@@ -5939,8 +5945,8 @@ test "copyIntoCache records fully covered piece digests and drops boundary ones"
     try std.testing.expect(st.copyIntoCache(f, 0, w20));
     var h0: [piece.digest_len]u8 = undefined;
     piece.digest("0123456789abcdef", &h0);
-    try std.testing.expectEqualSlices(u8, &h0, &st.expectedHash(f, 0).?);
-    try std.testing.expect(st.expectedHash(f, 1) == null);
+    try std.testing.expectEqualSlices(u8, &h0, &st.expectedHash(f, 0, 0).?);
+    try std.testing.expect(st.expectedHash(f, 1, 0) == null);
 }
 
 test "manifest publish then load: a fresh store verifies peer expectations from origin" {
@@ -5974,11 +5980,11 @@ test "manifest publish then load: a fresh store verifies peer expectations from 
     try std.testing.expectEqual(@as(i32, 0), reader.ensureLayout());
     const rf = try reader.get("m.bin", 32, sys.monoSec(std.testing.io));
     defer reader.releaseFile(rf);
-    const got0 = reader.expectedHash(rf, 0).?;
-    const got1 = reader.expectedHash(rf, 1).?;
+    const got0 = reader.expectedHash(rf, 0, 0).?;
+    const got1 = reader.expectedHash(rf, 1, 0).?;
     try std.testing.expectEqualSlices(u8, &h0, &got0);
     try std.testing.expectEqualSlices(u8, &h1, &got1);
-    try std.testing.expect(reader.expectedHash(rf, 2) == null);
+    try std.testing.expect(reader.expectedHash(rf, 2, 0) == null);
 
     // A manifest for a different grid or size is ignored: the trust
     // reference only applies to this file on this grid.
@@ -5986,7 +5992,7 @@ test "manifest publish then load: a fresh store verifies peer expectations from 
     defer other.deinit();
     const of = try other.get("m.bin", 32, sys.monoSec(std.testing.io));
     defer other.releaseFile(of);
-    try std.testing.expect(other.expectedHash(of, 0) == null);
+    try std.testing.expect(other.expectedHash(of, 0, 0) == null);
 }
 
 test "reconcileSize drops every trusted hash with the old marks" {
@@ -6008,13 +6014,13 @@ test "reconcileSize drops every trusted hash with the old marks" {
     piece.digest("0123456789abcdef", &h);
     try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, sys.monoSec(std.testing.io))).len);
     try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", h, sys.monoSec(std.testing.io)));
-    try std.testing.expect(st.expectedHash(f, 0) != null);
+    try std.testing.expect(st.expectedHash(f, 0, 0) != null);
     // The same entry observed at a new size reconciles: bits and digests
     // both reset, and the stale sidecar's claim is wiped.
     const f2 = try st.get("r.bin", 32, sys.monoSec(std.testing.io));
     defer st.releaseFile(f2);
     try std.testing.expectEqual(f, f2);
-    try std.testing.expect(st.expectedHash(f2, 0) == null);
+    try std.testing.expect(st.expectedHash(f2, 0, 0) == null);
     f2.mu.lockUncancelable(std.testing.io);
     try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
     f2.mu.unlock(std.testing.io);
@@ -6032,14 +6038,17 @@ test "a transient manifest absence is retried and picked up after publication" {
     // Reader misses first (the writer has not published yet). The absence
     // must be transient: an NFS negative cache can hide the manifest for a
     // moment after the writer's close, and remembering it would disable
-    // peer fills for the whole entry lifetime.
+    // peer fills for the whole entry lifetime. Virtual instants: the retry
+    // gate is a function of now_ms, so the miss, the still-too-soon lookup,
+    // and the due lookup run with no sleep.
     var reader = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
     defer reader.deinit();
     try std.testing.expectEqual(@as(i32, 0), reader.ensureLayout());
-    reader.manifest_retry_ms = 1;
+    reader.manifest_retry_ms = 5;
+    const t0: i64 = 1000;
     const rf = try reader.get("m.bin", 32, sys.monoSec(std.testing.io));
     defer reader.releaseFile(rf);
-    try std.testing.expect(reader.expectedHash(rf, 0) == null);
+    try std.testing.expect(reader.expectedHash(rf, 0, t0) == null);
 
     // The writer publishes its manifest (as its release would).
     var writer = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
@@ -6053,10 +6062,11 @@ test "a transient manifest absence is retried and picked up after publication" {
     try std.testing.expectEqual(@as(i32, 0), writer.completeFill(wf, 0, "0123456789abcdef", h0, sys.monoSec(std.testing.io)));
     writer.publishManifest(wf);
 
-    // After the retry interval the reader picks the manifest up and can
-    // verify peer fills.
-    sys.sleepMs(std.testing.io, 10);
-    const got = reader.expectedHash(rf, 0).?;
+    // Not yet due: the first miss stamped retry_at = t0 + 5. Exclusive of
+    // the boundary's predecessor, inclusive of the instant itself.
+    try std.testing.expect(reader.expectedHash(rf, 0, t0) == null);
+    try std.testing.expect(reader.expectedHash(rf, 0, t0 + 4) == null);
+    const got = reader.expectedHash(rf, 0, t0 + 5).?;
     try std.testing.expectEqualSlices(u8, &h0, &got);
 }
 

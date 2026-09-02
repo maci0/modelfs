@@ -263,8 +263,9 @@ The trusted digests come from two places:
   hold from an origin fill or write-through, and verify peer fills against
   it; a transient
   load failure (an NFS negative cache hiding the writer's just-published
-  manifest) is retried after a few seconds instead of disabling peer fills
-  for the entry's lifetime, and a manifest whose grid or size disagrees
+  manifest) is retried after `manifest_retry_ms` against the caller's
+  monotonic instant instead of disabling peer fills for the entry's
+  lifetime, and a manifest whose grid or size disagrees
   with the reader's is ignored (origin fills, no peer verification). A file with no manifest anywhere has no trust
   reference, so its fills stay origin-only -- the cost of never serving
   unverified bytes (THREAT_MODEL.md, former gap R2).

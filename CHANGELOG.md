@@ -42,6 +42,20 @@
 - **A newer origin mtime or a different inode at the same path wipes piece marks and trusted hashes**, the way a size change already did. Size-only reconciliation kept the previous object's pieces after a same-size rewrite (another node's FUSE write, or a direct origin write), so FUSE reads and `/have`/`/data` could serve the old bytes. An older mtime on the same inode is treated as NFS attribute lag after this node's own write, not a rewrite. The identity is an optional trailer on `meta/*.pieces`, so a restart still sees it; older sidecars without a trailer keep their prior behavior until the next save.
 - **Manifest load no longer replaces a hash this node already recorded** from an origin fill or write-through. Origin bytes stay the trust root for that piece; a later or stale same-size manifest fills only the gaps.
 
+### Manifest retry and down-list overflow run on injected instants - 2026-09-02
+- **`Store.expectedHash` takes the caller's monotonic-ms instant** so a
+  transient manifest miss retries when that sample crosses
+  `manifest_retry_at`, not when the wall clock does. `tryLoadManifest`
+  stamps the next attempt from the same sample. Tests drive the miss,
+  the still-too-soon lookup, and the due load with virtual instants and
+  no sleep.
+- **`noteStageDown` overflow evicts expired lines by soonest expiry then
+  (ip, port)**, and `noteProbeDown`/`noteFetchDown` overflow evicts the
+  (ip, port)-least line, so have_mu lock order cannot choose the casualty.
+  Live stage-down backoffs are still not dropped to admit a new failure.
+  `fetchFromCands` stamps a staged-fetch failure with the walk's clock
+  sample instead of a second read.
+
 ### Mongolian FVS4 and shorthand format controls no longer pass the path and echo gates - 2026-09-02
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused.** `relOk` and `discover.printable` already refused Default_Ignorable including U+180B..U+180E, but a planted path `gguf/model\u180F.bin` or lease id `spark1\u1BCA0` still echoed as the unadorned name. Those sequences are refused now; incomplete encodings and visible neighbours in the same UTF-8 blocks (U+1810, U+1BC9F) stay legal display text.
 

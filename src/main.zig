@@ -1684,6 +1684,7 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
     };
     defer gpa.free(buf);
     const nbits = piece.count(size, piece_size);
+    const now_ms = sys.monoMs(dummy_io.io());
     var i: u32 = 0;
     while (i < nbits) : (i += 1) {
         file.mu.lockUncancelable(dummy_io.io());
@@ -1693,7 +1694,7 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         // expectedHash loads the origin manifest lazily; with no manifest
         // and no hashes learned from a live daemon, there is no reference
         // and nothing to verify (reported in the summary, not an error).
-        const expect = store.expectedHash(file, i) orelse continue;
+        const expect = store.expectedHash(file, i, now_ms) orelse continue;
         const ln = piece.len(size, i, piece_size);
         if (ln == 0) continue;
         const n = store.readCache(file, buf[0..ln], piece.offset(i, piece_size), sys.monoSec(dummy_io.io()));

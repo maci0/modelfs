@@ -613,7 +613,7 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
             // trust root -- instead of accepting peer bytes blindly. expectedHash
             // loads the manifest lazily (one origin read per entry size), so a
             // cold entry can verify peer fills from the start.
-            expect = st.store.expectedHash(file, idx);
+            expect = st.store.expectedHash(file, idx, sys.monoMs(st.io));
             if (expect == null) from_peer = false;
         }
         if (from_peer) {
