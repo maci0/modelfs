@@ -652,8 +652,10 @@ pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in,
     const e0 = errno();
     if (e0 != c.EINPROGRESS) return -e0;
     // EINTR during poll must not fail the dial: retry against the original
-    // deadline, like the read/write loops retry their syscalls.
-    const deadline_ms = monoMs(io) + @as(i64, ms);
+    // deadline, like the read/write loops retry their syscalls. Saturating
+    // add matches every other elapsed-time budget in this tree: wrapping
+    // would make remain_ms 0 (or a huge wait) instead of "as long as we can".
+    const deadline_ms = monoMs(io) +| @as(i64, ms);
     while (true) {
         var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
         const remain_ms: i64 = deadline_ms -| monoMs(io);

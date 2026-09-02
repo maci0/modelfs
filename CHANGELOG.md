@@ -6,6 +6,10 @@ Work since `v0.5.0`. Upgrading a node or a script written against that tag:
 start at **Upgrade from v0.5.0** below. The binary still prints `0.5.0`
 until the next tag.
 
+### Peer goodput samples ignore sub-resolution clock ticks - 2026-09-02
+- **A piece fetch whose elapsed time is 1 ns no longer records ~10 PB/s.** `rangeBps` already returned 0 for a same-ns tick (which pulled the EWMA toward a dead path). A 1 ns tick on a 16 MiB piece is finite (~1.7e16 B/s) and pulled the EWMA the other way, so `pickBest` stuck on that path until tens of real samples decayed it. Samples above 1 TB/s now keep the prior, like a non-positive interval.
+
+
 ### Upgrade from v0.5.0 - 2026-09-02
 
 CLI, peer-HTTP, FUSE, and monitor changes that will surprise a node still

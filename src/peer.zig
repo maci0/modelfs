@@ -1260,10 +1260,20 @@ fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.
     return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, out, deadline_ms);
 }
 
+/// Measured goodput above this is treated as an unmeasurable interval
+/// (same as dt_ns <= 0). 1 TB/s is faster than a DRAM copy of a 16 MiB
+/// piece, let alone the peer HTTP path; a 1 ns clock tick on that piece
+/// is ~1.7e16 B/s, which is finite and would pull the EWMA toward "this
+/// path is infinitely fast" the way a 0 ns tick used to pull it toward
+/// dead.
+const max_sample_bps: f64 = 1e12;
+
 fn rangeBps(bytes: u64, dt_ns: i128) f64 {
+    if (dt_ns <= 0) return 0;
     const sec = @as(f64, @floatFromInt(dt_ns)) / 1e9;
-    if (sec <= 0) return 0;
-    return @as(f64, @floatFromInt(bytes)) / sec;
+    const bps = @as(f64, @floatFromInt(bytes)) / sec;
+    if (!std.math.isFinite(bps) or bps > max_sample_bps) return 0;
+    return bps;
 }
 
 /// Parses "IP" text plus numeric port into a sockaddr_in at the boundary
@@ -1795,6 +1805,15 @@ test "rangeBps" {
     // pull the EWMA 30% toward zero on a same-ns clock tick).
     try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, 0));
     try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, -1));
+    // Dual of the 0 ns case: 16 MiB in 1 ns is ~1.7e16 B/s, finite, and
+    // would poison pickBest toward this path until tens of real samples
+    // decayed the EWMA. Sub-resolution ticks keep the prior.
+    try std.testing.expectEqual(@as(f64, 0), rangeBps(16 * 1024 * 1024, 1));
+    // 16 MiB in 160 us is 100 GB/s: inside the cap, so a real fabric-speed
+    // sample still updates the EWMA.
+    const fabric = rangeBps(16 * 1024 * 1024, 160_000);
+    try std.testing.expect(fabric > 0 and fabric <= max_sample_bps);
+    try std.testing.expectEqual(@as(f64, 16 * 1024 * 1024) / 0.00016, fabric);
 }
 
 test "groupPathsByPeerId orders ties by ip and port, never by arrival order" {
