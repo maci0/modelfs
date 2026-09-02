@@ -42,12 +42,34 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 
 # Named preflight for scripts that invoke `zig build`: a missing toolchain
 # otherwise dies as bash "command not found" with no pointer at setup.
+# The version floor is minimum_zig_version in build.zig.zon, the same pin
+# CI installs; an older zig used to fail later as a compile error.
 require_zig() {
-    if command -v zig >/dev/null 2>&1; then
-        return 0
+    if ! command -v zig >/dev/null 2>&1; then
+        echo "cannot run: zig not found on PATH -- see CONTRIBUTING.md (setup section)" >&2
+        exit 1
     fi
-    echo "cannot run: zig not found on PATH -- see CONTRIBUTING.md (setup section)" >&2
-    exit 1
+    local min_zig zig_ver
+    min_zig="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
+    if [[ -z "${min_zig}" ]]; then
+        echo "cannot read minimum_zig_version from build.zig.zon" >&2
+        exit 1
+    fi
+    zig_ver="$(zig version)"
+    if ! awk -v cur="${zig_ver}" -v min="${min_zig}" 'BEGIN {
+        ncur = split(cur, c, /[^0-9]+/)
+        nmin = split(min, t, /[^0-9]+/)
+        for (i = 1; i <= nmin; i++) {
+            ci = (i <= ncur) ? (c[i] + 0) : 0
+            ti = t[i] + 0
+            if (ci < ti) exit 1
+            if (ci > ti) exit 0
+        }
+        exit 0
+    }'; then
+        echo "cannot run: zig ${zig_ver} is older than minimum_zig_version ${min_zig} in build.zig.zon" >&2
+        exit 1
+    fi
 }
 
 # Usage text is read from stdin so each script keeps its own --help body.

@@ -33,7 +33,7 @@ echo "=== 4-VM cluster: NFS server + 3 modelfs clients ==="
 cd "${ROOT_DIR}"
 
 # --- prerequisites -----------------------------------------------------
-for tool in qemu-img cloud-localds ssh scp virsh curl sha256sum tar; do
+for tool in qemu-img cloud-localds ssh scp virsh curl sha256sum tar git; do
     command -v "${tool}" >/dev/null 2>&1 || fail "missing tool: ${tool}"
 done
 sudo -n true 2>/dev/null || fail "passwordless sudo required (libvirt system daemon)"
@@ -239,16 +239,25 @@ echo "=== building modelfs inside the NFS VM (matches Ubuntu 24.04 fuse3) ==="
 # Arch/CachyOS), which Ubuntu 24.04's libfuse3-3 (.so.3) does not provide.
 # Build inside the VM against noble's libfuse3-dev instead: the e2e then
 # exercises the same binary configuration the production sparks run.
-# Ship the source (no run artifacts), fetch zig 0.16 (sha256-verified, the
-# same check the cloud image gets above), build.
-tar --exclude=.git --exclude=.scratch --exclude=zig-out --exclude=.venv -czf - -C "${ROOT_DIR}" . \
-    | ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "mkdir -p /home/ubuntu/src && tar xzf - -C /home/ubuntu/src"
-zig_cmd="test -x /home/ubuntu/zig/zig || { mkdir -p /home/ubuntu/zig && curl -fSL -o /home/ubuntu/zig/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz && echo '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00  /home/ubuntu/zig/zig.tar.xz' | sha256sum -c - && tar -xJ --strip-components=1 -f /home/ubuntu/zig/zig.tar.xz -C /home/ubuntu/zig && rm /home/ubuntu/zig/zig.tar.xz; }"
+# Copy exactly the tracked sources (git ls-files, same recipe as
+# repro_check.sh) so .zig-cache / host objects cannot ride along, fetch
+# zig at minimum_zig_version (sha256-verified), ReleaseFast.
+zig_ver="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
+[[ -n "${zig_ver}" ]] || fail "cannot read minimum_zig_version from build.zig.zon"
+# sha256 of the official x86_64-linux tarball for that version; bump with
+# minimum_zig_version. A version bump that leaves this digest in place
+# fails sha256sum -c instead of running an unverified compiler.
+zig_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+(
+    cd "${ROOT_DIR}"
+    git ls-files -z | tar --null --ignore-failed-read -T - -czf -
+) | ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "mkdir -p /home/ubuntu/src && tar xzf - -C /home/ubuntu/src"
+zig_cmd="test -x /home/ubuntu/zig/zig || { mkdir -p /home/ubuntu/zig && curl -fSL -o /home/ubuntu/zig/zig.tar.xz https://ziglang.org/download/${zig_ver}/zig-x86_64-linux-${zig_ver}.tar.xz && echo '${zig_sha256}  /home/ubuntu/zig/zig.tar.xz' | sha256sum -c - && tar -xJ --strip-components=1 -f /home/ubuntu/zig/zig.tar.xz -C /home/ubuntu/zig && rm /home/ubuntu/zig/zig.tar.xz; }"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${zig_cmd}"; then
-    echo "Error: could not fetch zig 0.16.0 into the NFS VM"
+    echo "Error: could not fetch zig ${zig_ver} into the NFS VM"
     exit 1
 fi
-build_cmd="cd /home/ubuntu/src && PATH=/home/ubuntu/zig:\$PATH zig build"
+build_cmd="cd /home/ubuntu/src && PATH=/home/ubuntu/zig:\$PATH zig build -Doptimize=ReleaseFast"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${build_cmd}"; then
     echo "Error: modelfs build failed inside the NFS VM"
     exit 1

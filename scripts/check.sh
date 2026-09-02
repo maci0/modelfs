@@ -3,6 +3,8 @@
 # restore-drill stub, vendored libfuse3 digests and extract, shell lint,
 # Python lint, Python type check, CycloneDX inventory.
 set -euo pipefail
+export LC_ALL=C
+export TZ=UTC
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

@@ -68,7 +68,8 @@ tests only run once that file is imported from [src/root.zig](src/root.zig).
 The filter matches test *names*, not file names: Zig collects tests from the
 whole import graph, so `-Dtest-filter=store` would miss most of `store.zig`.
 `zig build test` also links the shipped `modelfs` ELF and fails unless it is
-a PIE with full RELRO, BIND_NOW, and a non-executable stack.
+a PIE with full RELRO, BIND_NOW, a non-executable stack, and no
+DT_RPATH/DT_RUNPATH.
 
 ## End-to-end suites
 

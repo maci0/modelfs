@@ -5,6 +5,8 @@
 # .github/workflows/ci.yml and scripts/ci.sh run this, so the flags cannot
 # drift apart the way the old inlined extract recipe used to.
 set -euo pipefail
+export LC_ALL=C
+export TZ=UTC
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

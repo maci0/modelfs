@@ -115,9 +115,9 @@ fn linkFuse(m: *std.Build.Module, fuse_lib: ?[]const u8) void {
 }
 
 /// Fail `zig build` / `zig build test` unless the shipped ELF is a PIE with
-/// full RELRO, BIND_NOW, and a non-executable stack. Linking the executable
-/// as part of the test step also compiles `pub fn main`, which the test
-/// binary does not reference.
+/// full RELRO, BIND_NOW, a non-executable stack, and no DT_RPATH/DT_RUNPATH.
+/// Linking the executable as part of the test step also compiles
+/// `pub fn main`, which the test binary does not reference.
 fn checkHardenedElf(exe: *std.Build.Step.Compile) *std.Build.Step {
     const check = exe.checkObject();
     // Debug images can exceed CheckObject's 20 MiB default; headers+phdrs
@@ -134,6 +134,13 @@ fn checkHardenedElf(exe: *std.Build.Step.Compile) *std.Build.Step {
     check.checkContains("NOW");
     check.checkInDynamicSection();
     check.checkContains("PIE");
+    // Separate dumps: CheckObject walks one action's leftover lines, so a
+    // not-present check after NOW/PIE would miss a RPATH that appeared
+    // earlier in the same section. "RPATH" is not a substring of "RUNPATH".
+    check.checkInDynamicSection();
+    check.checkNotPresent("RPATH");
+    check.checkInDynamicSection();
+    check.checkNotPresent("RUNPATH");
     return &check.step;
 }
 
@@ -254,8 +261,12 @@ pub fn build(b: *std.Build) void {
     // Stack probing exists only for the x86 family in 0.16: aarch64 and
     // other targets reject -fstack-check, and the Sparks deploy as aarch64,
     // so the cross-build must not request it. Canaries are supported
-    // wherever libc is present, so they stay on for every target.
+    // wherever libc is present, so they stay on for every target. PIC is
+    // pinned with pie below: a non-PIC ET_DYN still relocates, but ASLR
+    // then depends on the linker rewriting text instead of the image being
+    // born position-independent.
     exe_mod.stack_protector = true;
+    exe_mod.pic = true;
     if (stack_check_supported) {
         exe_mod.stack_check = true;
     }
@@ -276,6 +287,14 @@ pub fn build(b: *std.Build) void {
     // a lazy-binding or partial-RELRO networked image.
     exe.link_z_relro = true;
     exe.link_z_lazy = false;
+    // -Dfuse-lib is a link-time -L search path. Embedding it as DT_RPATH
+    // or DT_RUNPATH would bake the build-host extract directory into the
+    // spark image, so two checkouts disagree and the binary looks for
+    // libfuse3 next to .scratch instead of in /usr/lib.
+    exe.each_lib_rpath = false;
+    // uuid build-ids are random; pin none so `zig build --build-id=uuid`
+    // cannot make two builds of the same tree disagree.
+    exe.build_id = .none;
     b.installArtifact(exe);
 
     if (target.result.ofmt == .elf) {
@@ -289,9 +308,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        // Exercise the same canary- and probe-instrumented code the executable ships.
+        // Exercise the same canary-, probe-, and PIC-instrumented code the executable ships.
         .stack_protector = true,
         .stack_check = stack_check_supported,
+        .pic = true,
     });
     linkFuse(test_mod, fuse_lib);
     test_mod.addIncludePath(.{ .cwd_relative = fuse_inc });

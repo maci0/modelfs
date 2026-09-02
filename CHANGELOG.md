@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Ship ELF pins PIC, no RPATH, and a frozen build-id; VM e2e matches ReleaseFast - 2026-09-02
+- **The shipped image now pins PIC, refuses DT_RPATH/DT_RUNPATH, and freezes `--build-id=none`.** `exe.pie` already produced an ET_DYN, but PIC was left to the compiler default, `-Dfuse-lib` could have become a runtime search path (baking the build-host extract dir into the spark binary), and a CLI `--build-id=uuid` would have made two builds of the same tree disagree. `checkHardenedElf` now fails those dynamic tags the same way it already fails a non-PIE or lazy-binding link. `scripts/check.sh` and `scripts/cross_aarch64.sh` pin `LC_ALL=C`/`TZ=UTC`; `require_zig` enforces `minimum_zig_version` so an old toolchain dies at the script preflight instead of as a compile error.
+- **The 4-VM cluster e2e builds the ReleaseFast image from tracked sources.** It used to `tar` the whole worktree (so a host `.zig-cache` could ride into the guest) and `zig build` Debug, while claiming to match the spark deploy. It now packs `git ls-files` like `repro_check.sh`, fetches the tarball named by `build.zig.zon`'s `minimum_zig_version`, and compiles `-Doptimize=ReleaseFast`.
+
 ### Mongolian FVS4 and shorthand format controls no longer pass the path and echo gates - 2026-09-02
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused.** `relOk` and `discover.printable` already refused Default_Ignorable including U+180B..U+180E, but a planted path `gguf/model\u180F.bin` or lease id `spark1\u1BCA0` still echoed as the unadorned name. Those sequences are refused now; incomplete encodings and visible neighbours in the same UTF-8 blocks (U+1810, U+1BC9F) stay legal display text.
 
