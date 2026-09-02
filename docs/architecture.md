@@ -51,7 +51,7 @@ One piece, one source. Misses block the read until that hole is filled. If the l
 
 Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run `modelfs` there.
 
-`stat` / `readdir` / `mkdir` / `rmdir` / `chmod` / `statfs` / `unlink` / `rename` → origin. `mkdir` (`Store.mkdirOrigin`) of a path that already exists as a directory is success, so a FUSE retry after a lost reply does not fail `EEXIST`; a non-directory at that name is still `EEXIST`. `rmdir` (`Store.rmdirOrigin`) of a path that is already gone is success, so the same retry does not fail `ENOENT`; a non-directory at that name is still `ENOTDIR` and a non-empty directory is still `ENOTEMPTY`. `rmdir` of the mount root (empty rel) is `EBUSY`. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `create` (`O_TRUNC`) and `truncate` with no live cache entry drop persisted marks via `Store.distrust` for the same reason; a cold `Store.get` whose sidecar geometry does not match the origin size persists that wipe so a restart cannot reload the old marks. `open` / `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`, lookup (`ENOENT`), and mutation (`EPERM`), and from peer `/have`/`/data`/`/stage` (404) and `modelfs pin`/`unpin`/`verify`/`dupes` (`relIsCluster` in src/discover.zig).
+`stat` / `readdir` / `mkdir` / `rmdir` / `chmod` / `statfs` / `unlink` / `rename` → origin. `mkdir` (`Store.mkdirOrigin`) of a path that already exists as a directory is success, so a FUSE retry after a lost reply does not fail `EEXIST`; a non-directory at that name is still `EEXIST`. `rmdir` (`Store.rmdirOrigin`) of a path that is already gone is success, so the same retry does not fail `ENOENT`; a non-directory at that name is still `ENOTDIR` and a non-empty directory is still `ENOTEMPTY`. `rmdir` of the mount root (empty rel) is `EBUSY`. `unlink` (`Store.unlinkOrigin`) and `rename` (`Store.renameOrigin`) also drop cache identity via `Store.forget`, including when the origin name is already gone, so a FUSE retry after a lost reply cannot leave a sidecar that a same-size recreate would serve as the new file. `create` (`O_TRUNC`) and `truncate` with no live cache entry drop persisted marks via `Store.distrust` for the same reason; a cold `Store.get` whose sidecar geometry does not match the origin size persists that wipe so a restart cannot reload the old marks. A same-size rewrite (newer origin mtime, or a different inode at the path) is the same wipe (`Store.getIdentified` / `OriginId`): size-only reconciliation used to keep the previous object's pieces. An older mtime on the same inode is treated as NFS attribute lag, not a rewrite. The identity rides as an optional trailer on `meta/*.pieces`, so a restart still sees it. `open` / `write` / `create` / `truncate` → origin, then this node's cache. `.cluster` is hidden from FUSE `readdir`, lookup (`ENOENT`), and mutation (`EPERM`), and from peer `/have`/`/data`/`/stage` (404) and `modelfs pin`/`unpin`/`verify`/`dupes` (`relIsCluster` in src/discover.zig).
 
 Origin is **required**. It can be any POSIX dir both nodes see, not only NFS. Two-node with no shared store is not implemented. The mountpoint must not overlap the origin or the cache (FUSE reentrancy: origin preads or cache writes under the mount nest through this daemon's own handlers), and the cache must not overlap the origin (piece files would land on the shared store and nodes would stomp each other). Origin data-plane opens (`originPread` / `originPwrite` in src/store.zig) use `O_NOFOLLOW` (ELOOP on a planted symlink) and `O_NONBLOCK` (a FIFO at the name cannot hang a FUSE worker). chmod, origin statvfs, and directory opens (`sys.chmod` / `sys.statvfsNoFollow` / `sys.opendirNoFollow`) also use `O_NOFOLLOW` and return `ELOOP` on a final-component symlink; `opendirNoFollow` is `O_NONBLOCK` as well. `preadAll` / `pwriteAll` / `writeAll` (src/sys.zig) return `-errno` like `sendfileAll`, so an origin I/O failure is the real errno (EIO/ESTALE) rather than EPERM. Weight files on the origin must be regular files (a Hugging Face hub-cache snapshot tree will not serve; see [operations.md](operations.md)).
 
@@ -259,7 +259,9 @@ The trusted digests come from two places:
   src/fuse_fs.zig), so an ingested file gets a manifest from its writer,
   and a legacy file with no manifest gets one from the first node that
   fully origin-reads it. Readers load the manifest lazily, once per entry
-  size (`expectedHash`), and verify peer fills against it; a transient
+  size (`expectedHash`), merging only hashes this node does not already
+  hold from an origin fill or write-through, and verify peer fills against
+  it; a transient
   load failure (an NFS negative cache hiding the writer's just-published
   manifest) is retried after a few seconds instead of disabling peer fills
   for the entry's lifetime, and a manifest whose grid or size disagrees
@@ -268,9 +270,11 @@ The trusted digests come from two places:
   unverified bytes (THREAT_MODEL.md, former gap R2).
 
 Digests survive a punch (they are the expectation a refill must meet) and
-are dropped together with the marks on size change, distrust, and forget
-(`Store.clearHashes`). The sidecar bitfield format is unchanged: hashes
-ride in memory and in the manifest, not in `meta/*.pieces`. Manifest blobs
+are dropped together with the marks on size change, same-size rewrite
+(mtime/ino), distrust, and forget (`Store.clearHashes`). The sidecar
+bitfield prefix is unchanged; an optional origin-identity trailer follows
+the bits so a restart can still detect a same-size rewrite. Hashes ride
+in memory and in the manifest, not in the bit bytes. Manifest blobs
 are bounded (64 MiB, `Store.max_manifest_bytes`), parsed by a fuzzed
 codec (`piece.manifestDecode`), and published atomically (tmp + rename,
 lazy mkdir of `.cluster/manifests` like lease publish); lease walks and
@@ -282,7 +286,7 @@ sweeps skip them (no `.json`/`.tmp` names).
 
 Write is NFS 1:1, then a copy into this node's cache. If NFS fails, the write fails. `originPwrite` (and FUSE create/truncate, lease/status/sidecar `writeFile*`) treat a failed close after a successful write as failure: NFS reports delayed write errors there. No write-back buffer. `create` / `mkdir` / `chmod` apply the caller's permission bits only (`clientCreateMode` in src/fuse_fs.zig): setuid, setgid, and sticky are stripped so a mount writer cannot plant a daemon-owned special-bit executable. `Store.copyIntoCache` bumps a per-entry write generation unless the copy already fully covers marked pieces (a FUSE retry of the same write-through) and records blake3 digests for the fully covered pieces from the write buffer (boundary pieces drop their old digest: their bytes are now a mix); `Store.completeFill` drops an in-flight fill whose generation no longer matches, and `Store.finishPiece` re-checks that generation after the cache write so a truncate, size reconcile, or distrust that landed during the pwrite cannot mark the fill's pre-mutation bytes. If the cache copy itself fails, overlapping piece marks drop (and the sidecar is saved) so this node's reads and `/have` answers cannot serve pre-write bytes; those pieces refill from origin. `Store.punchPiece` takes the same content lock as the copy so a cull cannot hole a piece between the write-through pwrite and its mark. Further misses on the writing node take the origin (`hydratePiece` in `src/fuse_fs.zig`): a fill discarded by a concurrent write-through retries once from origin, then fails the read with EIO rather than spinning while writers keep landing. `Store.truncateCacheFd` refuses to cut a live cache descriptor while a peer `/data` send (`Cached.xfer`) is streaming from it.
 
-Two writers on the same path: last `pwrite` on NFS wins. No cluster lock. The other node's cache can keep stale pieces until cull or size change. Ingest on one node; everyone else reads. Second copy of a model: new path.
+Two writers on the same path: last `pwrite` on NFS wins. No cluster lock. The other node's cache drops marks on the next open/read once it observes a newer origin mtime or a different inode (`Store.getIdentified`); until that stat, a warm read of already-cached pieces can still serve the previous write. Ingest on one node; everyone else reads. Second copy of a model: new path.
 
 UMA: kernel page cache is off (`direct_io`). mmap of FUSE files will fail; engines fall back to `read`. `--kernel-cache` if you need mmap and the file fits in RAM.
 

@@ -38,6 +38,10 @@
   `scripts/check.sh` fails if the venv's ruff, mypy, or Python disagree with
   those pins and `.python-version`.
 
+### Same-size origin rewrites drop cache marks - 2026-09-02
+- **A newer origin mtime or a different inode at the same path wipes piece marks and trusted hashes**, the way a size change already did. Size-only reconciliation kept the previous object's pieces after a same-size rewrite (another node's FUSE write, or a direct origin write), so FUSE reads and `/have`/`/data` could serve the old bytes. An older mtime on the same inode is treated as NFS attribute lag after this node's own write, not a rewrite. The identity is an optional trailer on `meta/*.pieces`, so a restart still sees it; older sidecars without a trailer keep their prior behavior until the next save.
+- **Manifest load no longer replaces a hash this node already recorded** from an origin fill or write-through. Origin bytes stay the trust root for that piece; a later or stale same-size manifest fills only the gaps.
+
 ### Mongolian FVS4 and shorthand format controls no longer pass the path and echo gates - 2026-09-02
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused.** `relOk` and `discover.printable` already refused Default_Ignorable including U+180B..U+180E, but a planted path `gguf/model\u180F.bin` or lease id `spark1\u1BCA0` still echoed as the unadorned name. Those sequences are refused now; incomplete encodings and visible neighbours in the same UTF-8 blocks (U+1810, U+1BC9F) stay legal display text.
 

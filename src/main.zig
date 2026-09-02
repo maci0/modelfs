@@ -1670,7 +1670,7 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         if (!builtin.is_test) std.log.err("origin size unusable for {s}", .{rel});
         return 1;
     };
-    const file = store.get(rel, size, sys.monoSec(dummy_io.io())) catch |err| {
+    const file = store.getIdentified(rel, size, store_mod.OriginId.fromStat(st), sys.monoSec(dummy_io.io())) catch |err| {
         if (!builtin.is_test) std.log.err("cache entry open failed for {s} ({t})", .{ rel, err });
         return 1;
     };

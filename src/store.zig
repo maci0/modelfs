@@ -215,6 +215,54 @@ fn unlinkOrWarn(path_z: [*:0]const u8, what: []const u8, rel: []const u8) void {
         std.log.warn("cannot remove cached {s} for {s} (errno {d})", .{ what, rel, -rc });
 }
 
+/// Origin file identity used to detect a same-size rewrite that size-only
+/// reconciliation cannot see (another node's FUSE write, or a direct write
+/// into the origin tree). Trailer on `meta/*.pieces`; optional, so older
+/// sidecars still load. An unknown identity skips the check.
+pub const OriginId = struct {
+    mtime_sec: i64 = 0,
+    mtime_nsec: i64 = 0,
+    ino: u64 = 0,
+    known: bool = false,
+
+    pub const encoded_len: usize = 24;
+
+    pub fn fromStat(st: c.struct_stat) OriginId {
+        return .{
+            .mtime_sec = st.st_mtim.tv_sec,
+            .mtime_nsec = @intCast(st.st_mtim.tv_nsec),
+            .ino = @intCast(st.st_ino),
+            .known = true,
+        };
+    }
+
+    /// True when `observed` is a different object or a strictly newer write
+    /// of the same object. An older or equal mtime on the same ino is NFS
+    /// attribute lag after our own write, not a rewrite.
+    pub fn contentChanged(recorded: OriginId, observed: OriginId) bool {
+        if (!recorded.known or !observed.known) return false;
+        if (recorded.ino != observed.ino) return true;
+        if (observed.mtime_sec != recorded.mtime_sec)
+            return observed.mtime_sec > recorded.mtime_sec;
+        return observed.mtime_nsec > recorded.mtime_nsec;
+    }
+
+    fn write(self: OriginId, out: *[encoded_len]u8) void {
+        std.mem.writeInt(i64, out[0..8], self.mtime_sec, .little);
+        std.mem.writeInt(i64, out[8..16], self.mtime_nsec, .little);
+        std.mem.writeInt(u64, out[16..24], self.ino, .little);
+    }
+
+    fn read(blob: *const [encoded_len]u8) OriginId {
+        return .{
+            .mtime_sec = std.mem.readInt(i64, blob[0..8], .little),
+            .mtime_nsec = std.mem.readInt(i64, blob[8..16], .little),
+            .ino = std.mem.readInt(u64, blob[16..24], .little),
+            .known = true,
+        };
+    }
+};
+
 pub const Store = struct {
     /// Idle window a file must exceed before a cached piece may be punched:
     /// cullOne picks candidates this stale, and punchPiece revalidates under
@@ -339,6 +387,12 @@ pub const Store = struct {
         /// write-through, or a size-change wipe). mf_release publishes when
         /// set. Read/written under file.mu.
         manifest_dirty: bool = false,
+        /// Origin mtime/ino last observed for this path. A later get() whose
+        /// origin stat is a different ino or a newer mtime wipes marks the
+        /// way a size change does, so a same-size rewrite cannot serve the
+        /// previous file's bytes. Unknown until the first origin-stat'd
+        /// get() or a sidecar trailer loads.
+        origin_id: OriginId = .{},
 
         pub fn deinit(self: *Cached, gpa: std.mem.Allocator) void {
             sys.close(self.cache_fd);
@@ -645,9 +699,10 @@ pub const Store = struct {
     const LoadedBits = struct {
         bits: piece.Bitfield,
         discarded: bool,
+        id: OriginId = .{},
     };
 
-    fn loadBits(self: *Store, rel: []const u8, file_size: u64) !LoadedBits {
+    fn loadBits(self: *Store, rel: []const u8, file_size: u64, origin_id: OriginId) !LoadedBits {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = try self.cacheMetaPath(&buf, rel);
         var open_errno: i32 = 0;
@@ -662,6 +717,7 @@ pub const Store = struct {
                 return .{
                     .bits = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size)),
                     .discarded = open_errno != c.ENOENT,
+                    .id = .{},
                 };
             },
             // Allocation failure propagates: callers turn it into EIO/500
@@ -677,6 +733,7 @@ pub const Store = struct {
                 return .{
                     .bits = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size)),
                     .discarded = true,
+                    .id = .{},
                 };
             },
         };
@@ -694,6 +751,7 @@ pub const Store = struct {
                 return .{
                     .bits = try piece.Bitfield.init(self.gpa, piece.count(file_size, self.piece_size)),
                     .discarded = true,
+                    .id = .{},
                 };
             },
         };
@@ -703,7 +761,19 @@ pub const Store = struct {
         const stale = blob.len >= 16 and std.mem.eql(u8, blob[0..4], piece.magic) and
             (std.mem.readInt(u32, blob[4..8], .little) != self.piece_size or
                 std.mem.readInt(u64, blob[8..16], .little) != file_size);
-        return .{ .bits = bits, .discarded = stale };
+        if (stale) return .{ .bits = bits, .discarded = true, .id = .{} };
+        // Optional identity trailer after the bit bytes. Older sidecars omit
+        // it; a rewrite then has no stamp to compare until the next save.
+        var id = OriginId{};
+        const trailer_off = 16 + bits.bytes.len;
+        if (blob.len >= trailer_off + OriginId.encoded_len) {
+            id = OriginId.read(blob[trailer_off..][0..OriginId.encoded_len]);
+            if (OriginId.contentChanged(id, origin_id)) {
+                @memset(bits.bytes, 0);
+                return .{ .bits = bits, .discarded = true, .id = id };
+            }
+        }
+        return .{ .bits = bits, .discarded = false, .id = id };
     }
 
     /// Persists the entry's current bits after a discarded sidecar load.
@@ -750,7 +820,8 @@ pub const Store = struct {
         // Stack for any sidecar that fits (16 KiB of bits is a 2 TiB file at
         // the default 16 MiB piece): a piece fill used to heap-allocate a
         // copy of bits the entry already holds, once per hydrated piece.
-        const need = file.bits.encodedLen();
+        const id_extra: usize = if (file.origin_id.known) OriginId.encoded_len else 0;
+        const need = file.bits.encodedLen() + id_extra;
         var stack: [16 * 1024]u8 = undefined;
         var heap: []u8 = &.{};
         defer if (heap.len != 0) self.gpa.free(heap);
@@ -762,9 +833,15 @@ pub const Store = struct {
             heap = h;
             break :blk h;
         };
-        const blob = file.bits.encodeTo(self.piece_size, file.size, buf) catch {
+        const bits_blob = file.bits.encodeTo(self.piece_size, file.size, buf) catch {
             std.log.warn("bitfield encode failed for {s}; cache state resets on restart", .{file.rel});
             return false;
+        };
+        const blob: []const u8 = if (!file.origin_id.known) bits_blob else blk: {
+            var trailer: [OriginId.encoded_len]u8 = undefined;
+            file.origin_id.write(&trailer);
+            @memcpy(buf[bits_blob.len..][0..OriginId.encoded_len], &trailer);
+            break :blk buf[0 .. bits_blob.len + OriginId.encoded_len];
         };
         var path_buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cacheMetaPath(&path_buf, file.rel) catch {
@@ -789,12 +866,25 @@ pub const Store = struct {
     /// old bytes or hole zeros as current. Must be called WITHOUT store.mu
     /// held (it takes content_mu then file.mu internally).
     fn reconcileSize(self: *Store, f: *Cached, file_size: u64) !*Cached {
-        // Size is mutated under file.mu; an unlocked compare races a
-        // concurrent truncate and can skip a needed wipe, or two getters
-        // that both sampled a mismatch can each swap in an empty field,
-        // the second wiping a fill that landed between them.
+        return self.reconcile(f, file_size, OriginId{});
+    }
+
+    /// Brings a live entry in line with a freshly observed origin size and
+    /// identity. Size mismatch is the existing wipe; a same-size rewrite
+    /// (newer mtime or different ino) is the same wipe, because the bits
+    /// still name the previous object's pieces. An unknown identity is
+    /// adopted without wiping so the next rewrite is visible. Callers that
+    /// have no origin stat pass OriginId{} and keep size-only behavior.
+    fn reconcile(self: *Store, f: *Cached, file_size: u64, origin_id: OriginId) !*Cached {
+        // Size and identity are mutated under file.mu; an unlocked compare
+        // races a concurrent truncate and can skip a needed wipe, or two
+        // getters that both sampled a mismatch can each swap in an empty
+        // field, the second wiping a fill that landed between them.
         f.mu.lockUncancelable(self.io);
-        if (f.size == file_size) {
+        const size_chg = f.size != file_size;
+        const content_chg = OriginId.contentChanged(f.origin_id, origin_id);
+        if (!size_chg and !content_chg) {
+            self.adoptOriginIdLocked(f, origin_id);
             f.mu.unlock(self.io);
             return f;
         }
@@ -810,7 +900,10 @@ pub const Store = struct {
         f.content_mu.lockUncancelable(self.io);
         defer f.content_mu.unlock(self.io);
         f.mu.lockUncancelable(self.io);
-        if (f.size == file_size) {
+        const size_chg2 = f.size != file_size;
+        const content_chg2 = OriginId.contentChanged(f.origin_id, origin_id);
+        if (!size_chg2 and !content_chg2) {
+            self.adoptOriginIdLocked(f, origin_id);
             f.mu.unlock(self.io);
             nb.deinit(self.gpa);
             return f;
@@ -819,9 +912,10 @@ pub const Store = struct {
         f.bits = nb;
         f.size = file_size;
         f.writes += 1;
-        // Digests described the pre-resize bytes: a size change means the
-        // old hashes can no longer gate refills of the new content.
+        // Digests described the pre-resize / pre-rewrite bytes: they can
+        // no longer gate refills of the new content.
         self.clearHashes(f);
+        if (origin_id.known) f.origin_id = origin_id;
         truncateCacheFd(f, file_size);
         // Same best-effort save mf_truncate pairs with its own swap: the
         // reset must outlive the process to count as an invalidation.
@@ -831,14 +925,23 @@ pub const Store = struct {
         return f;
     }
 
+    /// Caller holds file.mu. Records `origin_id` when the entry has none.
+    /// Persists only when there are marks to protect: first-touch of a new
+    /// file must not create an empty sidecar.
+    fn adoptOriginIdLocked(self: *Store, f: *Cached, origin_id: OriginId) void {
+        if (!origin_id.known or f.origin_id.known) return;
+        f.origin_id = origin_id;
+        if (f.bits.lastSet() != null) _ = self.saveBits(f, false);
+    }
+
     /// References a map hit found while holding store.mu, releases the lock,
-    /// and returns the entry reconciled to file_size; on reconcile failure
-    /// the reference is released before the error escapes (the one cleanup
-    /// rule all three lookup sites in get() must share).
-    fn refHitUnlocking(self: *Store, hit: *Cached, file_size: u64) !*Cached {
+    /// and returns the entry reconciled to file_size and origin identity; on
+    /// reconcile failure the reference is released before the error escapes
+    /// (the one cleanup rule all three lookup sites in get() must share).
+    fn refHitUnlocking(self: *Store, hit: *Cached, file_size: u64, origin_id: OriginId) !*Cached {
         _ = hit.refs.fetchAdd(1, .monotonic);
         self.mu.unlock(self.io);
-        return self.reconcileSize(hit, file_size) catch |err| {
+        return self.reconcile(hit, file_size, origin_id) catch |err| {
             self.releaseFile(hit);
             return err;
         };
@@ -852,6 +955,13 @@ pub const Store = struct {
     /// state plus caller-supplied instants, so simulation drives them without
     /// touching the wall clock.
     pub fn get(self: *Store, rel: []const u8, file_size: u64, now_sec: i64) !*Cached {
+        return self.getIdentified(rel, file_size, OriginId{}, now_sec);
+    }
+
+    /// Like get(), with the origin identity from the stat that produced
+    /// `file_size`. A same-size rewrite (newer mtime or different ino) wipes
+    /// marks the way a size change does. Callers without a stat use get().
+    pub fn getIdentified(self: *Store, rel: []const u8, file_size: u64, origin_id: OriginId, now_sec: i64) !*Cached {
         // Every pass probes the map first and serves a hit without any disk
         // I/O under the global lock; warm callers end there. A miss builds
         // the entry (sidecar read + decode) outside the lock so one cold
@@ -864,7 +974,7 @@ pub const Store = struct {
         // map probe and epoch sample.
         while (true) {
             self.mu.lockUncancelable(self.io);
-            if (self.files.get(rel)) |hit| return self.refHitUnlocking(hit, file_size);
+            if (self.files.get(rel)) |hit| return self.refHitUnlocking(hit, file_size, origin_id);
             const epoch0 = self.purge_epoch;
             self.mu.unlock(self.io);
 
@@ -878,7 +988,7 @@ pub const Store = struct {
                 errdefer self.gpa.destroy(raw);
                 const rel_own = try self.gpa.dupe(u8, rel);
                 errdefer self.gpa.free(rel_own);
-                const loaded = try self.loadBits(rel, file_size);
+                const loaded = try self.loadBits(rel, file_size, origin_id);
                 errdefer loaded.bits.deinit(self.gpa);
                 discarded = loaded.discarded;
                 raw.* = .{
@@ -888,6 +998,7 @@ pub const Store = struct {
                     .filling = std.AutoHashMap(u32, u64).init(self.gpa),
                     .hashes = std.AutoHashMap(u32, [piece.digest_len]u8).init(self.gpa),
                     .last_access = .init(now_sec),
+                    .origin_id = loaded.id,
                 };
                 break :blk raw;
             };
@@ -895,7 +1006,7 @@ pub const Store = struct {
             self.mu.lockUncancelable(self.io);
             if (self.files.get(rel)) |winner| {
                 defer f.deinit(self.gpa);
-                return self.refHitUnlocking(winner, file_size);
+                return self.refHitUnlocking(winner, file_size, origin_id);
             }
             if (self.purge_epoch != epoch0) {
                 self.mu.unlock(self.io);
@@ -917,7 +1028,10 @@ pub const Store = struct {
             // over post-wipe content. First-touch (no sidecar) does not
             // write one.
             if (discarded) self.persistDiscardedWipe(f);
-            return f;
+            return self.reconcile(f, file_size, origin_id) catch |err| {
+                self.releaseFile(f);
+                return err;
+            };
         }
     }
 
@@ -1334,12 +1448,15 @@ pub const Store = struct {
             file.manifest_size = file.size;
             return;
         }
-        // Manifest entries are expectations, not local admits: they must
-        // not mark the entry dirty (they already exist on origin) and they
-        // are overwritten by any local origin fill of the same piece.
-        for (mf.entries) |e| file.hashes.put(e.idx, e.hash) catch |err| {
-            std.log.warn("cannot load trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, e.idx, err });
-        };
+        // Manifest entries fill gaps only: a local origin fill or
+        // write-through is the trust root for that piece, and a later
+        // load (or a stale same-size manifest) must not replace it.
+        for (mf.entries) |e| {
+            if (file.hashes.contains(e.idx)) continue;
+            file.hashes.put(e.idx, e.hash) catch |err| {
+                std.log.warn("cannot load trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, e.idx, err });
+            };
+        }
         file.manifest_size = file.size;
     }
 
@@ -1694,9 +1811,16 @@ pub const Store = struct {
     /// sequential ingest). Call only when the observed origin size equals
     /// `end`; any other size goes through get()'s conservative reset.
     pub fn cacheFill(self: *Store, rel: []const u8, end: u64, off: u64, data: []const u8, now_sec: i64) void {
+        self.cacheFillIdentified(rel, end, off, data, OriginId{}, now_sec);
+    }
+
+    /// Like cacheFill(), recording the post-write origin identity so a later
+    /// getIdentified does not treat this node's own write as a foreign
+    /// rewrite (NFS mtime lag is ignored: an older stamp is not adopted).
+    pub fn cacheFillIdentified(self: *Store, rel: []const u8, end: u64, off: u64, data: []const u8, origin_id: OriginId, now_sec: i64) void {
         const file = blk: {
             if (self.lookupRef(rel)) |f| break :blk f;
-            break :blk self.get(rel, end, now_sec) catch {
+            break :blk self.getIdentified(rel, end, origin_id, now_sec) catch {
                 // Same contract as copyIntoCache's failures: say why reads
                 // will fall back to origin instead of skipping silently.
                 std.log.warn("cache fill skipped for {s} (no cache entry); reads fall back to origin", .{rel});
@@ -1749,9 +1873,26 @@ pub const Store = struct {
                 }
             }
             file.last_access.store(now_sec, .monotonic);
+            // Own write: adopt a newer/unknown identity so the next
+            // getIdentified does not wipe the copy we are about to mark.
+            // An older mtime on the same ino is NFS lag and is ignored.
+            if (origin_id.known and (!file.origin_id.known or OriginId.contentChanged(file.origin_id, origin_id)))
+                file.origin_id = origin_id;
         }
 
         _ = self.copyIntoCache(file, off, data);
+    }
+
+    /// Records a post-write origin identity on a live entry without wiping
+    /// marks. Same-ino older mtime is NFS lag and is ignored.
+    pub fn noteOriginId(self: *Store, file: *Cached, id: OriginId) void {
+        if (!id.known) return;
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        if (!file.origin_id.known or OriginId.contentChanged(file.origin_id, id)) {
+            file.origin_id = id;
+            _ = self.saveBits(file, false);
+        }
     }
 
     /// Copies a landed origin write into the cache fd and marks the pieces it
@@ -2231,7 +2372,7 @@ pub const Store = struct {
         self.mu.lockUncancelable(self.io);
         const epoch0 = self.purge_epoch;
         self.mu.unlock(self.io);
-        var loaded = self.loadBits(rel, size) catch |err| {
+        var loaded = self.loadBits(rel, size, OriginId{}) catch |err| {
             std.log.warn("cannot load piece sidecar for {s} ({t}); piece stays cached", .{ rel, err });
             return false;
         };
@@ -5917,4 +6058,179 @@ test "a transient manifest absence is retried and picked up after publication" {
     sys.sleepMs(std.testing.io, 10);
     const got = reader.expectedHash(rf, 0).?;
     try std.testing.expectEqualSlices(u8, &h0, &got);
+}
+
+test "OriginId.contentChanged is newer mtime or ino, never older mtime" {
+    const a = OriginId{ .mtime_sec = 10, .mtime_nsec = 5, .ino = 1, .known = true };
+    const newer_sec = OriginId{ .mtime_sec = 11, .mtime_nsec = 0, .ino = 1, .known = true };
+    const newer_nsec = OriginId{ .mtime_sec = 10, .mtime_nsec = 6, .ino = 1, .known = true };
+    const older = OriginId{ .mtime_sec = 9, .mtime_nsec = 0, .ino = 1, .known = true };
+    const other_ino = OriginId{ .mtime_sec = 10, .mtime_nsec = 5, .ino = 2, .known = true };
+    const unknown = OriginId{};
+    try std.testing.expect(OriginId.contentChanged(a, newer_sec));
+    try std.testing.expect(OriginId.contentChanged(a, newer_nsec));
+    try std.testing.expect(OriginId.contentChanged(a, other_ino));
+    try std.testing.expect(!OriginId.contentChanged(a, older));
+    try std.testing.expect(!OriginId.contentChanged(a, a));
+    try std.testing.expect(!OriginId.contentChanged(a, unknown));
+    try std.testing.expect(!OriginId.contentChanged(unknown, newer_sec));
+}
+
+test "same-size rewrite with newer mtime wipes cache marks and hashes" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-id-mtime");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-id-mtime");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const t0: i64 = 1_000;
+    const id1 = OriginId{ .mtime_sec = 100, .mtime_nsec = 0, .ino = 7, .known = true };
+    const id2 = OriginId{ .mtime_sec = 200, .mtime_nsec = 0, .ino = 7, .known = true };
+    const f = try st.getIdentified("rw.bin", 16, id1, t0);
+    var h: [piece.digest_len]u8 = undefined;
+    piece.digest("0123456789abcdef", &h);
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, t0)).len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", h, t0));
+    try std.testing.expect(st.hasPiece(f, 0, t0));
+    try std.testing.expect(st.expectedHash(f, 0) != null);
+
+    const f2 = try st.getIdentified("rw.bin", 16, id2, t0);
+    defer st.releaseFile(f2);
+    try std.testing.expectEqual(f, f2);
+    st.releaseFile(f);
+    try std.testing.expect(!st.hasPiece(f2, 0, t0));
+    try std.testing.expect(st.expectedHash(f2, 0) == null);
+}
+
+test "older origin mtime does not wipe (NFS attribute lag)" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-id-lag");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-id-lag");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const t0: i64 = 1_000;
+    const id1 = OriginId{ .mtime_sec = 200, .mtime_nsec = 0, .ino = 7, .known = true };
+    const lag = OriginId{ .mtime_sec = 100, .mtime_nsec = 0, .ino = 7, .known = true };
+    const f = try st.getIdentified("lag.bin", 16, id1, t0);
+    defer st.releaseFile(f);
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, t0)).len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", null, t0));
+
+    const f2 = try st.getIdentified("lag.bin", 16, lag, t0);
+    defer st.releaseFile(f2);
+    try std.testing.expect(st.hasPiece(f2, 0, t0));
+}
+
+test "ino change at the same size wipes cache marks" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-id-ino");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-id-ino");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const t0: i64 = 1_000;
+    const id1 = OriginId{ .mtime_sec = 100, .mtime_nsec = 0, .ino = 7, .known = true };
+    const id2 = OriginId{ .mtime_sec = 100, .mtime_nsec = 0, .ino = 8, .known = true };
+    const f = try st.getIdentified("ino.bin", 16, id1, t0);
+    defer st.releaseFile(f);
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, t0)).len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", null, t0));
+
+    const f2 = try st.getIdentified("ino.bin", 16, id2, t0);
+    defer st.releaseFile(f2);
+    try std.testing.expect(!st.hasPiece(f2, 0, t0));
+}
+
+test "sidecar identity trailer wipes a same-size rewrite across restart" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-id-restart");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-id-restart");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const t0: i64 = 1_000;
+    const id1 = OriginId{ .mtime_sec = 100, .mtime_nsec = 0, .ino = 7, .known = true };
+    const id2 = OriginId{ .mtime_sec = 200, .mtime_nsec = 0, .ino = 7, .known = true };
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+        const f = try st.getIdentified("rst.bin", 16, id1, t0);
+        defer st.releaseFile(f);
+        try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, t0)).len);
+        try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", null, t0));
+        try std.testing.expect(st.hasPiece(f, 0, t0));
+    }
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+        const f = try st.getIdentified("rst.bin", 16, id2, t0);
+        defer st.releaseFile(f);
+        try std.testing.expect(!st.hasPiece(f, 0, t0));
+        try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+    }
+}
+
+test "manifest load does not replace a local origin-fill hash" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-hash-keep");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-hash-keep");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("keep.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    var h_local: [piece.digest_len]u8 = undefined;
+    piece.digest("0123456789abcdef", &h_local);
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, sys.monoSec(std.testing.io))).len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", h_local, sys.monoSec(std.testing.io)));
+
+    var h_stale: [piece.digest_len]u8 = undefined;
+    piece.digest("ABCDEFGHIJKLMNOP", &h_stale);
+    var wcb: [128]u8 = undefined;
+    const writer_cache = try sys.scratchDir(&wcb, "modelfs-c-hash-keep-w");
+    defer sys.deleteTree(std.testing.io, writer_cache);
+    var writer = Store.init(gpa, std.testing.io, origin_d, writer_cache, 16);
+    defer writer.deinit();
+    try std.testing.expectEqual(@as(i32, 0), writer.ensureLayout());
+    const wf = try writer.get("keep.bin", 16, sys.monoSec(std.testing.io));
+    defer writer.releaseFile(wf);
+    try std.testing.expectEqual(@as(u32, 16), (try writer.beginFill(wf, 0, sys.monoSec(std.testing.io))).len);
+    try std.testing.expectEqual(@as(i32, 0), writer.completeFill(wf, 0, "ABCDEFGHIJKLMNOP", h_stale, sys.monoSec(std.testing.io)));
+    writer.publishManifest(wf);
+
+    f.mu.lockUncancelable(std.testing.io);
+    f.manifest_size = null;
+    f.manifest_retry_at = 0;
+    f.mu.unlock(std.testing.io);
+    const got = st.expectedHash(f, 0).?;
+    try std.testing.expectEqualSlices(u8, &h_local, &got);
 }

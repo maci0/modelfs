@@ -463,7 +463,7 @@ fn cachedFor(st: *State, rel: []const u8) ?*store_mod.Store.Cached {
     if (st.store.statOrigin(rel, &ost) != 0) return null;
     if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return null;
     const size = sys.sizeFromStat(ost.st_size) orelse return null;
-    return st.store.get(rel, size, sys.monoSec(st.io)) catch null;
+    return st.store.getIdentified(rel, size, store_mod.OriginId.fromStat(ost), sys.monoSec(st.io)) catch null;
 }
 
 export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
@@ -486,7 +486,7 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
             std.log.warn("origin size unusable for {s}; failing open", .{rel});
             return -sys.c.EIO;
         };
-        const file = st.store.get(rel, size, sys.monoSec(st.io)) catch |err| {
+        const file = st.store.getIdentified(rel, size, store_mod.OriginId.fromStat(ost), sys.monoSec(st.io)) catch |err| {
             std.log.warn("cache entry open failed for {s} ({t}); failing open", .{ rel, err });
             return -sys.c.ENOMEM;
         };
@@ -781,7 +781,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         std.log.warn("origin size unusable for {s}; failing read", .{rel});
         return -sys.c.EIO;
     };
-    const file = st.store.get(rel, origin_size, sys.monoSec(st.io)) catch |err| {
+    const file = st.store.getIdentified(rel, origin_size, store_mod.OriginId.fromStat(ost), sys.monoSec(st.io)) catch |err| {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         std.log.warn("cache entry open failed for {s} ({t}); failing read", .{ rel, err });
         return -sys.c.ENOMEM;
@@ -862,7 +862,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     const osize: ?u64 = if (regular) sys.sizeFromStat(ost.st_size) else null;
     if (osize) |sz| {
         if (sz == end) {
-            st.store.cacheFill(rel, end, uoff, buf[0..@intCast(n)], sys.monoSec(st.io));
+            st.store.cacheFillIdentified(rel, end, uoff, buf[0..@intCast(n)], store_mod.OriginId.fromStat(ost), sys.monoSec(st.io));
             return @intCast(n);
         }
     }
@@ -874,7 +874,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     // observed size lagged the write (the common ingest shape).
     const live = blk: {
         if (osize) |sz|
-            break :blk st.store.get(rel, sz, sys.monoSec(st.io)) catch null;
+            break :blk st.store.getIdentified(rel, sz, store_mod.OriginId.fromStat(ost), sys.monoSec(st.io)) catch null;
         // Failed observation: one retry through cachedFor's own stat before
         // trust is dropped below, so a single flaky GETATTR cannot wipe marks.
         break :blk cachedFor(st, rel);
@@ -898,6 +898,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
         // The origin write already succeeded, so a failed cache copy only
         // costs re-hydration; the helper logs it and skips piece marking.
         _ = st.store.copyIntoCache(file, uoff, buf[0..@intCast(n)]);
+        if (regular) st.store.noteOriginId(file, store_mod.OriginId.fromStat(ost));
         return @intCast(n);
     }
     // Neither a matching size observation nor a live cache entry landed:

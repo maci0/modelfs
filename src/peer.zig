@@ -519,11 +519,17 @@ fn decodePath(target: []const u8, out: []u8) ![]u8 {
     return proto.urlDecode(out, q);
 }
 
-/// Origin size of a regular file at `rel`, or null after sending the matching
-/// error reply. /have, /data, and /stage share this so a directory cannot 404
-/// on one route and 502 on another, and an unusable st_size stays 502 on
-/// every route.
-fn originRegularSize(self: *Server, fd: std.posix.fd_t, rel: []const u8) ?u64 {
+const OriginReg = struct {
+    size: u64,
+    id: store_mod.OriginId,
+};
+
+/// Origin size and identity of a regular file at `rel`, or null after sending
+/// the matching error reply. /have, /data, and /stage share this so a directory
+/// cannot 404 on one route and 502 on another, and an unusable st_size stays
+/// 502 on every route. Identity rides with the size so a same-size rewrite
+/// wipes this node's marks before /have advertises them or /data serves them.
+fn originRegular(self: *Server, fd: std.posix.fd_t, rel: []const u8) ?OriginReg {
     var st: sys.c.struct_stat = undefined;
     const rc = self.store.statOrigin(rel, &st);
     if (rc != 0) {
@@ -540,18 +546,19 @@ fn originRegularSize(self: *Server, fd: std.posix.fd_t, rel: []const u8) ?u64 {
         replyStatus(self, fd, "404 Not Found");
         return null;
     }
-    return sys.sizeFromStat(st.st_size) orelse {
+    const size = sys.sizeFromStat(st.st_size) orelse {
         std.log.warn("origin size unusable for {s}; replying 502", .{rel});
         replyStatus(self, fd, "502 Bad Gateway");
         return null;
     };
+    return .{ .size = size, .id = store_mod.OriginId.fromStat(st) };
 }
 
 /// Live cache entry for `rel`, or null after a 500. Shared by /have, /data,
 /// and /stage so an open failure cannot 500 on one route and drop the
 /// connection on the other.
-fn cacheEntry(self: *Server, fd: std.posix.fd_t, rel: []const u8, size: u64) ?*store_mod.Store.Cached {
-    return self.store.get(rel, size, sys.monoSec(self.io)) catch |err| {
+fn cacheEntry(self: *Server, fd: std.posix.fd_t, rel: []const u8, orig: OriginReg) ?*store_mod.Store.Cached {
+    return self.store.getIdentified(rel, orig.size, orig.id, sys.monoSec(self.io)) catch |err| {
         // The fetching peer only sees 500; without this line the serving
         // node's log says nothing about why.
         std.log.warn("cache entry open failed for {s} ({t}); replying 500", .{ rel, err });
@@ -561,18 +568,18 @@ fn cacheEntry(self: *Server, fd: std.posix.fd_t, rel: []const u8, size: u64) ?*s
 }
 
 fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
-    const size = originRegularSize(self, fd, rel) orelse return;
+    const orig = originRegular(self, fd, rel) orelse return;
     // Fetchers refuse a /have body above max_have_body_bytes. Serving one
     // would still open a cache entry (Bitfield.init of up to 512 MiB at
     // --piece 1 on a large sparse file) and dupe it for a reply no peer
     // would accept. Refuse before get() so the snapshot cannot land.
-    const nbits = piece.count(size, self.store.piece_size);
+    const nbits = piece.count(orig.size, self.store.piece_size);
     if (piece.Bitfield.bytesLen(nbits) > max_have_body_bytes) {
         std.log.warn("have bitmap for {s} exceeds {d} bytes; replying 500", .{ rel, max_have_body_bytes });
         replyStatus(self, fd, "500 Internal Server Error");
         return;
     }
-    const file = cacheEntry(self, fd, rel, size) orelse return;
+    const file = cacheEntry(self, fd, rel, orig) orelse return;
     defer self.store.releaseFile(file);
     // Snapshot the bits under the lock and answer outside it: a stalled peer
     // socket (30s send timeout) must not pin file.mu and freeze local reads,
@@ -630,8 +637,9 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
 /// into the staging buffer; once the bytes are in the backend's registered
 /// copy the cache fd no longer matters, so a punch after stage is safe.
 fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, idx: u32) void {
-    const size = originRegularSize(self, fd, rel) orelse return;
-    const file = cacheEntry(self, fd, rel, size) orelse return;
+    const orig = originRegular(self, fd, rel) orelse return;
+    const size = orig.size;
+    const file = cacheEntry(self, fd, rel, orig) orelse return;
     defer self.store.releaseFile(file);
     // Same whole-transfer guard as serveData: hydration and the staging
     // read must not race a punch, and a hole read here would stage zeros.
@@ -971,7 +979,8 @@ fn verifyRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
 }
 
 fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range) void {
-    const size = originRegularSize(self, fd, rel) orelse return;
+    const orig = originRegular(self, fd, rel) orelse return;
+    const size = orig.size;
     if (rg.start >= size or rg.end < rg.start) {
         // RFC 9110 §15.5.17/§14.4: a 416 should carry the selected
         // representation's complete length, so a client can recompute a
@@ -990,7 +999,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     // here would break ordinary HTTP clients asking for the rest of the file;
     // the internal peer protocol always sends exact piece bounds.
     const rg_end = @min(rg.end, size - 1);
-    const file = cacheEntry(self, fd, rel, size) orelse return;
+    const file = cacheEntry(self, fd, rel, orig) orelse return;
     defer self.store.releaseFile(file);
     // The whole response (hydration plus streaming) is one transfer: hold
     // punchPiece off for its duration. Per-chunk recency stamping alone
