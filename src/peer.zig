@@ -3960,6 +3960,9 @@ const seed_reply_zero_ps = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 
 const seed_reply_status_2000 = fuzzcorpus.entry("HTTP/1.1 2000 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nz");
 const seed_reply_status_4040 = fuzzcorpus.entry("HTTP/1.1 4040 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 const seed_reply_206_cl_mismatch = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-7/8\r\nConnection: close\r\n\r\nABCD");
+const seed_reply_stage = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16\r\nX-Stage: 1\r\nConnection: close\r\n\r\n\x01");
+const seed_reply_stage_true = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16\r\nX-Stage: true\r\nConnection: close\r\n\r\n\x01");
+const seed_reply_bitmap = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\n\x01\x80");
 
 const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_ok,
@@ -3982,6 +3985,9 @@ const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_status_2000,
     &seed_reply_status_4040,
     &seed_reply_206_cl_mismatch,
+    &seed_reply_stage,
+    &seed_reply_stage_true,
+    &seed_reply_bitmap,
 };
 
 /// Connected socketpair with `wire` already written into fds[0]: a
@@ -4000,6 +4006,17 @@ fn refDigitsU64(s: []const u8) ?u64 {
         if (ch < '0' or ch > '9') return null;
     }
     return std.fmt.parseInt(u64, s, 10) catch null;
+}
+
+/// Independent restatement of HaveBits.hasPiece: a mismatched advertised
+/// grid is no-answer, and bit `idx` is packed little-endian (bit 0 of
+/// byte 0) with an index past the slice unset. Digit-shift math instead
+/// of piece.bitIsSet so a corrupted packing helper cannot self-confirm.
+fn refHasPiece(bits: []const u8, piece_size: u32, idx: u32, local_piece_size: u32) bool {
+    if (piece_size != 0 and piece_size != local_piece_size) return false;
+    const byte_i = @divFloor(@as(usize, idx), 8);
+    if (byte_i >= bits.len) return false;
+    return bits[byte_i] & (@as(u8, 1) << @intCast(idx % 8)) != 0;
 }
 
 /// Independent restatement of httpStatusIs: "HTTP/1.1" SP 3DIGIT, then
@@ -4114,6 +4131,26 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                     const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
                     const ps_n = proto.parseU64Fast(ps_str) orelse return error.TestUnexpectedResult;
                     try std.testing.expectEqual(std.math.cast(u32, ps_n) orelse return error.TestUnexpectedResult, rep.piece_size);
+                    // X-Stage is the /stage probe gate: only the exact
+                    // token "1" advertises a staged data plane. Anything
+                    // else (absent, "true", "1 ") must not look staged.
+                    const want_stage = blk: {
+                        const v = proto.headerGet(head, "X-Stage") orelse break :blk false;
+                        break :blk v.len == 1 and v[0] == '1';
+                    };
+                    try std.testing.expectEqual(want_stage, rep.stage);
+                    // hasPiece is the fill-routing trust boundary: a
+                    // misaligned advertised grid cannot look like a hit,
+                    // and an index past the bitmap stays unset. Fixed
+                    // indices so existing corpus field mapping is unchanged.
+                    for ([_]u32{ 0, 7, 8, 15, 63, std.math.maxInt(u32) }) |idx| {
+                        for ([_]u32{ 0, 16, 4096, 8192, rep.piece_size }) |local_ps| {
+                            try std.testing.expectEqual(
+                                refHasPiece(rep.bits, rep.piece_size, idx, local_ps),
+                                rep.hasPiece(idx, local_ps),
+                            );
+                        }
+                    }
                 } else |_| {}
             } else |_| {}
         }

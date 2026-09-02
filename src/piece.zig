@@ -476,6 +476,69 @@ test "sidecarPieceSize reads the header and refuses a zero or foreign blob" {
     try std.testing.expect(sidecarPieceSize("") == null);
 }
 
+fn pieceSizeHdr(comptime ps: u32) [8]u8 {
+    var b: [8]u8 = undefined;
+    @memcpy(b[0..4], magic);
+    std.mem.writeInt(u32, b[4..8], ps, .little);
+    return b;
+}
+
+const seed_ps_clean = fuzzcorpus.entry(&pieceSizeHdr(4096));
+const seed_ps_one = fuzzcorpus.entry(&pieceSizeHdr(1));
+const seed_ps_max = fuzzcorpus.entry(&pieceSizeHdr(std.math.maxInt(u32)));
+const seed_ps_zero = fuzzcorpus.entry(&pieceSizeHdr(0));
+const seed_ps_truncated = fuzzcorpus.entry("MFS1\x00");
+const seed_ps_bad_magic = fuzzcorpus.entry("XXXX\x00\x10\x00\x00");
+const seed_ps_empty = fuzzcorpus.entry("");
+const seed_ps_trailing = fuzzcorpus.entry(&blk: {
+    var b: [12]u8 = undefined;
+    @memcpy(b[0..8], &pieceSizeHdr(16));
+    @memset(b[8..], 0xff);
+    break :blk b;
+});
+
+const fuzz_ps_corpus = [_][]const u8{
+    &seed_ps_clean,
+    &seed_ps_one,
+    &seed_ps_max,
+    &seed_ps_zero,
+    &seed_ps_truncated,
+    &seed_ps_bad_magic,
+    &seed_ps_empty,
+    &seed_ps_trailing,
+};
+
+/// `modelfs verify` sizes its grid from this 8-byte header on a cache
+/// sidecar anyone with the cache dir can plant. The harness asserts the
+/// published contract, not just crash-freedom: null on a short, foreign,
+/// or zero-size blob; the little-endian u32 otherwise, ignoring bytes
+/// past the prefix; and a decoded size re-encodes to the same header.
+fn fuzzSidecarPieceSizeOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [32]u8 = undefined;
+    const blob = buf[0..smith.slice(&buf)];
+
+    const want: ?u32 = if (blob.len < 8)
+        null
+    else if (!std.mem.eql(u8, blob[0..4], magic))
+        null
+    else blk: {
+        const ps = std.mem.readInt(u32, blob[4..8], .little);
+        break :blk if (ps != 0) ps else null;
+    };
+    try std.testing.expectEqual(want, sidecarPieceSize(blob));
+
+    if (want) |ps| {
+        var canon: [8]u8 = undefined;
+        @memcpy(canon[0..4], magic);
+        std.mem.writeInt(u32, canon[4..8], ps, .little);
+        try std.testing.expectEqual(@as(?u32, ps), sidecarPieceSize(&canon));
+    }
+}
+
+test "fuzz sidecar piece-size header matches an independent 8-byte oracle" {
+    try std.testing.fuzz({}, fuzzSidecarPieceSizeOne, .{ .corpus = &fuzz_ps_corpus });
+}
+
 test "digest matches published blake3 vectors" {
     var out: [digest_len]u8 = undefined;
     digest("", &out);

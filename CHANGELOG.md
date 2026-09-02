@@ -9,6 +9,10 @@ until the next tag.
 ### Concurrent fills of one file share one /have probe - 2026-09-02
 - **A cold or TTL-expired have cache no longer probes the cluster once per concurrent piece.** `fillFromPeers` used to call `probeCandidates` per FUSE worker per piece, so a large read covering many holes (or a 2 s TTL expiry under several workers) stampeded every peer's `/have` and filled the 16 inflight slots, after which fetches dropped to origin. `Catalog.probeTryClaim` is the same singleflight `beginFill` uses per piece: one owner walks the cluster, waiters retry the have cache. Cap overflow still probes so a many-file cold start cannot wait on a slot that will never name that rel.
 
+### Sidecar piece-size header and /have bit tests are fuzzed - 2026-09-02
+- **`sidecarPieceSize` is asserted against an independent 8-byte oracle.** `modelfs verify` sizes its grid from this header on a cache sidecar; a truncated, foreign, or zero-size blob stays null, extra bytes past the prefix are ignored, and a decoded size re-encodes to the same header.
+- **Accepted `/have` replies now pin `HaveBits.hasPiece` and `X-Stage`.** A peer-advertised grid that is not ours cannot look like a hit, an index past the bitmap stays unset, and only the exact `X-Stage: 1` token advertises a staged data plane (`true` does not).
+
 ### FUSE unlink retry of a gone file is success - 2026-09-02
 - **`Store.unlinkOrigin` treats ENOENT as success.** `mkdir` of an existing
   directory and `rmdir` of a gone directory already converged so a FUSE
