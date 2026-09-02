@@ -4029,6 +4029,8 @@ const seed_req_zwsp_path = fuzzcorpus.entry("GET /have?path=a%E2%80%8B.bin HTTP/
 const seed_req_vs_path = fuzzcorpus.entry("GET /have?path=a%EF%B8%8F.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_shy_path = fuzzcorpus.entry("GET /have?path=a%C2%AD.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_vs17_path = fuzzcorpus.entry("GET /have?path=a%F3%A0%84%80.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_fvs4_path = fuzzcorpus.entry("GET /have?path=a%E1%A0%8F.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_req_shorthand_path = fuzzcorpus.entry("GET /have?path=a%F0%9B%B2%A0.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_inverted_range = fuzzcorpus.entry("GET /data?path=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=10-5\r\n\r\n");
 const seed_req_no_path = fuzzcorpus.entry("GET /have HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_req_c1_csi_path = fuzzcorpus.entry("GET /have?path=%C2%9B%5b0m HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
@@ -4046,6 +4048,8 @@ const fuzz_request_corpus = [_][]const u8{
     &seed_req_vs_path,
     &seed_req_shy_path,
     &seed_req_vs17_path,
+    &seed_req_fvs4_path,
+    &seed_req_shorthand_path,
     &seed_req_inverted_range,
     &seed_req_no_path,
     &seed_req_c1_csi_path,

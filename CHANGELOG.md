@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Mongolian FVS4 and shorthand format controls no longer pass the path and echo gates - 2026-09-02
+- **U+180F and U+1BCA0..U+1BCA3 in paths are refused.** `relOk` and `discover.printable` already refused Default_Ignorable including U+180B..U+180E, but a planted path `gguf/model\u180F.bin` or lease id `spark1\u1BCA0` still echoed as the unadorned name. Those sequences are refused now; incomplete encodings and visible neighbours in the same UTF-8 blocks (U+1810, U+1BC9F) stay legal display text.
+
 ## [0.5.0] - 2026-08-31
 
 Observability release on top of 0.4.0: the FUSE metadata handlers and the

@@ -1449,6 +1449,8 @@ test "printable gates lease names and ids for log echo" {
     try std.testing.expect(!printable("spark1\u{fe0f}"));
     try std.testing.expect(!printable("\u{feff}spark1"));
     try std.testing.expect(!printable("spark1\u{ad}"));
+    try std.testing.expect(!printable("spark1\u{180f}"));
+    try std.testing.expect(!printable("spark1\u{1bca0}"));
     try std.testing.expect(!printable("spark1\u{e0100}"));
     try std.testing.expect(!printable("spark1\u{e007f}"));
     // Display text above the C1 range stays echoable: NBSP (U+00A0) shares
@@ -1464,7 +1466,10 @@ test "printable gates lease names and ids for log echo" {
     try std.testing.expect(printable("a\xef\xb8"));
     try std.testing.expect(printable("a\xf3"));
     try std.testing.expect(printable("a\xf3\xa0\x84"));
+    try std.testing.expect(printable("a\xf0\x9b\xb2"));
     try std.testing.expect(printable("a\u{ac}"));
+    try std.testing.expect(printable("a\u{1810}"));
+    try std.testing.expect(printable("a\u{1bc9f}"));
 }
 
 test "displayName echoes printable names and withholds the rest" {
@@ -1476,6 +1481,8 @@ test "displayName echoes printable names and withholds the rest" {
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{200b}"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{fe0f}"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{ad}"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{180f}"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{1bca0}"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{e0100}"));
 }
 

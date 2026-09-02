@@ -192,11 +192,12 @@ pub fn bearerOk(got: []const u8, want: []const u8) bool {
 /// True when s holds a C0 byte, DEL, a UTF-8 C1 pair (U+0080..U+009F), or
 /// a UTF-8 Default_Ignorable_Code_Point: line/paragraph separators, bidi
 /// and zero-width format controls, variation selectors (BMP, Mongolian
-/// FVS, VS17-256), BOM, soft hyphen, CGJ, Hangul fillers, tags, and the
-/// rest of that Unicode property. store.relOk and discover.printable share
-/// this set so a planted name cannot inject into logs or terminals, or spoof
-/// an identity, through only one of the two gates. Incomplete UTF-8
-/// encodings are display noise, not controls.
+/// FVS including FVS4, VS17-256), BOM, soft hyphen, CGJ, Hangul fillers,
+/// shorthand format controls, tags, and the rest of that Unicode property.
+/// store.relOk and discover.printable share this set so a planted name
+/// cannot inject into logs or terminals, or spoof an identity, through
+/// only one of the two gates. Incomplete UTF-8 encodings are display
+/// noise, not controls.
 pub fn containsControl(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
@@ -229,8 +230,9 @@ pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
         if (b == 0x85 and (c3 == 0x9f or c3 == 0xa0)) return true;
         // U+17B4 / U+17B5 Khmer inherent vowels (deprecated, invisible).
         if (b == 0x9e and (c3 == 0xb4 or c3 == 0xb5)) return true;
-        // U+180B..U+180D Mongolian free variation selectors; U+180E MVS.
-        if (b == 0xa0 and c3 >= 0x8b and c3 <= 0x8e) return true;
+        // U+180B..U+180D Mongolian free variation selectors; U+180E MVS;
+        // U+180F FVS FOUR.
+        if (b == 0xa0 and c3 >= 0x8b and c3 <= 0x8f) return true;
     }
     if (ch == 0xe2 and i + 2 < s.len) {
         const b = s[i + 1];
@@ -263,6 +265,8 @@ pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
         if (b == 0xbf and c3 >= 0xb0 and c3 <= 0xbb) return true;
     }
     if (ch == 0xf0 and i + 3 < s.len) {
+        // U+1BCA0..U+1BCA3 shorthand format controls (Duployan overlap/join).
+        if (s[i + 1] == 0x9b and s[i + 2] == 0xb2 and s[i + 3] >= 0xa0 and s[i + 3] <= 0xa3) return true;
         // U+1D173..U+1D17A musical-symbol invisible format controls.
         if (s[i + 1] == 0x9d and s[i + 2] == 0x85 and s[i + 3] >= 0xb3 and s[i + 3] <= 0xba) return true;
     }
@@ -355,6 +359,8 @@ test "containsControl covers C0 C1 line separators and format controls" {
     try std.testing.expect(!containsControl("a\xe3.bin"));
     try std.testing.expect(!containsControl("a\xef\xbe.bin"));
     try std.testing.expect(!containsControl("a\xf0.bin"));
+    try std.testing.expect(!containsControl("a\xf0\x9b.bin"));
+    try std.testing.expect(!containsControl("a\xf0\x9b\xb2.bin"));
     try std.testing.expect(!containsControl("a\xf0\x9d\x85.bin"));
     try std.testing.expect(!containsControl("a\xf3.bin"));
     try std.testing.expect(!containsControl("a\xf3\xa0.bin"));
@@ -366,6 +372,8 @@ test "containsControl covers C0 C1 line separators and format controls" {
     try std.testing.expect(!containsControl("a\u{ac}b"));
     try std.testing.expect(!containsControl("a\u{ae}b"));
     try std.testing.expect(!containsControl("a\u{180a}b"));
+    try std.testing.expect(!containsControl("a\u{1810}b"));
+    try std.testing.expect(!containsControl("a\u{1bc9f}b"));
     try std.testing.expect(!containsControl("a\u{fffc}b"));
     try std.testing.expect(containsControl("a\nb"));
     try std.testing.expect(containsControl("a\x7fb"));
@@ -404,6 +412,9 @@ test "containsControl covers C0 C1 line separators and format controls" {
     try std.testing.expect(containsControl("a\u{115f}b"));
     try std.testing.expect(containsControl("a\u{180b}b"));
     try std.testing.expect(containsControl("a\u{180e}b"));
+    try std.testing.expect(containsControl("a\u{180f}b"));
+    try std.testing.expect(containsControl("a\u{1bca0}b"));
+    try std.testing.expect(containsControl("a\u{1bca3}b"));
     try std.testing.expect(containsControl("a\u{3164}b"));
     try std.testing.expect(containsControl("a\u{ffa0}b"));
     try std.testing.expect(containsControl("a\u{1d173}b"));
@@ -423,7 +434,8 @@ fn isControlScalar(cp: u21) bool {
         0x00ad, 0x034f, 0x061c, 0x115f, 0x1160, 0x17b4, 0x17b5, 0x3164, 0xfeff, 0xffa0 => return true,
         else => {},
     }
-    if (cp >= 0x180b and cp <= 0x180e) return true;
+    if (cp >= 0x180b and cp <= 0x180f) return true;
+    if (cp >= 0x1bca0 and cp <= 0x1bca3) return true;
     if (cp >= 0x200b and cp <= 0x200f) return true;
     if (cp >= 0x2028 and cp <= 0x202e) return true;
     if (cp >= 0x2060 and cp <= 0x206f) return true;
@@ -472,6 +484,8 @@ const seed_ctl_zwsp = fuzzcorpus.entry("a\xe2\x80\x8bb");
 const seed_ctl_invisible_op = fuzzcorpus.entry("a\xe2\x81\xafb");
 const seed_ctl_bom = fuzzcorpus.entry("a\xef\xbb\xbfb");
 const seed_ctl_tag = fuzzcorpus.entry("a\xf3\xa0\x80\x80b");
+const seed_ctl_fvs4 = fuzzcorpus.entry("a\xe1\xa0\x8fb");
+const seed_ctl_shorthand = fuzzcorpus.entry("a\xf0\x9b\xb2\xa0b");
 const seed_ctl_musical = fuzzcorpus.entry("a\xf0\x9d\x85\xb3b");
 const seed_ctl_truncated_2 = fuzzcorpus.entry("a\xc2");
 const seed_ctl_truncated_3 = fuzzcorpus.entry("a\xe2\x80");
@@ -491,6 +505,8 @@ const fuzz_control_corpus = [_][]const u8{
     &seed_ctl_invisible_op,
     &seed_ctl_bom,
     &seed_ctl_tag,
+    &seed_ctl_fvs4,
+    &seed_ctl_shorthand,
     &seed_ctl_musical,
     &seed_ctl_truncated_2,
     &seed_ctl_truncated_3,

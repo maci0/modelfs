@@ -28,7 +28,8 @@ pub const status_file = "status.json";
 /// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
 /// and UTF-8 Default_Ignorable_Code_Point including line separators, bidi
 /// and zero-width format controls, variation selectors, BOM, soft hyphen,
-/// CGJ, Hangul fillers, and tags), the same discover.printable applies
+/// CGJ, Hangul fillers, Mongolian FVS4, shorthand format controls, and tags),
+/// the same discover.printable applies
 /// before echoing a lease name. Non-control text above that set (NFC/NFD
 /// spellings, astral emoji without a selector, names that are not valid
 /// UTF-8 at all) passes byte-exact; identity is byte equality all the way
@@ -3256,6 +3257,8 @@ test "relOk rejects traversal and absolute paths" {
     try std.testing.expect(!relOk("gguf/model\u{ad}.bin"));
     try std.testing.expect(!relOk("a\u{34f}b.bin"));
     try std.testing.expect(!relOk("a\u{180b}b.bin"));
+    try std.testing.expect(!relOk("a\u{180f}b.bin"));
+    try std.testing.expect(!relOk("a\u{1bca0}b.bin"));
     try std.testing.expect(!relOk("a\u{3164}b.bin"));
     try std.testing.expect(!relOk("a\u{e0020}b.bin"));
     try std.testing.expect(!relOk("a\u{e0100}b.bin"));
@@ -3299,6 +3302,9 @@ test "relOk passes non-ASCII and non-UTF-8 names through byte-exact" {
     try std.testing.expect(relOk("a\u{2010}b.bin"));
     try std.testing.expect(relOk("a\u{ac}b.bin"));
     try std.testing.expect(relOk("a\u{180a}b.bin"));
+    try std.testing.expect(relOk("a\u{1810}b.bin"));
+    try std.testing.expect(relOk("a\u{1bc9f}b.bin"));
+    try std.testing.expect(relOk("a\xf0\x9b\xb2.bin"));
     try std.testing.expect(relOk("a\u{fffc}b.bin"));
 }
 
@@ -3321,6 +3327,8 @@ const seed_rel_vs = fuzzcorpus.entry("a\u{fe0f}.bin");
 const seed_rel_bom = fuzzcorpus.entry("\u{feff}model.bin");
 const seed_rel_shy = fuzzcorpus.entry("gguf/model\u{ad}.bin");
 const seed_rel_vs17 = fuzzcorpus.entry("a\u{e0100}.bin");
+const seed_rel_fvs4 = fuzzcorpus.entry("a\u{180f}.bin");
+const seed_rel_shorthand = fuzzcorpus.entry("a\u{1bca0}.bin");
 const seed_rel_tag = fuzzcorpus.entry("a\u{e007f}.bin");
 const seed_rel_nbsp = fuzzcorpus.entry("model\u{a0}v2.bin");
 const seed_rel_lone_c1byte = fuzzcorpus.entry("a\x9bb.bin");
@@ -3347,6 +3355,8 @@ const fuzz_rel_corpus = [_][]const u8{
     &seed_rel_bom,
     &seed_rel_shy,
     &seed_rel_vs17,
+    &seed_rel_fvs4,
+    &seed_rel_shorthand,
     &seed_rel_tag,
     &seed_rel_nbsp,
     &seed_rel_lone_c1byte,

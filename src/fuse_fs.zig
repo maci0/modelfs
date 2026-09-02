@@ -221,6 +221,8 @@ const seed_path_zwsp = fuzzcorpus.entry("/gguf/model\u{200b}.bin");
 const seed_path_vs = fuzzcorpus.entry("/a\u{fe0f}.bin");
 const seed_path_shy = fuzzcorpus.entry("/gguf/model\u{ad}.bin");
 const seed_path_vs17 = fuzzcorpus.entry("/a\u{e0100}.bin");
+const seed_path_fvs4 = fuzzcorpus.entry("/a\u{180f}.bin");
+const seed_path_shorthand = fuzzcorpus.entry("/a\u{1bca0}.bin");
 const seed_path_empty = fuzzcorpus.entry("");
 const seed_path_unicode = fuzzcorpus.entry("/权重/mödel.gguf");
 
@@ -242,6 +244,8 @@ const fuzz_path_corpus = [_][]const u8{
     &seed_path_vs,
     &seed_path_shy,
     &seed_path_vs17,
+    &seed_path_fvs4,
+    &seed_path_shorthand,
     &seed_path_empty,
     &seed_path_unicode,
 };
