@@ -20,7 +20,7 @@ The origin (`tank/models` on the NAS) holds the **only copy** of every weight fi
 | `/etc/modelfs.psk` (every node) | peer auth secret | regenerable | only with total site loss; regenerate with `openssl rand -hex 32` and redistribute to all nodes |
 | `$HOME` HF token | hub auth | not on the origin | re-login |
 
-Verifiably safe to ignore in any backup plan: caches (next read re-hydrates; culling punches holes, never deletes files) and leases (swept after 300 s regardless). Everything else in this doc exists to protect row 1.
+Verifiably safe to ignore in any backup plan: caches (next read re-hydrates; culling punches holes, and `reapIdle` unlinks empty unpinned artifacts) and leases (swept after 300 s regardless). Everything else in this doc exists to protect row 1.
 
 ## 2. What survives what
 

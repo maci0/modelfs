@@ -106,11 +106,11 @@ pub const Stats = struct {
     fill_err_origin: std.atomic.Value(u64) = .init(0),
     fill_err_cache: std.atomic.Value(u64) = .init(0),
     fill_err_verify: std.atomic.Value(u64) = .init(0),
-    /// Peer /data replies dropped because the cached bytes being served
-    /// failed at-rest verification against their trusted digest (hole
+    /// Peer /data and /stage replies dropped because the cached bytes being
+    /// served failed at-rest verification against their trusted digest (hole
     /// zeros, bit rot, local tamper). The fetching peer falls through to
-    /// the origin, so the fleet keeps serving; this counter is how a node
-    /// whose cache is silently corrupt is visible in status.json.
+    /// the next path or the origin, so the fleet keeps serving; this counter
+    /// is how a node whose cache is silently corrupt is visible in status.json.
     serve_verify_fail: std.atomic.Value(u64) = .init(0),
     /// /have probes that failed for reasons other than a healthy 404 miss
     /// (dead peer, auth mismatch, malformed reply). A fleet silently

@@ -799,7 +799,7 @@ digest per piece, with the origin as the trust reference.
 Per-piece blake3 digests recorded at admit (origin fills, write-throughs,
 verified peer fills); published to the origin as a piece-hash manifest at
 close (`mf_release`); loaded lazily by readers as the trust reference for
-peer fills; verified again before every `/data` serve; auditable with
+peer fills; verified again before every `/data` and `/stage` serve; auditable with
 `modelfs verify <rel>`. This is an integrity mechanism first (closes
 THREAT_MODEL.md R2) and a dedup foundation second: the digest is the
 identity a future CAS can key on, and the manifest is the "file = ordered
@@ -809,8 +809,9 @@ What Level 1 deliberately does NOT do:
 
 - No content-addressed storage: cache `data/` files stay path-keyed, so
   the same bytes under two paths still occupy disk twice.
-- No wire change: `/have` and `/data` still name `(path, range)`, and the
-  peer protocol, `X-Piece-Size` handshake, and 2 s probe cache are
+- No digest-keyed wire: `/have` and `/data` still name `(path, range)`;
+  `/stage` (section 15) negotiates a window for the same piece, not a
+  content hash. The `X-Piece-Size` handshake and 2 s probe cache are
   untouched.
 - No CDC: dedup granularity is the fixed 16 MiB grid, so only pieces that
   are byte-identical whole (same grid, same size, same content regions)

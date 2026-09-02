@@ -36,7 +36,7 @@ flowchart TD
 Reads: **local piece → cluster peer (`sendfile`) → origin**.
 Writes: **origin first → then fill the local cache**.
 
-A read that misses blocks until that one piece is filled from a single source. There is no background whole-file striping: it OOMed the unified memory on the target hardware.
+A read that misses blocks until that one piece is filled from a single source. If the local cache cannot land the fill (full or broken cache disk), that one read is served from the origin and the piece stays unmarked. There is no background whole-file striping: it OOMed the unified memory on the target hardware.
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
 
@@ -88,7 +88,7 @@ modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models  # comp
 modelfs dupes --all --origin /net/192.168.0.100/models  # whole-store duplicate scan
 ```
 
-Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin/verify/dupes), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount; an explicit flag wins, every `MODELFS_*` value is trimmed of surrounding whitespace, and an empty or whitespace-only environment value counts as unset except a whitespace-only `MODELFS_PSK_VALUE`, which is refused as empty (like the PSK file). `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
+Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--allow-other` (needs `user_allow_other`; the only way another uid reaches the mount), `--detach`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin/verify/dupes), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount; an explicit flag wins, every `MODELFS_*` value is trimmed of surrounding whitespace, and an empty or whitespace-only environment value counts as unset except a whitespace-only `MODELFS_PSK_VALUE`, which is refused as empty (like the PSK file). `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
 
 Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS ([docs/operations.md](docs/operations.md)).
 
@@ -121,6 +121,7 @@ zig build fmt                             # apply zig fmt
 ./scripts/repro_check.sh                  # build twice, require byte-identical output
 ./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end
 ./scripts/run_cluster_e2e_9nodes.sh       # 9-instance block exchange
+./scripts/run_vm_cluster_e2e.sh           # 4 VMs (NFS server + 3 clients) on libvirt/KVM
 ./scripts/test_fault_tolerance.sh         # peer loss and lease expiry
 ./scripts/dr_restore_drill.sh             # monthly restore drill, on the NAS (docs/recovery.md)
 ./scripts/dr_restore_drill.sh --age-only  # fail if newest snapshot is older than 25 h

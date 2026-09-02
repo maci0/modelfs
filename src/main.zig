@@ -1277,7 +1277,7 @@ fn teardownMount(st: *fuse_fs.State) void {
 /// process cannot raise them without CAP_SYS_RESOURCE. Failure is
 /// returned so mount can refuse to keep the secret in a dumpable process.
 /// Lives here (mount-time process policy), not in sys.zig (syscall
-/// wrappers with no policy beyond EINTR retry).
+/// wrappers: EINTR retry, CLOEXEC, nofollow, owner-only writes).
 fn disableCoreDumps() !void {
     std.posix.setrlimit(.CORE, .{ .cur = 0, .max = 0 }) catch |err| {
         std.log.err("cannot disable core dumps ({t}); a crash may write the cluster PSK", .{err});

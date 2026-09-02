@@ -1,5 +1,6 @@
 //! Syscall and libc wrappers: fd I/O with EINTR retry, CLOEXEC fds, clocks,
-//! path helpers, nofollow/owner-only writes, core-dump disable, PSK env scrub.
+//! path helpers, nofollow/owner-only writes. Mount-time core-dump disable
+//! and PSK env scrub live in main.zig (`disableCoreDumps` / `scrubPskEnv`).
 const std = @import("std");
 pub const c = @import("c.zig").c;
 
