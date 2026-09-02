@@ -24,6 +24,21 @@ fail() {
 
 command -v timeout >/dev/null 2>&1 || fail "timeout not found on PATH (coreutils)"
 
+# version_ge is the floor compare require_zig / require_python / check.sh share.
+expect_version_ge() {
+    local rc=0
+    # shellcheck disable=SC2310 # version_ge is a pure awk compare; it never relies on set -e
+    version_ge "$1" "$2" && rc=0 || rc=$?
+    [[ "${rc}" -eq "$3" ]] || fail "version_ge $1 >= $2 exited ${rc}, want $3"
+}
+expect_version_ge 0.16.0 0.16.0 0
+expect_version_ge 0.16.1 0.16.0 0
+expect_version_ge 0.16.0 0.16 0
+expect_version_ge 3.12.0 3.12 0
+expect_version_ge 3.14.7 3.12 0
+expect_version_ge 0.15.99 0.16.0 1
+expect_version_ge 3.11.9 3.12 1
+
 # Every top-level scripts/*.sh and scripts/*.py is a contributor command
 # and must answer --help. Discovered by glob so a new script is covered the
 # moment it lands instead of needing its name added to a list that can be

@@ -16,6 +16,7 @@ echo "=== 9-node cluster piece-exchange ==="
 cd "${ROOT_DIR}"
 require_fuse
 require_zig
+require_python
 zig build
 
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"

@@ -14,15 +14,17 @@ usage_no_args "$@" <<'EOF'
 Usage: ./scripts/check.sh
 
 The blocking static gate: zig fmt, changelog headings and tag links
-versus build.zig.zon, unit tests, the restore-drill stub suite, vendored
-libfuse3 digests and extract, shellcheck, ruff, mypy, sbom. Same
-command the CI `check` job runs. Requires the pinned .venv from
-setup.
+versus build.zig.zon, src/root.zig imports, unit tests, the restore-drill
+stub suite, vendored libfuse3 digests and extract, shellcheck, ruff, mypy,
+sbom. Same command the CI `check` job runs. Requires the pinned .venv
+from setup (python3/ruff/mypy inside .venv/bin, interpreter matching
+.python-version).
 
 Contributor commands (also listed by `zig build --help`; each script
 answers --help):
   zig build                                 build the binary
   zig build fmt                             apply zig fmt
+  ruff format                               apply ruff format
   zig build test                            unit tests
   zig build test -Dtest-filter=relOk        tests whose names contain this substring
   zig build test --watch                    rebuild and re-run on change
@@ -52,17 +54,40 @@ fail() {
 # CI installs the pinned Python tooling into .venv and puts it on PATH
 # before running this script. Refuse to stand in with PATH's ruff/mypy:
 # those versions disagree with the lock and fail either here or only after
-# push.
-if [[ -d "${ROOT_DIR}/.venv/bin" ]]; then
-    export PATH="${ROOT_DIR}/.venv/bin:${PATH}"
-else
+# push. An empty directory (uv venv without the lock install) used to pass
+# the existence check and then pick up the OS ruff/mypy/python3.
+venv_bin="${ROOT_DIR}/.venv/bin"
+if [[ ! -d "${venv_bin}" ]]; then
     fail "pinned .venv not found; install it with: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+fi
+export PATH="${venv_bin}:${PATH}"
+for tool in python3 ruff mypy; do
+    resolved="$(command -v "${tool}" || true)"
+    case "${resolved}" in
+        "${venv_bin}"/*) ;;
+        *)
+            fail "pinned .venv is missing ${tool}; install it with: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+            ;;
+    esac
+done
+
+# Same series CI's setup-uv installs from .python-version. A 3.13 venv
+# would type-check with mypy python_version=3.12 but run the scripts on a
+# different stdlib than the check job.
+py_want="$(tr -d '[:space:]' < "${ROOT_DIR}/.python-version")"
+[[ -n "${py_want}" ]] || fail "empty .python-version"
+py_need="$(awk -v v="${py_want}" 'BEGIN { n = split(v, a, /[^0-9]+/); if (n < 2) exit 1; print a[1] "." a[2] }')" \
+    || fail "cannot parse .python-version (${py_want})"
+py_got="$(python3 -c 'import sys; print("%d.%d" % (sys.version_info[0], sys.version_info[1]))')" \
+    || fail "venv python3 is not a working interpreter"
+if [[ "${py_got}" != "${py_need}" ]]; then
+    fail "venv python is ${py_got}, want ${py_need} from .python-version; recreate with: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
 fi
 
 # Name every missing tool at once instead of dying mid-gate on a bare
 # "command not found"; CONTRIBUTING.md documents where each comes from.
 missing=""
-for tool in zig shellcheck ruff mypy python3 sha256sum; do
+for tool in zig shellcheck ruff mypy python3 sha256sum timeout; do
     command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
 done
 if [[ -n "${missing}" ]]; then
@@ -106,17 +131,10 @@ fi
 min_zig="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
 [[ -n "${min_zig}" ]] || fail "cannot read minimum_zig_version from build.zig.zon"
 zig_ver="$(zig version)"
-if ! awk -v cur="${zig_ver}" -v min="${min_zig}" 'BEGIN {
-    ncur = split(cur, c, /[^0-9]+/)
-    nmin = split(min, t, /[^0-9]+/)
-    for (i = 1; i <= nmin; i++) {
-        ci = (i <= ncur) ? (c[i] + 0) : 0
-        ti = t[i] + 0
-        if (ci < ti) exit 1
-        if (ci > ti) exit 0
-    }
-    exit 0
-}'; then
+ge_rc=0
+# shellcheck disable=SC2310 # version_ge is a pure awk compare; it never relies on set -e
+version_ge "${zig_ver}" "${min_zig}" && ge_rc=0 || ge_rc=$?
+if [[ "${ge_rc}" -ne 0 ]]; then
     fail "zig ${zig_ver} is older than minimum_zig_version ${min_zig} in build.zig.zon"
 fi
 
@@ -200,6 +218,31 @@ for f in README.md SECURITY.md docs/THREAT_MODEL.md; do
         fail "${f} does not mention v${zon_ver} (build.zig.zon .version)"
     fi
 done
+
+# A new src/*.zig is invisible to `zig build test` until root.zig imports
+# it (CONTRIBUTING.md). Discover by glob so a forgotten import fails this
+# gate instead of shipping with its tests never run. c.zig is the translate-c
+# re-export, wired as a build-system module, not this aggregator.
+echo "=== src modules in root.zig ==="
+shopt -s nullglob
+src_mods=(src/*.zig)
+shopt -u nullglob
+[[ "${#src_mods[@]}" -gt 0 ]] || fail "no Zig sources under src/"
+missing_mods=""
+for srcf in "${src_mods[@]}"; do
+    base="${srcf##*/}"
+    case "${base}" in
+        root.zig | c.zig) continue ;;
+        *)
+            if ! grep -Fq "@import(\"${base}\")" src/root.zig; then
+                missing_mods="${missing_mods} ${base}"
+            fi
+            ;;
+    esac
+done
+if [[ -n "${missing_mods}" ]]; then
+    fail "src/root.zig does not import:${missing_mods} -- zig build test will not run that file's tests (see CONTRIBUTING.md)"
+fi
 
 echo "=== vendored fuse3 hashes ==="
 (

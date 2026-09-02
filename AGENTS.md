@@ -16,12 +16,19 @@ and an NFS origin as the write authority. Linux only.
 
 ## Gates
 
-`./scripts/check.sh` is the blocking gate (fmt, changelog, tests, drill stub,
-fuse3 digests, script `--help`, shellcheck, ruff, mypy, sbom). Never loosen it
-to pass. CHANGELOG `##` headings: `[Unreleased]` first, dated `x.y.z` including
-the `build.zig.zon` version, `[name]:` footer links; `v<version>` in README,
-SECURITY.md, and `docs/THREAT_MODEL.md`; notes are `###`. CI adds aarch64
-cross-compile and a reproducibility rebuild (`./scripts/ci.sh` runs all three).
+`./scripts/check.sh` is the blocking gate: `zig fmt --check`, CHANGELOG `##`
+headings (`[Unreleased]` first, dated semver matching `build.zig.zon`,
+`[name]:` footer links, and current-tag sentences in README/SECURITY.md/
+THREAT_MODEL.md; dated notes are `###`), every `src/*.zig` other than
+`c.zig` imported from `src/root.zig`, `zig build test`, shellcheck
+(`.shellcheckrc` on every `scripts/**/*.sh`), `test_dr_restore_drill.sh`, vendored
+libfuse3 digest and extract checks, contributor-script `--help` handlers
+(`test_scripts_help.sh`), `ruff check`, `ruff format --check`,
+`mypy`, `scripts/sbom.py --self-test`, and `scripts/sbom.py --check`.
+The Python tools must come from `.venv/bin` (interpreter matching
+`.python-version`); an empty venv is not enough. CI runs that plus the
+aarch64 cross-compile and the reproducibility rebuild (`./scripts/ci.sh`
+runs all three). Never loosen a gate to pass it.
 
 `run_cluster_e2e_9nodes.sh` needs `/dev/fuse` and `fusermount3`, so it runs
 locally rather than in CI. `run_vm_cluster_e2e.sh` is the real-NFS cluster

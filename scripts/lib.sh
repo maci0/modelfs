@@ -40,6 +40,22 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # snapshot-age alarm), MF_DRILL_LOG_MAX_AGE (check_drill_log.sh),
 # MF_NAS_DEST (install_nas_backup.sh).
 
+# Dotted numeric compare: 0.16.1 >= 0.16.0, 3.12.4 >= 3.12, 0.15.99 < 0.16.0.
+# Extra trailing components on cur count as 0 against a longer min.
+version_ge() {
+    awk -v cur="$1" -v min="$2" 'BEGIN {
+        ncur = split(cur, c, /[^0-9]+/)
+        nmin = split(min, t, /[^0-9]+/)
+        for (i = 1; i <= nmin; i++) {
+            ci = (i <= ncur) ? (c[i] + 0) : 0
+            ti = t[i] + 0
+            if (ci < ti) exit 1
+            if (ci > ti) exit 0
+        }
+        exit 0
+    }'
+}
+
 # Named preflight for scripts that invoke `zig build`: a missing toolchain
 # otherwise dies as bash "command not found" with no pointer at setup.
 # The version floor is minimum_zig_version in build.zig.zon, the same pin
@@ -56,18 +72,39 @@ require_zig() {
         exit 1
     fi
     zig_ver="$(zig version)"
-    if ! awk -v cur="${zig_ver}" -v min="${min_zig}" 'BEGIN {
-        ncur = split(cur, c, /[^0-9]+/)
-        nmin = split(min, t, /[^0-9]+/)
-        for (i = 1; i <= nmin; i++) {
-            ci = (i <= ncur) ? (c[i] + 0) : 0
-            ti = t[i] + 0
-            if (ci < ti) exit 1
-            if (ci > ti) exit 0
-        }
-        exit 0
-    }'; then
+    local ge_rc=0
+    # shellcheck disable=SC2310 # version_ge is a pure awk compare; it never relies on set -e
+    version_ge "${zig_ver}" "${min_zig}" && ge_rc=0 || ge_rc=$?
+    if [[ "${ge_rc}" -ne 0 ]]; then
         echo "cannot run: zig ${zig_ver} is older than minimum_zig_version ${min_zig} in build.zig.zon" >&2
+        exit 1
+    fi
+}
+
+# Named preflight for harnesses that run the repo's Python CLIs. The floor
+# is .python-version (the same pin CI installs); an older interpreter used
+# to die as a SyntaxError inside 3.10+ type hints. A newer system python is
+# fine here; scripts/check.sh is the one that pins the venv to that series.
+require_python() {
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "cannot run: python3 not found on PATH -- see CONTRIBUTING.md (setup section)" >&2
+        exit 1
+    fi
+    local min_py py_ver
+    min_py="$(tr -d '[:space:]' < "${ROOT_DIR}/.python-version")"
+    if [[ -z "${min_py}" ]]; then
+        echo "cannot read .python-version" >&2
+        exit 1
+    fi
+    py_ver="$(python3 -c 'import sys; print("%d.%d.%d" % (sys.version_info[0], sys.version_info[1], sys.version_info[2]))')" || {
+        echo "cannot run: python3 is not a working interpreter -- see CONTRIBUTING.md (setup section)" >&2
+        exit 1
+    }
+    local ge_rc=0
+    # shellcheck disable=SC2310 # version_ge is a pure awk compare; it never relies on set -e
+    version_ge "${py_ver}" "${min_py}" && ge_rc=0 || ge_rc=$?
+    if [[ "${ge_rc}" -ne 0 ]]; then
+        echo "cannot run: python3 ${py_ver} is older than ${min_py} in .python-version -- see CONTRIBUTING.md (setup section)" >&2
         exit 1
     fi
 }
