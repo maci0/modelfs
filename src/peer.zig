@@ -562,6 +562,16 @@ fn cacheEntry(self: *Server, fd: std.posix.fd_t, rel: []const u8, size: u64) ?*s
 
 fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
     const size = originRegularSize(self, fd, rel) orelse return;
+    // Fetchers refuse a /have body above max_have_body_bytes. Serving one
+    // would still open a cache entry (Bitfield.init of up to 512 MiB at
+    // --piece 1 on a large sparse file) and dupe it for a reply no peer
+    // would accept. Refuse before get() so the snapshot cannot land.
+    const nbits = piece.count(size, self.store.piece_size);
+    if (piece.Bitfield.bytesLen(nbits) > max_have_body_bytes) {
+        std.log.warn("have bitmap for {s} exceeds {d} bytes; replying 500", .{ rel, max_have_body_bytes });
+        replyStatus(self, fd, "500 Internal Server Error");
+        return;
+    }
     const file = cacheEntry(self, fd, rel, size) orelse return;
     defer self.store.releaseFile(file);
     // Snapshot the bits under the lock and answer outside it: a stalled peer
@@ -2813,6 +2823,38 @@ test "serveHave answers with the exact cached bitfield blob" {
     var res = try roundTrip(port, "GET /have?path=sub HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
     defer res.deinit(gpa);
     try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+}
+
+test "serveHave refuses a bitmap above the fetch body bound before opening a cache entry" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-havebig");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-havebig");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    // piece_size 1: a file whose piece count makes bytesLen one past
+    // max_have_body_bytes. Sparse truncate so the origin does not store 128 MiB.
+    const over_bytes = max_have_body_bytes + 1;
+    const nbits: u32 = @intCast(over_bytes * 8 - 7);
+    try std.testing.expectEqual(over_bytes, piece.Bitfield.bytesLen(nbits));
+    var fbuf: [192]u8 = undefined;
+    var fz: [sys.c.PATH_MAX]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fbuf, "{s}/huge.bin", .{origin_d});
+    const z = try sys.toZ(&fz, fp);
+    const ofd = sys.open(z, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_NOFOLLOW, 0o644);
+    try std.testing.expect(ofd >= 0);
+    try std.testing.expectEqual(@as(i32, 0), sys.ftruncate(ofd, nbits));
+    try std.testing.expectEqual(@as(i32, 0), sys.closeWrite(ofd));
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 1, "secret");
+    defer srv.stop();
+    try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "secret", "127.0.0.1", srv.port(), "huge.bin"));
+    try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_5xx.load(.monotonic));
+    // The bound fires before cacheEntry/get: a miss here would have allocated
+    // the 16 MiB+ bitfield the fetcher already refuses.
+    try std.testing.expectEqual(@as(usize, 0), srv.store.files.count());
 }
 
 test "fetchHave surfaces the advertised piece size and rejects malformed ones" {

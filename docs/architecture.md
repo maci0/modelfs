@@ -186,7 +186,7 @@ pays the probe because the capability rides the have-cache line. The
 shipped backend is null, so this plane is protocol-and-pipeline only until
 the verbs tail lands (design.md section 15).
 
-`/have` replies carry `X-Piece-Size: <n>`, the piece grid the bitmap's bits are indexed against; a fetcher running a different `--piece` treats that peer's answer as no-answer instead of routing fills by bits that cover different byte ranges (a fleet should still run one piece size; mixed grids degrade to origin traffic, never to wrong data). Peers older than this header read as unknown and are assumed aligned. An advertised `0` is not unknown: `--piece 0` is refused at mount, so a zero on the wire fails the probe like any other malformed grid. The bitmap body itself stays raw bits: one byte per eight pieces, bit i naming piece i least-significant-bit first, `ceil(pieces / 8)` bytes long. `piece.count` clamps at 2^32-1 pieces (`trackedEnd` in src/piece.zig); bytes past that have no bit, and FUSE/peer reads take them from the origin rather than treating an empty `cover` as a cache hit (a sparse pread of the hole would otherwise return zeros).
+`/have` replies carry `X-Piece-Size: <n>`, the piece grid the bitmap's bits are indexed against; a fetcher running a different `--piece` treats that peer's answer as no-answer instead of routing fills by bits that cover different byte ranges (a fleet should still run one piece size; mixed grids degrade to origin traffic, never to wrong data). Peers older than this header read as unknown and are assumed aligned. An advertised `0` is not unknown: `--piece 0` is refused at mount, so a zero on the wire fails the probe like any other malformed grid. The bitmap body itself stays raw bits: one byte per eight pieces, bit i naming piece i least-significant-bit first, `ceil(pieces / 8)` bytes long. A `/have` whose bitmap would exceed 16 MiB (`max_have_body_bytes` in src/peer.zig, the same cap fetchers enforce) answers 500 without opening a cache entry, so a huge sparse origin file cannot drive a half-gigabyte snapshot. `piece.count` clamps at 2^32-1 pieces (`trackedEnd` in src/piece.zig); bytes past that have no bit, and FUSE/peer reads take them from the origin rather than treating an empty `cover` as a cache hit (a sparse pread of the hole would otherwise return zeros).
 
 Status codes, identical framing on every endpoint (`Content-Length` always present, `Connection: close`, empty body on errors):
 
@@ -199,7 +199,7 @@ Status codes, identical framing on every endpoint (`Content-Length` always prese
 | 404 | Unknown path, a `.cluster` control path, or the origin has no regular file at `path` |
 | 405 | Authenticated request whose method is not GET (`Allow: GET`) |
 | 416 | `/data` range start at/after EOF, with `Content-Range: bytes */<size>` naming the complete length (an over-long end clamps to EOF instead) |
-| 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write, staging verify failure) |
+| 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write, staging verify failure), or a `/have` bitmap that would exceed the 16 MiB fetch bound |
 | 501 | `/stage` only: this node has no data-plane backend (its `/have` does not advertise `X-Stage`); the fetching peer falls back to `/data`. Capability, not a 5xx for the `http_5xx` health gauge |
 | 502 | The origin is unreachable or failed (stat/pread error, or a size that does not fit `off_t`), i.e. retry another peer |
 

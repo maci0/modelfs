@@ -357,6 +357,13 @@ pub fn rmdir(path: [*:0]const u8) i32 {
     return 0;
 }
 
+/// unlink(2). ENOENT is left for the caller: pin-clear and sweep races treat
+/// it as already-gone success, while forget/publish warn on any other errno.
+pub fn unlink(path: [*:0]const u8) i32 {
+    if (c.unlink(path) != 0) return negErrno();
+    return 0;
+}
+
 /// chmod(2) without following a final symlink. Linux has no lchmod, and
 /// fchmodat(AT_SYMLINK_NOFOLLOW) is a 6.6+ syscall that older kernels reject
 /// with EOPNOTSUPP on every call, including regular files. Open O_PATH|
@@ -622,11 +629,12 @@ pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in,
     const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
     if (fl < 0) return negErrno();
     if (c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK) < 0) return negErrno();
+    // Restore the caller's flags on every path, including connect/poll
+    // errors: leaving O_NONBLOCK set would make a later blocking read on
+    // this fd return EAGAIN instead of honoring SO_RCVTIMEO.
+    defer _ = c.fcntl(fd, c.F_SETFL, fl);
     const rc = c.connect(fd, .{ .__sockaddr__ = @ptrCast(@constCast(addr)) }, @sizeOf(c.struct_sockaddr_in));
-    if (rc == 0) {
-        _ = c.fcntl(fd, c.F_SETFL, fl);
-        return 0;
-    }
+    if (rc == 0) return 0;
     const e0 = errno();
     if (e0 != c.EINPROGRESS) return -e0;
     // EINTR during poll must not fail the dial: retry against the original
@@ -649,7 +657,6 @@ pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in,
     var slen: c.socklen_t = @sizeOf(c_int);
     if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &soerr, &slen) != 0) return negErrno();
     if (soerr != 0) return -soerr;
-    _ = c.fcntl(fd, c.F_SETFL, fl);
     return 0;
 }
 

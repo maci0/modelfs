@@ -209,11 +209,9 @@ pub const Stats = struct {
 /// Callers span forget, distrust, and the reaper's purges, so the line names
 /// the artifact rather than attributing itself to one of them.
 fn unlinkOrWarn(path_z: [*:0]const u8, what: []const u8, rel: []const u8) void {
-    if (c.unlink(path_z) != 0) {
-        const e = sys.errno();
-        if (e != c.ENOENT)
-            std.log.warn("cannot remove cached {s} for {s} (errno {d})", .{ what, rel, e });
-    }
+    const rc = sys.unlink(path_z);
+    if (rc != 0 and rc != -c.ENOENT)
+        std.log.warn("cannot remove cached {s} for {s} (errno {d})", .{ what, rel, -rc });
 }
 
 pub const Store = struct {
@@ -425,12 +423,19 @@ pub const Store = struct {
     }
 
     pub fn originPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+        // Empty rel names the origin root (FUSE "/"). Anything else joins
+        // this root and must already have passed relOk at the trust
+        // boundary; refuse here too so a missed gate cannot escape the tree
+        // via ".." components. NameTooLong is the only error joinZ returns,
+        // and callers already map it to ENAMETOOLONG.
+        if (rel.len != 0 and !relOk(rel)) return error.NameTooLong;
         return sys.joinZ(buf, self.origin, rel);
     }
 
     /// Joins cache/<sub>/<rel> (rel empty names the subdir itself): one
     /// policy for every artifact path under the cache root.
     fn cacheSubPath(self: *const Store, buf: []u8, sub: []const u8, rel: []const u8) ![*:0]u8 {
+        if (rel.len != 0 and !relOk(rel)) return error.NameTooLong;
         var mid: [sys.c.PATH_MAX]u8 = undefined;
         const d = try sys.joinZ(&mid, self.cache, sub);
         return sys.joinZ(buf, std.mem.span(d), rel);
@@ -508,12 +513,9 @@ pub const Store = struct {
             _ = sys.mkdirAll(parent, cache_dir_mode);
             return sys.writeFileOwnerOnly(p, "");
         }
-        if (c.unlink(p) != 0) {
-            const e = sys.errno();
-            if (e == c.ENOENT) return 0;
-            return -e;
-        }
-        return 0;
+        const rc = sys.unlink(p);
+        if (rc == -c.ENOENT) return 0;
+        return rc;
     }
 
     /// Unlinks the data/meta/pin artifacts keyed to rel. A path that no
@@ -1424,13 +1426,13 @@ pub const Store = struct {
             w = sys.writeFileNoFollow(ztmp, enc);
         }
         if (w != 0) {
-            _ = c.unlink(ztmp);
+            _ = sys.unlink(ztmp);
             std.log.warn("piece manifest publish failed for {s} (errno {d}); retried on next close", .{ file.rel, -w });
             return;
         }
         const re = sys.rename(ztmp, p);
         if (re != 0) {
-            _ = c.unlink(ztmp);
+            _ = sys.unlink(ztmp);
             std.log.warn("piece manifest rename failed for {s} (errno {d}); retried on next close", .{ file.rel, -re });
             return;
         }
@@ -1616,14 +1618,12 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const op = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
         if (rel.len != 0) self.forget(rel);
-        const rc = c.unlink(op);
-        const e: i32 = if (rc != 0) sys.errno() else 0;
+        const rc = sys.unlink(op);
         // A racer's get() between the first forget and the unlink may have
         // rebuilt an entry over the still-live origin name; drop it now that
         // the name is gone (or was already gone).
         if (rel.len != 0) self.forget(rel);
-        if (e != 0) return -e;
-        return 0;
+        return rc;
     }
 
     /// Origin rename plus cache-identity drop of both names. Flags ride
@@ -3212,6 +3212,21 @@ test "copyIntoCache unmarks overlapping pieces when the cache write fails" {
         try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
         f.mu.unlock(std.testing.io);
     }
+}
+
+test "originPath and cacheDataPath refuse a rel that fails relOk" {
+    const gpa = std.testing.allocator;
+    var st = Store.init(gpa, std.testing.io, "/o", "/c", 16);
+    defer st.deinit();
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expectError(error.NameTooLong, st.originPath(&buf, "../etc/passwd"));
+    try std.testing.expectError(error.NameTooLong, st.originPath(&buf, "/etc/passwd"));
+    try std.testing.expectError(error.NameTooLong, st.originPath(&buf, "a/../b"));
+    try std.testing.expectError(error.NameTooLong, st.cacheDataPath(&buf, "../x"));
+    const ok = try st.originPath(&buf, "a.bin");
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.span(ok), "/o/a.bin"));
+    const root = try st.originPath(&buf, "");
+    try std.testing.expectEqualStrings("/o", std.mem.span(root));
 }
 
 test "relOk rejects traversal and absolute paths" {

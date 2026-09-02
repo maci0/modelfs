@@ -819,13 +819,13 @@ pub const Catalog = struct {
             // Staging file may exist from a partial write; leave none behind.
             // A retry every tick would refresh mtime, so sweepLeases would
             // never age it out.
-            _ = c.unlink(ztmp);
+            _ = sys.unlink(ztmp);
             std.log.warn("lease publish failed at {s} (errno {d})", .{ zpath, -w });
             return;
         }
         const re = sys.rename(ztmp, zpath);
         if (re != 0) {
-            _ = c.unlink(ztmp);
+            _ = sys.unlink(ztmp);
             std.log.warn("lease publish rename failed at {s} (errno {d})", .{ zpath, -re });
         }
     }
@@ -950,7 +950,7 @@ pub const Catalog = struct {
             for (names.items) |n| self.gpa.free(n);
             names.deinit(self.gpa);
         }
-        while (c.readdir(dir)) |ent| {
+        while (sys.readdir(dir)) |ent| {
             const name = sys.dirName(ent);
             if (name.len == 0 or name[0] == '.') continue;
             if (std.mem.endsWith(u8, name, ".json")) {
@@ -982,10 +982,10 @@ pub const Catalog = struct {
             // swept outcome already reached, not a failure. Only a real
             // unlink error gets an operator line (same policy as store.zig's
             // unlinkOrWarn); the info line stays tied to actually sweeping.
-            if (c.unlink(fp) != 0) {
-                const e = sys.errno();
-                if (e != c.ENOENT) {
-                    std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ displayName(name), e });
+            const urc = sys.unlink(fp);
+            if (urc != 0) {
+                if (urc != -c.ENOENT) {
+                    std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ displayName(name), -urc });
                 }
                 continue;
             }

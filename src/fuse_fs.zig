@@ -1440,11 +1440,11 @@ fn statusJson(st: *State) !void {
     if (sys.writeFileOwnerOnly(tp, json) != 0) {
         // Staging file may exist from a partial write; leave none behind.
         // A retry every tick would refresh mtime, so no sweeper ages it out.
-        _ = sys.c.unlink(tp);
+        _ = sys.unlink(tp);
         return error.StatusWriteFailed;
     }
     if (sys.rename(tp, p) != 0) {
-        _ = sys.c.unlink(tp);
+        _ = sys.unlink(tp);
         return error.StatusRenameFailed;
     }
 }
