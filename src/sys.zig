@@ -58,16 +58,6 @@ pub fn sleepMs(io: std.Io, ms: u32) void {
     std.Io.sleep(io, .fromMilliseconds(ms), .awake) catch {};
 }
 
-/// Kernel CLOCK_MONOTONIC nanoseconds (kept for non-simulated callers).
-/// Policy dial timeouts go through `connectInWithIo` on the injected
-/// `std.Io` clock (`sys.monoMs`) so a simulator drives expiry; only
-/// scratch-dir naming and direct `connectIn` tests reach this helper.
-fn monoNsRaw() i128 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
-}
-
 /// Kernel CLOCK_REALTIME seconds for test-scratch uniqueness (pid-colliding
 /// names). Not a policy instant: scratch dirs are not simulated.
 fn nowSecRaw() i64 {

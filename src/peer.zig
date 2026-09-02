@@ -310,15 +310,6 @@ fn readHeadFull(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize,
     return readHeadFullDeadline(io, fd, buf, out_head_len, out_total_read, sys.monoMs(io) +| head_deadline_ms);
 }
 
-/// readHeadFull with an injectable budget: a non-null deadline drives the
-/// head stage directly (virtual time in tests and any caller that already
-/// holds an instant), null stamps through `io` here like every production
-/// entry point. One branch so the expiry rule stays in readHeadFullDeadline.
-fn readHeadFullAt(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: ?i64) !void {
-    if (deadline_ms) |d| return readHeadFullDeadline(io, fd, buf, out_head_len, out_total_read, d);
-    return readHeadFull(io, fd, buf, out_head_len, out_total_read);
-}
-
 fn readHeadFullDeadline(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: i64) !void {
     var n: usize = 0;
     while (n < buf.len) {
@@ -1241,7 +1232,8 @@ fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    try readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms);
+    const head_deadline = deadline_ms orelse (sys.monoMs(io) +| head_deadline_ms);
+    try readHeadFullDeadline(io, fd, &head_buf, &head_len, &total_read, head_deadline);
     try checkRangeReply(head_buf[0..head_len], start, end);
     return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, out, deadline_ms);
 }
@@ -1264,7 +1256,7 @@ fn sockaddrV4(ip: []const u8, port: u16, out: *c.struct_sockaddr_in) !void {
 }
 
 /// Connect budget for one dial under an injected deadline (see
-/// readHeadFullAt): null stamps the full dial_timeout_ms like every
+/// readHeadFullDeadline): null stamps the full dial_timeout_ms like every
 /// production entry point; a live deadline clamps the wait to its remainder;
 /// a spent one refuses before any blocking syscall, so a simulator expires
 /// the wire round trip at the dial instead of after it.
@@ -1306,7 +1298,8 @@ fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.f
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
-    try readHeadFullAt(io, fd, &head_buf, &head_len, &total_read, deadline_ms);
+    const head_deadline = deadline_ms orelse (sys.monoMs(io) +| head_deadline_ms);
+    try readHeadFullDeadline(io, fd, &head_buf, &head_len, &total_read, head_deadline);
     return finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, out, deadline_ms);
 }
 
@@ -2072,7 +2065,7 @@ test "readFlexBodyAllocDeadline and readRangeBodyAllocDeadline keep HeadTimeout"
     }
 }
 
-test "readHeadFullAt expires an injected budget without waiting real time" {
+test "readHeadFullDeadline expires an injected budget without waiting real time" {
     // Nothing staged and an already-past budget: the first armChunkTimeout
     // check must refuse before any blocking syscall, so a simulator (or this
     // test) can drive head expiry virtually instead of holding a socket
@@ -2084,7 +2077,7 @@ test "readHeadFullAt expires an injected budget without waiting real time" {
     var total: usize = 0;
     var buf: [64]u8 = undefined;
     const t0 = sys.monoMs(std.testing.io);
-    const err = readHeadFullAt(std.testing.io, pair[1], &buf, &head_len, &total, t0 - 1);
+    const err = readHeadFullDeadline(std.testing.io, pair[1], &buf, &head_len, &total, t0 - 1);
     try std.testing.expectError(error.HeadTimeout, err);
     try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }

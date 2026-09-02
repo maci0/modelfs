@@ -296,7 +296,7 @@ pub const Catalog = struct {
     /// the down, PSK-drifted, or wedged node; repeats ride the counter and a
     /// success clears the entry and logs recovery. No TTL: a peer that stays
     /// down logs exactly once until it answers again. Bounded like stage_down.
-    probe_down: std.ArrayList(ProbeDown) = .empty,
+    probe_down: std.ArrayList(AddrDown) = .empty,
 
     /// Addresses whose /data (HTTP) piece fetch failed since the peer last
     /// served a piece, keyed by (ip, port) and guarded by have_mu like the
@@ -306,7 +306,7 @@ pub const Catalog = struct {
     /// and logs recovery. A peer that answers /have but fails every /data
     /// (broken cache backend, flaky transfer) would otherwise flood the
     /// journal with one warn per piece. Bounded like probe_down.
-    fetch_down: std.ArrayList(FetchDown) = .empty,
+    fetch_down: std.ArrayList(AddrDown) = .empty,
 
     /// /have answers from recent probes, keyed by (rel, ip, port).
     /// fillFromPeers runs once per piece; without this cache a sequential
@@ -329,16 +329,11 @@ pub const Catalog = struct {
         expires_ms: i64,
     };
 
-    const probe_down_cap: usize = 32;
+    const addr_down_cap: usize = 32;
 
-    const ProbeDown = struct {
-        ip: []u8,
-        port: u16,
-    };
-
-    const fetch_down_cap: usize = 32;
-
-    const FetchDown = struct {
+    /// (ip, port) mark for an edge-triggered outage (probe_down, fetch_down).
+    /// No TTL: a peer that stays down logs once until it answers again.
+    const AddrDown = struct {
         ip: []u8,
         port: u16,
     };
@@ -421,11 +416,6 @@ pub const Catalog = struct {
         return (proto.HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
     }
 
-    /// Caches one /have answer: a 200 bitmap, or a healthy 404 stored as
-    /// an empty field so the next piece of this file does not re-dial a
-    /// peer that already said it has nothing. Connection failures must not
-    /// reach here; a down peer is retried on the next piece. `now_ms` is
-    /// the caller's monotonic-ms instant (see haveGet).
     /// Whether an unexpired (rel, ip, port) line advertises the staged
     /// data plane. Null means no usable line (probe first); false means
     /// the peer answered /have without X-Stage.
@@ -487,6 +477,44 @@ pub const Catalog = struct {
         return true;
     }
 
+    /// First failure for (ip, port) since the last clear: true so the caller
+    /// logs once. Repeats return false and ride their counter. Cap eviction
+    /// drops the oldest entry, so a still-down peer may log once more.
+    fn noteAddrDown(self: *Catalog, list: *std.ArrayList(AddrDown), ip: []const u8, port: u16) bool {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (list.items) |e| {
+            if (e.port == port and std.mem.eql(u8, e.ip, ip)) return false;
+        }
+        if (list.items.len >= addr_down_cap) {
+            if (list.items.len > 0) {
+                gpa.free(list.items[0].ip);
+                _ = list.orderedRemove(0);
+            } else return false;
+        }
+        const ip_own = gpa.dupe(u8, ip) catch return false;
+        list.append(gpa, .{ .ip = ip_own, .port = port }) catch {
+            gpa.free(ip_own);
+            return false;
+        };
+        return true;
+    }
+
+    /// True when an entry was removed so the caller can log recovery.
+    fn clearAddrDown(self: *Catalog, list: *std.ArrayList(AddrDown), ip: []const u8, port: u16) bool {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (list.items, 0..) |e, i| {
+            if (e.port != port or !std.mem.eql(u8, e.ip, ip)) continue;
+            gpa.free(list.items[i].ip);
+            _ = list.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
     /// Records a failed /have probe from (ip, port). True only for the first
     /// failure since the peer last answered (the caller logs that one with
     /// address and error class); later failures return false and ride the
@@ -495,24 +523,7 @@ pub const Catalog = struct {
     /// cannot fit evicts another, else is dropped -- worst case a still-down
     /// peer logs once more when the eviction clears its entry.
     pub fn noteProbeDown(self: *Catalog, ip: []const u8, port: u16) bool {
-        const gpa = self.gpa;
-        self.have_mu.lockUncancelable(self.io);
-        defer self.have_mu.unlock(self.io);
-        for (self.probe_down.items) |e| {
-            if (e.port == port and std.mem.eql(u8, e.ip, ip)) return false;
-        }
-        if (self.probe_down.items.len >= probe_down_cap) {
-            if (self.probe_down.items.len > 0) {
-                gpa.free(self.probe_down.items[0].ip);
-                _ = self.probe_down.orderedRemove(0);
-            } else return false;
-        }
-        const ip_own = gpa.dupe(u8, ip) catch return false;
-        self.probe_down.append(gpa, .{ .ip = ip_own, .port = port }) catch {
-            gpa.free(ip_own);
-            return false;
-        };
-        return true;
+        return self.noteAddrDown(&self.probe_down, ip, port);
     }
 
     /// Clears a /have probe failure for (ip, port) after the peer answered
@@ -520,16 +531,7 @@ pub const Catalog = struct {
     /// caller logs the recovery so a returning peer is visible in the journal
     /// without anyone watching counters.
     pub fn clearProbeDown(self: *Catalog, ip: []const u8, port: u16) bool {
-        const gpa = self.gpa;
-        self.have_mu.lockUncancelable(self.io);
-        defer self.have_mu.unlock(self.io);
-        for (self.probe_down.items, 0..) |e, i| {
-            if (e.port != port or !std.mem.eql(u8, e.ip, ip)) continue;
-            gpa.free(self.probe_down.items[i].ip);
-            _ = self.probe_down.orderedRemove(i);
-            return true;
-        }
-        return false;
+        return self.clearAddrDown(&self.probe_down, ip, port);
     }
 
     /// Records a failed /data (HTTP) piece fetch from (ip, port). True only
@@ -541,24 +543,7 @@ pub const Catalog = struct {
     /// another, else is dropped -- worst case a still-failing peer logs once
     /// more when the eviction clears its entry.
     pub fn noteFetchDown(self: *Catalog, ip: []const u8, port: u16) bool {
-        const gpa = self.gpa;
-        self.have_mu.lockUncancelable(self.io);
-        defer self.have_mu.unlock(self.io);
-        for (self.fetch_down.items) |e| {
-            if (e.port == port and std.mem.eql(u8, e.ip, ip)) return false;
-        }
-        if (self.fetch_down.items.len >= fetch_down_cap) {
-            if (self.fetch_down.items.len > 0) {
-                gpa.free(self.fetch_down.items[0].ip);
-                _ = self.fetch_down.orderedRemove(0);
-            } else return false;
-        }
-        const ip_own = gpa.dupe(u8, ip) catch return false;
-        self.fetch_down.append(gpa, .{ .ip = ip_own, .port = port }) catch {
-            gpa.free(ip_own);
-            return false;
-        };
-        return true;
+        return self.noteAddrDown(&self.fetch_down, ip, port);
     }
 
     /// Clears a /data fetch failure for (ip, port) after a piece fetch from
@@ -566,18 +551,14 @@ pub const Catalog = struct {
     /// the recovery so a returning peer is visible in the journal without
     /// anyone watching counters.
     pub fn clearFetchDown(self: *Catalog, ip: []const u8, port: u16) bool {
-        const gpa = self.gpa;
-        self.have_mu.lockUncancelable(self.io);
-        defer self.have_mu.unlock(self.io);
-        for (self.fetch_down.items, 0..) |e, i| {
-            if (e.port != port or !std.mem.eql(u8, e.ip, ip)) continue;
-            gpa.free(self.fetch_down.items[i].ip);
-            _ = self.fetch_down.orderedRemove(i);
-            return true;
-        }
-        return false;
+        return self.clearAddrDown(&self.fetch_down, ip, port);
     }
 
+    /// Caches one /have answer: a 200 bitmap, or a healthy 404 stored as
+    /// an empty field so the next piece of this file does not re-dial a
+    /// peer that already said it has nothing. Connection failures must not
+    /// reach here; a down peer is retried on the next piece. `now_ms` is
+    /// the caller's monotonic-ms instant (see haveGet).
     pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, stage: bool, now_ms: i64) void {
         const gpa = self.gpa;
         self.have_mu.lockUncancelable(self.io);
