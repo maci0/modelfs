@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly check that the ModelFS offsite copy is inside the claimed site-loss RPO
+Documentation=file:///usr/local/share/doc/modelfs/recovery.md
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

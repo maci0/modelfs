@@ -38,6 +38,8 @@ answers --help):
   ./scripts/test_fault_tolerance.sh         peer loss and lease expiry
   ./scripts/test_dr_restore_drill.sh        restore drill against stub zfs (also in this script)
   ./scripts/check_drill_log.sh              alarm if the monthly drill log is stale
+  ./scripts/check_offsite.sh                alarm if the site-loss copy is missing or older than 8 days
+  ./scripts/dr_pool_restore.sh              pool-loss recv (dry-run; --execute pulls from the replica)
   ./scripts/dr_restore_drill.sh --age-only  alarm if newest snapshot is older than 25 h
   ./scripts/hold_monthlies.sh               hold monthly snapshots (syncoid ExecStartPost)
   ./scripts/install_nas_backup.sh           copy NAS snapshot/replica/drill units (dry-run by default)

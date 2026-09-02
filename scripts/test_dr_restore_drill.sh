@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Regression tests for scripts/dr_restore_drill.sh. The real drill runs on
-# the NAS against tank/models; this drives it through a stub zfs(8) that
-# copies fixture trees in place of clone, so CI can fail a drill that would
-# hash the live export against itself, bless an empty or lease-only
-# snapshot, or ignore a dead autosnap schedule.
+# Regression tests for scripts/dr_restore_drill.sh, hold_monthlies.sh,
+# check_drill_log.sh, check_offsite.sh, dr_pool_restore.sh, and
+# install_nas_backup.sh. The real drill runs on the NAS against
+# tank/models; this drives it through a stub zfs(8) that copies fixture
+# trees in place of clone, so CI can fail a drill that would hash the
+# live export against itself, bless an empty or lease-only snapshot,
+# ignore a dead autosnap schedule, hold a replica with no snapshots,
+# bless a stale offsite copy, or recv onto the live export.
 set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
@@ -790,6 +793,19 @@ else
 fi
 
 rm -rf "${HOLD_STATE}/holds"
+write_hold_env tank/models ""
+HOLD_OUT=""
+HOLD_RC=0
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+if [[ "${HOLD_RC}" -eq 0 ]]; then
+    fail "hold no-snapshots: expected failure: ${HOLD_OUT}"
+elif ! grep -q "no snapshots" <<<"${HOLD_OUT}"; then
+    fail "hold no-snapshots missing message: ${HOLD_OUT}"
+else
+    pass "hold no-snapshots is an alarm"
+fi
+
+rm -rf "${HOLD_STATE}/holds"
 write_hold_env tank/models tank/models@autosnap_m_monthly \
     tank/models@autosnap_m_monthly
 HOLD_OUT=""
@@ -895,6 +911,12 @@ elif ! grep -q "modelfs-snap-age.timer" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing snap-age timer: ${DRY_OUT}"
 elif ! grep -q "modelfs-hold-monthlies" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing hold_monthlies: ${DRY_OUT}"
+elif ! grep -q "modelfs-pool-restore" <<<"${DRY_OUT}"; then
+    fail "installer dry-run missing pool-restore: ${DRY_OUT}"
+elif ! grep -q "modelfs-check-offsite" <<<"${DRY_OUT}"; then
+    fail "installer dry-run missing check-offsite: ${DRY_OUT}"
+elif ! grep -q "modelfs-offsite-age.timer" <<<"${DRY_OUT}"; then
+    fail "installer dry-run missing offsite-age timer: ${DRY_OUT}"
 else
     pass "installer dry-run lists the NAS units"
 fi
@@ -920,9 +942,13 @@ else
         etc/systemd/system/modelfs-drill-log.timer \
         etc/systemd/system/modelfs-snap-age.service \
         etc/systemd/system/modelfs-snap-age.timer \
+        etc/systemd/system/modelfs-offsite-age.service \
+        etc/systemd/system/modelfs-offsite-age.timer \
         usr/local/sbin/modelfs-restore-drill \
         usr/local/sbin/modelfs-check-drill-log \
         usr/local/sbin/modelfs-hold-monthlies \
+        usr/local/sbin/modelfs-pool-restore \
+        usr/local/sbin/modelfs-check-offsite \
         usr/local/share/doc/modelfs/recovery.md; do
         if [[ ! -f "${INSTALL_DEST}/${rel}" ]]; then
             missing="${missing} ${rel}"
@@ -952,9 +978,393 @@ else
         fail "installer --install hold wrapper is not executable"
     elif ! grep -q "recursive = yes" "${INSTALL_DEST}/etc/sanoid/sanoid.conf"; then
         fail "installer --install sanoid.conf lost recursive = yes"
+    elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-pool-restore" ]]; then
+        fail "installer --install pool-restore wrapper is not executable"
+    elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-check-offsite" ]]; then
+        fail "installer --install offsite wrapper is not executable"
+    elif grep -q "OnFailure" "${INSTALL_DEST}/etc/systemd/system/modelfs-offsite-age.timer"; then
+        fail "installer --install put OnFailure on the offsite-age timer (belongs on the service)"
+    elif ! grep -q "OnFailure=notify-admin@%n.service" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-offsite-age.service"; then
+        fail "installer --install offsite-age service lost OnFailure"
     else
         pass "installer --install lands units, wrappers, and the service OnFailure"
     fi
+fi
+
+# --- check_offsite.sh: site-loss copy freshness
+OFFSITE="${SCRIPTS_DIR}/check_offsite.sh"
+OFFSITE_BIN="${TEMP}/offsitebin"
+OFFSITE_STATE="${TEMP}/offsitestub"
+mkdir -p "${OFFSITE_BIN}" "${OFFSITE_STATE}"
+cat >"${OFFSITE_BIN}/zfs" <<'OFFSTUB'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE="${OFFSITE_STATE:?}"
+read_state() {
+    # shellcheck source=/dev/null
+    source "${STATE}/env"
+}
+sub="$1"
+shift
+case "${sub}" in
+    list)
+        read_state
+        t=""
+        dataset=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -H | -p)
+                    shift
+                    ;;
+                -o | -s)
+                    shift 2
+                    ;;
+                -t)
+                    t="${2-}"
+                    shift 2
+                    ;;
+                *)
+                    dataset="$1"
+                    shift
+                    ;;
+            esac
+        done
+        if [[ "${t}" == "snapshot" ]]; then
+            if [[ "${dataset}" == "${ORIGIN}" && -n "${SNAP_NAME:-}" ]]; then
+                printf '%s\t%s\n' "${SNAP_NAME}" "${SNAP_CREATION}"
+            fi
+            exit 0
+        fi
+        if [[ "${dataset}" == "${ORIGIN}" ]]; then
+            printf '%s\n' "${ORIGIN}"
+            exit 0
+        fi
+        exit 1
+        ;;
+    *)
+        echo "offsite stub zfs: unsupported subcommand ${sub}" >&2
+        exit 1
+        ;;
+esac
+OFFSTUB
+chmod +x "${OFFSITE_BIN}/zfs"
+
+write_offsite_env() {
+    printf 'ORIGIN=%q\nSNAP_NAME=%q\nSNAP_CREATION=%q\n' "$1" "$2" "$3" >"${OFFSITE_STATE}/env"
+}
+
+expect_offsite() {
+    local name="$1"
+    local want_rc="$2"
+    local needle="$3"
+    shift 3
+    local out rc
+    rc=0
+    out="$(env OFFSITE_STATE="${OFFSITE_STATE}" PATH="${OFFSITE_BIN}:${PATH}" "$@" 2>&1)" || rc=$?
+    if [[ "${rc}" -ne "${want_rc}" ]]; then
+        fail "${name}: expected rc=${want_rc}, got ${rc}: ${out}"
+        return 0
+    fi
+    if ! grep -q "${needle}" <<<"${out}"; then
+        fail "${name}: expected '${needle}' in: ${out}"
+        return 0
+    fi
+    pass "${name}"
+}
+
+expect_offsite "offsite with no dataset is an alarm" 1 "dataset required" \
+    "${OFFSITE}"
+
+write_offsite_env tank/models-offsite tank/models-offsite@autosnap_ok "${FRESH}"
+expect_offsite "missing offsite dataset is an alarm" 1 "does not exist" \
+    "${OFFSITE}" tank/models
+
+write_offsite_env tank/models-offsite "" "${FRESH}"
+expect_offsite "offsite with no snapshots is an alarm" 1 "has no snapshots" \
+    "${OFFSITE}" tank/models-offsite
+
+OFFSITE_STALE=$((NOW - 800000))
+write_offsite_env tank/models-offsite tank/models-offsite@old "${OFFSITE_STALE}"
+expect_offsite "stale offsite snapshot is an alarm" 1 "past the" \
+    "${OFFSITE}" tank/models-offsite
+
+write_offsite_env tank/models-offsite tank/models-offsite@future "${FUTURE}"
+expect_offsite "future offsite snapshot is an alarm" 1 "in the future" \
+    "${OFFSITE}" tank/models-offsite
+
+write_offsite_env tank/models-offsite tank/models-offsite@ok "${FRESH}"
+expect_offsite "fresh offsite snapshot is ok" 0 "offsite OK" \
+    "${OFFSITE}" tank/models-offsite
+
+expect_offsite "padded MF_OFFSITE_MAX_AGE=08 is decimal not an octal abort" 1 "past the" \
+    MF_OFFSITE_MAX_AGE=08 "${OFFSITE}" tank/models-offsite
+expect_offsite "MF_OFFSITE_DATASET names the copy when no operand" 0 "offsite OK" \
+    MF_OFFSITE_DATASET=tank/models-offsite "${OFFSITE}"
+expect_offsite "bad MF_OFFSITE_MAX_AGE is an alarm" 1 "whole number of seconds" \
+    MF_OFFSITE_MAX_AGE="8d" "${OFFSITE}" tank/models-offsite
+expect_offsite "overlong MF_OFFSITE_MAX_AGE is an alarm" 1 "whole number of seconds" \
+    MF_OFFSITE_MAX_AGE="12345678901" "${OFFSITE}" tank/models-offsite
+
+# A 90s-old snap is stale under decimal 08 and fresh under decimal 0120
+# (octal 0120 is 80, which would fail). Reuse NINETY from the log tests
+# only as an age; here the snapshot creation is NOW-90.
+NINETY_CTIME=$((NOW - 90))
+write_offsite_env tank/models-offsite tank/models-offsite@ok "${NINETY_CTIME}"
+expect_offsite "padded MF_OFFSITE_MAX_AGE=0120 is 120 seconds, not octal 80" 0 "offsite OK" \
+    MF_OFFSITE_MAX_AGE=0120 "${OFFSITE}" tank/models-offsite
+
+# --- dr_pool_restore.sh: procedure C as a dry-run-default command
+RESTORE="${SCRIPTS_DIR}/dr_pool_restore.sh"
+RESTORE_BIN="${TEMP}/restorebin"
+RESTORE_STATE="${TEMP}/restorestub"
+mkdir -p "${RESTORE_BIN}" "${RESTORE_STATE}"
+cat >"${RESTORE_BIN}/zfs" <<'RESTUB'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE="${RESTORE_STATE:?}"
+read_state() {
+    # shellcheck source=/dev/null
+    source "${STATE}/env"
+    if [[ -f "${STATE}/runtime" ]]; then
+        # shellcheck source=/dev/null
+        source "${STATE}/runtime"
+    fi
+}
+sub="$1"
+shift
+printf 'zfs %s %s\n' "${sub}" "$*" >>"${STATE}/commands.log"
+case "${sub}" in
+    list)
+        read_state
+        t=""
+        dataset=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -H | -p)
+                    shift
+                    ;;
+                -o | -s)
+                    shift 2
+                    ;;
+                -t)
+                    t="${2-}"
+                    shift 2
+                    ;;
+                *)
+                    dataset="$1"
+                    shift
+                    ;;
+            esac
+        done
+        if [[ "${t}" == "snapshot" ]]; then
+            if [[ "${dataset}" == "${LOCAL_FROM:-}" && -n "${LOCAL_SNAP:-}" ]]; then
+                printf '%s\t%s\n' "${LOCAL_SNAP}" "${LOCAL_CREATION}"
+            fi
+            exit 0
+        fi
+        if [[ "${dataset}" == "${DEST:-}" && "${DEST_EXISTS:-0}" == "1" ]]; then
+            printf '%s\n' "${DEST}"
+            exit 0
+        fi
+        if [[ -n "${LOCAL_FROM:-}" && "${dataset}" == "${LOCAL_FROM}" ]]; then
+            printf '%s\n' "${LOCAL_FROM}"
+            exit 0
+        fi
+        exit 1
+        ;;
+    get)
+        read_state
+        prop=""
+        dataset=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -H | -p)
+                    shift
+                    ;;
+                -o)
+                    shift 2
+                    ;;
+                *)
+                    if [[ -z "${prop}" ]]; then
+                        prop="$1"
+                    else
+                        dataset="$1"
+                    fi
+                    shift
+                    ;;
+            esac
+        done
+        case "${prop}" in
+            mounted)
+                if [[ "${dataset}" == "${DEST:-}" ]]; then
+                    printf '%s\n' "${DEST_MOUNTED:-no}"
+                    exit 0
+                fi
+                exit 1
+                ;;
+            mountpoint)
+                if [[ "${dataset}" == "${DEST:-}" ]]; then
+                    printf '%s\n' "${DEST_MP:-/export/models}"
+                    exit 0
+                fi
+                exit 1
+                ;;
+            *)
+                echo "restore stub zfs: unsupported property ${prop}" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    send)
+        echo SEND_STREAM
+        exit 0
+        ;;
+    recv)
+        cat >/dev/null
+        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=/export/models\n' >"${STATE}/runtime"
+        exit 0
+        ;;
+    set)
+        mp=""
+        dest=""
+        for arg in "$@"; do
+            case "${arg}" in
+                mountpoint=*)
+                    mp="${arg#mountpoint=}"
+                    ;;
+                *=*)
+                    ;;
+                *)
+                    dest="${arg}"
+                    ;;
+            esac
+        done
+        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=%q\n' "${mp:-/export/models}" >"${STATE}/runtime"
+        printf 'zfs set dest=%s mp=%s\n' "${dest}" "${mp}" >>"${STATE}/set.log"
+        exit 0
+        ;;
+    *)
+        echo "restore stub zfs: unsupported subcommand ${sub}" >&2
+        exit 1
+        ;;
+esac
+RESTUB
+chmod +x "${RESTORE_BIN}/zfs"
+cat >"${RESTORE_BIN}/syncoid" <<'SYNSTUB'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE="${RESTORE_STATE:?}"
+printf '%s\n' "$*" >"${STATE}/syncoid.args"
+printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=/export/models\n' >"${STATE}/runtime"
+exit 0
+SYNSTUB
+chmod +x "${RESTORE_BIN}/syncoid"
+
+write_restore_env() {
+    cat >"${RESTORE_STATE}/env" <<EOF
+DEST=$(printf '%q' "$1")
+DEST_EXISTS=$(printf '%q' "$2")
+DEST_MOUNTED=$(printf '%q' "$3")
+DEST_MP=$(printf '%q' "$4")
+LOCAL_FROM=$(printf '%q' "${5-}")
+LOCAL_SNAP=$(printf '%q' "${6-}")
+LOCAL_CREATION=$(printf '%q' "${7-}")
+EOF
+    rm -f "${RESTORE_STATE}/runtime" "${RESTORE_STATE}/commands.log" \
+        "${RESTORE_STATE}/syncoid.args" "${RESTORE_STATE}/set.log"
+}
+
+expect_restore() {
+    local name="$1"
+    local want_rc="$2"
+    local needle="$3"
+    shift 3
+    local out rc
+    rc=0
+    out="$(env RESTORE_STATE="${RESTORE_STATE}" PATH="${RESTORE_BIN}:${PATH}" "$@" 2>&1)" || rc=$?
+    if [[ "${rc}" -ne "${want_rc}" ]]; then
+        fail "${name}: expected rc=${want_rc}, got ${rc}: ${out}"
+        return 0
+    fi
+    if ! grep -q "${needle}" <<<"${out}"; then
+        fail "${name}: expected '${needle}' in: ${out}"
+        return 0
+    fi
+    pass "${name}"
+}
+
+write_restore_env tank/models 0 no /export/models
+expect_restore "pool restore dry-run --from prints the plan" 0 "without --execute" \
+    "${RESTORE}" --from replica-host:tank/models
+if [[ -f "${RESTORE_STATE}/syncoid.args" ]]; then
+    fail "pool restore dry-run invoked syncoid"
+else
+    pass "pool restore dry-run did not invoke syncoid"
+fi
+
+expect_restore "pool restore with no source is an alarm" 1 "replica source required" \
+    "${RESTORE}" tank/models
+
+expect_restore "pool restore with both sources is an alarm" 1 "only one of" \
+    "${RESTORE}" --from replica-host:tank/models --local-from tank/models-backup
+
+expect_restore "pool restore dest must be nested" 1 "must be nested" \
+    "${RESTORE}" --from replica-host:tank/models models
+
+write_restore_env tank/models 1 yes /export/models
+expect_restore "pool restore refuses a mounted dest" 1 "is mounted" \
+    "${RESTORE}" --from replica-host:tank/models
+
+expect_restore "pool restore dry-run --force on mounted dest prints the plan" 0 "without --execute" \
+    "${RESTORE}" --force --from replica-host:tank/models
+
+write_restore_env tank/models 0 no /export/models \
+    tank/models-backup tank/models-backup@autosnap_ok "${FRESH}"
+expect_restore "pool restore dry-run --local-from names the newest snap" 0 "zfs send -R tank/models-backup@autosnap_ok" \
+    "${RESTORE}" --local-from tank/models-backup
+
+write_restore_env tank/models 0 no /export/models tank/models-backup "" "${FRESH}"
+expect_restore "pool restore --local-from with no snapshots is an alarm" 1 "has no snapshots" \
+    "${RESTORE}" --local-from tank/models-backup
+
+write_restore_env tank/models 0 no /export/models tank/models tank/models@snap "${FRESH}"
+expect_restore "pool restore --local-from DEST is an alarm" 1 "is DEST" \
+    "${RESTORE}" --local-from tank/models
+
+RLOG="${TEMP}/pool-restore.log"
+write_restore_env tank/models 0 no /export/models
+expect_restore "pool restore --execute --from pulls and sets properties" 0 "pool-restore OK" \
+    MF_RESTORE_LOG="${RLOG}" "${RESTORE}" --execute --from replica-host:tank/models
+if [[ ! -f "${RESTORE_STATE}/syncoid.args" ]]; then
+    fail "pool restore --execute --from did not invoke syncoid"
+elif ! grep -q -- "--force-delete replica-host:tank/models tank/models" "${RESTORE_STATE}/syncoid.args"; then
+    fail "pool restore syncoid args: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
+elif [[ ! -f "${RESTORE_STATE}/set.log" ]]; then
+    fail "pool restore --execute --from did not zfs set"
+elif ! grep -q "mp=/export/models" "${RESTORE_STATE}/set.log"; then
+    fail "pool restore zfs set lost mountpoint: $(cat "${RESTORE_STATE}/set.log" 2>/dev/null || true)"
+elif [[ ! -f "${RLOG}" ]] || ! grep -q "recv_s=" "${RLOG}"; then
+    fail "pool restore log missing recv_s: $(cat "${RLOG}" 2>/dev/null || true)"
+elif ! grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z ' "${RLOG}"; then
+    fail "pool restore log stamp is not UTC Z-form: $(cat "${RLOG}" 2>/dev/null || true)"
+else
+    pass "pool restore --execute --from recorded syncoid, properties, and recv_s"
+fi
+
+RLOG2="${TEMP}/pool-restore-local.log"
+write_restore_env tank/models 0 no /export/models \
+    tank/models-backup tank/models-backup@autosnap_ok "${FRESH}"
+expect_restore "pool restore --execute --local-from send/recv" 0 "cache/modelfs" \
+    MF_RESTORE_LOG="${RLOG2}" "${RESTORE}" --execute --local-from tank/models-backup
+if [[ -f "${RESTORE_STATE}/syncoid.args" ]]; then
+    fail "pool restore --local-from invoked syncoid"
+elif [[ ! -f "${RESTORE_STATE}/set.log" ]]; then
+    fail "pool restore --local-from did not zfs set"
+elif ! grep -q "zfs send" "${RESTORE_STATE}/commands.log" || ! grep -q "zfs recv" "${RESTORE_STATE}/commands.log"; then
+    fail "pool restore --local-from missing send/recv: $(cat "${RESTORE_STATE}/commands.log" 2>/dev/null || true)"
+else
+    pass "pool restore --execute --local-from used send/recv and printed the cache wipe"
 fi
 
 if [[ "${FAILS}" -ne 0 ]]; then

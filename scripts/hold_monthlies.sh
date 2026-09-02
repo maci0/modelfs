@@ -3,6 +3,9 @@
 # recursive zfs destroy cannot take them without an explicit zfs release.
 # Already-held is success (the previous pull tagged it). Any other hold
 # failure is an alarm: the pool-loss copy's fat-finger hold is missing.
+# Zero snapshots at all is also an alarm (a replica with nothing to
+# restore cannot survive destroy -r). Zero monthlies among other
+# snapshots is success: the first month has no *_monthly yet.
 # Invoked as ExecStartPost from scripts/nas/syncoid-models.service.
 set -euo pipefail
 
@@ -38,8 +41,10 @@ zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
 
 LIST="$(zfs list -H -t snapshot -o name "${DATASET}")" || die "cannot list snapshots of ${DATASET}"
 HELD=0
+SAW_ANY=0
 while IFS= read -r snap; do
     [[ -n "${snap}" ]] || continue
+    SAW_ANY=1
     case "${snap}" in
         *_monthly)
             # Tag already present is the rerun case (yesterday's
@@ -60,4 +65,7 @@ while IFS= read -r snap; do
             ;;
     esac
 done <<<"${LIST}"
+if [[ "${SAW_ANY}" -eq 0 ]]; then
+    die "no snapshots of ${DATASET}: a replica with nothing to hold cannot survive zfs destroy -r (docs/recovery.md section 3)"
+fi
 echo "hold OK: ${HELD} monthly snapshot(s) of ${DATASET} tagged ${TAG}"

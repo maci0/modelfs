@@ -38,7 +38,10 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # MF_DRILL_MAX_SNAP_AGE, MF_DRILL_MAX_REPLICA_AGE, MF_DRILL_REPLICA,
 # MF_DRILL_SCRATCH (dr_restore_drill.sh; --age-only is the hourly
 # snapshot-age alarm), MF_DRILL_LOG_MAX_AGE (check_drill_log.sh),
-# MF_NAS_DEST (install_nas_backup.sh).
+# MF_NAS_DEST (install_nas_backup.sh), MF_OFFSITE_DATASET,
+# MF_OFFSITE_MAX_AGE (check_offsite.sh), MF_RESTORE_FROM,
+# MF_RESTORE_LOCAL_FROM, MF_RESTORE_MOUNTPOINT, MF_RESTORE_SHARENFS,
+# MF_RESTORE_LOG (dr_pool_restore.sh).
 
 # Dotted numeric compare: 0.16.1 >= 0.16.0, 3.12.4 >= 3.12, 0.15.99 < 0.16.0.
 # Extra trailing components on cur count as 0 against a longer min.

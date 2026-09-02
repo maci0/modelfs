@@ -126,6 +126,8 @@ zig build fmt                             # apply zig fmt
 ./scripts/dr_restore_drill.sh             # monthly restore drill, on the NAS (docs/recovery.md)
 ./scripts/dr_restore_drill.sh --age-only  # fail if newest snapshot is older than 25 h
 ./scripts/check_drill_log.sh              # fail if that drill's log is missing or older than 35 days
+./scripts/check_offsite.sh                # fail if the site-loss copy is missing or older than 8 days
+./scripts/dr_pool_restore.sh              # pool-loss recv (dry-run; --execute pulls from the replica)
 ./scripts/hold_monthlies.sh               # hold monthly snapshots on the replica
 ./scripts/install_nas_backup.sh           # copy NAS snapshot/replica/drill units (dry-run; --install writes)
 ./scripts/test_dr_restore_drill.sh        # restore drill against stub zfs (also in check.sh)
