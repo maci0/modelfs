@@ -1833,16 +1833,19 @@ pub const Store = struct {
         return sys.statvfsNoFollow(p, vs);
     }
 
-    /// Origin unlink plus cache-identity drop. Forget runs even when the
-    /// origin name is already gone: a FUSE retry after the first attempt
-    /// unlinked then crashed (or lost the reply) would otherwise leave
-    /// data/meta/pin in place, and a same-size recreate would serve the
-    /// deleted file's bytes. Forget also runs before the unlink so a crash
-    /// between the two steps cannot leave a filled sidecar over a name that
-    /// is already gone. The empty rel (FUSE "/") is the origin root itself
-    /// and is not a cache key -- skipping forget there keeps unlink of the
-    /// mount root from targeting cache/data. The origin errno is returned
-    /// as-is (ENOENT stays ENOENT); only the cache side is retry-safe.
+    /// Origin unlink plus cache-identity drop, with FUSE-retry semantics.
+    /// Forget runs even when the origin name is already gone: a FUSE retry
+    /// after the first attempt unlinked then crashed (or lost the reply)
+    /// would otherwise leave data/meta/pin in place, and a same-size
+    /// recreate would serve the deleted file's bytes. Forget also runs
+    /// before the unlink so a crash between the two steps cannot leave a
+    /// filled sidecar over a name that is already gone. The empty rel
+    /// (FUSE "/") is the origin root itself and is not a cache key --
+    /// skipping forget there keeps unlink of the mount root from targeting
+    /// cache/data. A lost reply after a successful unlink is retried as
+    /// ENOENT; if the name is already gone the second call is success,
+    /// matching one unlink (and rmdirOrigin). A directory at that name
+    /// stays EISDIR, the origin's own POSIX answer.
     pub fn unlinkOrigin(self: *Store, rel: []const u8) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const op = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
@@ -1852,6 +1855,7 @@ pub const Store = struct {
         // rebuilt an entry over the still-live origin name; drop it now that
         // the name is gone (or was already gone).
         if (rel.len != 0) self.forget(rel);
+        if (rc == -c.ENOENT) return 0;
         return rc;
     }
 
@@ -4517,10 +4521,11 @@ test "pin and unpin run twice converge on the one-marker state" {
 
 // Re-execution of unlink is the FUSE retry after a lost reply (daemon
 // crash between origin unlink and the response, or a dropped FUSE
-// buffer). The origin name is already gone, so the second call returns
-// ENOENT; cache identity must still drop, or a same-size recreate serves
-// the deleted file's bytes. Twice-versus-once: both end with origin,
-// data, meta, and pin gone.
+// buffer). The origin name is already gone, so the second call is
+// success (ENOENT would fail the FUSE retry after the file had already
+// converged); cache identity must still drop, or a same-size recreate
+// serves the deleted file's bytes. Twice-versus-once: both end with
+// origin, data, meta, and pin gone.
 test "unlinkOrigin twice matches once, and a retry after origin-only unlink still drops cache" {
     const gpa = std.testing.allocator;
     var ob1: [128]u8 = undefined;
@@ -4563,8 +4568,9 @@ test "unlinkOrigin twice matches once, and a retry after origin-only unlink stil
 
     try std.testing.expectEqual(@as(i32, 0), once.unlinkOrigin("gone.bin"));
     try std.testing.expectEqual(@as(i32, 0), twice.unlinkOrigin("gone.bin"));
-    // Retry: origin already gone, POSIX ENOENT, cache still purged.
-    try std.testing.expectEqual(@as(i32, -c.ENOENT), twice.unlinkOrigin("gone.bin"));
+    // FUSE retry after a lost reply: the name is gone, the second call
+    // must not fail ENOENT.
+    try std.testing.expectEqual(@as(i32, 0), twice.unlinkOrigin("gone.bin"));
 
     var stbuf: c.struct_stat = undefined;
     try std.testing.expect(sys.statPath(try once.originPath(&op1, "gone.bin"), &stbuf) != 0);
@@ -4602,12 +4608,17 @@ test "unlinkOrigin twice matches once, and a retry after origin-only unlink stil
     var mb3: [sys.c.PATH_MAX]u8 = undefined;
     const meta3 = try retry.cacheMetaPath(&mb3, "gone.bin");
     try std.testing.expect(sys.statPath(meta3, &stbuf) == 0);
-    try std.testing.expectEqual(@as(i32, -c.ENOENT), retry.unlinkOrigin("gone.bin"));
+    try std.testing.expectEqual(@as(i32, 0), retry.unlinkOrigin("gone.bin"));
     try std.testing.expect(sys.statPath(meta3, &stbuf) != 0);
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try retry.originPath(&op3, "gone.bin"), content));
     const f4 = try retry.get("gone.bin", content.len, now);
     defer retry.releaseFile(f4);
     try std.testing.expectEqual(@as(u32, 0), f4.bits.filled());
+
+    // A directory at that name stays EISDIR: ENOENT-as-success is only the
+    // already-gone file case, not "unlink whatever is missing or wrong".
+    try std.testing.expectEqual(@as(i32, 0), once.mkdirOrigin("subdir", 0o755));
+    try std.testing.expectEqual(@as(i32, -c.EISDIR), once.unlinkOrigin("subdir"));
 }
 
 // Same retry contract for rename: an origin-only rename (first attempt
