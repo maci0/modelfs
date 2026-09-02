@@ -86,8 +86,8 @@ pub const Stats = struct {
     fills_origin: std.atomic.Value(u64) = .init(0),
     bytes_from_peer: std.atomic.Value(u64) = .init(0),
     bytes_from_origin: std.atomic.Value(u64) = .init(0),
-    /// Content-Length of accepted /have 200, /data 206, and /stage 200 replies. Counted
-    /// when the status goes on the wire, not after the body drain, so a
+    /// Content-Length of accepted /have 200, /data 206, and /stage 200 replies.
+    /// Counted when the status goes on the wire, not after the body drain, so a
     /// client that has already read the reply cannot race the bump. Truncated
     /// sends keep the count and a warn. A serving node is otherwise
     /// indistinguishable from an idle one: http_5xx only moves when replies fail.
@@ -138,10 +138,11 @@ pub const Stats = struct {
     /// Unsupported HTTP methods (non-GET). Deduplicated at warn level; every
     /// occurrence still counts here so a probing campaign is not silent.
     http_405: std.atomic.Value(u64) = .init(0),
-    /// Cumulative wall time inside /have, /data, /stage, and /ping handlers.
+    /// Cumulative wall time inside /ping, /have, /data, and /stage handlers.
     /// http_us on the tick line is the serving-side twin of rd_us: without it
     /// a node whose peer replies are slow looks healthy (http_ok climbing,
-    /// inflight low between requests). 401 and malformed heads stay untimed.
+    /// inflight low between requests). 401, 405, and malformed heads stay
+    /// untimed. /ping is timed here but not counted in http_ok.
     http_nanos: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks

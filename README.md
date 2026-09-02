@@ -116,7 +116,7 @@ The blocking gate and clone setup (Zig, libfuse3 headers, shellcheck, uv):
 zig build test -Dtest-filter=relOk        # only tests whose names contain this substring
 zig build test --watch                    # rebuild and re-run on change
 zig build fmt                             # apply zig fmt
-./scripts/check.sh                        # fmt, changelog headings, unit tests, restore-drill stub, vendored fuse extract, script --help, shellcheck, ruff, mypy, sbom
+./scripts/check.sh                        # fmt, changelog headings, unit tests, restore-drill stub, vendored fuse extract, script --help, shellcheck, ruff check+format, mypy, sbom
 ./scripts/ci.sh                           # every CI job: check, aarch64 cross, repro
 ./scripts/repro_check.sh                  # build twice, require byte-identical output
 ./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end
