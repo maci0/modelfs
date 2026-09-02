@@ -3027,9 +3027,10 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         try std.testing.expect(std.mem.startsWith(u8, post.items, "HTTP/1.1 401 Unauthorized\r\n"));
         try std.testing.expect(std.mem.indexOf(u8, post.items, "Allow: GET") == null);
         // Auth runs before the method gate: both missing-bearer requests
-        // count as 401, and the earlier POST /ping 405 must not move.
+        // count as 401, and the earlier 405s (POST, then the CR/LF method)
+        // must not move.
         try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_unauthorized.load(.monotonic));
-        try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_405.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_405.load(.monotonic));
     }
     // Unknown paths are 404 regardless of the query string behind them.
     // Regression: routing used to run after path-parameter decoding, so an

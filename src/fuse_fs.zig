@@ -1038,9 +1038,7 @@ export fn mf_rmdir(path: [*c]const u8) callconv(.c) c_int {
     var rel: []const u8 = "";
     const rerr = resolveRel(p, -sys.c.EPERM, &rel);
     if (rerr != 0) return rerr;
-    var buf: [sys.c.PATH_MAX]u8 = undefined;
-    const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
-    return sys.rmdir(op);
+    return st.store.rmdirOrigin(rel);
 }
 
 export fn mf_rename(old: [*c]const u8, new: [*c]const u8, flags: c_uint) callconv(.c) c_int {

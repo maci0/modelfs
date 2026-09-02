@@ -16,6 +16,19 @@
 - **Every `MODELFS_*` value is trimmed of surrounding whitespace.** An EnvironmentFile trailing space or a copied path with a newline used to become the path (`MODELFS_ORIGIN=/nas/models ` failed later as "not reachable"; `MODELFS_ID=spark1 ` published a different cluster id). Empty or whitespace-only now counts as unset, matching an empty export. `MODELFS_PSK_VALUE` is the exception: a whitespace-only inline secret is still refused as empty rather than falling through to the PSK file. `--seed` trims the same way `--advertise` already trimmed each address.
 - **`modelfs verify` and `modelfs dupes` refuse a file or unreachable `--origin`.** `dupes --all` used to treat a regular file at `--origin` as an empty scan and exit 0. Mount and peers already had the directory gate; `resolveOriginDir` is the shared check.
 
+### FUSE rmdir retry of a gone directory is success - 2026-09-02
+- **`Store.rmdirOrigin` treats ENOENT as success.** `mkdir` of an existing
+  directory already converged so a FUSE retry after a lost reply did not
+  fail `EEXIST`; `rmdir` still returned the origin errno, so the same retry
+  failed `ENOENT` after the directory was already gone. A non-directory at
+  that name stays `ENOTDIR`, a non-empty directory `ENOTEMPTY`. `rmdir` of
+  the mount root (FUSE "/") is `EBUSY` so it cannot delete the origin
+  export. `mf_rmdir` calls the helper, matching `mf_mkdir`.
+- **Peer dispatch test counts both 405s after the CR/LF method case.** The
+  unauthenticated-POST assertion still expected `http_405 == 1` after a
+  second authenticated 405 was added, so `zig build test` failed on that
+  case. It now expects 2, matching the POST and CR/LF method refusals.
+
 ### Mongolian FVS4 and shorthand format controls no longer pass the path and echo gates - 2026-09-02
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused.** `relOk` and `discover.printable` already refused Default_Ignorable including U+180B..U+180E, but a planted path `gguf/model\u180F.bin` or lease id `spark1\u1BCA0` still echoed as the unadorned name. Those sequences are refused now; incomplete encodings and visible neighbours in the same UTF-8 blocks (U+1810, U+1BC9F) stay legal display text.
 

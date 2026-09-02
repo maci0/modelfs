@@ -1670,6 +1670,21 @@ pub const Store = struct {
         return rc;
     }
 
+    /// Origin rmdir with FUSE-retry semantics. A lost reply after a
+    /// successful rmdir is retried as ENOENT; if the name is already gone
+    /// the second call is success, matching one rmdir. A non-directory at
+    /// that name stays ENOTDIR and a non-empty directory stays ENOTEMPTY,
+    /// the origin's own POSIX answers. Empty rel is the origin root and
+    /// is EBUSY: rmdir of FUSE "/" must not delete the export.
+    pub fn rmdirOrigin(self: Store, rel: []const u8) i32 {
+        if (rel.len == 0) return -c.EBUSY;
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const op = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
+        const rc = sys.rmdir(op);
+        if (rc == -c.ENOENT) return 0;
+        return rc;
+    }
+
     /// Copies bytes this node just wrote through the mount into the local
     /// cache and marks the pieces they fully span. The entry is grown with
     /// its piece marks preserved: an append is our own write, not an external
@@ -4373,6 +4388,40 @@ test "mkdirOrigin twice matches once, and a file at that name stays EEXIST" {
 
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try st.originPath(&pb, "file.bin"), "x"));
     try std.testing.expectEqual(@as(i32, -c.EEXIST), st.mkdirOrigin("file.bin", 0o755));
+}
+
+test "rmdirOrigin twice matches once, a file stays ENOTDIR, nonempty stays ENOTEMPTY" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-rmdir-twice");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-rmdir-twice");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    try std.testing.expectEqual(@as(i32, 0), st.mkdirOrigin("sub", 0o755));
+    try std.testing.expectEqual(@as(i32, 0), st.rmdirOrigin("sub"));
+    // FUSE retry after a lost reply: the directory is gone, the second call
+    // must not fail ENOENT.
+    try std.testing.expectEqual(@as(i32, 0), st.rmdirOrigin("sub"));
+
+    var stbuf: c.struct_stat = undefined;
+    var pb: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expect(sys.lstatPath(try st.originPath(&pb, "sub"), &stbuf) != 0);
+
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try st.originPath(&pb, "file.bin"), "x"));
+    try std.testing.expectEqual(@as(i32, -c.ENOTDIR), st.rmdirOrigin("file.bin"));
+
+    try std.testing.expectEqual(@as(i32, 0), st.mkdirOrigin("full", 0o755));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try st.originPath(&pb, "full/x.bin"), "x"));
+    try std.testing.expectEqual(@as(i32, -c.ENOTEMPTY), st.rmdirOrigin("full"));
+
+    // FUSE "/" is the origin root. Removing it would delete the export.
+    try std.testing.expectEqual(@as(i32, -c.EBUSY), st.rmdirOrigin(""));
 }
 
 test "punchPiece refuses pinned and freshly accessed entries" {
