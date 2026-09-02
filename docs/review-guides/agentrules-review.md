@@ -11,7 +11,7 @@ Your goal is to evaluate whether `AGENTS.md` works as a rubric an agent can appl
 - The user's requested mode controls output. If it forbids a report, do not create or update the review document despite any "always" wording below.
 - Before reporting or fixing a finding, read the `AGENTS.md` sentence and the code or sibling prompt it refers to. A wording tweak that disagrees with `zig-src-review.md` or `scripts-review.md` on the same rule is a regression.
 - Unless the user sets another budget, fix at most five distinct findings and skip any single-file fix expected to exceed 200 changed lines.
-- Spend that budget on P0 before P1, then on the smallest proven live-path fixes. Leave P2/P3 as findings unless the user explicitly requests them.
+- Spend that budget on P0 before P1, then on the smallest proven wording fixes. Leave P2/P3 as findings unless the user explicitly requests them.
 
 ## Review the following
 
