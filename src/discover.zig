@@ -176,9 +176,11 @@ pub fn printable(s: []const u8) bool {
 }
 
 /// Name safe to echo into a log line: the input when printable, else a fixed
-/// placeholder. Lease file names come off shared NFS storage anyone with
-/// origin write access can craft, so every site that logs one goes through
-/// here rather than re-deciding the printable gate inline.
+/// placeholder. Lease file names and piece-hash manifest names come off
+/// shared NFS storage anyone with origin write access can craft, and the
+/// peer 405 journal line echoes a request-line method a PSK holder chose,
+/// so every site that logs one of those goes through here rather than
+/// re-deciding the printable gate inline.
 pub fn displayName(name: []const u8) []const u8 {
     return if (printable(name)) name else "<name withheld: control bytes>";
 }
@@ -1474,7 +1476,9 @@ test "printable gates lease names and ids for log echo" {
 
 test "displayName echoes printable names and withholds the rest" {
     try std.testing.expectEqualStrings("spark1.json", displayName("spark1.json"));
+    try std.testing.expectEqualStrings("POST", displayName("POST"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("a\nb"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("FOO\nforged"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("\x7f"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{2028}ERROR forged"));
     try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{202e}gnp"));

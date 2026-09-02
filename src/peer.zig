@@ -429,7 +429,11 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         _ = self.store.stats.http_405.fetchAdd(1, .monotonic);
         if (claimMethodWarn(self, sys.monoMs(self.io))) {
             var abuf: [64]u8 = undefined;
-            std.log.warn("peer http: rejected unsupported {s} from {s}", .{ method, peerAddrText(peer, &abuf) });
+            // The request-line method is attacker-chosen once the bearer
+            // check has passed. Echoing it verbatim would let a PSK holder
+            // forge follow-up journal lines (CR/LF) or inject terminal
+            // escapes, the same class a planted lease name already cannot.
+            std.log.warn("peer http: rejected unsupported {s} from {s}", .{ discover.displayName(method), peerAddrText(peer, &abuf) });
         }
         // RFC 9110 §15.5.5: a 405 must name the methods the resource
         // supports, so a probing client can discover the shape of the API.
@@ -2913,6 +2917,20 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_405.load(.monotonic));
         try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
         try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_unauthorized.load(.monotonic));
+    }
+    // A method carrying CR/LF is still 405 (the reply never echoes it) and
+    // still counts; the journal goes through displayName so the raw token
+    // cannot split a log line. The warn is suppressed here the way the 401
+    // path already is.
+    {
+        const prev_log_level = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = prev_log_level;
+        var res = try roundTrip(port, "FOO\nforged GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 405 Method Not Allowed\r\n"));
+        try std.testing.expect(std.mem.indexOf(u8, res.items, "Allow: GET\r\n") != null);
+        try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_405.load(.monotonic));
     }
     // A missing bearer token is a 401 that names the scheme to retry with
     // (RFC 9110 §15.5.2). The expected rejection warning stays off the

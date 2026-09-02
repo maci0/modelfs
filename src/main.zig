@@ -2629,23 +2629,26 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     while (sys.readdir(dir)) |ent| {
         const name = sys.dirName(ent);
         if (name.len == 0 or name[0] == '.') continue;
+        // Names come off shared NFS storage. Skip-warns go through
+        // displayName so a planted CR/LF or terminal escape cannot forge
+        // journal lines; lease walks already apply the same gate.
         var fbuf: [sys.c.PATH_MAX]u8 = undefined;
         const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
         var open_errno: i32 = 0;
         const blob = sys.readFileAllocNoFollowOpenErrno(gpa, fp, store_mod.Store.max_manifest_bytes, &open_errno) catch |err| switch (err) {
             error.OpenFailed => {
                 if (open_errno != sys.c.ENOENT)
-                    if (!builtin.is_test) std.log.warn("manifest open failed for {s} (errno {d}); skipping", .{ name, open_errno });
+                    if (!builtin.is_test) std.log.warn("manifest open failed for {s} (errno {d}); skipping", .{ discover.displayName(name), open_errno });
                 continue;
             },
             else => {
-                if (!builtin.is_test) std.log.warn("manifest read failed for {s}: {t}; skipping", .{ name, err });
+                if (!builtin.is_test) std.log.warn("manifest read failed for {s}: {t}; skipping", .{ discover.displayName(name), err });
                 continue;
             },
         };
         defer gpa.free(blob);
         const m = piece.manifestDecode(gpa, blob) catch {
-            if (!builtin.is_test) std.log.warn("corrupt piece-hash manifest {s}; skipping", .{name});
+            if (!builtin.is_test) std.log.warn("corrupt piece-hash manifest {s}; skipping", .{discover.displayName(name)});
             continue;
         } orelse continue;
         total_pieces += m.entries.len;
@@ -3058,6 +3061,36 @@ test "cmdDupesAll scans the manifest store and --all is dupes-only" {
     try std.testing.expect(parsed_ok.opts.all);
     try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &env, &.{ "peers", "--all", "--origin", origin_d }));
     try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &env, &.{ "verify", "--all", "--origin", origin_d, "m.bin" }));
+}
+
+test "cmdDupesAll skips a control-byte manifest name and still scans the rest" {
+    // Origin-write plant: a manifests/ file whose name holds CR/LF. The
+    // skip-warn goes through displayName (so the raw name never reaches
+    // the journal); this pins that the scan still succeeds and does not
+    // count the junk as a manifest. The echo gate itself is tested in
+    // discover.zig.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-dupes-ctrl");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    const h0 = [_]u8{0x11} ** piece.digest_len;
+    var entries = [_]piece.ManifestEntry{.{ .idx = 0, .hash = h0 }};
+    try writeManifestForTest(gpa, origin_d, "a.bin", 16, 16, &entries);
+
+    var mb: [256]u8 = undefined;
+    var zb: [256]u8 = undefined;
+    const evil = try std.fmt.bufPrint(&mb, "{s}/.cluster/manifests/evil\n2026-09-02 forged", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(try sys.toZ(&zb, evil), "not a manifest"));
+
+    const opts = Opts{ .origin = origin_d };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, opts));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "scanned 1 manifest(s), 1 piece(s) total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "forged") == null);
 }
 
 fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {

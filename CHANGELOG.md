@@ -13,6 +13,14 @@
   distinct hashes they actually have in common. Aligned overlap and
   byte-identical detection are unchanged.
 
+### Peer 405 and dupes logs withhold control bytes - 2026-09-02
+- **The 405 journal line and `modelfs dupes --all` skip-warns no longer echo
+  attacker-chosen tokens verbatim.** A PSK holder could put CR/LF or a
+  terminal escape in the request-line method, and an origin writer could
+  plant the same in a `.cluster/manifests/` file name; both now go through
+  `discover.displayName` the way lease names already do. The 405 reply and
+  the dupes scan are unchanged.
+
 ## [0.5.0] - 2026-08-31
 
 Observability release on top of 0.4.0: the FUSE metadata handlers and the
