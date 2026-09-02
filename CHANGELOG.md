@@ -5,6 +5,14 @@
 ### Mongolian FVS4 and shorthand format controls no longer pass the path and echo gates - 2026-09-02
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused.** `relOk` and `discover.printable` already refused Default_Ignorable including U+180B..U+180E, but a planted path `gguf/model\u180F.bin` or lease id `spark1\u1BCA0` still echoed as the unadorned name. Those sequences are refused now; incomplete encodings and visible neighbours in the same UTF-8 blocks (U+1810, U+1BC9F) stay legal display text.
 
+### `modelfs dupes` counts each shared digest once - 2026-09-02
+- **`modelfs dupes` reports each digest shared between two files once.**
+  A file that repeats the same piece hash (padding, duplicated tensors)
+  used to increment the "shared digest(s)" count once per occurrence,
+  so two copies of a padded GGUF could report more shared digests than
+  distinct hashes they actually have in common. Aligned overlap and
+  byte-identical detection are unchanged.
+
 ## [0.5.0] - 2026-08-31
 
 Observability release on top of 0.4.0: the FUSE metadata handlers and the

@@ -110,16 +110,34 @@ pub const Backend = struct {
                 lockOrYield(&self.lock);
                 defer self.lock.unlock();
                 self.stage_calls += 1;
-                if (self.staged.items.len >= self.fake_cap) return null;
+                // Tombstones are empty slices (releaseLocked) so Window.addr
+                // stays a stable index. Count live buffers, not the array
+                // length: a consumed window must free the slot for the next
+                // piece, or the cap is a lifetime limit and every /stage after
+                // fake_cap sequential pieces falls back to /data.
+                var free_slot: ?usize = null;
+                var live: usize = 0;
+                for (self.staged.items, 0..) |buf, i| {
+                    if (buf.len == 0) {
+                        if (free_slot == null) free_slot = i;
+                    } else live += 1;
+                }
+                if (live >= self.fake_cap) return null;
                 const own = self.gpa.dupe(u8, data) catch return null;
-                self.staged.append(self.gpa, own) catch {
-                    self.gpa.free(own);
-                    return null;
+                const addr: u64 = if (free_slot) |i| blk: {
+                    self.staged.items[i] = own;
+                    break :blk i;
+                } else blk: {
+                    self.staged.append(self.gpa, own) catch {
+                        self.gpa.free(own);
+                        return null;
+                    };
+                    break :blk self.staged.items.len - 1;
                 };
                 return .{
                     .len = data.len,
                     .rkey = 1,
-                    .addr = self.staged.items.len - 1,
+                    .addr = addr,
                     .digest = digest.*,
                 };
             },
@@ -276,6 +294,15 @@ test "fake backend stages and reads one window" {
         for (small.staged.items) |buf| gpa.free(buf);
         small.staged.deinit(gpa);
     }
-    try std.testing.expect(small.stage(data, &d) != null);
+    const w_cap = small.stage(data, &d).?;
     try std.testing.expect(small.stage(data, &d) == null);
+    // Cap is concurrent occupancy: consuming the window frees the slot
+    // so a later piece can stage. A lifetime count would 501 every
+    // /stage after fake_cap sequential pieces even with nothing live.
+    var out_cap: [16]u8 = undefined;
+    try std.testing.expect(small.read(w_cap, &out_cap));
+    try std.testing.expectEqualSlices(u8, data, &out_cap);
+    const w_reuse = small.stage(data, &d).?;
+    try std.testing.expect(small.stage(data, &d) == null);
+    try std.testing.expect(small.read(w_reuse, &out_cap));
 }

@@ -2873,9 +2873,15 @@ fn manifestOverlapPrepared(
             .lt => i += 1,
             .gt => j += 1,
             .eq => {
+                // One increment per distinct digest: a file that repeats
+                // the same piece hash (padding, duplicated tensors) must
+                // not inflate "shared digest(s)" once per occurrence.
                 ov.shared += 1;
+                const h = a_dig[i].hash;
                 i += 1;
                 j += 1;
+                while (i < a_dig.len and std.mem.eql(u8, &a_dig[i].hash, &h)) i += 1;
+                while (j < b_dig.len and std.mem.eql(u8, &b_dig[j].hash, &h)) j += 1;
             },
         }
     }
@@ -2928,6 +2934,23 @@ test "manifestOverlap counts aligned, shared, and identical content" {
     try std.testing.expectEqual(@as(u64, 2), ad.aligned);
     try std.testing.expectEqual(@as(u64, 2), ad.shared);
     try std.testing.expect(ad.identical);
+    // Repeated digest in both files is one distinct shared digest, not
+    // one per occurrence (the report names "shared digest(s)").
+    var d_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h0 },
+    };
+    var e_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h0 },
+        .{ .idx = 2, .hash = h1 },
+    };
+    const D = piece.Manifest{ .piece_size = 16, .file_size = 32, .entries = &d_entries };
+    const E = piece.Manifest{ .piece_size = 16, .file_size = 48, .entries = &e_entries };
+    const de = manifestOverlap(std.testing.allocator, D, E);
+    try std.testing.expectEqual(@as(u64, 2), de.aligned);
+    try std.testing.expectEqual(@as(u64, 1), de.shared);
+    try std.testing.expect(!de.identical);
 }
 
 test "cmdDupes reports manifest overlap and gates its paths" {
