@@ -20,10 +20,10 @@ and an NFS origin as the write authority. Linux only.
 headings (`[Unreleased]` first, dated semver matching `build.zig.zon`,
 `[name]:` footer links, and current-tag sentences in README/SECURITY.md/
 THREAT_MODEL.md; dated notes are `###`), `zig build test`, shellcheck
-(`.shellcheckrc` on `scripts/*.sh`), `test_dr_restore_drill.sh`, vendored
+(`.shellcheckrc` on every `scripts/**/*.sh`), `test_dr_restore_drill.sh`, vendored
 libfuse3 digest and extract checks, contributor-script `--help` handlers
-(`test_scripts_help.sh`), `ruff check scripts/`, `ruff format --check scripts/`,
-`mypy scripts/`, `scripts/sbom.py --self-test`, and `scripts/sbom.py --check`.
+(`test_scripts_help.sh`), `ruff check`, `ruff format --check`,
+`mypy`, `scripts/sbom.py --self-test`, and `scripts/sbom.py --check`.
 CI runs that plus the aarch64 cross-compile and the reproducibility rebuild.
 Never loosen a gate to pass it.
 

@@ -119,7 +119,7 @@ command -v zfs >/dev/null 2>&1 || die "zfs not found; this drill runs on the NAS
 # sort -z, and stat -c are not in BusyBox/BSD. This host (Rocky/RHEL NAS)
 # ships GNU; probe early so a different host fails with a named fix.
 if ! find / -maxdepth 0 -printf '' >/dev/null 2>&1; then
-    # shellcheck disable=SC2185
+    # shellcheck disable=SC2185 # GNU find --version takes no path; error-path after -printf failed
     find_ver="$(find --version 2>/dev/null | head -1 || echo non-GNU find)"
     die "GNU find is required (need find -printf); this host has ${find_ver}"
 fi

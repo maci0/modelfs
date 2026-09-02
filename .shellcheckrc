@@ -1,6 +1,7 @@
-# Optional checks the gate enables. A bare `shellcheck scripts/*.sh` from
-# the repo root must match scripts/check.sh; without this file it would
-# skip every optional check and pass scripts the gate rejects.
+# Optional checks the gate enables. A glob of every scripts/**/*.sh
+# (what scripts/check.sh runs, via globstar) must match a local run of
+# the same glob; without this file it would skip every optional check
+# and pass scripts the gate rejects.
 #
 # Defect-oriented extras this tree already passes: every case statement
 # must handle an unmatched input, bare [ $x ] conditions are ambiguous,

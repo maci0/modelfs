@@ -22,13 +22,16 @@ required-version = ">=0.16,<0.17"
 # 0.16 line starts failing this gate instead of staying off by not being
 # listed. Formatter preview stays off (it would reformat dict literals).
 # Ignores are only the exceptions this tree does not pass, each named.
+# Selectors are rule names, not codes, so preview rule-codes-in-selectors
+# cannot hide on pyproject.toml (scripts/check.sh runs a pathless
+# `ruff check`, which includes this file).
 preview = true
 select = ["ALL"]
 ignore = [
     # CLI harnesses print to stdout/stderr as their interface.
-    "T201",
+    "print",
     # Conflicts with ruff format (the formatter owns trailing commas).
-    "COM812",
+    "missing-trailing-comma",
     # Internal scripts, not a published library: no pydocstyle,
     # pydoclint, or copyright-header convention.
     "D",
@@ -36,17 +39,22 @@ ignore = [
     "CPY",
     # Preview: prefer `ruff: ignore` over `noqa`. noqa stays so a comment
     # that also names a bandit code remains valid for both tools.
-    "RUF105",
+    "noqa-comments",
     # Preview nits this tree does not pass: repeated list.append,
-    # Path.write_text, too-many-locals, empty-string comparisons.
-    "FURB113",
-    "FURB103",
-    "PLR0914",
-    "PLC1901",
-    # Preview: import of subprocess is the documented spawn path (S603
-    # still flags each call; those are noqa'd with a reason).
-    "S404",
+    # too-many-locals, empty-string comparisons.
+    "repeated-append",
+    "too-many-locals",
+    "compare-to-empty-string",
+    # Preview: import of subprocess is the documented spawn path
+    # (subprocess-without-shell-equals-true still flags each call; those
+    # are noqa'd with a reason).
+    "suspicious-subprocess-import",
 ]
+
+# Flag typing-only imports even when a runtime sibling from the same
+# module exists; the scripts already pass this.
+[tool.ruff.lint.flake8-type-checking]
+strict = true
 
 [tool.ruff.format]
 # Formatter also normalizes Python snippets inside docstrings, so examples
@@ -125,9 +133,10 @@ enable_error_code = [
     # a value narrowed to a type the declared annotation cannot hold is a
     # latent AttributeError/TypeError at runtime, not a style nit
     "narrowed-type-not-subtype",
-    # --strict already turns warn_unused_ignores on; listing the code keeps
-    # every default-off extra code in this one list so a later --strict
-    # reshape cannot drop it silently.
+    # --strict already turns warn_unused_ignores and warn_redundant_casts
+    # on; listing the codes keeps every default-off extra code in this one
+    # list so a later --strict reshape cannot drop them silently.
     "unused-ignore",
+    "redundant-cast",
 ]
 

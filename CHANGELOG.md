@@ -29,6 +29,17 @@
   slot until `read` or `release`. A length-mismatch `read` consumes the
   slot too, so a failed fetch cannot pin the cap until exit.
 
+### Python and shell gates cover the config file and nested scripts - 2026-09-02
+- **ruff no longer ignores `write-whole-file`.** The scripts already use
+  `Path.write_text`, so that ignore was silencing a rule that no longer
+  fired. Ignore selectors are rule names rather than codes, type-checking
+  imports stay flagged even when a runtime sibling exists, and `ruff check`
+  / `ruff format --check` run with no path so `pyproject.toml` and a Python
+  module outside `scripts/` cannot skip the gate. mypy lists `redundant-cast`
+  next to the other default-off extras `--strict` already turns on.
+- **shellcheck walks every `scripts/**/*.sh`**, so a nested script cannot
+  skip the top-level `scripts/*.sh` glob.
+
 ## [0.5.0] - 2026-08-31
 
 Observability release on top of 0.4.0: the FUSE metadata handlers and the

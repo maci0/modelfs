@@ -174,10 +174,15 @@ echo "=== vendored fuse3 hashes ==="
 ) || fail "vendored libfuse3 sha256 mismatch; refresh per .deps/fuse3-arm64/README.md"
 
 echo "=== shellcheck ==="
-# Optional checks live in .shellcheckrc so a bare `shellcheck scripts/*.sh`
-# from the repo root matches this gate. The style-only brace/double-bracket
-# checks stay off: this tree does not follow those conventions.
-shellcheck scripts/*.sh || fail "shellcheck reported violations"
+# Optional checks live in .shellcheckrc so a glob of every scripts/**/*.sh
+# matches this gate. Recurse: scripts/*.sh would skip a nested script.
+# The style-only brace/double-bracket checks stay off: this tree does
+# not follow those conventions.
+shopt -s globstar nullglob
+sh_files=(scripts/**/*.sh)
+shopt -u nullglob
+[[ "${#sh_files[@]}" -gt 0 ]] || fail "no shell scripts found under scripts/"
+shellcheck "${sh_files[@]}" || fail "shellcheck reported violations"
 
 # The NAS drill cannot run here (no zfs pool). The stub suite is what
 # keeps a clone-onto-live or empty-snapshot false pass from shipping.
@@ -191,13 +196,16 @@ echo "=== vendored libfuse3 extract ==="
 "${SCRIPTS_DIR}/test_extract_fuse3_arm64.sh" || fail "vendored libfuse3 extract tests failed"
 
 echo "=== ruff ==="
-ruff check scripts/ || fail "ruff check reported violations"
+# No path: pyproject.toml is in ruff's default set, and a Python file
+# outside scripts/ cannot skip the gate. Matches a bare `ruff check`.
+ruff check || fail "ruff check reported violations"
 
 echo "=== ruff format --check ==="
-ruff format --check scripts/ || fail "ruff format --check reported unformatted files; fix with: ruff format scripts/"
+ruff format --check || fail "ruff format --check reported unformatted files; fix with: ruff format"
 
 echo "=== mypy ==="
-mypy scripts/ || fail "mypy reported errors"
+# files = ["scripts"] in pyproject.toml, so a bare `mypy` matches this gate.
+mypy || fail "mypy reported errors"
 
 echo "=== sbom ==="
 python3 "${SCRIPTS_DIR}/sbom.py" --self-test || fail "sbom self-test failed"
