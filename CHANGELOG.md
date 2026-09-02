@@ -34,6 +34,9 @@ until the next tag.
 ### Socket options and listen use std.c like bind/accept - 2026-09-02
 - **Peer listen, poll, fcntl, and socket options no longer go through translate-c.** `bind`/`connect`/`accept4`/`getsockname` already used `std.c` so musl headers (and a glibc field-name change) cannot break the ABI. `listen`, `setsockopt`, `getsockopt`, `poll`, and `fcntl` now share that door; `sys.listen` and `sys.setReuseAddr` are the shared wrappers. `dirName` reads `d_name[0]` so a musl flexible-array dirent still names the first byte.
 
+### Cache-refusal /data 500 case runs as root - 2026-09-02
+- **The /data 500-on-cache-refusal unit test no longer skips as root.** It chmod'd the cache file 0444, which root's DAC_OVERRIDE bypasses (the reply became 206). A directory at the data path fails the O_RDWR open with EISDIR for every uid, matching `serveHydrated`. The peer HTTP dispatch and `/have` tests now require a data-plane 206 to increment `http_ok` and `http_nanos`, so `/ping`'s zeros cannot pass if every reply skipped those counters. `fuzzcorpus.entry` pins its little-endian length prefix so a raw codec blob cannot be consumed as that prefix.
+
 ### Peer goodput samples ignore sub-resolution clock ticks - 2026-09-02
 - **A piece fetch whose elapsed time is 1 ns no longer records ~10 PB/s.** `rangeBps` already returned 0 for a same-ns tick (which pulled the EWMA toward a dead path). A 1 ns tick on a 16 MiB piece is finite (~1.7e16 B/s) and pulled the EWMA the other way, so `pickBest` stuck on that path until tens of real samples decayed it. Samples above 1 TB/s now keep the prior, like a non-positive interval.
 

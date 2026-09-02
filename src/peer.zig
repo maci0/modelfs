@@ -2872,6 +2872,9 @@ test "serveHave answers with the exact cached bitfield blob" {
     try std.testing.expectEqual(@as(u64, 33), srv.store.stats.bytes_to_peer.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), srv.store.stats.fills_origin.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 32), srv.store.stats.bytes_from_origin.load(.monotonic));
+    // Data-plane replies are timed; /ping's http_nanos==0 is only
+    // meaningful if these transfers actually move the counter.
+    try std.testing.expect(srv.store.stats.http_nanos.load(.monotonic) > 0);
 
     // A directory at the requested path is a miss (404), same as ENOENT:
     // /have advertises regular files only.
@@ -2879,6 +2882,7 @@ test "serveHave answers with the exact cached bitfield blob" {
     var res = try roundTrip(port, "GET /have?path=sub HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
     defer res.deinit(gpa);
     try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_ok.load(.monotonic));
 }
 
 test "serveHave refuses a bitmap above the fetch body bound before opening a cache entry" {
@@ -3148,6 +3152,11 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
             try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 206 Partial Content\r\n"));
             try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Type: application/octet-stream\r\n") != null);
             try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\ndata"));
+            // Dual of /ping above: a data-plane 206 must count in http_ok
+            // and http_nanos, or ping's zeros would still pass if every
+            // reply skipped those counters.
+            try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_ok.load(.monotonic));
+            try std.testing.expect(srv.store.stats.http_nanos.load(.monotonic) > 0);
         }
         // A directory at the path is the same miss /have reports (404), not
         // an origin failure (502): hydration's pread on the dir fd must never
@@ -3158,15 +3167,12 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
             defer res.deinit(gpa);
             try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
         }
+        // A miss must not look like a transfer: http_ok stays the 206 above.
+        try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_ok.load(.monotonic));
     }
 }
 
 test "serveData replies 500 when the cache refuses hydrated bytes" {
-    // The failure is staged with a 0444 cache file: root's DAC_OVERRIDE
-    // bypasses the mode bits, so the O_RDWR open succeeds, the fill lands,
-    // and the reply is 206 -- the test fails spuriously. Not stageable as
-    // root; skip instead of flaking in a root container or VM.
-    if (std.os.linux.geteuid() == 0) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;
@@ -3176,8 +3182,8 @@ test "serveData replies 500 when the cache refuses hydrated bytes" {
     defer sys.deleteTree(std.testing.io, cache_d);
 
     // Regression: when the origin read succeeded but the cache fs refused the
-    // bytes (here: an unwritable data artifact), the unset bit fell through
-    // to a 404 -- telling the fetching peer the path was gone -- with no log.
+    // bytes, the unset bit fell through to a 404 -- telling the fetching
+    // peer the path was gone -- with no log.
     var pattern: [16]u8 = undefined;
     for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 53);
     var fbuf: [192]u8 = undefined;
@@ -3185,21 +3191,18 @@ test "serveData replies 500 when the cache refuses hydrated bytes" {
     const fp = try std.fmt.bufPrint(&fbuf, "{s}/ro.bin", .{origin_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
 
-    // Unwritable cache data file: openCache's O_RDWR|O_CREAT fails EACCES,
-    // so writePiece fails after originPread delivered every byte.
-    var dbuf: [192]u8 = undefined;
-    const data_dir = try std.fmt.bufPrint(&dbuf, "{s}/data", .{cache_d});
-    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(data_dir, 0o755));
-    var pbuf: [192]u8 = undefined;
-    const dp = try std.fmt.bufPrint(&pbuf, "{s}/ro.bin", .{data_dir});
-    var dz: [sys.c.PATH_MAX]u8 = undefined;
-    const dpz = try sys.toZ(&dz, dp);
-    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(dpz, ""));
-    try std.testing.expectEqual(@as(i32, 0), c.chmod(dpz, 0o444));
-
     const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
     defer srv.stop();
     const port = srv.port();
+
+    // Directory at the cache data path: openCache's O_RDWR|O_CREAT fails
+    // EISDIR for every uid (root's DAC_OVERRIDE cannot open a directory
+    // for writing). A 0444 file used to skip this case as root and leave
+    // the 500-vs-404 regression untested in root containers and VMs.
+    try std.testing.expectEqual(@as(i32, 0), srv.store.ensureLayout());
+    var dbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const dp = try srv.store.cacheDataPath(&dbuf, "ro.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(dp), 0o755));
 
     // Expected-path warning; keep it off the runner's stderr like sibling
     // fault-tolerance tests do.

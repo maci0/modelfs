@@ -11,3 +11,17 @@ pub fn entry(comptime payload: []const u8) [4 + payload.len]u8 {
     @memcpy(out[4..], payload);
     return out;
 }
+
+test "entry prefixes payload with a little-endian length" {
+    // Smith.slice reads a u32 length prefix then that many bytes. A raw
+    // codec blob used as a corpus seed is consumed as that prefix, so a
+    // well-formed window or MFSM never reaches the decoder. Empty and
+    // multi-byte payloads must both frame exactly.
+    const framed = entry("abcd");
+    try std.testing.expectEqual(@as(usize, 8), framed.len);
+    try std.testing.expectEqual(@as(u32, 4), std.mem.readInt(u32, framed[0..4], .little));
+    try std.testing.expectEqualSlices(u8, "abcd", framed[4..]);
+    const empty = entry("");
+    try std.testing.expectEqual(@as(usize, 4), empty.len);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, empty[0..4], .little));
+}
