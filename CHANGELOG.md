@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-03
+
+Follow-up to 0.7.0, closing what its review pass deferred. A FUSE read no
+longer allocates: reply buffers come from a fixed pool sized to what the
+kernel actually asks for, measured rather than assumed. `modelfs update`
+fails loudly when the kernel cannot supply random bytes instead of falling
+back to a pid-derived handshake token. The inode and handle layer the
+low-level FUSE migration introduced gained unit tests, and the tree moved
+off the `std.mem` index names Zig 0.16 deprecated.
+
+No CLI, wire, or on-disk change, so a mixed fleet with `0.7.0` peers still
+fills and `modelfs update` still hands over between the two.
+
+### FUSE reads no longer allocate - 2026-09-03
+- **A FUSE read borrows a reply buffer from a fixed pool instead of allocating one.** `ll_read` called `gpa.alloc` once per read, against the house rule that the read path uses stack buffers or a reusable one. Measured first: with `direct_io` the kernel asks for exactly 1 MiB every time, and with `--kernel-cache` 512 KiB or less, because both are bounded by `max_pages * PAGE_SIZE` and libfuse caps `max_pages` at 256 pages. `claimReadBuf` therefore hands out one of 16 slot buffers of that size (`read_slots` mirrors `peer.Server.max_inflight`), claimed with an atomic bitmask so the owner can fill its slot lazily without a race. An idle mount holds no buffers and a single reader holds one; a burst past the last slot falls back to the allocator rather than blocking a reader or replying short, which the page-cache path would read as a hole. FUSE INIT negotiation is untouched, so the `modelfs update` replay contract is untouched. The ENOMEM branch now counts `reads_err` instead of failing silently.
+
+### Migrated off the deprecated `std.mem` index names - 2026-09-03
+- **All 111 `std.mem.indexOf*` call sites moved to the 0.16 `find*` names.** Zig 0.16 renamed "index of" to "find" and kept the old spellings as aliases the stdlib marks deprecated, so both compiled and the tree had drifted into using both: 31 `find*` against 111 deprecated, and the modules `v0.7.0` added had picked up the old spelling from their surroundings. The mapping is one-to-one (`indexOf` to `find`, `indexOfScalar` to `findScalar`, `lastIndexOfScalar` to `findScalarLast`), so this is a rename with no behavior change.
+
 ### Review-pass fixes - 2026-09-02
 - **`modelfs update` now fails loudly when the kernel cannot supply random bytes.** The handshake token that matches an `update.req` to its `update.ack` fell back to a pid-derived value if `getrandom` failed, and a derivable token lets a same-uid racer ack an update it did not request. The raw syscall stays (`std.crypto.random` and `std.posix.getrandom` are both gone in Zig 0.16) but now lives behind `sys.randomBytes` with EINTR retry and short-read looping, and `cmdUpdate` names the failure and exits 1 rather than proceeding with a weak token.
 - **The inode and handle layer gained unit tests.** `v0.7.0` moved the daemon to libfuse's low-level API, so modelfs owns the ino/path table, the lookup counts, and the fh/path table; the nine functions carrying that were covered only by `scripts/test_hot_reload.sh`, which needs `/dev/fuse` and so never runs in CI. No behavior change.
@@ -922,7 +941,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/maci0/modelfs/releases/tag/v0.8.0
 [0.7.0]: https://github.com/maci0/modelfs/releases/tag/v0.7.0
 [0.6.0]: https://github.com/maci0/modelfs/releases/tag/v0.6.0
 [0.5.0]: https://github.com/maci0/modelfs/releases/tag/v0.5.0
