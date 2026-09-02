@@ -185,9 +185,22 @@ pub fn socket(domain: c_int, type_: c_int, protocol: c_int) c_int {
 }
 
 /// Accept with SOCK_CLOEXEC (accept4). Same inherit contract as socket.
+/// std.c.accept4 takes `*sockaddr` on every Linux ABI Zig ships; translate-c
+/// of glibc's `__SOCKADDR_ARG` union (`.__sockaddr__`) is glibc-only.
 pub fn accept(listen_fd: c_int, peer: *c.struct_sockaddr_in) c_int {
-    var peer_len: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-    return c.accept4(listen_fd, .{ .__sockaddr__ = @ptrCast(peer) }, &peer_len, c.SOCK_CLOEXEC);
+    var peer_len: std.c.socklen_t = @intCast(@sizeOf(c.struct_sockaddr_in));
+    return std.c.accept4(listen_fd, @ptrCast(peer), &peer_len, @intCast(c.SOCK_CLOEXEC));
+}
+
+/// bind(2) for an IPv4 address. Same std.c `*sockaddr` door as accept.
+pub fn bind(fd: c_int, addr: *const c.struct_sockaddr_in) c_int {
+    return std.c.bind(fd, @ptrCast(addr), @intCast(@sizeOf(c.struct_sockaddr_in)));
+}
+
+/// getsockname(2) into an IPv4 address. Same std.c `*sockaddr` door as accept.
+pub fn getsockname(fd: c_int, addr: *c.struct_sockaddr_in) c_int {
+    var len: std.c.socklen_t = @intCast(@sizeOf(c.struct_sockaddr_in));
+    return std.c.getsockname(fd, @ptrCast(addr), &len);
 }
 
 pub fn close(fd: c_int) void {
@@ -634,7 +647,7 @@ pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in,
     // errors: leaving O_NONBLOCK set would make a later blocking read on
     // this fd return EAGAIN instead of honoring SO_RCVTIMEO.
     defer _ = c.fcntl(fd, c.F_SETFL, fl);
-    const rc = c.connect(fd, .{ .__sockaddr__ = @ptrCast(@constCast(addr)) }, @sizeOf(c.struct_sockaddr_in));
+    const rc = std.c.connect(fd, @ptrCast(addr), @intCast(@sizeOf(c.struct_sockaddr_in)));
     if (rc == 0) return 0;
     const e0 = errno();
     if (e0 != c.EINPROGRESS) return -e0;
@@ -893,11 +906,10 @@ test "open, socket, and accept are close-on-exec" {
     addr.sin_family = c.AF_INET;
     addr.sin_port = 0;
     addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
-    if (c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)) != 0) return error.SkipZigTest;
+    if (bind(lfd, &addr) != 0) return error.SkipZigTest;
     if (c.listen(lfd, 1) != 0) return error.SkipZigTest;
     var got = std.mem.zeroes(c.struct_sockaddr_in);
-    var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-    if (c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen) != 0) return error.SkipZigTest;
+    if (getsockname(lfd, &got) != 0) return error.SkipZigTest;
 
     const cfd = socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(cfd >= 0);
@@ -922,12 +934,11 @@ test "connectIn succeeds against a local listener" {
     addr.sin_family = c.AF_INET;
     addr.sin_port = 0;
     addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
-    if (c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)) != 0) return error.SkipZigTest;
+    if (bind(lfd, &addr) != 0) return error.SkipZigTest;
     if (c.listen(lfd, 1) != 0) return error.SkipZigTest;
     // Port 0 lets the kernel pick; read the assigned port back before dial.
     var got = std.mem.zeroes(c.struct_sockaddr_in);
-    var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-    if (c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen) != 0) return error.SkipZigTest;
+    if (getsockname(lfd, &got) != 0) return error.SkipZigTest;
     const cfd = socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(cfd >= 0);
     defer close(cfd);

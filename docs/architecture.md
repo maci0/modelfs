@@ -105,7 +105,7 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 | File | Role |
 |---|---|
 | `c.h`, `c.zig` | Sole door to libfuse3 and libc |
-| `sys.zig` | Syscall wrappers: EINTR retry, CLOEXEC, nofollow/owner-only writes |
+| `sys.zig` | Syscall wrappers: EINTR retry, CLOEXEC, nofollow/owner-only writes; IPv4 `bind`/`accept`/`connect`/`getsockname` through `std.c` |
 | `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`) and the persisted bitfield codec |
 | `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`) |
 | `cull.zig` | Free-space watermark policy |

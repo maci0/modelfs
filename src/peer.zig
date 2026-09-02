@@ -64,7 +64,7 @@ pub const Server = struct {
         // PSKs, so peers see random 401s -- instead of failing the duplicate
         // start loudly like the FUSE mount side does.
         _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
-        if (c.bind(fd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)) != 0) {
+        if (sys.bind(fd, &addr) != 0) {
             sys.close(fd);
             return error.Bind;
         }
@@ -2590,8 +2590,7 @@ test "a symlink planted at an origin model path is a miss, never served" {
 /// Read the kernel-assigned port back from a listening socket (for port 0).
 fn boundPort(fd: c_int) u16 {
     var addr = std.mem.zeroes(c.struct_sockaddr_in);
-    var len: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-    if (c.getsockname(fd, .{ .__sockaddr__ = @ptrCast(&addr) }, &len) != 0) return 0;
+    if (sys.getsockname(fd, &addr) != 0) return 0;
     return std.mem.bigToNative(u16, addr.sin_port);
 }
 
@@ -2613,10 +2612,9 @@ fn freeTcpPort() !u16 {
     try std.testing.expect(lfd >= 0);
     defer sys.close(lfd);
     var addr = loopbackAddr(0);
-    try std.testing.expectEqual(@as(i32, 0), c.bind(lfd, .{ .__sockaddr__ = @ptrCast(&addr) }, @sizeOf(c.struct_sockaddr_in)));
+    try std.testing.expectEqual(@as(i32, 0), sys.bind(lfd, &addr));
     var got = std.mem.zeroes(c.struct_sockaddr_in);
-    var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-    try std.testing.expectEqual(@as(i32, 0), c.getsockname(lfd, .{ .__sockaddr__ = @ptrCast(&got) }, &glen));
+    try std.testing.expectEqual(@as(i32, 0), sys.getsockname(lfd, &got));
     return std.mem.bigToNative(u16, got.sin_port);
 }
 
