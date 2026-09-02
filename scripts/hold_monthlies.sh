@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Hold every *_monthly snapshot of DATASET with tag modelfs-dr so a
-# recursive zfs destroy cannot take them without an explicit zfs release.
+# Hold every *_monthly snapshot of DATASET (and descendants) with tag
+# modelfs-dr so a recursive zfs destroy cannot take them without an
+# explicit zfs release.
 # Already-held is success (the previous pull tagged it). Any other hold
 # failure is an alarm: the pool-loss copy's fat-finger hold is missing.
 # Zero snapshots at all is also an alarm (a replica with nothing to
@@ -18,8 +19,9 @@ print_usage() {
     cat <<'EOF'
 Usage: ./scripts/hold_monthlies.sh [DATASET]
 
-Hold every *_monthly snapshot of DATASET (default tank/models) with
-tag modelfs-dr. Already-held is success. Any other hold failure exits 1.
+Hold every *_monthly snapshot of DATASET and its descendants
+(default tank/models) with tag modelfs-dr. Already-held is success.
+Any other hold failure exits 1.
 EOF
 }
 
@@ -39,7 +41,10 @@ command -v zfs >/dev/null 2>&1 || die "zfs not found; this runs on the replica h
 zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
     || die "dataset ${DATASET} does not exist on this host"
 
-LIST="$(zfs list -H -t snapshot -o name "${DATASET}")" || die "cannot list snapshots of ${DATASET}"
+# -r: sanoid recursive and syncoid --recursive cover child datasets
+# (a later zfs create tank/models/gguf). Holds on the parent alone
+# would leave those monthlies destroyable without zfs release.
+LIST="$(zfs list -H -t snapshot -r -o name "${DATASET}")" || die "cannot list snapshots of ${DATASET}"
 HELD=0
 SAW_ANY=0
 while IFS= read -r snap; do

@@ -71,9 +71,14 @@ case "${sub}" in
         read_state
         t=""
         dataset=""
+        rec=0
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -H | -p)
+                    shift
+                    ;;
+                -r)
+                    rec=1
                     shift
                     ;;
                 -o | -s)
@@ -102,7 +107,27 @@ case "${sub}" in
                 fi
                 exit 0
             fi
+            if [[ -n "${CHILD:-}" && "${dataset}" == "${CHILD}" ]]; then
+                if [[ -n "${CHILD_SNAP_NAME:-}" ]]; then
+                    printf '%s\t%s\n' "${CHILD_SNAP_NAME}" "${CHILD_SNAP_CREATION}"
+                fi
+                exit 0
+            fi
             exit 0
+        fi
+        if [[ "${t}" == "filesystem" ]]; then
+            if [[ "${dataset}" == "${ORIGIN}" ]]; then
+                printf '%s\n' "${ORIGIN}"
+                if [[ "${rec}" -eq 1 && -n "${CHILD:-}" ]]; then
+                    printf '%s\n' "${CHILD}"
+                fi
+                exit 0
+            fi
+            if [[ -n "${CHILD:-}" && "${dataset}" == "${CHILD}" ]]; then
+                printf '%s\n' "${CHILD}"
+                exit 0
+            fi
+            exit 1
         fi
         if [[ "${dataset}" == "${ORIGIN}" ]]; then
             printf '%s\n' "${ORIGIN}"
@@ -110,6 +135,10 @@ case "${sub}" in
         fi
         if [[ -n "${REPLICA:-}" && "${dataset}" == "${REPLICA}" ]]; then
             printf '%s\n' "${REPLICA}"
+            exit 0
+        fi
+        if [[ -n "${CHILD:-}" && "${dataset}" == "${CHILD}" ]]; then
+            printf '%s\n' "${CHILD}"
             exit 0
         fi
         if [[ -f "${STATE}/clone" ]]; then
@@ -256,6 +285,9 @@ SNAP_TREE=$(printf '%q' "$5")
 REPLICA=$(printf '%q' "${6-}")
 REPLICA_SNAP=$(printf '%q' "${7-}")
 REPLICA_CREATION=$(printf '%q' "${8-}")
+CHILD=$(printf '%q' "${CHILD_DS:-}")
+CHILD_SNAP_NAME=$(printf '%q' "${CHILD_SNAP:-}")
+CHILD_SNAP_CREATION=$(printf '%q' "${CHILD_CREATION:-}")
 EOF
 }
 
@@ -528,6 +560,32 @@ write_env tank/models "${LIVE14}" tank/models@ok "${FRESH}" "${SNAP14}" \
 expect_ok "replica 26h old is inside the daily slack" "${LIVE14}" "${LOG14}" \
     MF_DRILL_REPLICA="tank/models-backup"
 
+# --- child datasets: sanoid recursive must still cover them
+LIVE14C="${TEMP}/live14c"
+SNAP14C="${TEMP}/snap14c"
+mkdir -p "${LIVE14C}/gguf" "${SNAP14C}/gguf"
+echo weight >"${SNAP14C}/gguf/m.gguf"
+cp -a "${SNAP14C}/gguf/m.gguf" "${LIVE14C}/gguf/m.gguf"
+LOG14C="${TEMP}/drill14c.log"
+CHILD_DS="tank/models/gguf" CHILD_SNAP="tank/models/gguf@autosnap_ok" CHILD_CREATION="${FRESH}" \
+    write_env tank/models "${LIVE14C}" tank/models@ok "${FRESH}" "${SNAP14C}"
+expect_ok "fresh child dataset snapshot is recorded" "${LIVE14C}" "${LOG14C}"
+unset CHILD_DS CHILD_SNAP CHILD_CREATION
+
+LOG14D="${TEMP}/drill14d.log"
+CHILD_DS="tank/models/gguf" CHILD_SNAP="" CHILD_CREATION="${FRESH}" \
+    write_env tank/models "${LIVE14C}" tank/models@ok "${FRESH}" "${SNAP14C}"
+expect_fail "child dataset with no snapshots is an alarm" "child dataset" \
+    "${LIVE14C}" "${LOG14D}"
+unset CHILD_DS CHILD_SNAP CHILD_CREATION
+
+LOG14E="${TEMP}/drill14e.log"
+CHILD_DS="tank/models/gguf" CHILD_SNAP="tank/models/gguf@old" CHILD_CREATION="${STALE}" \
+    write_env tank/models "${LIVE14C}" tank/models@ok "${FRESH}" "${SNAP14C}"
+expect_fail "stale child dataset snapshot is an alarm" "stopped covering" \
+    "${LIVE14C}" "${LOG14E}"
+unset CHILD_DS CHILD_SNAP CHILD_CREATION
+
 # --- --age-only: snapshot/replica freshness without clone or drill log
 expect_age_ok() {
     local name="$1"
@@ -625,6 +683,13 @@ write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
 expect_age_ok "age-only does not need a writable drill log" "${LIVE15}" "${LOG15D}"
 chmod u+w "${LOG15D}"
 
+LOG15E="${TEMP}/drill15e.log"
+CHILD_DS="tank/models/gguf" CHILD_SNAP="" CHILD_CREATION="${FRESH}" \
+    write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
+expect_age_fail "age-only child with no snapshots is an alarm" "child dataset" \
+    "${LIVE15}" "${LOG15E}"
+unset CHILD_DS CHILD_SNAP CHILD_CREATION
+
 AGE_USAGE_RC=0
 AGE_USAGE_OUT="$("${DRILL}" --age-only tank/models extra 2>&1)" || AGE_USAGE_RC=$?
 if [[ "${AGE_USAGE_RC}" -ne 2 ]]; then
@@ -655,9 +720,14 @@ case "${sub}" in
         read_state
         t=""
         dataset=""
+        rec=0
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -H | -p)
+                    shift
+                    ;;
+                -r)
+                    rec=1
                     shift
                     ;;
                 -o | -s)
@@ -674,8 +744,16 @@ case "${sub}" in
             esac
         done
         if [[ "${t}" == "snapshot" ]]; then
-            if [[ "${dataset}" == "${ORIGIN}" && -f "${STATE}/snaps" ]]; then
-                cat "${STATE}/snaps"
+            if [[ -f "${STATE}/snaps" ]]; then
+                while IFS= read -r snap; do
+                    [[ -n "${snap}" ]] || continue
+                    ds="${snap%%@*}"
+                    if [[ "${ds}" == "${dataset}" ]]; then
+                        printf '%s\n' "${snap}"
+                    elif [[ "${rec}" -eq 1 && "${ds}" == "${dataset}/"* ]]; then
+                        printf '%s\n' "${snap}"
+                    fi
+                done <"${STATE}/snaps"
             fi
             exit 0
         fi
@@ -817,6 +895,24 @@ elif ! grep -q "cannot hold" <<<"${HOLD_OUT}"; then
     fail "hold denied missing cannot hold: ${HOLD_OUT}"
 else
     pass "hold denied is an alarm"
+fi
+
+rm -rf "${HOLD_STATE}/holds"
+write_hold_env tank/models "" \
+    tank/models@autosnap_m_monthly tank/models/gguf@autosnap_m_monthly
+HOLD_OUT=""
+HOLD_RC=0
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+if [[ "${HOLD_RC}" -ne 0 ]]; then
+    fail "hold child monthlies: expected success, rc=${HOLD_RC}: ${HOLD_OUT}"
+elif ! grep -q "hold OK: 2 monthly" <<<"${HOLD_OUT}"; then
+    fail "hold child monthlies missing two-monthly OK: ${HOLD_OUT}"
+elif [[ ! -f "${HOLD_STATE}/holds/tank_models@autosnap_m_monthly" ]]; then
+    fail "hold child monthlies did not tag the parent monthly"
+elif [[ ! -f "${HOLD_STATE}/holds/tank_models_gguf@autosnap_m_monthly" ]]; then
+    fail "hold child monthlies did not tag the child monthly"
+else
+    pass "hold monthlies tags child dataset monthlies"
 fi
 
 HOLD_OUT=""
@@ -1002,8 +1098,34 @@ else
     elif ! grep -q "OnFailure=notify-admin@%n.service" \
         "${INSTALL_DEST}/etc/systemd/system/modelfs-offsite-age.service"; then
         fail "installer --install offsite-age service lost OnFailure"
+    elif ! grep -q "Requires=zfs-import.target" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-offsite-age.service"; then
+        fail "installer --install offsite-age unit lost Requires=zfs-import.target"
+    elif ! grep -q -- "--recursive" \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit lost --recursive"
     else
-        pass "installer --install lands units, wrappers, and the service OnFailure"
+        nas_list="${TEMP}/nas-files"
+        if ! find "${SCRIPTS_DIR}/nas" -type f >"${nas_list}.raw"; then
+            fail "find scripts/nas failed"
+        elif ! sort -o "${nas_list}" "${nas_list}.raw"; then
+            fail "sort of nas files failed"
+        else
+            rm -f "${nas_list}.raw"
+            forgotten=""
+            while IFS= read -r src; do
+                [[ -n "${src}" ]] || continue
+                rel="${src#"${SCRIPTS_DIR}"/nas/}"
+                if ! grep -Fq "${rel}" "${INSTALLER}"; then
+                    forgotten="${forgotten} ${rel}"
+                fi
+            done <"${nas_list}"
+            if [[ -n "${forgotten}" ]]; then
+                fail "install_nas_backup.sh does not copy:${forgotten}"
+            else
+                pass "installer --install lands units, wrappers, and the service OnFailure"
+            fi
+        fi
     fi
 fi
 
@@ -1156,7 +1278,7 @@ case "${sub}" in
         dataset=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -H | -p)
+                -H | -p | -r)
                     shift
                     ;;
                 -o | -s)
@@ -1175,6 +1297,11 @@ case "${sub}" in
         if [[ "${t}" == "snapshot" ]]; then
             if [[ "${dataset}" == "${LOCAL_FROM:-}" && -n "${LOCAL_SNAP:-}" ]]; then
                 printf '%s\t%s\n' "${LOCAL_SNAP}" "${LOCAL_CREATION}"
+                exit 0
+            fi
+            if [[ "${dataset}" == "${DEST:-}" && "${DEST_EXISTS:-0}" == "1" ]]; then
+                printf '%s\n' "${DEST}@autosnap_m_monthly"
+                exit 0
             fi
             exit 0
         fi
@@ -1259,6 +1386,13 @@ case "${sub}" in
         printf 'zfs set dest=%s mp=%s\n' "${dest}" "${mp}" >>"${STATE}/set.log"
         exit 0
         ;;
+    hold)
+        printf 'hold %s\n' "$*" >>"${STATE}/hold.log"
+        exit 0
+        ;;
+    holds)
+        exit 0
+        ;;
     *)
         echo "restore stub zfs: unsupported subcommand ${sub}" >&2
         exit 1
@@ -1287,7 +1421,8 @@ LOCAL_SNAP=$(printf '%q' "${6-}")
 LOCAL_CREATION=$(printf '%q' "${7-}")
 EOF
     rm -f "${RESTORE_STATE}/runtime" "${RESTORE_STATE}/commands.log" \
-        "${RESTORE_STATE}/syncoid.args" "${RESTORE_STATE}/set.log"
+        "${RESTORE_STATE}/syncoid.args" "${RESTORE_STATE}/set.log" \
+        "${RESTORE_STATE}/hold.log"
 }
 
 expect_restore() {
@@ -1311,6 +1446,8 @@ expect_restore() {
 
 write_restore_env tank/models 0 no /export/models
 expect_restore "pool restore dry-run --from prints the plan" 0 "without --execute" \
+    "${RESTORE}" --from replica-host:tank/models
+expect_restore "pool restore dry-run --from names recursive syncoid" 0 "syncoid --recursive" \
     "${RESTORE}" --from replica-host:tank/models
 if [[ -f "${RESTORE_STATE}/syncoid.args" ]]; then
     fail "pool restore dry-run invoked syncoid"
@@ -1353,18 +1490,26 @@ expect_restore "pool restore --execute --from pulls and sets properties" 0 "pool
     MF_RESTORE_LOG="${RLOG}" "${RESTORE}" --execute --from replica-host:tank/models
 if [[ ! -f "${RESTORE_STATE}/syncoid.args" ]]; then
     fail "pool restore --execute --from did not invoke syncoid"
-elif ! grep -q -- "--force-delete replica-host:tank/models tank/models" "${RESTORE_STATE}/syncoid.args"; then
+elif ! grep -q -- "--force-delete" "${RESTORE_STATE}/syncoid.args"; then
     fail "pool restore syncoid args: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
+elif ! grep -q -- "replica-host:tank/models tank/models" "${RESTORE_STATE}/syncoid.args"; then
+    fail "pool restore syncoid lost source/dest: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
+elif ! grep -q -- "--recursive" "${RESTORE_STATE}/syncoid.args"; then
+    fail "pool restore syncoid lost --recursive: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
+elif ! grep -q -- "BatchMode=yes" "${RESTORE_STATE}/syncoid.args"; then
+    fail "pool restore syncoid lost SSH BatchMode: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
 elif [[ ! -f "${RESTORE_STATE}/set.log" ]]; then
     fail "pool restore --execute --from did not zfs set"
 elif ! grep -q "mp=/export/models" "${RESTORE_STATE}/set.log"; then
     fail "pool restore zfs set lost mountpoint: $(cat "${RESTORE_STATE}/set.log" 2>/dev/null || true)"
+elif [[ ! -f "${RESTORE_STATE}/hold.log" ]]; then
+    fail "pool restore --execute --from did not hold monthlies"
 elif [[ ! -f "${RLOG}" ]] || ! grep -q "recv_s=" "${RLOG}"; then
     fail "pool restore log missing recv_s: $(cat "${RLOG}" 2>/dev/null || true)"
 elif ! grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z ' "${RLOG}"; then
     fail "pool restore log stamp is not UTC Z-form: $(cat "${RLOG}" 2>/dev/null || true)"
 else
-    pass "pool restore --execute --from recorded syncoid, properties, and recv_s"
+    pass "pool restore --execute --from recorded syncoid, properties, holds, and recv_s"
 fi
 
 RLOG2="${TEMP}/pool-restore-local.log"
@@ -1376,10 +1521,12 @@ if [[ -f "${RESTORE_STATE}/syncoid.args" ]]; then
     fail "pool restore --local-from invoked syncoid"
 elif [[ ! -f "${RESTORE_STATE}/set.log" ]]; then
     fail "pool restore --local-from did not zfs set"
+elif [[ ! -f "${RESTORE_STATE}/hold.log" ]]; then
+    fail "pool restore --local-from did not hold monthlies"
 elif ! grep -q "zfs send" "${RESTORE_STATE}/commands.log" || ! grep -q "zfs recv" "${RESTORE_STATE}/commands.log"; then
     fail "pool restore --local-from missing send/recv: $(cat "${RESTORE_STATE}/commands.log" 2>/dev/null || true)"
 else
-    pass "pool restore --execute --local-from used send/recv and printed the cache wipe"
+    pass "pool restore --execute --local-from used send/recv, held monthlies, and printed the cache wipe"
 fi
 
 if [[ "${FAILS}" -ne 0 ]]; then

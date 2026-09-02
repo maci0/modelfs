@@ -55,9 +55,9 @@ Usage: ./scripts/dr_restore_drill.sh [--age-only] [DATASET]
 
 Monthly restore drill (docs/recovery.md section 6). Default DATASET is
 tank/models. Exit 0 means the newest snapshot restored, mounted off the
-live tree, and read back verified. --age-only checks snapshot (and
-optional replica) age only: no clone, no drill log. That is the hourly
-sanoid.timer-down alarm (modelfs-snap-age.timer).
+live tree, and read back verified. --age-only checks snapshot, child
+dataset, and optional replica age only: no clone, no drill log. That
+is the hourly sanoid.timer-down alarm (modelfs-snap-age.timer).
 
 Environment: MF_DRILL_LOG, MF_DRILL_LIVE, MF_DRILL_CLONE_MP, MF_DRILL_KEEP,
 MF_DRILL_MAX_SNAP_AGE, MF_DRILL_REPLICA, MF_DRILL_MAX_REPLICA_AGE,
@@ -235,6 +235,40 @@ if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
     REPLICA_STATUS="ok"
     echo "drill: replica ${MF_DRILL_REPLICA} newest ${REPLICA_SNAP} (age ${REPLICA_AGE}s)"
 fi
+
+# Child datasets (a later `zfs create tank/models/gguf`) have their own
+# snapshots under sanoid recursive=. The parent clone does not include
+# them, but a child with no snapshot, or one older than the RPO, means
+# backup scope shrank when the layout grew. Age-check every descendant
+# so the hourly snap-age timer catches that without waiting for the
+# monthly clone.
+CHILD_LIST="$(zfs list -H -o name -r -t filesystem "${DATASET}")" \
+    || die "cannot list datasets under ${DATASET}"
+while IFS= read -r child; do
+    [[ -n "${child}" ]] || continue
+    [[ "${child}" == "${DATASET}" ]] && continue
+    CHILD_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${child}" | tail -n 1)"
+    CHILD_SNAP="${CHILD_LINE%%$'\t'*}"
+    if [[ -z "${CHILD_SNAP}" ]]; then
+        die "child dataset ${child} has no snapshots: sanoid recursive did not cover it (docs/recovery.md section 3)"
+    fi
+    CHILD_CTIME="${CHILD_LINE##*$'\t'}"
+    case "${CHILD_CTIME}" in
+        '' | *[!0-9]*)
+            die "child ${child} newest snapshot creation is not an epoch second: ${CHILD_LINE}"
+            ;;
+        *)
+            ;;
+    esac
+    CHILD_AGE=$((NOW - CHILD_CTIME))
+    if [[ "${CHILD_AGE}" -lt 0 ]]; then
+        die "child snapshot ${CHILD_SNAP} has creation ${CHILD_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"
+    fi
+    if [[ "${CHILD_AGE}" -gt "${MAX_SNAP_AGE}" ]]; then
+        die "child snapshot ${CHILD_SNAP} is ${CHILD_AGE}s old, past the ${MAX_SNAP_AGE}s limit: the autosnap schedule stopped covering ${child} (docs/recovery.md sections 3 and 5)"
+    fi
+    echo "drill: child ${child} newest ${CHILD_SNAP} (age ${CHILD_AGE}s)"
+done <<<"${CHILD_LIST}"
 
 # Hourly freshness alarm: the monthly clone is the restore proof, this
 # is the "sanoid.timer was disabled" alarm that cannot wait 30 days.

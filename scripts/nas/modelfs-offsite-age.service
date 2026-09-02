@@ -3,12 +3,15 @@ Description=Alarm if the ModelFS offsite copy is older than the claimed site-los
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 OnFailure=notify-admin@%n.service
 After=zfs-import.target
+Requires=zfs-import.target
 # Weekly, not the monthly clone: a stopped disk rotation or hosted pull
 # never fails sanoid.service. Enable this timer only on a box that always
 # holds the copy (hosted ZFS). A rotated disk that is not always imported
 # should run modelfs-check-offsite by hand when the disk is attached.
 # Leave MF_OFFSITE_DATASET unset here and the unit fails closed: checking
 # the live tank/models on the NAS would bless production as the offsite copy.
+# Requires=zfs-import.target matches the other ZFS units: a failed pool
+# import must not still start a oneshot that can only fail.
 
 [Service]
 Type=oneshot

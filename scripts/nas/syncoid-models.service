@@ -19,7 +19,10 @@ TimeoutStartSec=infinity
 # BatchMode: fail the unit on a missing host key or a password prompt
 # instead of hanging until TimeoutStartSec=infinity. ConnectTimeout
 # bounds a blackholed NAS so the daily timer can fire OnFailure.
-ExecStart=/usr/bin/syncoid --no-privilege-elevation --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 nas:tank/models tank/models
+# --recursive matches sanoid.conf recursive = yes: a later
+# `zfs create tank/models/gguf` is snapshotted and must also land
+# on the replica, or pool-loss restore silently drops the new dataset.
+ExecStart=/usr/bin/syncoid --recursive --no-privilege-elevation --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 nas:tank/models tank/models
 # Monthlies survive a recursive destroy only until `zfs release`.
 # Already-held is success; any other hold failure fails this unit
 # (scripts/hold_monthlies.sh). The previous `|| true` swallowed a

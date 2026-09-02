@@ -26,14 +26,15 @@ Replay the pool-loss copy onto DEST (default tank/models). This is
 docs/recovery.md procedure C. Without --execute, print the plan and
 write nothing.
 
---from HOST:DATASET     syncoid pull from the replica host
+--from HOST:DATASET     syncoid --recursive pull from the replica host
 --local-from DATASET    zfs send -R newest snapshot | zfs recv -Fs DEST
 --force                 allow DEST that is currently mounted (otherwise refuse)
---execute               run the recv and set export properties
+--execute               run the recv, set export properties, hold monthlies
 
 Does not create the pool. Does not wipe node caches: after a successful
-recv, print the cache-wipe commands that must run before any client
-remounts. Environment: MF_RESTORE_FROM, MF_RESTORE_LOCAL_FROM,
+recv, hold monthlies on DEST (holds do not travel with zfs send) and
+print the cache-wipe commands that must run before any client remounts.
+Environment: MF_RESTORE_FROM, MF_RESTORE_LOCAL_FROM,
 MF_RESTORE_MOUNTPOINT (default /export/models), MF_RESTORE_SHARENFS
 (default operations.md flags), MF_RESTORE_LOG (default
 /var/log/modelfs-pool-restore.log).
@@ -163,9 +164,10 @@ print_plan() {
     if [[ -n "${LOCAL_FROM}" ]]; then
         echo "  recv        zfs send -R ${SEND_SNAP} | zfs recv -Fs ${DEST}"
     else
-        echo "  recv        syncoid --no-privilege-elevation --force-delete ${FROM} ${DEST}"
+        echo "  recv        syncoid --recursive --no-privilege-elevation --force-delete --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 ${FROM} ${DEST}"
     fi
     echo "  then        zfs set mountpoint=${MOUNTPOINT} compression=lz4 recordsize=1M atime=off xattr=sa relatime=off sharenfs=${SHARENFS} ${DEST}"
+    echo "  then        hold monthlies on ${DEST}"
     echo "  log         ${LOG_FILE}"
     echo "without --execute this script writes nothing"
 }
@@ -194,7 +196,9 @@ if [[ -n "${LOCAL_FROM}" ]]; then
 else
     command -v syncoid >/dev/null 2>&1 \
         || die "syncoid not found; install sanoid (docs/recovery.md section 3) or use --local-from"
-    syncoid --no-privilege-elevation --force-delete "${FROM}" "${DEST}" \
+    syncoid --recursive --no-privilege-elevation --force-delete \
+        --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 \
+        "${FROM}" "${DEST}" \
         || die "syncoid pull from ${FROM} to ${DEST} failed"
 fi
 T1="$(awk '{print $1}' /proc/uptime)"
@@ -212,6 +216,20 @@ GOT_MP="$(zfs get -H -o value mountpoint "${DEST}")" \
 if [[ "${GOT_MP}" != "${MOUNTPOINT}" ]]; then
     die "destination ${DEST} mountpoint is ${GOT_MP}, expected ${MOUNTPOINT}"
 fi
+
+# Holds are local and do not travel with zfs send / syncoid. The replica
+# had them; the restored NAS needs them too or a fat-finger destroy -r
+# on the new primary has no tag to release first.
+HOLD_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -x "${HOLD_BIN}/hold_monthlies.sh" ]]; then
+    HOLD_CMD="${HOLD_BIN}/hold_monthlies.sh"
+elif [[ -x "${HOLD_BIN}/modelfs-hold-monthlies" ]]; then
+    HOLD_CMD="${HOLD_BIN}/modelfs-hold-monthlies"
+else
+    die "hold_monthlies helper not found next to this script (${HOLD_BIN}); re-run install_nas_backup.sh"
+fi
+"${HOLD_CMD}" "${DEST}" \
+    || die "recv succeeded but holding monthlies on ${DEST} failed (docs/recovery.md section 3)"
 
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "${STAMP} ${DEST} ok recv_s=${ELAPSED} source=${SOURCE_LABEL}" >>"${LOG_FILE}"
