@@ -1459,7 +1459,10 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         return 1;
     };
     var tok: [handover.token_bytes * 2]u8 = undefined;
-    handover.randomToken(&tok);
+    handover.randomToken(&tok) catch {
+        printErr("modelfs: cannot read random bytes for the update handshake token\n", .{});
+        return 1;
+    };
     const req = handover.encodeReq(gpa, bin, &tok) catch return 1;
     defer gpa.free(req);
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;

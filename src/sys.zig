@@ -241,6 +241,29 @@ pub fn setCloexec(fd: c_int, on: bool) i32 {
     return 0;
 }
 
+/// Fills `buf` from the kernel CSPRNG. 0 on success, -errno on failure.
+/// `std.crypto.random` and `std.posix.getrandom` are both gone in 0.16, so
+/// the raw syscall is the available primitive and it lives behind this layer
+/// like every other. Short reads are looped and EINTR retried; callers must
+/// fail rather than substitute a guessable value.
+pub fn randomBytes(buf: []u8) i32 {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = std.os.linux.getrandom(buf[off..].ptr, buf.len - off, 0);
+        const signed: isize = @bitCast(n);
+        if (signed < 0) {
+            const err: i32 = @intCast(-signed);
+            if (err == c.EINTR) continue;
+            return -err;
+        }
+        // A zero-length read cannot make progress; treat it as a failure
+        // rather than spinning on a kernel that will not fill the buffer.
+        if (signed == 0) return -c.EIO;
+        off += @intCast(signed);
+    }
+    return 0;
+}
+
 /// Set or clear O_NONBLOCK. Origin files are opened non-blocking so a FIFO
 /// planted at the name cannot hang the open; the flag is cleared once the
 /// fd is known to be a regular file and is about to be handed to a writer

@@ -24,6 +24,12 @@ pub const Addr = struct {
 /// the payload without needing a new handover format.
 pub const init_max: usize = 256;
 
+/// Cap on the sealed state blob a replacement image reads back. The knobs
+/// are a few hundred bytes plus one path per cached inode and open handle;
+/// a megabyte is far past any live mount and bounds what a planted fd can
+/// make the new image allocate.
+pub const max_state_bytes: usize = 1 << 20;
+
 /// Serializable serving identity. Strings are borrowed from the caller on
 /// encode and owned by `Owned` on decode.
 pub const Knobs = struct {
@@ -284,7 +290,7 @@ pub fn writeStateFd(blob: []const u8) !std.posix.fd_t {
 }
 
 pub fn readStateFd(gpa: std.mem.Allocator, fd: std.posix.fd_t) !Owned {
-    const blob = try sys.readAllFdAlloc(gpa, fd, 1 << 20);
+    const blob = try sys.readAllFdAlloc(gpa, fd, max_state_bytes);
     defer gpa.free(blob);
     return decode(gpa, blob);
 }
@@ -308,19 +314,12 @@ pub fn decodeAck(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Ack)
     return std.json.parseFromSlice(Ack, gpa, std.mem.trim(u8, blob, " \t\r\n"), .{ .ignore_unknown_fields = true });
 }
 
-pub fn randomToken(out: *[token_bytes * 2]u8) void {
+/// Hex handshake nonce matching one `update.req` to its `update.ack`. Fails
+/// rather than falling back to anything derivable: a pid-shaped token would
+/// let a same-uid racer ack an update it did not request.
+pub fn randomToken(out: *[token_bytes * 2]u8) !void {
     var raw: [token_bytes]u8 = undefined;
-    var off: usize = 0;
-    while (off < raw.len) {
-        const n = std.os.linux.getrandom(raw[off..].ptr, raw.len - off, 0);
-        const signed: isize = @bitCast(n);
-        if (signed <= 0) {
-            const pid: u64 = @intCast(std.os.linux.getpid());
-            for (raw[off..], 0..) |*b, i| b.* = @truncate(pid ^ (i + off));
-            break;
-        }
-        off += n;
-    }
+    if (sys.randomBytes(&raw) != 0) return error.NoRandom;
     const hex = std.fmt.bytesToHex(raw, .lower);
     @memcpy(out, &hex);
 }
@@ -463,7 +462,12 @@ test "parseHandoffArgs takes only the form execArgvZ writes" {
 test "update req/ack carry a token the client can match" {
     const gpa = std.testing.allocator;
     var tok: [token_bytes * 2]u8 = undefined;
-    randomToken(&tok);
+    try randomToken(&tok);
+    // Two tokens in a row must differ, or a stale ack would match the next
+    // request; a constant fallback used to make that possible.
+    var again: [token_bytes * 2]u8 = undefined;
+    try randomToken(&again);
+    try std.testing.expect(!std.mem.eql(u8, &tok, &again));
     const req = try encodeReq(gpa, "/bin/modelfs", &tok);
     defer gpa.free(req);
     const parsed = try decodeReq(gpa, req);

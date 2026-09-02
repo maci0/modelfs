@@ -2492,6 +2492,217 @@ pub fn writeAck(st: *State, token: []const u8) void {
     _ = sys.writeFileOwnerOnly(p, blob);
 }
 
+/// A State with only the fields the inode and handle tables touch. The
+/// tables are pure bookkeeping over `gpa` and `io`, so they are drivable
+/// without a mount, an origin, or a peer server; `deinit` on a full State
+/// would tear down workers that were never started.
+fn tableFixture(gpa: std.mem.Allocator) State {
+    return .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .store = undefined,
+        .catalog = undefined,
+        .server = undefined,
+        .direct_io = true,
+        .start_secs = 0,
+    };
+}
+
+fn freeTables(st: *State) void {
+    var it = st.nodes.iterator();
+    while (it.next()) |e| st.gpa.free(e.value_ptr.path);
+    st.nodes.deinit(st.gpa);
+    st.paths.deinit(st.gpa);
+    var o = st.opens.iterator();
+    while (o.next()) |e| st.gpa.free(e.value_ptr.*);
+    st.opens.deinit(st.gpa);
+}
+
+test "childPath joins under the root without doubling the slash" {
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expectEqualStrings("/a", childPath(&buf, "/", "a").?);
+    try std.testing.expectEqualStrings("/a/b", childPath(&buf, "/a", "b").?);
+    try std.testing.expectEqualStrings("/a/b/c", childPath(&buf, "/a/b", "c").?);
+    // A name that would not fit is refused rather than truncated: a
+    // truncated path names a different file.
+    var tiny: [sys.c.PATH_MAX]u8 = undefined;
+    const long = "x" ** (sys.c.PATH_MAX - 1);
+    try std.testing.expectEqual(@as(?[]const u8, null), childPath(&tiny, "/a", long));
+}
+
+test "internPath mints once, counts lookups, and forgets at zero" {
+    const gpa = std.testing.allocator;
+    var st = tableFixture(gpa);
+    defer freeTables(&st);
+
+    // The root is fixed by the protocol and never enters the table.
+    try std.testing.expectEqual(root_ino, try internPath(&st, "/"));
+    try std.testing.expectEqual(@as(usize, 0), st.nodes.count());
+
+    const a = try internPath(&st, "/gguf/a.bin");
+    const b = try internPath(&st, "/gguf/b.bin");
+    try std.testing.expect(a != b);
+    // A second lookup of the same name is the same inode with one more
+    // reference, not a new number: the kernel would otherwise hold two.
+    try std.testing.expectEqual(a, try internPath(&st, "/gguf/a.bin"));
+    try std.testing.expectEqual(@as(u64, 2), st.nodes.get(a).?.nlookup);
+
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expectEqualStrings("/gguf/a.bin", pathForIno(&st, a, &buf).?);
+    try std.testing.expectEqualStrings("/", pathForIno(&st, root_ino, &buf).?);
+
+    // One forget of two references keeps the node; the second drops it.
+    dropLookup(&st, a, 1);
+    try std.testing.expectEqualStrings("/gguf/a.bin", pathForIno(&st, a, &buf).?);
+    dropLookup(&st, a, 1);
+    try std.testing.expectEqual(@as(?[]const u8, null), pathForIno(&st, a, &buf));
+    try std.testing.expect(!st.paths.contains("/gguf/a.bin"));
+
+    // Inode numbers are never reused, so a request naming a forgotten one
+    // can only answer ENOENT, never a different file.
+    try std.testing.expect(try internPath(&st, "/gguf/a.bin") > b);
+    // A batched forget larger than the count still drops exactly once, and
+    // the root is not forgettable.
+    dropLookup(&st, b, 99);
+    try std.testing.expectEqual(@as(?[]const u8, null), pathForIno(&st, b, &buf));
+    dropLookup(&st, root_ino, 1);
+    try std.testing.expectEqualStrings("/", pathForIno(&st, root_ino, &buf).?);
+}
+
+test "open handles resolve to their path and are released by fh" {
+    const gpa = std.testing.allocator;
+    var st = tableFixture(gpa);
+    defer freeTables(&st);
+
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    const fh = rememberOpen(&st, "/gguf/a.bin");
+    try std.testing.expect(fh != 0);
+    try std.testing.expectEqualStrings("/gguf/a.bin", pathForFh(&st, fh, &buf).?);
+    // Handle 0 means "no record kept", so it must never resolve.
+    try std.testing.expectEqual(@as(?[]const u8, null), pathForFh(&st, 0, &buf));
+    try std.testing.expectEqual(@as(?[]const u8, null), pathForFh(&st, fh + 1, &buf));
+
+    const second = rememberOpen(&st, "/gguf/a.bin");
+    try std.testing.expect(second != fh);
+    forgetOpen(&st, fh);
+    try std.testing.expectEqual(@as(?[]const u8, null), pathForFh(&st, fh, &buf));
+    // The other handle on the same file is untouched.
+    try std.testing.expectEqualStrings("/gguf/a.bin", pathForFh(&st, second, &buf).?);
+    forgetOpen(&st, second);
+    forgetOpen(&st, 0);
+}
+
+test "renamedPath rewrites only paths the rename covers" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { path: []const u8, want: ?[]const u8 }{
+        .{ .path = "/a", .want = "/z" },
+        .{ .path = "/a/b", .want = "/z/b" },
+        .{ .path = "/a/b/c", .want = "/z/b/c" },
+        // A prefix that does not end on a component boundary is a
+        // different name: /ab must not move when /a does.
+        .{ .path = "/ab", .want = null },
+        .{ .path = "/abc/d", .want = null },
+        .{ .path = "/b", .want = null },
+        .{ .path = "/", .want = null },
+    };
+    for (cases) |c| {
+        const got = try renamedPath(gpa, "/a", "/z", c.path);
+        if (c.want) |want| {
+            defer gpa.free(got.?);
+            try std.testing.expectEqualStrings(want, got.?);
+        } else {
+            try std.testing.expectEqual(@as(?[]u8, null), got);
+        }
+    }
+}
+
+test "renameNodes moves a subtree and its open handles, and lets the destination win" {
+    const gpa = std.testing.allocator;
+    var st = tableFixture(gpa);
+    defer freeTables(&st);
+
+    const dir = try internPath(&st, "/d");
+    const child = try internPath(&st, "/d/sub/f.txt");
+    const other = try internPath(&st, "/keep");
+    const fh = rememberOpen(&st, "/d/sub/f.txt");
+
+    renameNodes(&st, "/d", "/moved");
+
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    // The kernel keeps these inode numbers across a rename, so they must
+    // now resolve to the new names, not the old ones.
+    try std.testing.expectEqualStrings("/moved", pathForIno(&st, dir, &buf).?);
+    try std.testing.expectEqualStrings("/moved/sub/f.txt", pathForIno(&st, child, &buf).?);
+    try std.testing.expectEqualStrings("/moved/sub/f.txt", pathForFh(&st, fh, &buf).?);
+    try std.testing.expectEqualStrings("/keep", pathForIno(&st, other, &buf).?);
+    try std.testing.expectEqual(child, st.paths.get("/moved/sub/f.txt").?);
+    try std.testing.expect(!st.paths.contains("/d/sub/f.txt"));
+
+    // Rename onto a live name: the destination inode keeps its number and
+    // its path, but the name now resolves to the mover. Forgetting the
+    // displaced node must not unmap the name from under the winner.
+    const victim = try internPath(&st, "/victim");
+    renameNodes(&st, "/keep", "/victim");
+    try std.testing.expectEqual(other, st.paths.get("/victim").?);
+    dropLookup(&st, victim, 1);
+    try std.testing.expectEqual(other, st.paths.get("/victim").?);
+    try std.testing.expectEqualStrings("/victim", pathForIno(&st, other, &buf).?);
+    forgetOpen(&st, fh);
+}
+
+test "restoreMaps rebuilds the tables a handover snapshot carried" {
+    const gpa = std.testing.allocator;
+    var st = tableFixture(gpa);
+    defer freeTables(&st);
+
+    var owned: handover.Owned = .{
+        .origin = &.{},
+        .cache = &.{},
+        .id = &.{},
+        .mount = &.{},
+        .piece = 0,
+        .listen = 0,
+        .water = .{},
+        .direct_io = true,
+        .allow_other = false,
+        .fuse_fd = -1,
+        .listen_fds = &.{},
+        .advertise = &.{},
+        .seeds = &.{},
+        .psk = &.{},
+        .nodes = @constCast(&[_]handover.NodeSnap{
+            .{ .ino = 5, .path = "/gguf/a.bin", .nlookup = 3 },
+        }),
+        .opens = @constCast(&[_]handover.OpenSnap{
+            .{ .fh = 9, .path = "/gguf/a.bin" },
+        }),
+        .next_ino = 6,
+        .next_fh = 10,
+        .arena = std.heap.ArenaAllocator.init(gpa),
+    };
+    owned.arena.deinit();
+
+    try restoreMaps(&st, &owned);
+
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    // The kernel still holds ino 5 and fh 9 across the exec, so both must
+    // resolve without a fresh lookup.
+    try std.testing.expectEqualStrings("/gguf/a.bin", pathForIno(&st, 5, &buf).?);
+    try std.testing.expectEqualStrings("/gguf/a.bin", pathForFh(&st, 9, &buf).?);
+    try std.testing.expectEqual(@as(u64, 3), st.nodes.get(5).?.nlookup);
+    // The counters resume where the previous image left them, so a new
+    // lookup cannot collide with an inode the kernel already holds.
+    try std.testing.expectEqual(@as(u64, 6), try internPath(&st, "/new.bin"));
+    try std.testing.expectEqual(@as(u64, 10), rememberOpen(&st, "/new.bin"));
+    // The restored reference count is still honored: three forgets, not one.
+    dropLookup(&st, 5, 2);
+    try std.testing.expectEqualStrings("/gguf/a.bin", pathForIno(&st, 5, &buf).?);
+    dropLookup(&st, 5, 1);
+    try std.testing.expectEqual(@as(?[]const u8, null), pathForIno(&st, 5, &buf));
+    forgetOpen(&st, 9);
+    forgetOpen(&st, 10);
+}
+
 test "fuse operations wire every supported handler" {
     const o = llOps();
     // A null entry makes libfuse answer that operation with a default

@@ -28,6 +28,10 @@ pub const home_env = "HF_HOME";
 pub const token_under_home = "token";
 pub const token_under_cache = ".cache/huggingface/token";
 
+/// Cap on the token file, matching `proto.max_psk_bytes` for the other
+/// secret this tree reads off disk. A larger file is a wrong file.
+pub const max_token_bytes: usize = 4096;
+
 /// Hugging Face caps ids at 96 characters per part; this bounds the URL
 /// buffers rather than restating their rule.
 pub const max_repo_bytes: usize = 200;
@@ -186,7 +190,7 @@ pub fn loadToken(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map
         if (home.len == 0) return null;
         break :blk sys.joinZ(&path_buf, home, token_under_cache) catch return null;
     };
-    const blob = sys.readFileAlloc(gpa, path, 4096) catch return null;
+    const blob = sys.readFileAlloc(gpa, path, max_token_bytes) catch return null;
     defer gpa.free(blob);
     const trimmed = std.mem.trim(u8, blob, " \t\r\n");
     if (trimmed.len == 0) return null;

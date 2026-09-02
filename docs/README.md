@@ -12,6 +12,7 @@ Setup and CLI usage are in the [top-level README](../README.md). Recent changes 
 | [THREAT_MODEL.md](THREAT_MODEL.md) | Attack surface, trust boundaries, risk-ranked threats, and which controls exist versus which are missing |
 | [audits.md](audits.md) | Findings from the 2026-08-22 review passes and how each was fixed |
 | [design.md](design.md) | The original architecture sketch, goals G1-G10, and key decisions, each with ship status. Kept for history; current behavior is architecture.md |
+| [reviews/](reviews/) | Output of the review passes below: findings, severity, and what was fixed |
 
 ## review-guides/
 
