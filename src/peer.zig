@@ -76,6 +76,34 @@ pub const Server = struct {
         std.log.info("peer http on {s}:{d}", .{ ip, port });
     }
 
+    /// Take over an already-listening fd (handover). Does not bind or
+    /// listen. SO_REUSEPORT is refused so a replacement cannot split the
+    /// port with another daemon. CLOEXEC is set: the auto_unmount helper
+    /// must not inherit this fd after attach.
+    pub fn adoptListenFd(self: *Server, fd: std.posix.fd_t) !void {
+        var addr = std.mem.zeroes(c.struct_sockaddr_in);
+        if (sys.getsockname(fd, &addr) != 0) return error.BadFd;
+        var accept_on: c_int = 0;
+        var slen: std.c.socklen_t = @intCast(@sizeOf(c_int));
+        if (std.c.getsockopt(fd, c.SOL_SOCKET, @intCast(c.SO_ACCEPTCONN), &accept_on, &slen) != 0)
+            return error.BadFd;
+        if (accept_on == 0) return error.NotListening;
+        if (sys.reuseportIsOn(fd)) return error.ReusePort;
+        if (sys.setCloexec(fd, true) != 0) return error.Cloexec;
+        try self.listen_fds.append(self.gpa, fd);
+    }
+
+    pub fn setListenCloexec(self: *Server, on: bool) void {
+        for (self.listen_fds.items) |fd| _ = sys.setCloexec(fd, on);
+    }
+
+    /// Empty the listen list without closing or shutting down, so exec can
+    /// inherit the fds. stop() would close them.
+    pub fn detachListenFds(self: *Server) void {
+        self.listen_fds.deinit(self.gpa);
+        self.listen_fds = .empty;
+    }
+
     pub fn serve(self: *Server) void {
         var threads: std.ArrayList(std.Thread) = .empty;
         defer {
@@ -2315,6 +2343,62 @@ test "duplicate bind of a live port fails instead of sharing it" {
     try std.testing.expectEqual(@as(usize, 0), second.listen_fds.items.len);
 
     first.stop();
+}
+
+test "adoptListenFd serves /ping on the inherited fd without bind" {
+    const gpa = std.testing.allocator;
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-adopt-o");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-adopt-c");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+
+    var first = Server{ .gpa = gpa, .io = std.testing.io, .psk = "adopt-secret", .store = &st };
+    try first.bindOne("127.0.0.1", 0);
+    try std.testing.expectEqual(@as(usize, 1), first.listen_fds.items.len);
+    const fd = first.listen_fds.items[0];
+    const port = boundPort(fd);
+    try std.testing.expect(port > 0);
+    try std.testing.expect(!sys.reuseportIsOn(fd));
+    first.detachListenFds();
+
+    var adopted = Server{ .gpa = gpa, .io = std.testing.io, .psk = "adopt-secret", .store = &st };
+    try adopted.adoptListenFd(fd);
+    defer adopted.stop();
+    try std.testing.expectEqual(@as(usize, 1), adopted.listen_fds.items.len);
+    try std.testing.expect(sys.fdIsCloexec(adopted.listen_fds.items[0]));
+    try std.testing.expect(!sys.reuseportIsOn(adopted.listen_fds.items[0]));
+
+    adopted.running.store(true, .release);
+    const accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{ &adopted, adopted.listen_fds.items[0] });
+    defer {
+        adopted.running.store(false, .release);
+        _ = c.shutdown(adopted.listen_fds.items[0], c.SHUT_RDWR);
+        accept_thread.join();
+    }
+
+    {
+        var res = try roundTrip(port, "GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer adopt-secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\nok"));
+    }
+    {
+        var res = try roundTrip(port, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 401 "));
+    }
+
+    var second = Server{ .gpa = gpa, .io = std.testing.io, .psk = "other", .store = &st };
+    try std.testing.expectError(error.Bind, second.bindOne("127.0.0.1", port));
+    try std.testing.expectEqual(@as(usize, 0), second.listen_fds.items.len);
 }
 
 test "bindAll collapses duplicate specs and refuses an already-bound port" {

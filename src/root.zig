@@ -11,5 +11,7 @@ test {
     _ = @import("discover.zig");
     _ = @import("peer.zig");
     _ = @import("fuse_fs.zig");
+    _ = @import("handover.zig");
+    _ = @import("hf.zig");
     _ = @import("main.zig");
 }

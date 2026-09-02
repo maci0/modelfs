@@ -1,6 +1,9 @@
 #include <fuse.h>
 #include <fuse_common.h>
+#include <fuse_lowlevel.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/uio.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>

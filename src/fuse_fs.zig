@@ -11,6 +11,7 @@ const discover = @import("discover.zig");
 const peer = @import("peer.zig");
 const cull = @import("cull.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
+const handover = @import("handover.zig");
 
 pub const State = struct {
     gpa: std.mem.Allocator,
@@ -27,6 +28,43 @@ pub const State = struct {
     /// spawned earlier dies with the parent and a detached mount would
     /// silently lose its peer server, discovery, and culling.
     workers: std.ArrayList(std.Thread) = .empty,
+    mountpoint: []const u8 = "",
+    allow_other: bool = false,
+    detach: bool = false,
+    listen_port: u16 = 0,
+    fuse_fd: c_int = -1,
+    /// Set by SIGUSR2: the session loop exits without unmounting so
+    /// `execHandover` can hand the FUSE and listen fds to a new image.
+    handover_asked: std.atomic.Value(bool) = .init(false),
+    /// The FUSE_INIT request the kernel opened this connection with, kept
+    /// verbatim off the wire (`captureInit`) and replayed by a replacement
+    /// image (`replayInit`). Written once, before any thread that reads it.
+    init_raw: [handover.init_max]u8 = undefined,
+    init_len: std.atomic.Value(usize) = .init(0),
+    /// Set by `ll_init`: proof that a replayed INIT was accepted.
+    init_seen: std.atomic.Value(bool) = .init(false),
+    /// Set while the synthetic INIT of a handover is being processed: the
+    /// kernel already has its INIT reply, so libfuse's must be dropped
+    /// instead of written back onto the connection.
+    swallow_reply: std.atomic.Value(bool) = .init(false),
+    /// The mount namespace this daemon owns: `nodes`/`paths` map the inode
+    /// numbers the kernel holds to mount-relative paths, `opens` maps open
+    /// file handles, and `nlookup` counts the kernel's outstanding lookup
+    /// references per inode (FORGET decrements; zero drops the node). The
+    /// high-level libfuse API keeps this table privately, which is exactly
+    /// why the daemon speaks the low-level API: only a table we own can be
+    /// carried across a process-image handover.
+    nodes_mu: std.Io.Mutex = .init,
+    nodes: std.AutoHashMapUnmanaged(u64, Node) = .empty,
+    paths: std.StringHashMapUnmanaged(u64) = .empty,
+    opens: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+    next_ino: u64 = 2,
+    next_fh: u64 = 1,
+    /// Handshake token from `update.req`, acked once the new image serves.
+    update_token: ?[]const u8 = null,
+
+    /// `path` is owned here and aliased as the `paths` key.
+    const Node = struct { path: []u8, nlookup: u64 };
 
     /// One constructor for the daemon composition: cache, membership, and
     /// peer HTTP share this object, and Server.store must alias the Store
@@ -63,6 +101,15 @@ pub const State = struct {
             .start_secs = sys.monoSec(io),
         };
         self.store.water = water;
+    }
+
+    /// Restores the captured FUSE_INIT request in an image that inherited
+    /// the connection. Refuses an empty or oversized one: without a request
+    /// to replay the session answers every op with EIO.
+    pub fn setInitRequest(self: *State, msg: []const u8) !void {
+        if (msg.len == 0 or msg.len > self.init_raw.len) return error.BadInitRequest;
+        @memcpy(self.init_raw[0..msg.len], msg);
+        self.init_len.store(msg.len, .release);
     }
 
     pub fn spawnWorkers(self: *State) void {
@@ -121,11 +168,24 @@ pub const State = struct {
         }
         self.store.deinit();
         self.catalog.deinit();
+        var n_it = self.nodes.iterator();
+        while (n_it.next()) |e| self.gpa.free(e.value_ptr.path);
+        self.nodes.deinit(self.gpa);
+        self.paths.deinit(self.gpa);
+        var o_it = self.opens.iterator();
+        while (o_it.next()) |e| self.gpa.free(e.value_ptr.*);
+        self.opens.deinit(self.gpa);
+        if (self.update_token) |t| self.gpa.free(t);
     }
 };
 
+/// The State the request being served belongs to. Set once per low-level
+/// op from `fuse_req_userdata`, so the path handlers below stay free of
+/// libfuse request types and remain callable from tests.
+threadlocal var tls_state: ?*State = null;
+
 fn statePtr() *State {
-    return @ptrCast(@alignCast(fuse.fuse_get_context().*.private_data));
+    return tls_state.?;
 }
 
 fn cPath(p: [*c]const u8) []const u8 {
@@ -1181,46 +1241,18 @@ export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_i
     return sys.chmod(op, clientCreateMode(mode));
 }
 
-export fn mf_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: fuse.fuse_fill_dir_t, off: fuse.off_t, fi: ?*fuse.fuse_file_info, flags: fuse.enum_fuse_readdir_flags) callconv(.c) c_int {
-    _ = fi;
-    _ = flags;
-    const st = statePtr();
-    const p = cPath(path);
-    var rel: []const u8 = "";
-    const rerr = resolveRel(p, -sys.c.ENOENT, &rel);
-    if (rerr != 0) return rerr;
-    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const op = st.store.originPath(&pbuf, rel) catch return -sys.c.ENAMETOOLONG;
-    // A planted directory symlink must not have the daemon list its target's
-    // (client-local) contents into this mount. Open O_NOFOLLOW rather than
-    // lstat-then-opendir: a racer swapping the name to a link in that window
-    // would otherwise list the target. ELOOP on links, ENOTDIR on a file,
-    // matching the previous lstat gates.
-    const dir = sys.opendirNoFollow(op) orelse {
-        const rc = sys.negErrno();
-        countMetaErr(st, rc);
-        return rc;
-    };
-    defer sys.closedir(dir);
-    const fill = filler orelse return -sys.c.EIO;
-    var names = OriginDirNames{ .dir = dir, .hide_cluster = rel.len == 0 };
-    const emit = DirFiller{ .buf = buf, .fill = fill };
-    readdirResume(&names, emit, off);
-    return 0;
-}
-
-/// libfuse's readdir contract has two valid modes: ignore the offset and
-/// always pass zero to filler (only legal when the whole listing fits one
-/// reply buffer), or track offsets and resume where the kernel asks. This
-/// handler implements the second: a listing of a models directory past one
-/// reply (~32-128 KiB of fuse_dirent records) made filler report full with
-/// every entry stamped offset 0, so the kernel's next READDIR resumed at 0
-/// and re-received the head of the directory forever -- duplicates without
-/// end in ls/readdir(3). Entries carry stable 1-based ordinals (".", "..",
-/// then origin order); entries at or below the incoming offset are skipped
-/// and emitted entries hand filler their ordinal, which is exactly the
-/// value the kernel returns to resume after them. Extracted from
-/// mf_readdir so the resume contract is drivable in tests without mounting.
+/// A READDIR contract has two valid modes: ignore the offset and stamp
+/// every entry zero (only legal when the whole listing fits one reply), or
+/// track offsets and resume where the kernel asks. This walk implements the
+/// second: a listing of a models directory past one reply (~32-128 KiB of
+/// fuse_dirent records) used to stamp every entry offset 0, so the kernel's
+/// next READDIR resumed at 0 and re-received the head of the directory
+/// forever -- duplicates without end in ls/readdir(3). Entries carry stable
+/// 1-based ordinals (".", "..", then origin order); entries at or below the
+/// incoming offset are skipped and emitted entries carry their ordinal,
+/// which is exactly the value the kernel returns to resume after them.
+/// Separate from ll_readdir so the resume contract is drivable in tests
+/// without mounting.
 fn readdirResume(names: anytype, emit: anytype, off: fuse.off_t) void {
     var pos: fuse.off_t = 0;
     inline for ([_][]const u8{ ".", ".." }) |dot| {
@@ -1258,25 +1290,6 @@ const OriginDirNames = struct {
     }
 };
 
-/// Hands each planned entry to libfuse's filler. False ends the walk when
-/// the reply buffer is full (filler nonzero), and the kernel resumes from
-/// the last ordinal actually emitted. An entry longer than the staging
-/// buffer is skipped instead: Linux NAME_MAX caps directory components at
-/// 255 bytes and namez holds 256, so the branch is defense against a
-/// hostile origin filesystem, not a state the walk can reach on a real one.
-const DirFiller = struct {
-    buf: ?*anyopaque,
-    fill: fuse.fuse_fill_dir_t,
-
-    fn run(self: DirFiller, name: []const u8, ordinal: fuse.off_t) bool {
-        var namez: [256]u8 = undefined;
-        if (name.len >= namez.len) return true;
-        @memcpy(namez[0..name.len], name);
-        namez[name.len] = 0;
-        return self.fill.?(self.buf, &namez, null, ordinal, 0) == 0;
-    }
-};
-
 export fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.c) c_int {
     const st = statePtr();
     const statfs_t0 = sys.monoNs(st.io);
@@ -1292,30 +1305,17 @@ export fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.
     return 0;
 }
 
-export fn mf_init(conn: ?*fuse.fuse_conn_info, cfg: ?*fuse.fuse_config) callconv(.c) ?*anyopaque {
+export fn ll_init(ud: ?*anyopaque, conn: ?*fuse.fuse_conn_info) callconv(.c) void {
     _ = conn;
-    const st = statePtr();
-    if (cfg) |cf| {
-        // The kernel page cache is UMA RAM shared with the GPU, so it stays
-        // off under direct_io (the default). `--kernel-cache` flips direct_io
-        // off to permit mmap; the cache only engages when kernel_cache is also
-        // enabled, so mirror the flag here instead of hardcoding it off, which
-        // would leave --kernel-cache a no-op.
-        cf.*.kernel_cache = @intFromBool(!st.direct_io);
-        cf.*.auto_cache = 0;
-        cf.*.direct_io = @intFromBool(st.direct_io);
-        cf.*.use_ino = 0;
-        cf.*.entry_timeout = 1.0;
-        cf.*.attr_timeout = 1.0;
-        cf.*.negative_timeout = 0.0;
-    }
+    const st: *State = @ptrCast(@alignCast(ud));
+    tls_state = st;
+    st.init_seen.store(true, .release);
     // First point that is guaranteed to be the final (post-fork) process:
     // background workers must start here or --detach loses them.
     st.spawnWorkers();
-    return st;
 }
 
-export fn mf_destroy(ud: ?*anyopaque) callconv(.c) void {
+export fn ll_destroy(ud: ?*anyopaque) callconv(.c) void {
     const st: *State = @ptrCast(@alignCast(ud));
     st.running.store(false, .release);
     st.server.stop();
@@ -1587,81 +1587,952 @@ fn statusJson(st: *State) !void {
     }
 }
 
-pub fn ops() fuse.fuse_operations {
-    var o = std.mem.zeroes(fuse.fuse_operations);
-    o.getattr = mf_getattr;
-    o.open = mf_open;
-    o.create = mf_create;
-    o.read = mf_read;
-    o.write = mf_write;
-    o.release = mf_release;
-    o.fsync = mf_fsync;
-    o.truncate = mf_truncate;
-    o.unlink = mf_unlink;
-    o.mkdir = mf_mkdir;
-    o.rmdir = mf_rmdir;
-    o.rename = mf_rename;
-    o.chmod = mf_chmod;
-    o.readdir = mf_readdir;
-    o.statfs = mf_statfs;
-    o.init = mf_init;
-    o.destroy = mf_destroy;
+// The low-level session below owns the mount's inode namespace. libfuse's
+// high-level API keeps that table privately and aborts the process on an
+// inode it does not know, which is exactly what a replacement image would
+// inherit from the kernel after `modelfs update`; owning the table is what
+// makes the handover possible. The path handlers above stay unchanged and
+// are reached through the ino/fh resolution here.
+
+/// libfuse's `struct fuse_file_info` carries bitfields, so translate-c
+/// renders it opaque and the daemon reaches its head by offset. That head
+/// is identical on libfuse 3.14 (the vendored arm64 build) and 3.18: int32
+/// `flags` at 0, the bitfield word at 4 with `direct_io` at bit 1 and
+/// `keep_cache` at bit 2, then the 8-byte-aligned uint64 `fh` at 16.
+const fi_bits_off: usize = 4;
+const fi_fh_off: usize = 16;
+const fi_direct_io_bit: u5 = 1;
+const fi_keep_cache_bit: u5 = 2;
+
+fn fiFh(fi: ?*fuse.fuse_file_info) u64 {
+    const p = fi orelse return 0;
+    const bytes: [*]const u8 = @ptrCast(p);
+    return std.mem.readInt(u64, bytes[fi_fh_off..][0..8], .little);
+}
+
+fn setFiFh(fi: ?*fuse.fuse_file_info, fh: u64) void {
+    const p = fi orelse return;
+    const bytes: [*]u8 = @ptrCast(p);
+    std.mem.writeInt(u64, bytes[fi_fh_off..][0..8], fh, .little);
+}
+
+/// The kernel page cache is UMA RAM shared with the GPU, so it stays off
+/// under direct_io (the default). `--kernel-cache` clears direct_io to
+/// permit mmap and keeps cached pages across opens of the same file.
+fn setFiCaching(st: *State, fi: ?*fuse.fuse_file_info) void {
+    const p = fi orelse return;
+    const bytes: [*]u8 = @ptrCast(p);
+    const dio = @as(u32, 1) << fi_direct_io_bit;
+    const keep = @as(u32, 1) << fi_keep_cache_bit;
+    var bits = std.mem.readInt(u32, bytes[fi_bits_off..][0..4], .little);
+    bits = if (st.direct_io) (bits | dio) & ~keep else (bits & ~dio) | keep;
+    std.mem.writeInt(u32, bytes[fi_bits_off..][0..4], bits, .little);
+}
+
+/// Attribute and entry lifetime the kernel may cache before revalidating.
+/// Negative lookups get a plain ENOENT and no caching at all, so a name
+/// that appears on the origin is visible at the next access.
+const cache_timeout_s: f64 = 1.0;
+
+/// The mount root. Fixed by the FUSE protocol, never in `State.nodes`.
+const root_ino: u64 = 1;
+
+/// The path an inode names, copied into `buf`: a borrowed slice would be
+/// freed under the caller by a concurrent FORGET the moment the table lock
+/// is dropped.
+fn pathForIno(st: *State, ino: u64, buf: *[sys.c.PATH_MAX]u8) ?[]const u8 {
+    if (ino == root_ino) {
+        buf[0] = '/';
+        return buf[0..1];
+    }
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    const node = st.nodes.get(ino) orelse return null;
+    if (node.path.len > buf.len) return null;
+    @memcpy(buf[0..node.path.len], node.path);
+    return buf[0..node.path.len];
+}
+
+/// The path an open file handle names. Preferred over the inode's own path
+/// wherever both are available: a rename between open and I/O moves the
+/// handle with the name, and both tables are kept in step by `renameNodes`.
+fn pathForFh(st: *State, fh: u64, buf: *[sys.c.PATH_MAX]u8) ?[]const u8 {
+    if (fh == 0) return null;
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    const p = st.opens.get(fh) orelse return null;
+    if (p.len > buf.len) return null;
+    @memcpy(buf[0..p.len], p);
+    return buf[0..p.len];
+}
+
+fn pathForOp(st: *State, ino: u64, fi: ?*fuse.fuse_file_info, buf: *[sys.c.PATH_MAX]u8) ?[]const u8 {
+    if (pathForFh(st, fiFh(fi), buf)) |p| return p;
+    return pathForIno(st, ino, buf);
+}
+
+/// The inode number for `path`, minting one if the kernel has not seen the
+/// name yet. Every reply_entry/reply_create hands the kernel one lookup
+/// reference, which it returns through FORGET.
+fn internPath(st: *State, path: []const u8) !u64 {
+    if (std.mem.eql(u8, path, "/")) return root_ino;
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    if (st.paths.get(path)) |ino| {
+        // getPtr cannot be null here: paths and nodes are only ever written
+        // together under this lock.
+        st.nodes.getPtr(ino).?.nlookup += 1;
+        return ino;
+    }
+    const owned = try st.gpa.dupe(u8, path);
+    errdefer st.gpa.free(owned);
+    try st.nodes.ensureUnusedCapacity(st.gpa, 1);
+    try st.paths.ensureUnusedCapacity(st.gpa, 1);
+    const ino = st.next_ino;
+    st.next_ino += 1;
+    st.nodes.putAssumeCapacity(ino, .{ .path = owned, .nlookup = 1 });
+    st.paths.putAssumeCapacity(owned, ino);
+    return ino;
+}
+
+/// FORGET: the kernel dropped `n` of its references to `ino`. At zero the
+/// node goes; its number is never reused, so a stale request naming it can
+/// only ever answer ENOENT, never a different file.
+fn dropLookup(st: *State, ino: u64, n: u64) void {
+    if (ino == root_ino) return;
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    const node = st.nodes.getPtr(ino) orelse return;
+    if (node.nlookup > n) {
+        node.nlookup -= n;
+        return;
+    }
+    const path = node.path;
+    // Only unmap the name when it still resolves here: a rename onto this
+    // name has already pointed it at the other inode, and that mapping must
+    // survive this node's last forget.
+    if (st.paths.get(path)) |mapped| {
+        if (mapped == ino) _ = st.paths.remove(path);
+    }
+    _ = st.nodes.remove(ino);
+    st.gpa.free(path);
+}
+
+/// `path` rewritten for a rename of `old` to `new`, or null when the rename
+/// does not cover it. A directory rename moves its whole subtree, so a
+/// prefix match counts as long as it ends on a component boundary.
+fn renamedPath(gpa: std.mem.Allocator, old: []const u8, new: []const u8, path: []const u8) !?[]u8 {
+    const covered = std.mem.eql(u8, path, old) or
+        (path.len > old.len and std.mem.startsWith(u8, path, old) and path[old.len] == '/');
+    if (!covered) return null;
+    const suffix = path[old.len..];
+    const out = try gpa.alloc(u8, new.len + suffix.len);
+    @memcpy(out[0..new.len], new);
+    @memcpy(out[new.len..], suffix);
+    return out;
+}
+
+/// Re-points the inode and open-handle tables after a successful rename.
+/// The kernel keeps the inode numbers across a rename, so without this an
+/// inode it still holds would keep resolving to the name it had before the
+/// move. A node whose new path cannot be allocated is dropped rather than
+/// left pointing at the old name: later requests naming it answer ENOENT
+/// instead of reaching a different file.
+fn renameNodes(st: *State, old: []const u8, new: []const u8) void {
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    var stale: bool = false;
+    var it = st.nodes.iterator();
+    while (it.next()) |e| {
+        const ino = e.key_ptr.*;
+        const moved = renamedPath(st.gpa, old, new, e.value_ptr.path) catch {
+            stale = true;
+            continue;
+        } orelse continue;
+        if (st.paths.get(e.value_ptr.path)) |mapped| {
+            if (mapped == ino) _ = st.paths.remove(e.value_ptr.path);
+        }
+        // Drop any node the destination name already had: the name is ours
+        // now, and the displaced inode stays reachable only through handles
+        // the kernel already holds until it forgets them.
+        _ = st.paths.remove(moved);
+        st.gpa.free(e.value_ptr.path);
+        e.value_ptr.path = moved;
+        st.paths.put(st.gpa, moved, ino) catch {
+            stale = true;
+        };
+    }
+    var oit = st.opens.iterator();
+    while (oit.next()) |e| {
+        const moved = renamedPath(st.gpa, old, new, e.value_ptr.*) catch {
+            stale = true;
+            continue;
+        } orelse continue;
+        st.gpa.free(e.value_ptr.*);
+        e.value_ptr.* = moved;
+    }
+    if (stale) std.log.warn("rename bookkeeping ran out of memory; some cached inodes now answer ENOENT", .{});
+}
+
+/// Records an open file so later reads, writes, and the release can find
+/// the name even after a rename. A zero handle means "no record kept"; the
+/// inode's own path answers those requests.
+fn rememberOpen(st: *State, path: []const u8) u64 {
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    const owned = st.gpa.dupe(u8, path) catch return 0;
+    const fh = st.next_fh;
+    st.opens.put(st.gpa, fh, owned) catch {
+        st.gpa.free(owned);
+        return 0;
+    };
+    st.next_fh += 1;
+    return fh;
+}
+
+fn forgetOpen(st: *State, fh: u64) void {
+    if (fh == 0) return;
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    if (st.opens.fetchRemove(fh)) |kv| st.gpa.free(kv.value);
+}
+
+/// `parent` joined with one component. The root is spelled "/", so its
+/// children are built from an empty stem rather than doubling the slash.
+fn childPath(buf: *[sys.c.PATH_MAX]u8, parent: []const u8, name: []const u8) ?[]const u8 {
+    const stem: []const u8 = if (std.mem.eql(u8, parent, "/")) "" else parent;
+    if (stem.len + 1 + name.len >= buf.len) return null;
+    @memcpy(buf[0..stem.len], stem);
+    buf[stem.len] = '/';
+    @memcpy(buf[stem.len + 1 ..][0..name.len], name);
+    return buf[0 .. stem.len + 1 + name.len];
+}
+
+/// Attributes plus an inode number for `path`, the reply shape LOOKUP,
+/// MKDIR, and CREATE share.
+fn fillEntry(st: *State, path: []const u8, e: *fuse.fuse_entry_param) c_int {
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, path) catch return -sys.c.ENAMETOOLONG;
+    e.* = std.mem.zeroes(fuse.fuse_entry_param);
+    const rc = mf_getattr(z, &e.attr, null);
+    if (rc != 0) return rc;
+    const ino = internPath(st, path) catch return -sys.c.ENOMEM;
+    e.ino = ino;
+    // Inode numbers are never reused, so one generation covers the mount.
+    e.generation = 1;
+    e.attr_timeout = cache_timeout_s;
+    e.entry_timeout = cache_timeout_s;
+    e.attr.st_ino = ino;
+    return 0;
+}
+
+fn llEnter(req: fuse.fuse_req_t) *State {
+    const st: *State = @ptrCast(@alignCast(fuse.fuse_req_userdata(req)));
+    tls_state = st;
+    return st;
+}
+
+fn replyErr(req: fuse.fuse_req_t, rc: c_int) void {
+    _ = fuse.fuse_reply_err(req, if (rc < 0) -rc else rc);
+}
+
+export fn ll_lookup(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const parent_path = pathForIno(st, parent, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var cbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const child = childPath(&cbuf, parent_path, cPath(name)) orelse return replyErr(req, sys.c.ENAMETOOLONG);
+    var e: fuse.fuse_entry_param = undefined;
+    const rc = fillEntry(st, child, &e);
+    if (rc != 0) return replyErr(req, rc);
+    _ = fuse.fuse_reply_entry(req, &e);
+}
+
+export fn ll_forget(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, nlookup: u64) callconv(.c) void {
+    dropLookup(llEnter(req), ino, nlookup);
+    fuse.fuse_reply_none(req);
+}
+
+export fn ll_forget_multi(req: fuse.fuse_req_t, count: usize, forgets: [*c]fuse.fuse_forget_data) callconv(.c) void {
+    const st = llEnter(req);
+    var i: usize = 0;
+    while (i < count) : (i += 1) dropLookup(st, forgets[i].ino, forgets[i].nlookup);
+    fuse.fuse_reply_none(req);
+}
+
+export fn ll_getattr(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForOp(st, ino, fi, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    var attr: sys.c.struct_stat = undefined;
+    const rc = mf_getattr(z, &attr, fi);
+    if (rc != 0) return replyErr(req, rc);
+    attr.st_ino = ino;
+    _ = fuse.fuse_reply_attr(req, &attr, cache_timeout_s);
+}
+
+/// The attribute bits the mount can actually apply. Ownership and
+/// timestamps have no handler, exactly as they had none under the
+/// high-level ops table, and answer ENOSYS in the same order libfuse used
+/// to: mode first, then size, then the unsupported rest.
+const settable_attrs: c_int = fuse.FUSE_SET_ATTR_MODE | fuse.FUSE_SET_ATTR_SIZE;
+
+export fn ll_setattr(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, attr: [*c]fuse.struct_stat, to_set: c_int, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForOp(st, ino, fi, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    if ((to_set & fuse.FUSE_SET_ATTR_MODE) != 0) {
+        const rc = mf_chmod(z, attr.*.st_mode, fi);
+        if (rc != 0) return replyErr(req, rc);
+    }
+    if ((to_set & fuse.FUSE_SET_ATTR_SIZE) != 0) {
+        const rc = mf_truncate(z, attr.*.st_size, fi);
+        if (rc != 0) return replyErr(req, rc);
+    }
+    if ((to_set & ~settable_attrs) != 0) return replyErr(req, sys.c.ENOSYS);
+    var out: sys.c.struct_stat = undefined;
+    const rc = mf_getattr(z, &out, fi);
+    if (rc != 0) return replyErr(req, rc);
+    out.st_ino = ino;
+    _ = fuse.fuse_reply_attr(req, &out, cache_timeout_s);
+}
+
+export fn ll_open(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForIno(st, ino, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    const rc = mf_open(z, fi);
+    if (rc != 0) return replyErr(req, rc);
+    setFiFh(fi, rememberOpen(st, p));
+    setFiCaching(st, fi);
+    _ = fuse.fuse_reply_open(req, fi);
+}
+
+export fn ll_create(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const parent_path = pathForIno(st, parent, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var cbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const child = childPath(&cbuf, parent_path, cPath(name)) orelse return replyErr(req, sys.c.ENAMETOOLONG);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, child) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    const rc = mf_create(z, mode, fi);
+    if (rc != 0) return replyErr(req, rc);
+    var e: fuse.fuse_entry_param = undefined;
+    const erc = fillEntry(st, child, &e);
+    if (erc != 0) return replyErr(req, erc);
+    setFiFh(fi, rememberOpen(st, child));
+    setFiCaching(st, fi);
+    _ = fuse.fuse_reply_create(req, &e, fi);
+}
+
+export fn ll_read(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForOp(st, ino, fi, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    const want = @min(size, @as(usize, std.math.maxInt(c_int)));
+    // One buffer per read request, sized by the kernel's ask. libfuse's
+    // high-level layer did the same malloc on this path; the no-hot-path
+    // -allocation rule covers piece hydration and request parsing, which
+    // still run on stack or on the one reusable piece buffer.
+    const buf = st.gpa.alloc(u8, want) catch return replyErr(req, sys.c.ENOMEM);
+    defer st.gpa.free(buf);
+    const n = mf_read(z, buf.ptr, want, off, fi);
+    if (n < 0) return replyErr(req, n);
+    _ = fuse.fuse_reply_buf(req, buf.ptr, @intCast(n));
+}
+
+export fn ll_write(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, buf: [*c]const u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForOp(st, ino, fi, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    const n = mf_write(z, buf, size, off, fi);
+    if (n < 0) return replyErr(req, n);
+    _ = fuse.fuse_reply_write(req, @intCast(n));
+}
+
+export fn ll_release(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForOp(st, ino, fi, &pbuf);
+    forgetOpen(st, fiFh(fi));
+    if (p) |path| {
+        var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+        if (sys.toZ(&zbuf, path)) |z| {
+            _ = mf_release(z, fi);
+        } else |_| {}
+    }
+    _ = fuse.fuse_reply_err(req, 0);
+}
+
+export fn ll_fsync(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, datasync: c_int, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForOp(st, ino, fi, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    replyErr(req, mf_fsync(z, datasync, fi));
+}
+
+export fn ll_unlink(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const parent_path = pathForIno(st, parent, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var cbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const child = childPath(&cbuf, parent_path, cPath(name)) orelse return replyErr(req, sys.c.ENAMETOOLONG);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, child) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    replyErr(req, mf_unlink(z));
+}
+
+export fn ll_mkdir(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]const u8, mode: fuse.mode_t) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const parent_path = pathForIno(st, parent, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var cbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const child = childPath(&cbuf, parent_path, cPath(name)) orelse return replyErr(req, sys.c.ENAMETOOLONG);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, child) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    const rc = mf_mkdir(z, mode);
+    if (rc != 0) return replyErr(req, rc);
+    var e: fuse.fuse_entry_param = undefined;
+    const erc = fillEntry(st, child, &e);
+    if (erc != 0) return replyErr(req, erc);
+    _ = fuse.fuse_reply_entry(req, &e);
+}
+
+export fn ll_rmdir(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const parent_path = pathForIno(st, parent, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var cbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const child = childPath(&cbuf, parent_path, cPath(name)) orelse return replyErr(req, sys.c.ENAMETOOLONG);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, child) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    replyErr(req, mf_rmdir(z));
+}
+
+export fn ll_rename(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]const u8, newparent: fuse.fuse_ino_t, newname: [*c]const u8, flags: c_uint) callconv(.c) void {
+    const st = llEnter(req);
+    var opbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const old_parent = pathForIno(st, parent, &opbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var ocbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const old = childPath(&ocbuf, old_parent, cPath(name)) orelse return replyErr(req, sys.c.ENAMETOOLONG);
+    var npbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const new_parent = pathForIno(st, newparent, &npbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var ncbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const new = childPath(&ncbuf, new_parent, cPath(newname)) orelse return replyErr(req, sys.c.ENAMETOOLONG);
+    var ozbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const oz = sys.toZ(&ozbuf, old) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    var nzbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const nz = sys.toZ(&nzbuf, new) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    const rc = mf_rename(oz, nz, flags);
+    if (rc != 0) return replyErr(req, rc);
+    // RENAME_EXCHANGE leaves both names in place and swaps what they hold.
+    // Inode identity here is the path, and every handler resolves through
+    // it, so the tables already describe the post-exchange mount and only a
+    // plain rename (where the old name is gone) needs re-pointing.
+    if ((flags & sys.c.RENAME_EXCHANGE) == 0) renameNodes(st, old, new);
+    _ = fuse.fuse_reply_err(req, 0);
+}
+
+export fn ll_statfs(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t) callconv(.c) void {
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForIno(st, ino, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    var vs: sys.c.struct_statvfs = undefined;
+    const rc = mf_statfs(z, &vs);
+    if (rc != 0) return replyErr(req, rc);
+    _ = fuse.fuse_reply_statfs(req, &vs);
+}
+
+/// Largest READDIR reply the daemon stages before handing it back. The
+/// kernel asks for at most one page-cache page's worth per round today;
+/// anything it asks beyond this simply resumes on the next request.
+const readdir_reply_max: usize = 64 * 1024;
+
+/// Entries the mount does not resolve to an inode report this number, the
+/// same placeholder libfuse's high-level readdir used with `use_ino` off.
+/// Zero would make glibc's readdir(3) skip the entry as deleted.
+const unknown_dir_ino: u64 = 0xffff_ffff;
+
+/// Stages planned entries into one READDIR reply. False ends the walk when
+/// the next entry no longer fits, and the kernel resumes from the last
+/// ordinal actually emitted. An entry longer than the staging buffer is
+/// skipped instead: Linux NAME_MAX caps directory components at 255 bytes
+/// and namez holds 256, so that branch is defense against a hostile origin
+/// filesystem, not a state the walk can reach on a real one.
+const LlDirFiller = struct {
+    req: fuse.fuse_req_t,
+    buf: []u8,
+    used: *usize,
+
+    fn run(self: LlDirFiller, name: []const u8, ordinal: fuse.off_t) bool {
+        var namez: [256]u8 = undefined;
+        if (name.len >= namez.len) return true;
+        @memcpy(namez[0..name.len], name);
+        namez[name.len] = 0;
+        var attr = std.mem.zeroes(sys.c.struct_stat);
+        attr.st_ino = unknown_dir_ino;
+        const left = self.buf.len - self.used.*;
+        const need = fuse.fuse_add_direntry(self.req, null, 0, &namez, &attr, ordinal);
+        if (need > left) return false;
+        _ = fuse.fuse_add_direntry(self.req, self.buf.ptr + self.used.*, left, &namez, &attr, ordinal);
+        self.used.* += need;
+        return true;
+    }
+};
+
+export fn ll_readdir(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
+    _ = fi;
+    const st = llEnter(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = pathForIno(st, ino, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    var rel: []const u8 = "";
+    const rerr = resolveRel(p, -sys.c.ENOENT, &rel);
+    if (rerr != 0) return replyErr(req, rerr);
+    var opbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const op = st.store.originPath(&opbuf, rel) catch return replyErr(req, sys.c.ENAMETOOLONG);
+    // A planted directory symlink must not have the daemon list its
+    // target's (client-local) contents into this mount. Open O_NOFOLLOW
+    // rather than lstat-then-opendir: a racer swapping the name to a link
+    // in that window would otherwise list the target.
+    const dir = sys.opendirNoFollow(op) orelse {
+        const rc = sys.negErrno();
+        countMetaErr(st, rc);
+        return replyErr(req, rc);
+    };
+    defer sys.closedir(dir);
+    var reply: [readdir_reply_max]u8 = undefined;
+    var used: usize = 0;
+    var names = OriginDirNames{ .dir = dir, .hide_cluster = rel.len == 0 };
+    const emit = LlDirFiller{ .req = req, .buf = reply[0..@min(size, reply.len)], .used = &used };
+    readdirResume(&names, emit, off);
+    _ = fuse.fuse_reply_buf(req, &reply[0], used);
+}
+
+pub fn llOps() fuse.fuse_lowlevel_ops {
+    var o = std.mem.zeroes(fuse.fuse_lowlevel_ops);
+    o.init = ll_init;
+    o.destroy = ll_destroy;
+    o.lookup = ll_lookup;
+    o.forget = ll_forget;
+    o.forget_multi = ll_forget_multi;
+    o.getattr = ll_getattr;
+    o.setattr = ll_setattr;
+    o.open = ll_open;
+    o.create = ll_create;
+    o.read = ll_read;
+    o.write = ll_write;
+    o.release = ll_release;
+    o.fsync = ll_fsync;
+    o.unlink = ll_unlink;
+    o.mkdir = ll_mkdir;
+    o.rmdir = ll_rmdir;
+    o.rename = ll_rename;
+    o.statfs = ll_statfs;
+    o.readdir = ll_readdir;
     return o;
 }
 
-/// Enters the libfuse session with `st` as private_data. Returns libfuse's
-/// status code; the caller then `deinit`s the same State. Lives here so
-/// the CLI does not speak libfuse types.
-pub fn run(argv: []const [*c]u8, st: *State) c_int {
-    var o = ops();
-    const argc: c_int = @intCast(argv.len);
-    const cargv: [*c][*c]u8 = @ptrCast(@constCast(argv.ptr));
-    if (@hasDecl(fuse, "fuse_main_real_versioned")) {
-        var ver = fuse.libfuse_version{
-            .major = fuse.FUSE_MAJOR_VERSION,
-            .minor = fuse.FUSE_MINOR_VERSION,
-            .hotfix = fuse.FUSE_HOTFIX_VERSION,
-            .padding = 0,
-        };
-        return fuse.fuse_main_real_versioned(argc, cargv, &o, @sizeOf(fuse.fuse_operations), &ver, st);
+// ---------------------------------------------------------------------------
+// Session lifecycle: mount, attach across exec, and the handover exec itself
+// ---------------------------------------------------------------------------
+
+const mount_opts_max: usize = 192;
+
+/// `auto_unmount` also carries the teardown of a handed-over mount: the
+/// fusermount3 helper it leaves behind holds a socket this process keeps
+/// across exec, so the mount comes down when the replacement image exits,
+/// even though that image never called `fuse_session_mount`.
+fn mountOpts(buf: *[mount_opts_max]u8, allow_other: bool) ![:0]u8 {
+    return std.fmt.bufPrintZ(buf, "default_permissions,auto_unmount,fsname=modelfs,subtype=modelfs{s}", .{
+        if (allow_other) ",allow_other" else "",
+    });
+}
+
+fn newSession(args: *fuse.fuse_args, o: *const fuse.fuse_lowlevel_ops, st: *State) ?*fuse.fuse_session {
+    // libfuse 3.17 moved the constructor behind a version-stamped call; the
+    // vendored arm64 3.14 still exports the plain one.
+    if (@hasDecl(fuse, "fuse_session_new_fn"))
+        return fuse.fuse_session_new_fn(args, o, @sizeOf(fuse.fuse_lowlevel_ops), st);
+    return fuse.fuse_session_new(args, o, @sizeOf(fuse.fuse_lowlevel_ops), st);
+}
+
+/// Mounts `st.mountpoint` and serves it. Returns libfuse's status code; the
+/// caller then `deinit`s the same State. Lives here so the CLI does not
+/// speak libfuse types. On SIGUSR2 the loop exits without unmounting and
+/// the process image is replaced in place.
+pub fn run(st: *State) c_int {
+    return serve(st, null);
+}
+
+/// Serves a FUSE connection inherited across exec: no mount, no INIT
+/// negotiation, just the fd the previous image was serving.
+pub fn attach(st: *State, fuse_fd: c_int) c_int {
+    return serve(st, fuse_fd);
+}
+
+fn serve(st: *State, inherit_fd: ?c_int) c_int {
+    var opt_buf: [mount_opts_max]u8 = undefined;
+    const opts = mountOpts(&opt_buf, st.allow_other) catch return 1;
+    var prog_z: [8]u8 = "modelfs\x00".*;
+    var dash_o: [3]u8 = "-o\x00".*;
+    var argv = [_][*c]u8{ &prog_z, &dash_o, opts.ptr };
+    var args = fuse.fuse_args{ .argc = argv.len, .argv = &argv, .allocated = 0 };
+
+    const o = llOps();
+    const se = newSession(&args, &o, st) orelse {
+        std.log.err("fuse_session_new failed", .{});
+        return 1;
+    };
+    var keep_session = false;
+    defer if (!keep_session) fuse.fuse_session_destroy(se);
+
+    if (inherit_fd) |fd| {
+        st.fuse_fd = fd;
+    } else {
+        var mz_buf: [sys.c.PATH_MAX]u8 = undefined;
+        const mz = sys.toZ(&mz_buf, st.mountpoint) catch return 1;
+        if (fuse.fuse_session_mount(se, mz) != 0) return 1;
+        st.fuse_fd = fuse.fuse_session_fd(se);
     }
-    return fuse.fuse_main_real(argc, cargv, &o, @sizeOf(fuse.fuse_operations), st);
+    // Custom io on both paths, not only the inherited one: the read hook is
+    // what keeps the kernel's FUSE_INIT request, and only a verbatim copy of
+    // that request lets a later image take this connection over. A libfuse
+    // that refuses it on an already-mounted session costs `modelfs update`,
+    // not the mount, so say so and keep serving.
+    var io = std.mem.zeroes(fuse.fuse_custom_io);
+    io.read = ioRead;
+    io.writev = ioWritev;
+    const iorc = fuse.fuse_session_custom_io(se, &io, st.fuse_fd);
+    if (iorc != 0) {
+        if (inherit_fd != null) {
+            std.log.err("handover: custom io on FUSE fd {d} failed (rc {d})", .{ st.fuse_fd, iorc });
+            return 1;
+        }
+        std.log.warn("custom io on FUSE fd {d} failed (rc {d}); serving normally, but 'modelfs update' cannot replace this image", .{ st.fuse_fd, iorc });
+    }
+    _ = sys.setCloexec(st.fuse_fd, true);
+    if (inherit_fd == null) {
+        _ = fuse.fuse_daemonize(@intFromBool(!st.detach));
+    } else {
+        if (!replayInit(st, se)) return 1;
+        // Back on for the image that is serving: a later auto_unmount
+        // helper or any other fork must not inherit the peer sockets.
+        st.server.setListenCloexec(true);
+        std.log.info("attached to the FUSE connection on fd {d}", .{st.fuse_fd});
+    }
+
+    _ = fuse.fuse_set_signal_handlers(se);
+    installHandoverSignal(st, se);
+    // The replacement is serving from here: requests are answered as soon
+    // as the loop below picks them up, so this is the honest point to tell
+    // the waiting `modelfs update` that the swap took.
+    if (st.update_token) |tok| writeAck(st, tok);
+    const rc = fuse.fuse_session_loop_mt_31(se, 0);
+    fuse.fuse_remove_signal_handlers(se);
+    live_state = null;
+    live_session = null;
+
+    if (st.handover_asked.load(.acquire)) {
+        // Neither unmount nor destroy: destroy closes the FUSE fd, and the
+        // whole point is to hand that connection to the next image. execve
+        // does not come back, so reaching the return means it failed.
+        keep_session = true;
+        execHandover(st) catch |err| {
+            std.log.err("handover exec failed: {t}; the mount is unserved, restart the daemon", .{err});
+        };
+        return 1;
+    }
+    if (inherit_fd == null) fuse.fuse_session_unmount(se);
+    return rc;
+}
+
+fn ioRead(fd: c_int, buf: ?*anyopaque, size: usize, userdata: ?*anyopaque) callconv(.c) isize {
+    const n = sys.c.read(fd, buf, size);
+    if (n <= 0) return n;
+    const st: *State = @ptrCast(@alignCast(userdata.?));
+    const bytes: [*]const u8 = @ptrCast(buf.?);
+    captureInit(st, bytes[0..@intCast(n)]);
+    return n;
+}
+
+/// Keeps the connection's FUSE_INIT request verbatim the one time it comes
+/// past. Nothing derived from it survives the round trip: libfuse's
+/// `fuse_conn_info` drops wire bits such as FUSE_MAX_PAGES, and a replay
+/// missing that one leaves the kernel writing 1 MiB requests into a 128 KiB
+/// buffer, which the connection reports as EINVAL on every read.
+fn captureInit(st: *State, msg: []const u8) void {
+    if (st.init_len.load(.acquire) != 0) return;
+    if (msg.len < @sizeOf(FuseInHeader) or msg.len > st.init_raw.len) return;
+    if (std.mem.readInt(u32, msg[4..8], .little) != fuse_opcode_init) return;
+    @memcpy(st.init_raw[0..msg.len], msg);
+    st.init_len.store(msg.len, .release);
+}
+
+fn ioWritev(fd: c_int, iov: ?*sys.c.iovec, count: c_int, userdata: ?*anyopaque) callconv(.c) isize {
+    const st: *State = @ptrCast(@alignCast(userdata.?));
+    if (!st.swallow_reply.load(.acquire)) return sys.c.writev(fd, iov, @intCast(count));
+    // The synthetic INIT of a handover: the kernel already holds its INIT
+    // reply from the previous image and is not waiting for another one, so
+    // report the write as done without putting it on the connection.
+    var total: isize = 0;
+    var i: usize = 0;
+    const vec: [*]const sys.c.iovec = @ptrCast(iov.?);
+    while (i < @as(usize, @intCast(count))) : (i += 1) total += @intCast(vec[i].iov_len);
+    return total;
+}
+
+/// FUSE kernel ABI (linux/fuse.h): the request header every message on the
+/// connection starts with, and the one opcode the daemon recognises itself.
+const fuse_opcode_init: u32 = 26;
+
+const FuseInHeader = extern struct {
+    len: u32,
+    opcode: u32,
+    unique: u64,
+    nodeid: u64,
+    uid: u32,
+    gid: u32,
+    pid: u32,
+    total_extlen: u16,
+    padding: u16,
+};
+
+/// The kernel sends FUSE_INIT once per connection and libfuse answers every
+/// request with EIO until it has seen one, so an inherited connection needs
+/// the negotiation replayed: hand libfuse the exact request the kernel sent
+/// the previous image, and drop the reply it produces (the kernel already
+/// has one). libfuse lands on the same connection terms and calls
+/// `ll_init`, whose arrival is the proof the replay took.
+fn replayInit(st: *State, se: *fuse.fuse_session) bool {
+    const len = st.init_len.load(.acquire);
+    if (len == 0) {
+        std.log.err("handover: no FUSE_INIT request to replay", .{});
+        return false;
+    }
+    st.swallow_reply.store(true, .release);
+    var buf = fuse.fuse_buf{ .size = len, .mem = &st.init_raw };
+    fuse.fuse_session_process_buf(se, &buf);
+    st.swallow_reply.store(false, .release);
+    if (!st.init_seen.load(.acquire)) {
+        std.log.err("handover: libfuse refused the replayed FUSE_INIT", .{});
+        return false;
+    }
+    return true;
+}
+
+var live_session: ?*fuse.fuse_session = null;
+var live_state: ?*State = null;
+
+/// SIGUSR2 asks for a handover. Refused, silently and without leaving the
+/// loop, when this session has no FUSE_INIT request to pass on: exiting
+/// would end the only thing serving the mount, and the exec that followed
+/// could not bring it back. `modelfs update` then reports its timeout,
+/// which is the honest outcome. Signal context, so nothing here allocates,
+/// locks, or logs.
+fn onUsr2(_: c_int) callconv(.c) void {
+    const st = live_state orelse return;
+    if (st.init_len.load(.acquire) == 0) return;
+    st.handover_asked.store(true, .release);
+    if (live_session) |se| fuse.fuse_session_exit(se);
+}
+
+fn installHandoverSignal(st: *State, se: *fuse.fuse_session) void {
+    live_state = st;
+    live_session = se;
+    var sa = std.mem.zeroes(sys.c.struct_sigaction);
+    sa.__sigaction_handler.sa_handler = onUsr2;
+    _ = sys.c.sigemptyset(&sa.sa_mask);
+    sa.sa_flags = sys.c.SA_RESTART;
+    _ = sys.c.sigaction(sys.c.SIGUSR2, &sa, null);
+}
+
+fn snapNodes(st: *State, gpa: std.mem.Allocator) ![]handover.NodeSnap {
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    var list: std.ArrayList(handover.NodeSnap) = .empty;
+    errdefer list.deinit(gpa);
+    var it = st.nodes.iterator();
+    while (it.next()) |e| {
+        try list.append(gpa, .{ .ino = e.key_ptr.*, .path = e.value_ptr.path, .nlookup = e.value_ptr.nlookup });
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+fn snapOpens(st: *State, gpa: std.mem.Allocator) ![]handover.OpenSnap {
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    var list: std.ArrayList(handover.OpenSnap) = .empty;
+    errdefer list.deinit(gpa);
+    var it = st.opens.iterator();
+    while (it.next()) |e| {
+        try list.append(gpa, .{ .fh = e.key_ptr.*, .path = e.value_ptr.* });
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+/// Rebuilds the inode and open-handle tables in a replacement image from
+/// the snapshot the previous one took, before a single request is served:
+/// the kernel keeps handing back the inode numbers it already holds.
+pub fn restoreMaps(st: *State, owned: *const handover.Owned) !void {
+    st.nodes_mu.lockUncancelable(st.io);
+    defer st.nodes_mu.unlock(st.io);
+    st.next_ino = owned.next_ino;
+    st.next_fh = owned.next_fh;
+    try st.nodes.ensureUnusedCapacity(st.gpa, @intCast(owned.nodes.len));
+    try st.paths.ensureUnusedCapacity(st.gpa, @intCast(owned.nodes.len));
+    try st.opens.ensureUnusedCapacity(st.gpa, @intCast(owned.opens.len));
+    for (owned.nodes) |n| {
+        const path = try st.gpa.dupe(u8, n.path);
+        st.nodes.putAssumeCapacity(n.ino, .{ .path = path, .nlookup = n.nlookup });
+        st.paths.putAssumeCapacity(path, n.ino);
+    }
+    for (owned.opens) |o| {
+        st.opens.putAssumeCapacity(o.fh, try st.gpa.dupe(u8, o.path));
+    }
+}
+
+fn asHandoverAddrs(gpa: std.mem.Allocator, addrs: []const proto.LeaseAddr) ![]handover.Addr {
+    const out = try gpa.alloc(handover.Addr, addrs.len);
+    for (addrs, 0..) |a, i| out[i] = .{ .ip = a.ip, .port = a.port };
+    return out;
+}
+
+/// Replaces this process image with the binary `update.req` names, handing
+/// it the FUSE connection, the peer listen sockets, and everything needed
+/// to keep serving them. Only returns on failure: execve does not come
+/// back, and by then the mount and the port are already this image's to
+/// lose.
+fn execHandover(st: *State) !void {
+    const gpa = st.gpa;
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const req_path = try sys.joinZ(&pbuf, st.store.cache, handover.req_file);
+    var open_errno: i32 = 0;
+    const req_blob = sys.readFileAllocNoFollowOpenErrno(gpa, req_path, 4096, &open_errno) catch return error.NoRequest;
+    defer gpa.free(req_blob);
+    const parsed = handover.decodeReq(gpa, req_blob) catch return error.BadRequest;
+    defer parsed.deinit();
+    const bin = parsed.value.bin;
+    if (bin.len == 0 or bin[0] != '/') return error.BadBin;
+
+    const node_snaps = try snapNodes(st, gpa);
+    defer gpa.free(node_snaps);
+    const open_snaps = try snapOpens(st, gpa);
+    defer gpa.free(open_snaps);
+    const adv = try asHandoverAddrs(gpa, st.catalog.addrs);
+    defer gpa.free(adv);
+    const seeds = try asHandoverAddrs(gpa, st.catalog.seeds);
+    defer gpa.free(seeds);
+    const listen_fds = try gpa.alloc(i32, st.server.listen_fds.items.len);
+    defer gpa.free(listen_fds);
+    for (st.server.listen_fds.items, 0..) |fd, i| listen_fds[i] = fd;
+
+    const blob = try handover.encode(gpa, .{
+        .origin = st.store.origin,
+        .cache = st.store.cache,
+        .id = st.catalog.self_id,
+        .mount = st.mountpoint,
+        .piece = st.store.piece_size,
+        .listen = st.listen_port,
+        .water = st.store.water,
+        .direct_io = st.direct_io,
+        .allow_other = st.allow_other,
+        .fuse_fd = st.fuse_fd,
+        .listen_fds = listen_fds,
+        .advertise = adv,
+        .seeds = seeds,
+        .psk = st.server.psk,
+        .init = st.init_raw[0..st.init_len.load(.acquire)],
+        .nodes = node_snaps,
+        .opens = open_snaps,
+        .next_ino = st.next_ino,
+        .next_fh = st.next_fh,
+    });
+    defer {
+        std.crypto.secureZero(u8, blob);
+        gpa.free(blob);
+    }
+    const state_fd = try handover.writeStateFd(blob);
+    // Everything the next image must find has to survive execve; the sealed
+    // memfd carries the secret, so the fd number is all argv needs.
+    if (sys.setCloexec(state_fd, false) != 0) return error.Cloexec;
+    if (sys.setCloexec(st.fuse_fd, false) != 0) return error.Cloexec;
+    st.server.setListenCloexec(false);
+
+    var bin_z: [sys.c.PATH_MAX]u8 = undefined;
+    const bz = try sys.toZ(&bin_z, bin);
+    const argv_z = try handover.execArgvZ(gpa, bin, state_fd, st.mountpoint);
+    // Only reached when execve fails: on success this image is gone.
+    defer handover.freeExecArgvZ(gpa, argv_z);
+    _ = sys.c.execve(bz, @ptrCast(argv_z.ptr), std.c.environ);
+    return error.ExecFailed;
+}
+
+/// Tells the waiting `modelfs update` that this image is the one serving.
+pub fn writeAck(st: *State, token: []const u8) void {
+    const gpa = st.gpa;
+    const blob = handover.encodeAck(gpa, token) catch return;
+    defer gpa.free(blob);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const p = sys.joinZ(&pbuf, st.store.cache, handover.ack_file) catch return;
+    _ = sys.writeFileOwnerOnly(p, blob);
 }
 
 test "fuse operations wire every supported handler" {
-    const o = ops();
+    const o = llOps();
     // A null entry makes libfuse answer that operation with a default
-    // behavior instead of going through the store: e.g. a dropped truncate
+    // behavior instead of going through the store: e.g. a dropped setattr
     // wiring would silently corrupt cache/origin size agreement. Identity,
     // not mere non-null: swapping two handlers would still pass a null check.
-    try std.testing.expectEqual(&mf_getattr, o.getattr);
-    try std.testing.expectEqual(&mf_open, o.open);
-    try std.testing.expectEqual(&mf_create, o.create);
-    try std.testing.expectEqual(&mf_read, o.read);
-    try std.testing.expectEqual(&mf_write, o.write);
-    try std.testing.expectEqual(&mf_release, o.release);
-    try std.testing.expectEqual(&mf_fsync, o.fsync);
-    try std.testing.expectEqual(&mf_truncate, o.truncate);
-    try std.testing.expectEqual(&mf_unlink, o.unlink);
-    try std.testing.expectEqual(&mf_mkdir, o.mkdir);
-    try std.testing.expectEqual(&mf_rmdir, o.rmdir);
-    try std.testing.expectEqual(&mf_rename, o.rename);
-    try std.testing.expectEqual(&mf_chmod, o.chmod);
-    try std.testing.expectEqual(&mf_readdir, o.readdir);
-    try std.testing.expectEqual(&mf_statfs, o.statfs);
-    try std.testing.expectEqual(&mf_init, o.init);
-    try std.testing.expectEqual(&mf_destroy, o.destroy);
+    try std.testing.expectEqual(&ll_init, o.init);
+    try std.testing.expectEqual(&ll_destroy, o.destroy);
+    try std.testing.expectEqual(&ll_lookup, o.lookup);
+    // Without forget the inode table grows for the life of the mount, and
+    // without the batched form the kernel's FORGET_MULTI is dropped whole.
+    try std.testing.expectEqual(&ll_forget, o.forget);
+    try std.testing.expectEqual(&ll_forget_multi, o.forget_multi);
+    try std.testing.expectEqual(&ll_getattr, o.getattr);
+    try std.testing.expectEqual(&ll_setattr, o.setattr);
+    try std.testing.expectEqual(&ll_open, o.open);
+    try std.testing.expectEqual(&ll_create, o.create);
+    try std.testing.expectEqual(&ll_read, o.read);
+    try std.testing.expectEqual(&ll_write, o.write);
+    try std.testing.expectEqual(&ll_release, o.release);
+    try std.testing.expectEqual(&ll_fsync, o.fsync);
+    try std.testing.expectEqual(&ll_unlink, o.unlink);
+    try std.testing.expectEqual(&ll_mkdir, o.mkdir);
+    try std.testing.expectEqual(&ll_rmdir, o.rmdir);
+    try std.testing.expectEqual(&ll_rename, o.rename);
+    try std.testing.expectEqual(&ll_statfs, o.statfs);
+    try std.testing.expectEqual(&ll_readdir, o.readdir);
     // Unwired ops stay ENOSYS: a planted symlink/mknod/link/xattr handler
     // would let a local process create names the path gate never sees.
     try std.testing.expect(o.readlink == null);
     try std.testing.expect(o.mknod == null);
     try std.testing.expect(o.symlink == null);
     try std.testing.expect(o.link == null);
-    try std.testing.expect(o.chown == null);
     try std.testing.expect(o.setxattr == null);
     try std.testing.expect(o.getxattr == null);
     try std.testing.expect(o.listxattr == null);
     try std.testing.expect(o.removexattr == null);
+    try std.testing.expect(o.readdirplus == null);
+    try std.testing.expect(o.getlk == null);
+    try std.testing.expect(o.setlk == null);
+    try std.testing.expect(o.ioctl == null);
 }
 
 test "statusJson publishes parseable liveness atomically and replaces in place" {

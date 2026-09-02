@@ -222,6 +222,83 @@ pub fn close(fd: c_int) void {
     if (fd >= 0) _ = c.close(fd);
 }
 
+pub fn fdIsCloexec(fd: c_int) bool {
+    const flags = std.c.fcntl(fd, c.F_GETFD);
+    return flags >= 0 and (flags & c.FD_CLOEXEC) != 0;
+}
+
+/// Set or clear FD_CLOEXEC. Handover clears it on the FUSE fd and listen
+/// fds so they survive exec; after attach they go back on so a later
+/// auto_unmount helper cannot inherit the peer port.
+pub fn setCloexec(fd: c_int, on: bool) i32 {
+    const flags = std.c.fcntl(fd, c.F_GETFD);
+    if (flags < 0) return negErrno();
+    const next: c_int = if (on)
+        flags | c.FD_CLOEXEC
+    else
+        flags & ~@as(c_int, c.FD_CLOEXEC);
+    if (std.c.fcntl(fd, c.F_SETFD, next) < 0) return negErrno();
+    return 0;
+}
+
+/// Set or clear O_NONBLOCK. Origin files are opened non-blocking so a FIFO
+/// planted at the name cannot hang the open; the flag is cleared once the
+/// fd is known to be a regular file and is about to be handed to a writer
+/// that expects blocking semantics.
+pub fn setNonblocking(fd: c_int, on: bool) i32 {
+    const flags = std.c.fcntl(fd, c.F_GETFL);
+    if (flags < 0) return negErrno();
+    const next: c_int = if (on)
+        flags | c.O_NONBLOCK
+    else
+        flags & ~@as(c_int, c.O_NONBLOCK);
+    if (std.c.fcntl(fd, c.F_SETFL, next) < 0) return negErrno();
+    return 0;
+}
+
+/// True when SO_REUSEPORT is set. Listeners must not carry it: a second
+/// daemon would share the port instead of failing Bind.
+pub fn reuseportIsOn(fd: c_int) bool {
+    var val: c_int = 0;
+    var len: std.c.socklen_t = @intCast(@sizeOf(c_int));
+    if (std.c.getsockopt(fd, c.SOL_SOCKET, @intCast(c.SO_REUSEPORT), &val, &len) != 0) return false;
+    return val != 0;
+}
+
+const mfd_cloexec: u32 = 1;
+const mfd_allow_sealing: u32 = 2;
+const f_add_seals: i32 = 1033;
+const f_seal_seal: u32 = 0x0001;
+const f_seal_shrink: u32 = 0x0002;
+const f_seal_grow: u32 = 0x0004;
+const f_seal_write: u32 = 0x0008;
+
+/// memfd holding `blob`, write-sealed so the replacement cannot change the
+/// knobs or PSK after we hand the fd over. Starts CLOEXEC; handover clears
+/// that bit on the fd it will inherit.
+pub fn memfdSealed(blob: []const u8) !c_int {
+    const fd = std.posix.memfd_create("modelfs-handover", mfd_cloexec | mfd_allow_sealing) catch return error.Memfd;
+    errdefer close(fd);
+    if (writeAll(fd, blob) != @as(isize, @intCast(blob.len))) return error.WriteFailed;
+    _ = std.os.linux.lseek(fd, 0, std.os.linux.SEEK.SET);
+    const seals = f_seal_seal | f_seal_shrink | f_seal_grow | f_seal_write;
+    if (std.c.fcntl(fd, f_add_seals, seals) < 0) return error.SealFailed;
+    return fd;
+}
+
+pub fn readAllFdAlloc(gpa: std.mem.Allocator, fd: c_int, max: usize) ![]u8 {
+    var st: c.struct_stat = undefined;
+    if (fstat(fd, &st) != 0) return error.StatFailed;
+    const n64 = sizeFromStat(st.st_size) orelse return error.StatFailed;
+    const size = std.math.cast(usize, n64) orelse return error.FileTooBig;
+    if (size > max) return error.FileTooBig;
+    const buf = try gpa.alloc(u8, size);
+    errdefer gpa.free(buf);
+    const n = preadAll(fd, buf, 0);
+    if (n < 0 or @as(usize, @intCast(n)) != size) return error.ReadFailed;
+    return buf;
+}
+
 /// libc fsync with EINTR retry. A raw `linux.fsync` return is a usize with
 /// -errno in the high bits, which does not fit i32 (the retry would panic
 /// in safe builds and skip in ReleaseFast).
@@ -939,11 +1016,6 @@ test "parentOf" {
     try std.testing.expectEqualStrings("/", parentOf("///"));
 }
 
-fn fdIsCloexec(fd: c_int) bool {
-    const flags = std.c.fcntl(fd, c.F_GETFD);
-    return flags >= 0 and (flags & c.FD_CLOEXEC) != 0;
-}
-
 test "open, socket, and accept are close-on-exec" {
     var path_buf: [128]u8 = undefined;
     var z_buf: [128]u8 = undefined;
@@ -980,6 +1052,40 @@ test "open, socket, and accept are close-on-exec" {
     try std.testing.expect(afd >= 0);
     defer close(afd);
     try std.testing.expect(fdIsCloexec(afd));
+    try std.testing.expect(!reuseportIsOn(lfd));
+    try std.testing.expectEqual(@as(i32, 0), setCloexec(lfd, false));
+    try std.testing.expect(!fdIsCloexec(lfd));
+    try std.testing.expectEqual(@as(i32, 0), setCloexec(lfd, true));
+    try std.testing.expect(fdIsCloexec(lfd));
+}
+
+test "setNonblocking clears the flag an origin file was opened with" {
+    var path_buf: [128]u8 = undefined;
+    var z_buf: [128]u8 = undefined;
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/nonblock-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const z = try toZ(&z_buf, p);
+    // The open flags a pull uses: non-blocking so a FIFO planted at the name
+    // cannot hang the open, then cleared before the fd reaches a writer that
+    // expects blocking semantics.
+    const fd = open(z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_NOFOLLOW | c.O_NONBLOCK, 0o644);
+    try std.testing.expect(fd >= 0);
+    defer close(fd);
+    defer _ = c.unlink(z);
+    try std.testing.expect((std.c.fcntl(fd, c.F_GETFL) & c.O_NONBLOCK) != 0);
+    try std.testing.expectEqual(@as(i32, 0), setNonblocking(fd, false));
+    try std.testing.expect((std.c.fcntl(fd, c.F_GETFL) & c.O_NONBLOCK) == 0);
+    try std.testing.expectEqual(@as(i32, 0), setNonblocking(fd, true));
+    try std.testing.expect((std.c.fcntl(fd, c.F_GETFL) & c.O_NONBLOCK) != 0);
+}
+
+test "memfdSealed holds bytes and is close-on-exec" {
+    const gpa = std.testing.allocator;
+    const fd = try memfdSealed("handover-blob");
+    defer close(fd);
+    try std.testing.expect(fdIsCloexec(fd));
+    const got = try readAllFdAlloc(gpa, fd, 64);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("handover-blob", got);
 }
 
 test "connectIn succeeds against a local listener" {

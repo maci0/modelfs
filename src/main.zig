@@ -1,5 +1,5 @@
 //! CLI entry point: argument parsing, command dispatch (mount/status/peers/
-//! pin/unpin/verify/dupes), and mount wiring into State.init / fuse_fs.run.
+//! pin/unpin/verify/dupes/update), and mount wiring into State.init / fuse_fs.run.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -36,6 +36,8 @@ const discover = @import("discover.zig");
 const fuse_fs = @import("fuse_fs.zig");
 const cull = @import("cull.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
+const handover = @import("handover.zig");
+const hf = @import("hf.zig");
 
 const usage =
     \\modelfs: POSIX mount for model files. Local NVMe, then peers, then NFS.
@@ -49,6 +51,8 @@ const usage =
     \\  modelfs verify <relpath> --origin PATH [--cache PATH]
     \\  modelfs dupes <relpath>... --origin PATH
     \\  modelfs dupes --all --origin PATH
+    \\  modelfs pull <owner/repo> --origin PATH [--revision REF] [--dest REL]
+    \\  modelfs update [--cache PATH]
     \\  modelfs version
     \\  modelfs help
     \\
@@ -74,11 +78,16 @@ const usage =
     \\  --detach              Background after mount
     \\  -f, --foreground      Stay in the foreground (default)
     \\
-    \\mount/status/peers/pin/unpin/verify/dupes:
+    \\pull options:
+    \\  --revision REF        Hugging Face branch, tag, or commit (default main)
+    \\  --dest REL            Where under --origin the files land (default: the
+    \\                        repo id, so owner/repo lands at origin/owner/repo)
+    \\
+    \\mount/status/peers/pin/unpin/verify/dupes/pull/update:
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
     \\
-    \\status/peers/pin/unpin/verify/dupes take only the flags shown on their
-    \\Usage line plus the shared --origin/--cache/--psk/--log values.
+    \\status/peers/pin/unpin/verify/dupes/pull/update take only the flags shown on
+    \\their Usage line plus the shared --origin/--cache/--psk/--log values.
     \\dupes --all scans every manifest on the origin and refuses a path
     \\list; mount-only options are refused on the rest. Every command also
     \\accepts -h/--help and -V/--version. "--" ends flag parsing: later
@@ -93,7 +102,10 @@ const usage =
     \\combined with --psk or MODELFS_PSK on mount. Every MODELFS_* value
     \\is trimmed of surrounding whitespace. An empty or whitespace-only
     \\value counts as unset (defaults apply), except a whitespace-only
-    \\MODELFS_PSK_VALUE which is refused as empty.
+    \\MODELFS_PSK_VALUE which is refused as empty. pull reads its Hugging
+    \\Face token from HF_TOKEN, else $HF_HOME/token, else
+    \\~/.cache/huggingface/token; there is no token flag, because argv is
+    \\world-readable through /proc. Without one, only public repos pull.
     \\
     \\Examples:
     \\  modelfs mount /models --origin /net/192.168.0.100/models
@@ -102,6 +114,7 @@ const usage =
     \\  modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models
     \\  modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models
     \\  modelfs dupes --all --origin /net/192.168.0.100/models
+    \\  modelfs pull unsloth/Qwen3-8B-GGUF --origin /net/192.168.0.100/models
     \\
     \\Cluster leases live on the origin at .cluster/<id>.json, not under the
     \\FUSE mount. Same PSK on every node. Desktop can stay on plain NFS.
@@ -121,7 +134,7 @@ pub fn main(init: std.process.Init) !u8 {
         // command: dumping the help blob here made `modelfs` with no args
         // the only usage error that printed the full text instead of
         // naming what was missing.
-        std.debug.print("missing command (want mount, status, peers, pin, unpin, verify, dupes, version, help)\n", .{});
+        std.debug.print("missing command (want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)\n", .{});
         return 2;
     }
     // Bare global forms live at position 0, where parseArgs sees a command
@@ -129,6 +142,9 @@ pub fn main(init: std.process.Init) !u8 {
     // Extra arguments are refused unless they are themselves those global
     // flags: `modelfs version --help` must match the documented "every
     // command also accepts -h/--help" instead of dying as a positional error.
+    if (argv.items.len >= 1 and std.mem.eql(u8, argv.items[0], handover.internal_cmd)) {
+        return cmdHandover(init, argv.items);
+    }
     switch (classifyMeta(argv.items)) {
         .none => {},
         .help => return if (printOut(init.io, init.gpa, usage, .{proto.default_port})) 0 else 1,
@@ -208,6 +224,20 @@ pub fn main(init: std.process.Init) !u8 {
         }
         return cmdDupes(init.io, gpa, parsed.opts, parsed.rest);
     }
+    if (std.mem.eql(u8, parsed.cmd, "pull")) {
+        if (parsed.rest.len != 1) {
+            std.debug.print("pull takes exactly one owner/repo (see 'modelfs help')\n", .{});
+            return 2;
+        }
+        return cmdPull(init.io, gpa, init.environ_map, parsed.opts, parsed.rest[0]);
+    }
+    if (std.mem.eql(u8, parsed.cmd, "update")) {
+        if (parsed.rest.len != 0) {
+            std.debug.print("update takes no arguments (see 'modelfs help')\n", .{});
+            return 2;
+        }
+        return cmdUpdate(init.io, gpa, parsed.opts);
+    }
     // parseArgs refuses anything outside the commands dispatched above, so
     // this point is unreachable unless the knownCommand list and this
     // dispatch drift apart; failing loudly here surfaces that immediately.
@@ -236,6 +266,24 @@ fn writeOut(io: std.Io, bytes: []const u8) bool {
 }
 
 var captured_stdout: ?*std.ArrayList(u8) = null;
+var captured_stderr: ?*std.ArrayList(u8) = null;
+
+fn printErr(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, fmt, args) catch {
+        if (builtin.is_test) {
+            if (captured_stderr) |b| b.appendSlice(std.testing.allocator, "modelfs: error\n") catch {};
+            return;
+        }
+        std.debug.print(fmt, args);
+        return;
+    };
+    if (builtin.is_test) {
+        if (captured_stderr) |b| b.appendSlice(std.testing.allocator, line) catch {};
+        return;
+    }
+    std.debug.print("{s}", .{line});
+}
 
 fn printOut(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) bool {
     var buf: [4096]u8 = undefined;
@@ -257,6 +305,10 @@ const Opts = struct {
     /// dupes-only: scan every manifest under origin/.cluster/manifests
     /// instead of a positional rel list (aggregate duplicate telemetry).
     all: bool = false,
+    /// pull-only: the Hugging Face ref to pull, and where under the origin
+    /// its files land (default: the repo id itself).
+    revision: []const u8 = hf.default_revision,
+    dest: ?[]const u8 = null,
     id: ?[]const u8 = null,
     psk_file: []const u8 = "/etc/modelfs.psk",
     psk_value: ?[]const u8 = null,
@@ -551,6 +603,15 @@ fn resolveOriginDir(gpa: std.mem.Allocator, origin: []const u8) ![]u8 {
 /// accepted-and-ignored they would silently do nothing (a `status --detach`,
 /// a `pin --piece 4M` that changes no piece grid), leaving the caller to
 /// believe an option took effect.
+/// A flag only one non-mount command understands. Accepted-and-ignored is
+/// the failure to avoid: it reads as a working knob.
+fn rejectOutsideCommand(cmd: []const u8, want: []const u8, flag: []const u8) !void {
+    if (!std.mem.eql(u8, cmd, want)) {
+        if (!builtin.is_test) std.debug.print("{s} only applies to modelfs {s}\n", .{ flag, want });
+        return error.FlagOutsideCommand;
+    }
+}
+
 fn rejectOutsideMount(cmd: []const u8, flag: []const u8) !void {
     if (!std.mem.eql(u8, cmd, "mount")) {
         if (!builtin.is_test) std.debug.print("{s} only applies to modelfs mount\n", .{flag});
@@ -592,7 +653,7 @@ fn parsePercent(flag: []const u8, raw: []const u8) !u32 {
 /// command missing from it fails loudly everywhere instead of slipping past
 /// this gate into the help answer below.
 fn knownCommand(cmd: []const u8) bool {
-    inline for (.{ "mount", "status", "peers", "pin", "unpin", "verify", "dupes" }) |c| {
+    inline for (.{ "mount", "status", "peers", "pin", "unpin", "verify", "dupes", "pull", "update" }) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
     return false;
@@ -608,7 +669,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // reached before -h/-V get their turn.
     if (!knownCommand(cmd)) {
         if (!builtin.is_test)
-            std.debug.print("unknown command \"{s}\" (want mount, status, peers, pin, unpin, verify, dupes, version, help)\n", .{cmd});
+            std.debug.print("unknown command \"{s}\" (want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)\n", .{cmd});
         return error.UnknownCommand;
     }
     var opts = Opts{};
@@ -698,12 +759,15 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         } else if (std.mem.eql(u8, flag, "--all")) {
             // dupes-only: the other commands have no whole-store scan, and
             // an accepted-and-ignored --all would read as a working knob.
-            if (!std.mem.eql(u8, cmd, "dupes")) {
-                if (!builtin.is_test) std.debug.print("--all only applies to modelfs dupes\n", .{});
-                return error.FlagOutsideCommand;
-            }
+            try rejectOutsideCommand(cmd, "dupes", flag);
             try rejectInlineValue(flag, inline_val);
             opts.all = true;
+        } else if (std.mem.eql(u8, flag, "--revision")) {
+            try rejectOutsideCommand(cmd, "pull", flag);
+            opts.revision = try takeValue(args, flag, &i, inline_val);
+        } else if (std.mem.eql(u8, flag, "--dest")) {
+            try rejectOutsideCommand(cmd, "pull", flag);
+            opts.dest = try takeValue(args, flag, &i, inline_val);
         } else if (std.mem.eql(u8, flag, "--id")) {
             try rejectOutsideMount(cmd, flag);
             opts.id = try takeValue(args, flag, &i, inline_val);
@@ -1198,6 +1262,10 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
 
     const st = try gpa.create(fuse_fs.State);
     st.init(gpa, init.io, origin, cache, opts.piece, opts.water, id, addrs.items, local_ips, seed_list.addrs.items, psk, opts.direct_io);
+    st.mountpoint = mount_abs;
+    st.allow_other = opts.allow_other;
+    st.detach = opts.detach;
+    st.listen_port = eff_port;
     // From here every error return owns st. Without this, an allocation
     // failure while building the fuse argv escaped without teardown,
     // leaking the bound listen fds and skipping the shutdown path that
@@ -1221,30 +1289,6 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         return 1;
     };
 
-    var o_args: std.ArrayList(u8) = .empty;
-    defer o_args.deinit(gpa);
-    try o_args.appendSlice(gpa, "default_permissions,auto_unmount,fsname=modelfs,subtype=modelfs,max_idle_threads=8");
-    if (opts.allow_other) try o_args.appendSlice(gpa, ",allow_other");
-    const o_slice = try gpa.dupeZ(u8, o_args.items);
-    defer gpa.free(o_slice);
-
-    const prog = try gpa.dupeZ(u8, "modelfs");
-    defer gpa.free(prog);
-    const mount_z = try gpa.dupeZ(u8, mount_abs);
-    defer gpa.free(mount_z);
-    const f_flag = try gpa.dupeZ(u8, "-f");
-    defer gpa.free(f_flag);
-    const o_flag = try gpa.dupeZ(u8, "-o");
-    defer gpa.free(o_flag);
-
-    var cargv: std.ArrayList([*c]u8) = .empty;
-    defer cargv.deinit(gpa);
-    try cargv.append(gpa, prog.ptr);
-    if (!opts.detach) try cargv.append(gpa, f_flag.ptr);
-    try cargv.append(gpa, o_flag.ptr);
-    try cargv.append(gpa, o_slice.ptr);
-    try cargv.append(gpa, mount_z.ptr);
-
     // The whole effective configuration in one line: a cull/listen/io
     // misconfiguration must be diagnosable from the journal alone, without
     // reconstructing which flag or env var won. Secrets never appear here.
@@ -1255,7 +1299,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         opts.water.bstop,                           opts.allow_other,
     });
 
-    const rc = fuse_fs.run(cargv.items, st);
+    const rc = fuse_fs.run(st);
     teardownMount(st);
     // Lifecycle closure next to the startup "mount" line: when this node
     // later shows up with an expired lease in `modelfs peers`, the journal
@@ -1340,62 +1384,266 @@ fn statusAgeSecs(io: std.Io, doc: StatusLiveness) ?i64 {
     return null;
 }
 
-fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
+/// Same pid + 120s heartbeat gates `status` and `update` use. On success
+/// `blob_out` owns the document (caller frees). Failures print a named
+/// line through printErr and return error.NotLive.
+fn liveDaemon(io: std.Io, gpa: std.mem.Allocator, cache: []const u8, blob_out: *?[]u8) error{ NotLive, OutOfMemory }!i64 {
+    blob_out.* = null;
     var z: [sys.c.PATH_MAX]u8 = undefined;
-    const p = sys.joinZ(&z, opts.cache, store_mod.status_file) catch {
-        // Same audience as the "not running" prints below: a bare exit 1
-        // would leave the operator guessing which path was refused.
-        std.debug.print("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, store_mod.status_file });
-        return 1;
+    const p = sys.joinZ(&z, cache, store_mod.status_file) catch {
+        printErr("modelfs: cache path too long to name {s}/{s}\n", .{ cache, store_mod.status_file });
+        return error.NotLive;
     };
     var open_errno: i32 = 0;
     const blob = sys.readFileAllocNoFollowOpenErrno(gpa, p, 4096, &open_errno) catch |err| {
-        // An artifact that exists but cannot be opened (EACCES for a status
-        // query from another user, ELOOP on a planted link) must not read as
-        // "not running (no ...)": a daemon may be live and refreshing exactly
-        // this file, and the remediation differs -- the same distinction
-        // loadPsk draws for its PSK file.
-        if (!builtin.is_test) {
-            if (err == error.OpenFailed and open_errno != sys.c.ENOENT)
-                std.debug.print("modelfs: cannot read {s}/{s} (errno {d}); cannot tell whether the daemon is running\n", .{ opts.cache, store_mod.status_file, open_errno })
-            else
-                std.debug.print("modelfs: not running (no {s}/{s})\n", .{ opts.cache, store_mod.status_file });
-        }
-        return 1;
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.OpenFailed and open_errno != sys.c.ENOENT)
+            printErr("modelfs: cannot read {s}/{s} (errno {d}); cannot tell whether the daemon is running\n", .{ cache, store_mod.status_file, open_errno })
+        else
+            printErr("modelfs: not running (no {s}/{s})\n", .{ cache, store_mod.status_file });
+        return error.NotLive;
     };
-    defer gpa.free(blob);
-    // status.json is a crash leftover until proven otherwise: a daemon that
-    // died without unmounting leaves its document behind indefinitely, and
-    // serving it verbatim would report a dead node as live to every monitor
-    // keying on this command. The pid check retires the artifact when its
-    // writer exits; pid reuse can only ever false-positive, never hide a
-    // genuinely running daemon behind a stale report.
     const doc = std.json.parseFromSlice(StatusLiveness, gpa, blob, .{ .ignore_unknown_fields = true }) catch {
-        if (!builtin.is_test) std.debug.print("modelfs: not running ({s}/{s} is unreadable)\n", .{ opts.cache, store_mod.status_file });
-        return 1;
+        printErr("modelfs: not running ({s}/{s} is unreadable)\n", .{ cache, store_mod.status_file });
+        gpa.free(blob);
+        return error.NotLive;
     };
     defer doc.deinit();
     if (!pidAlive(doc.value.pid)) {
-        if (!builtin.is_test) std.debug.print("modelfs: not running (stale status.json names exited pid {d})\n", .{doc.value.pid});
-        return 1;
+        printErr("modelfs: not running (stale status.json names exited pid {d})\n", .{doc.value.pid});
+        gpa.free(blob);
+        return error.NotLive;
     }
-    // A live pid with a frozen artifact is the wedged case: the daemon hangs
-    // (origin call that never returns, deadlocked worker) and keeps status.json
-    // exactly as it was when the discovery tick last got to run. Serving it
-    // would report a mount that cannot serve reads as healthy to every
-    // monitor keying on this command's exit code. Age is monotonic when the
-    // document carries mono_s, so a wall-clock step no longer flips the
-    // verdict; a leftover from the previous boot (CLOCK_MONOTONIC reset,
-    // stamp ahead of now) is stale even when pid reuse keeps pidAlive true.
-    // The now_s fallback still treats a backward step as fresh.
     if (statusAgeSecs(io, doc.value)) |age| {
         if (age > max_status_age_secs) {
-            if (!builtin.is_test)
-                std.debug.print("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ opts.cache, store_mod.status_file, age });
-            return 1;
+            printErr("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ cache, store_mod.status_file, age });
+            gpa.free(blob);
+            return error.NotLive;
         }
     }
-    return if (writeOut(io, blob)) 0 else 1;
+    blob_out.* = blob;
+    return doc.value.pid;
+}
+
+fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
+    var blob: ?[]u8 = null;
+    _ = liveDaemon(io, gpa, opts.cache, &blob) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NotLive => return 1,
+    };
+    defer if (blob) |b| gpa.free(b);
+    return if (writeOut(io, blob.?)) 0 else 1;
+}
+
+const update_wait_ms: u32 = 30_000;
+const update_poll_ms: u32 = 50;
+
+fn selfExe(buf: *[sys.c.PATH_MAX]u8) ![]const u8 {
+    const n = std.os.linux.readlink("/proc/self/exe", buf, buf.len);
+    const signed: isize = @bitCast(n);
+    if (signed < 0 or n == 0 or n >= buf.len) return error.NoExe;
+    return buf[0..n];
+}
+
+fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
+    var blob: ?[]u8 = null;
+    const pid = liveDaemon(io, gpa, opts.cache, &blob) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.NotLive => return 1,
+    };
+    defer if (blob) |b| gpa.free(b);
+
+    var exe_buf: [sys.c.PATH_MAX]u8 = undefined;
+    const bin = selfExe(&exe_buf) catch {
+        printErr("modelfs: cannot resolve this binary via /proc/self/exe\n", .{});
+        return 1;
+    };
+    var tok: [handover.token_bytes * 2]u8 = undefined;
+    handover.randomToken(&tok);
+    const req = handover.encodeReq(gpa, bin, &tok) catch return 1;
+    defer gpa.free(req);
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const req_path = sys.joinZ(&pbuf, opts.cache, handover.req_file) catch {
+        printErr("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, handover.req_file });
+        return 1;
+    };
+    if (sys.writeFileOwnerOnly(req_path, req) != 0) {
+        printErr("modelfs: cannot write {s}/{s}\n", .{ opts.cache, handover.req_file });
+        return 1;
+    }
+    std.posix.kill(@intCast(pid), .USR2) catch {
+        printErr("modelfs: cannot signal pid {d} to replace its image\n", .{pid});
+        return 1;
+    };
+
+    var ack_buf: [sys.c.PATH_MAX]u8 = undefined;
+    const ack_path = sys.joinZ(&ack_buf, opts.cache, handover.ack_file) catch {
+        printErr("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, handover.ack_file });
+        return 1;
+    };
+    var waited: u32 = 0;
+    while (waited < update_wait_ms) : (waited += update_poll_ms) {
+        var open_errno: i32 = 0;
+        const ack_blob = sys.readFileAllocNoFollowOpenErrno(gpa, ack_path, 4096, &open_errno) catch {
+            sys.sleepMs(io, update_poll_ms);
+            continue;
+        };
+        defer gpa.free(ack_blob);
+        const ack = handover.decodeAck(gpa, ack_blob) catch {
+            sys.sleepMs(io, update_poll_ms);
+            continue;
+        };
+        defer ack.deinit();
+        if (std.mem.eql(u8, ack.value.token, &tok)) {
+            if (!printOut(io, gpa, "updated pid {d}\n", .{pid})) return 1;
+            return 0;
+        }
+        sys.sleepMs(io, update_poll_ms);
+    }
+    printErr("modelfs: update timed out waiting for pid {d} to replace its image\n", .{pid});
+    return 1;
+}
+
+/// Pulls one Hugging Face model revision onto the origin. No daemon and no
+/// PSK: this writes the NFS export the cluster reads from, and every node's
+/// mount then serves what landed. Files already present at the listed size
+/// are left alone, so a rerun after a failure finishes the job.
+fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, opts: Opts, repo: []const u8) !u8 {
+    const origin_raw = opts.origin orelse {
+        printErr("pull needs --origin (or MODELFS_ORIGIN)\n", .{});
+        return 2;
+    };
+    if (!hf.repoOk(repo)) {
+        printErr("modelfs: {s} is not a Hugging Face owner/repo id\n", .{discover.displayName(repo)});
+        return 2;
+    }
+    if (!hf.revisionOk(opts.revision)) {
+        printErr("modelfs: --revision {s} is not a branch, tag, or commit\n", .{discover.displayName(opts.revision)});
+        return 2;
+    }
+    // Default destination is the repo id, so two models never collide and
+    // the mount path reads like the model card it came from.
+    const dest = opts.dest orelse repo;
+    if (dest.len != 0 and (!store_mod.relOk(dest) or discover.relIsCluster(dest))) {
+        printErr("modelfs: --dest {s} is not a path under the origin\n", .{discover.displayName(dest)});
+        return 2;
+    }
+
+    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    defer gpa.free(origin);
+
+    const token = hf.loadToken(gpa, environ) catch null;
+    defer if (token) |t| {
+        std.crypto.secureZero(u8, t);
+        gpa.free(t);
+    };
+    // A token is a bearer credential for a private repo; core dumps of this
+    // process must not carry it, the same gate mount applies to the PSK.
+    if (token != null) {
+        disableCoreDumps() catch {
+            printErr("modelfs: cannot disable core dumps; refusing to pull with a token in a dumpable process\n", .{});
+            return 1;
+        };
+    }
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    var report: hf.Report = .{};
+    hf.pull(gpa, io, &client, origin, dest, repo, opts.revision, token, &report) catch |err| {
+        printErr("modelfs: pull {s}@{s} failed ({t}) after {d} file(s); rerun to resume\n", .{
+            discover.displayName(repo), discover.displayName(opts.revision), err, report.pulled,
+        });
+        return 1;
+    };
+    if (!printOut(io, gpa, "pulled {d} file(s), {d} bytes; {d} already present\n", .{
+        report.pulled, report.bytes, report.skipped,
+    })) return 1;
+    return 0;
+}
+
+fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
+    const gpa = init.gpa;
+    const handoff = handover.parseHandoffArgs(args) catch {
+        printErr("modelfs: _handover needs --state-fd N MOUNTPOINT\n", .{});
+        return 1;
+    };
+    var owned = handover.readStateFd(gpa, @intCast(handoff.state_fd)) catch |err| {
+        printErr("modelfs: cannot read handover state fd {d} ({t})\n", .{ handoff.state_fd, err });
+        return 1;
+    };
+    defer {
+        std.crypto.secureZero(u8, owned.psk);
+        owned.deinit();
+    }
+    // argv and the state blob name the same mount or this is not the
+    // handover the exec intended.
+    if (!std.mem.eql(u8, handoff.mount, owned.mount)) {
+        printErr("modelfs: handover state names {s} but argv names {s}\n", .{ owned.mount, handoff.mount });
+        return 1;
+    }
+    disableCoreDumps() catch {
+        printErr("modelfs: cannot disable core dumps; refusing handover with the PSK in a dumpable process\n", .{});
+        return 1;
+    };
+    scrubPskEnv();
+
+    const local_ips = discover.localIpv4(gpa) catch @as([][]const u8, &.{});
+    defer {
+        if (local_ips.len > 0) {
+            for (local_ips) |s| gpa.free(s);
+            gpa.free(local_ips);
+        }
+    }
+
+    const st = try gpa.create(fuse_fs.State);
+    st.init(gpa, init.io, owned.origin, owned.cache, owned.piece, owned.water, owned.id, owned.advertise, local_ips, owned.seeds, owned.psk, owned.direct_io);
+    st.mountpoint = owned.mount;
+    st.allow_other = owned.allow_other;
+    st.listen_port = owned.listen;
+    st.setInitRequest(owned.init) catch {
+        printErr("modelfs: handover state carries no usable FUSE_INIT request\n", .{});
+        teardownMount(st);
+        return 1;
+    };
+    errdefer teardownMount(st);
+    fuse_fs.restoreMaps(st, &owned) catch {
+        printErr("modelfs: cannot restore the inode and open-file tables after handover\n", .{});
+        teardownMount(st);
+        return 1;
+    };
+    const layout_rc = st.store.ensureLayout();
+    if (layout_rc != 0) {
+        std.log.err("cannot create cache dirs under {s} (errno {d})", .{ owned.cache, -layout_rc });
+        teardownMount(st);
+        return 1;
+    }
+    for (owned.listen_fds) |fd| {
+        st.server.adoptListenFd(@intCast(fd)) catch |err| {
+            std.log.err("adopt listen fd {d}: {t}", .{ fd, err });
+            teardownMount(st);
+            return 1;
+        };
+    }
+    // The request that triggered this exec carries the token the waiting
+    // CLI matches against the ack. It is consumed here so a leftover cannot
+    // make a later SIGUSR2 replay an update nobody asked for.
+    {
+        var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+        if (sys.joinZ(&pbuf, owned.cache, handover.req_file)) |rp| {
+            var open_errno: i32 = 0;
+            if (sys.readFileAllocNoFollowOpenErrno(gpa, rp, 4096, &open_errno)) |req_blob| {
+                defer gpa.free(req_blob);
+                if (handover.decodeReq(gpa, req_blob)) |parsed| {
+                    defer parsed.deinit();
+                    st.update_token = gpa.dupe(u8, parsed.value.token) catch null;
+                } else |_| {}
+            } else |_| {}
+            _ = sys.unlink(rp);
+        } else |_| {}
+    }
+    const rc = fuse_fs.attach(st, owned.fuse_fd);
+    teardownMount(st);
+    return @intCast(if (rc < 0) 1 else rc);
 }
 
 fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
@@ -2239,6 +2487,104 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
         try std.testing.expectEqual(@as(i32, 0), sys.c.symlink("other.json", try sys.toZ(&sbuf, fp)));
         try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
     }
+}
+
+test "cmdUpdate retires missing stale dead and requests handover for live" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-update-live");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ cache_d, store_mod.status_file });
+
+    {
+        var err: std.ArrayList(u8) = .empty;
+        defer err.deinit(gpa);
+        captured_stderr = &err;
+        defer captured_stderr = null;
+        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expect(std.mem.indexOf(u8, err.items, "not running") != null);
+    }
+
+    {
+        const dead_doc = "{\"id\":\"me\",\"pid\":-3,\"uptime_s\":99}\n";
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), dead_doc));
+        var err: std.ArrayList(u8) = .empty;
+        defer err.deinit(gpa);
+        captured_stderr = &err;
+        defer captured_stderr = null;
+        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expect(std.mem.indexOf(u8, err.items, "not running") != null);
+        try std.testing.expect(std.mem.indexOf(u8, err.items, "exited pid") != null);
+    }
+
+    {
+        const old_doc = try std.fmt.allocPrint(gpa, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) - 121 });
+        defer gpa.free(old_doc);
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), old_doc));
+        var err: std.ArrayList(u8) = .empty;
+        defer err.deinit(gpa);
+        captured_stderr = &err;
+        defer captured_stderr = null;
+        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expect(std.mem.indexOf(u8, err.items, "not serving") != null);
+        try std.testing.expect(std.mem.indexOf(u8, err.items, "stale") != null);
+    }
+
+    const script = try std.fmt.allocPrint(gpa,
+        \\trap 'cp "{s}/{s}" "{s}/{s}"' USR2
+        \\touch "{s}/child.ready"
+        \\while [ ! -f "{s}/{s}" ]; do
+        \\  if [ -f "{s}/{s}" ]; then cp "{s}/{s}" "{s}/{s}"; break; fi
+        \\  sleep 0.05
+        \\done
+        \\while true; do sleep 3600; done
+    , .{
+        cache_d,           handover.req_file, cache_d,           handover.ack_file,
+        cache_d,           cache_d,           handover.ack_file, cache_d,
+        handover.req_file, cache_d,           handover.req_file, cache_d,
+        handover.ack_file,
+    });
+    defer gpa.free(script);
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{ "sh", "-c", script },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    defer child.kill(std.testing.io);
+
+    var ready_buf: [192]u8 = undefined;
+    const ready = try std.fmt.bufPrint(&ready_buf, "{s}/child.ready", .{cache_d});
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 20) {
+        var stbuf: sys.c.struct_stat = undefined;
+        if (sys.statPath(try sys.toZ(&zbuf, ready), &stbuf) == 0) break;
+        sys.sleepMs(std.testing.io, 20);
+    }
+    const child_pid: i32 = child.id.?;
+    const live_doc = try std.fmt.allocPrint(gpa, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
+        child_pid,
+        sys.nowSec(std.testing.io),
+        sys.monoSec(std.testing.io),
+    });
+    defer gpa.free(live_doc);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live_doc));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 0), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "updated pid") != null);
+    var reqp: [192]u8 = undefined;
+    const req_path = try std.fmt.bufPrint(&reqp, "{s}/{s}", .{ cache_d, handover.req_file });
+    const req_blob = try sys.readFileAlloc(gpa, try sys.toZ(&zbuf, req_path), 4096);
+    defer gpa.free(req_blob);
+    try std.testing.expect(std.mem.indexOf(u8, req_blob, "\"bin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req_blob, "\"token\"") != null);
 }
 
 const seed_status_live = fuzzcorpus.entry("{\"id\":\"me\",\"pid\":1,\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"now_s\":1710000060,\"mono_s\":100,\"stats\":{}}\n");
@@ -3351,6 +3697,100 @@ test "parseArgs refuses unknown commands before flag scanning" {
     try std.testing.expectError(error.UnknownCommand, parseArgs(gpa, &environ, &.{ "frobnicate", "-h", "--origin", "/o" }));
 }
 
+test "parseArgs accepts update and honors --cache" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try std.testing.expect(knownCommand("update"));
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"update"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("update", parsed.cmd);
+        try std.testing.expectEqualStrings("/var/cache/modelfs", parsed.opts.cache);
+        try std.testing.expectEqual(@as(usize, 0), parsed.rest.len);
+    }
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "update", "--cache", "/c" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/c", parsed.opts.cache);
+    }
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "update", "--cache=/env/cache" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/env/cache", parsed.opts.cache);
+    }
+    try environ.put("MODELFS_CACHE", "/from-env");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"update"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/from-env", parsed.opts.cache);
+    }
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "update", "--detach" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "update", "--kernel-cache" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "update", "--listen", "19090" }));
+    try std.testing.expectError(error.Help, parseArgs(gpa, &environ, &.{ "update", "--help" }));
+    try std.testing.expectError(error.Version, parseArgs(gpa, &environ, &.{ "update", "-V" }));
+}
+
+test "parseArgs scopes the pull flags to pull and defaults the revision" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try std.testing.expect(knownCommand("pull"));
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "pull", "owner/repo", "--origin", "/o" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("pull", parsed.cmd);
+        try std.testing.expectEqualStrings("/o", parsed.opts.origin.?);
+        try std.testing.expectEqualStrings(hf.default_revision, parsed.opts.revision);
+        try std.testing.expectEqual(@as(?[]const u8, null), parsed.opts.dest);
+        try std.testing.expectEqual(@as(usize, 1), parsed.rest.len);
+        try std.testing.expectEqualStrings("owner/repo", parsed.rest[0]);
+    }
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "pull", "owner/repo", "--origin=/o", "--revision=v2", "--dest=gguf/x" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("v2", parsed.opts.revision);
+        try std.testing.expectEqualStrings("gguf/x", parsed.opts.dest.?);
+    }
+    // Accepted-and-ignored is the failure to avoid: --revision on verify
+    // would read as a working knob.
+    try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &environ, &.{ "verify", "a.bin", "--origin", "/o", "--revision", "v2" }));
+    try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &environ, &.{ "status", "--dest", "x" }));
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "pull", "owner/repo", "--origin", "/o", "--listen", "19090" }));
+    try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &environ, &.{ "pull", "owner/repo", "--origin", "/o", "--all" }));
+    try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "pull", "owner/repo", "--origin", "/o", "--revision" }));
+}
+
+test "cmdPull names a bad repo, revision, or destination and never opens a socket" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var db: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&db, "modelfs-pull-args");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    const Case = struct { repo: []const u8, opts: Opts, want: []const u8 };
+    const cases = [_]Case{
+        .{ .repo = "owner/repo", .opts = .{}, .want = "pull needs --origin" },
+        .{ .repo = "no-slash", .opts = .{ .origin = origin_d }, .want = "not a Hugging Face owner/repo id" },
+        .{ .repo = "owner/..", .opts = .{ .origin = origin_d }, .want = "not a Hugging Face owner/repo id" },
+        .{ .repo = "owner/repo", .opts = .{ .origin = origin_d, .revision = "bad ref" }, .want = "not a branch, tag, or commit" },
+        .{ .repo = "owner/repo", .opts = .{ .origin = origin_d, .dest = "../escape" }, .want = "not a path under the origin" },
+        .{ .repo = "owner/repo", .opts = .{ .origin = origin_d, .dest = discover.cluster_dir }, .want = "not a path under the origin" },
+    };
+    for (cases) |case| {
+        var err: std.ArrayList(u8) = .empty;
+        defer err.deinit(gpa);
+        captured_stderr = &err;
+        defer captured_stderr = null;
+        // Exit 2, the usage code: these are all argument mistakes, and none
+        // of them may cost a DNS lookup or a TLS handshake first.
+        try std.testing.expectEqual(@as(u8, 2), try cmdPull(std.testing.io, gpa, &environ, case.opts, case.repo));
+        try std.testing.expect(std.mem.indexOf(u8, err.items, case.want) != null);
+    }
+}
+
 test "parseArgs rejects mount-only flags on other commands" {
     const gpa = std.testing.allocator;
     var environ = std.process.Environ.Map.init(gpa);
@@ -3398,6 +3838,11 @@ test "classifyMeta answers help/version and refuses real extras" {
 test "usage lists exclusive dupes forms and interpolates the default port" {
     var buf: [usage.len + 16]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, usage, .{proto.default_port});
+    try std.testing.expect(std.mem.indexOf(u8, text, "modelfs update [--cache PATH]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "modelfs pull <owner/repo> --origin PATH") != null);
+    // The token has no flag on purpose; help has to say where it comes from
+    // or the only documented way to reach a private repo is guesswork.
+    try std.testing.expect(std.mem.indexOf(u8, text, hf.token_env) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "modelfs dupes <relpath>... --origin PATH") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "modelfs dupes --all --origin PATH") != null);
     // Combined `[--all]` next to the path list implied `dupes a --all` was
