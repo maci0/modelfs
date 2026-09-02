@@ -8,7 +8,7 @@ and an NFS origin as the write authority. Linux only.
 
 | Path | Contents |
 |---|---|
-| `src/*.zig` | The daemon. Tests live beside the code they cover; a new file is invisible to `zig build test` until `root.zig` imports it |
+| `src/*.zig` | The daemon. Tests live beside the code they cover; a new file is invisible to `zig build test` until `root.zig` imports it. `-Dtest-filter=` matches test names, not files |
 | `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once; import via `c.zig` / `sys.zig`, never `@cImport` |
 | `scripts/` | Gates and harnesses. `lib.sh` defines `ROOT_DIR`/`SCRATCH_DIR`/`SCRIPTS_DIR`; harnesses source it |
 | `docs/` | `README.md` indexes them. `architecture.md` is shipped behavior; `design.md` is history |
@@ -16,22 +16,19 @@ and an NFS origin as the write authority. Linux only.
 
 ## Gates
 
-`./scripts/check.sh` is the blocking gate: `zig fmt --check`, CHANGELOG `##`
-headings (`[Unreleased]` first, dated semver matching `build.zig.zon`,
-`[name]:` footer links, and current-tag sentences in README/SECURITY.md/
-THREAT_MODEL.md; dated notes are `###`), `zig build test`, shellcheck
-(`.shellcheckrc` on every `scripts/**/*.sh`), `test_dr_restore_drill.sh`, vendored
-libfuse3 digest and extract checks, contributor-script `--help` handlers
-(`test_scripts_help.sh`), `ruff check`, `ruff format --check`,
-`mypy`, `scripts/sbom.py --self-test`, and `scripts/sbom.py --check`.
-CI runs that plus the aarch64 cross-compile and the reproducibility rebuild.
-Never loosen a gate to pass it.
+`./scripts/check.sh` is the blocking gate (fmt, changelog, tests, drill stub,
+fuse3 digests, script `--help`, shellcheck, ruff, mypy, sbom). Never loosen it
+to pass. CHANGELOG `##` headings: `[Unreleased]` first, dated `x.y.z` including
+the `build.zig.zon` version, `[name]:` footer links; `v<version>` in README,
+SECURITY.md, and `docs/THREAT_MODEL.md`; notes are `###`. CI adds aarch64
+cross-compile and a reproducibility rebuild (`./scripts/ci.sh` runs all three).
 
 `run_cluster_e2e_9nodes.sh` needs `/dev/fuse` and `fusermount3`, so it runs
-locally rather than in CI. `run_e2e_tests.sh` is CLI/protocol only (no FUSE).
-`test_fault_tolerance.sh` needs a live peer or skips loudly.
-`dr_restore_drill.sh` runs on the NAS; `test_dr_restore_drill.sh` is the CI
-stand-in (stub `zfs`).
+locally rather than in CI. `run_vm_cluster_e2e.sh` is the real-NFS cluster
+(4 VMs, libvirt/KVM); also local. `run_e2e_tests.sh` is CLI/protocol only
+(no FUSE). `test_fault_tolerance.sh` skips the live-peer check loudly if none
+is listening. `dr_restore_drill.sh` runs on the NAS; `test_dr_restore_drill.sh`
+is the CI stand-in (stub `zfs`).
 
 ## Constraints
 
