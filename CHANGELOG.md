@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+Work since `v0.5.0`. Upgrading a node or a script written against that tag:
+start at **Upgrade from v0.5.0** below. The binary still prints `0.5.0`
+until the next tag.
+
+### Upgrade from v0.5.0 - 2026-09-02
+
+CLI, peer-HTTP, FUSE, and monitor changes that will surprise a node still
+running the tagged binary, or a script written against it. A mixed fleet
+with `v0.5.0` peers still fills: those fetchers already send `piece=N` on
+`/stage` and only probe `/stage` when `X-Stage` is advertised. No on-disk
+format change. Details stay in the entries below. These are CLI, peer-HTTP,
+and default-behavior changes: the next tag is a minor, not a patch
+(CONTRIBUTING).
+
+- **`modelfs verify` and `modelfs dupes` refuse a file or unreachable `--origin`** (exit 1). `dupes --all` used to treat a regular file as an empty scan and exit 0.
+- **Every `MODELFS_*` value is trimmed of surrounding whitespace**; whitespace-only counts as unset (defaults apply), except a whitespace-only `MODELFS_PSK_VALUE` which is still refused as empty.
+- **`modelfs dupes` counts each shared digest once**, not once per repeated occurrence in a file.
+- **`/stage` missing, malformed, or over-wide `piece` is 400** before origin or cache, matching a missing `Range` on `/data`. A request that never named a piece can no longer 404 on an absent path.
+- **A `/have` bitmap that would exceed 16 MiB replies 500** without opening a cache entry. Fetchers already refused that body.
+- **A 501 from `/stage` does not increment `http_5xx`.** HTTP-only nodes no longer look failing on that gauge; 500 and 502 still feed it. Monitors alerting on `http_5xx` for capability probes must treat 501 separately if they still care.
+- **Origin I/O failures return the libc errno** (FUSE replies and `noteOriginIo` used to report EPERM because the wrappers passed through libc's `-1`).
+- **A FIFO at a model path fails ESPIPE on read and ENXIO on write** (used to hang the FUSE worker until a counterpart appeared).
+- **U+180F and U+1BCA0..U+1BCA3 in paths are refused**, matching the rest of Default_Ignorable.
+
 ### /stage window and origin manifest fuzz seeds reach the decode path - 2026-09-02
 - **The `/stage` window and piece-hash manifest fuzz corpora now use `fuzzcorpus.entry` framing.** `Smith.slice` reads a u32 length prefix; the raw codec bytes were consumed as that prefix, so a well-formed window or `MFSM` blob never decoded during corpus replay. Truncated, empty, over-long, and structurally corrupt seeds now sit next to a clean one; a decoded manifest re-encodes to the same blob.
 
@@ -123,6 +147,9 @@
   failure (same edge trigger as `/have` and `/data` downs), and a
   `getifaddrs` failure at start (it no longer reads as "no NICs"). A
   length-mismatch staged read frees the pool slot instead of pinning it.
+- **`connectInWithIo` restores the caller's flags on every path.** A failed
+  connect or poll used to leave `O_NONBLOCK` set, so a later blocking read
+  on that fd would return EAGAIN instead of honoring `SO_RCVTIMEO`.
 
 ### Peer /stage matches /have and /data - 2026-09-02
 - **`/stage` required `piece=N` is gated like `/data` Range.** Missing,
@@ -144,10 +171,12 @@ Observability release on top of 0.4.0: the FUSE metadata handlers and the
 and logged instead of being silently refused, and the dial timeout runs on
 the injected `std.Io` clock so a simulator can drive expiry. A
 `_FORTIFY_SOURCE` define that broke every optimized build is reverted, and
-the NAS drill scripts probe for the GNU tools they need. status.json gains five keys and the `tick:` line
-two fields; no wire or on-disk changes, so upgrading from v0.4.0 is a
-rebuild and restart. Monitors parsing the tick line by field position must
-be updated; parsing by name is unaffected.
+the NAS drill scripts probe for the GNU tools they need. status.json stats
+gain four keys (`getattr_nanos`, `open_nanos`, `statfs_nanos`, `http_405`)
+and the `tick:` line two fields (`http405`, `md_us`); no wire or on-disk
+changes, so upgrading from v0.4.0 is a rebuild and restart. Monitors
+parsing the tick line by field position must be updated; parsing by name
+is unaffected.
 
 ### Metadata handlers report their latency - 2026-08-31
 - **`getattr_nanos`, `open_nanos`, and `statfs_nanos` count wall time inside

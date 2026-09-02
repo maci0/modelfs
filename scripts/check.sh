@@ -149,9 +149,11 @@ zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported u
 
 # ## [Name] is a release to changelog readers and tools. Dated notes nest
 # as ### under a version so they are not read as one (CONTRIBUTING.md).
-# Footer [name]: links are the compare/tag URLs; a heading without one
-# cannot be fetched. README/SECURITY.md/THREAT_MODEL.md name the current
-# tag so a cut cannot leave those sentences on the previous release.
+# Version headings after Unreleased must be unique and strictly descending
+# so a cut cannot insert 0.5.1 above 0.6.0 or repeat a tag. Footer [name]:
+# links are the compare/tag URLs; a heading without one cannot be fetched.
+# README/SECURITY.md/THREAT_MODEL.md name the current tag so a cut cannot
+# leave those sentences on the previous release.
 echo "=== changelog headings ==="
 zon_ver="$(sed -n 's/^[[:space:]]*\.version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
 [[ -n "${zon_ver}" ]] || fail "cannot read .version from build.zig.zon"
@@ -198,6 +200,49 @@ done < "${ROOT_DIR}/CHANGELOG.md"
 [[ "${saw_unreleased}" -eq 1 ]] || fail "CHANGELOG.md missing ## [Unreleased]"
 [[ "${first_h2}" == "Unreleased" ]] || fail "CHANGELOG.md first ## heading must be [Unreleased] (got ${first_h2:-none})"
 [[ "${saw_current}" -eq 1 ]] || fail "CHANGELOG.md missing ## [${zon_ver}] (build.zig.zon .version)"
+
+# Sets changelog_lt to 0 when $1 < $2 as x.y.z (pre-release/build suffix
+# ignored), else 1. A result variable rather than the function's exit
+# status: invoking it in `if`/`||` would suppress set -e inside the body
+# (SC2310). 10# so a leading-zero patch cannot parse as octal.
+changelog_ver_lt_set() {
+    changelog_lt=1
+    local a="${1%%[+]*}"
+    a="${a%%-*}"
+    local b="${2%%[+]*}"
+    b="${b%%-*}"
+    local a1 a2 a3 rest b1 b2 b3
+    IFS=. read -r a1 a2 a3 rest <<<"${a}"
+    IFS=. read -r b1 b2 b3 rest <<<"${b}"
+    : "${rest}"
+    a1="${a1:-0}"
+    a2="${a2:-0}"
+    a3="${a3:-0}"
+    b1="${b1:-0}"
+    b2="${b2:-0}"
+    b3="${b3:-0}"
+    if ((10#$a1 < 10#$b1)); then changelog_lt=0; return; fi
+    if ((10#$a1 > 10#$b1)); then return; fi
+    if ((10#$a2 < 10#$b2)); then changelog_lt=0; return; fi
+    if ((10#$a2 > 10#$b2)); then return; fi
+    if ((10#$a3 < 10#$b3)); then changelog_lt=0; return; fi
+}
+changelog_ver_lt_set "0.4.0" "0.5.0"
+[[ "${changelog_lt}" -eq 0 ]] || fail "changelog_ver_lt_set 0.4.0 < 0.5.0"
+changelog_ver_lt_set "0.3.1" "0.3.0"
+[[ "${changelog_lt}" -ne 0 ]] || fail "changelog_ver_lt_set 0.3.1 < 0.3.0 should be false"
+changelog_ver_lt_set "0.5.0" "0.5.0"
+[[ "${changelog_lt}" -ne 0 ]] || fail "changelog_ver_lt_set equal should be false"
+if [[ "${#versions[@]}" -gt 0 ]]; then
+    prev=""
+    for ver in "${versions[@]}"; do
+        if [[ -n "${prev}" ]]; then
+            changelog_ver_lt_set "${ver}" "${prev}"
+            [[ "${changelog_lt}" -eq 0 ]] || fail "CHANGELOG.md versions must be strictly descending: ${prev} then ${ver}"
+        fi
+        prev="${ver}"
+    done
+fi
 
 if ! grep -q '^\[Unreleased\]:' "${ROOT_DIR}/CHANGELOG.md"; then
     fail "CHANGELOG.md missing [Unreleased] link"

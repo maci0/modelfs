@@ -932,6 +932,9 @@ test "connectIn succeeds against a local listener" {
     try std.testing.expect(cfd >= 0);
     defer close(cfd);
     try std.testing.expectEqual(@as(i32, 0), connectIn(cfd, &got, 5000));
+    const fl = c.fcntl(cfd, c.F_GETFL, @as(c_int, 0));
+    try std.testing.expect(fl >= 0);
+    try std.testing.expectEqual(@as(c_int, 0), fl & c.O_NONBLOCK);
 }
 
 test "connectIn bounds a dead dial" {
@@ -949,6 +952,12 @@ test "connectIn bounds a dead dial" {
     const rc = connectIn(fd, &addr, 250);
     try std.testing.expect(rc != 0);
     try std.testing.expect(monoSec(std.testing.io) - t0 <= 5);
+    // Failure must still restore the caller's flags: leaving O_NONBLOCK
+    // would make a later blocking read return EAGAIN instead of honoring
+    // SO_RCVTIMEO. socket() is blocking by default.
+    const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    try std.testing.expect(fl >= 0);
+    try std.testing.expectEqual(@as(c_int, 0), fl & c.O_NONBLOCK);
 }
 
 test "resolveIpv4 passes numeric quads and resolves localhost" {

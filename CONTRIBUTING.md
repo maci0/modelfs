@@ -96,10 +96,10 @@ The blocking requirement is green CI: `./scripts/check.sh`, the
 `cross-aarch64` compile job, and the `reproducibility` job
 (`./scripts/ci.sh` runs all three). There is no sign-off gate and no
 requirement that a PR add a changelog entry, but `scripts/check.sh`
-requires CHANGELOG.md's `##` headings to be `[Unreleased]` first or a dated
-semver version matching build.zig.zon, plus a `[name]:` footer link for
-each heading and a current-tag mention in README.md, SECURITY.md, and
-docs/THREAT_MODEL.md. Behavior changes belong in
+requires CHANGELOG.md's `##` headings to be `[Unreleased]` first, then dated
+semver versions in strictly descending order, one of them matching
+build.zig.zon, plus a `[name]:` footer link for each heading and a
+current-tag mention in README.md, SECURITY.md, and docs/THREAT_MODEL.md. Behavior changes belong in
 [CHANGELOG.md](CHANGELOG.md) as a dated
 `###` section under `[Unreleased]` (`## [Unreleased]` and `## [x.y.z] - date`
 are the only `##` headings; a sibling `## [Name] - date` reads as a

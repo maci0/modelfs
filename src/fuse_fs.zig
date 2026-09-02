@@ -1603,6 +1603,8 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     _ = st.store.stats.bytes_from_peer.fetchAdd(4096, .monotonic);
     _ = st.store.stats.http_405.fetchAdd(3, .monotonic);
     _ = st.store.stats.getattr_nanos.fetchAdd(2000, .monotonic);
+    _ = st.store.stats.open_nanos.fetchAdd(4000, .monotonic);
+    _ = st.store.stats.statfs_nanos.fetchAdd(8000, .monotonic);
     st.store.origin_io_down.store(true, .monotonic);
     try statusJson(&st);
     const blob2 = try sys.readFileAlloc(gpa, fp, 4096);
@@ -1614,9 +1616,11 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expectEqual(@as(u64, 4096), doc2.value.stats.bytes_from_peer);
     try std.testing.expectEqual(@as(i32, 1), doc2.value.origin_down);
     // Snap fields default to 0, so a missing JSON key would still parse.
-    // These two must actually be in the published document.
+    // The four keys 0.5.0 added must actually be in the published document.
     try std.testing.expectEqual(@as(u64, 3), doc2.value.stats.http_405);
     try std.testing.expectEqual(@as(u64, 2000), doc2.value.stats.getattr_nanos);
+    try std.testing.expectEqual(@as(u64, 4000), doc2.value.stats.open_nanos);
+    try std.testing.expectEqual(@as(u64, 8000), doc2.value.stats.statfs_nanos);
 
     // A leftover world-readable status.json (older daemon, or a 0644 tmp
     // that was renamed in) is tightened on the next publish: O_CREAT's
