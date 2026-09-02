@@ -1573,9 +1573,9 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     const rel = mountRel(path);
     // Gate before ensureLayout so a refused path cannot create cache dirs.
     if (refuseCliRel(if (on) "pin" else "unpin", rel)) return 1;
-    var dummy_io = std.Io.Threaded.init(gpa, .{});
-    defer dummy_io.deinit();
-    var store = store_mod.Store.init(gpa, dummy_io.io(), opts.origin orelse "", opts.cache, opts.piece);
+    // Same process Io the daemon and cmdDupes use: Store recency and mutex
+    // waits stay on the injected clock, not a second Threaded wall clock.
+    var store = store_mod.Store.init(gpa, io, opts.origin orelse "", opts.cache, opts.piece);
     defer store.deinit();
     // Same operator trace as cmdMount's mount-time layout check: the errno
     // distinguishes EACCES from ENOSPC, which the remediation differs for.
@@ -1626,9 +1626,9 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
     }
     const rel = mountRel(path);
     if (refuseCliRel("verify", rel)) return 1;
-    var dummy_io = std.Io.Threaded.init(gpa, .{});
-    defer dummy_io.deinit();
-    var store = store_mod.Store.init(gpa, dummy_io.io(), origin, cache, opts.piece);
+    // Same process Io as cmdPin/cmdDupes: expectedHash retry instants and
+    // recency stamps stay on the injected clock.
+    var store = store_mod.Store.init(gpa, io, origin, cache, opts.piece);
     defer store.deinit();
     // The piece grid comes from the cache's own sidecar header, not a flag:
     // the daemon that wrote the marks chose the grid, and verifying against
@@ -1660,7 +1660,7 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         if (!builtin.is_test) std.log.err("origin size unusable for {s}", .{rel});
         return 1;
     };
-    const file = store.getIdentified(rel, size, store_mod.OriginId.fromStat(st), sys.monoSec(dummy_io.io())) catch |err| {
+    const file = store.getIdentified(rel, size, store_mod.OriginId.fromStat(st), sys.monoSec(io)) catch |err| {
         if (!builtin.is_test) std.log.err("cache entry open failed for {s} ({t})", .{ rel, err });
         return 1;
     };
@@ -1674,12 +1674,12 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
     };
     defer gpa.free(buf);
     const nbits = piece.count(size, piece_size);
-    const now_ms = sys.monoMs(dummy_io.io());
+    const now_ms = sys.monoMs(io);
     var i: u32 = 0;
     while (i < nbits) : (i += 1) {
-        file.mu.lockUncancelable(dummy_io.io());
+        file.mu.lockUncancelable(io);
         const marked = file.bits.get(i);
-        file.mu.unlock(dummy_io.io());
+        file.mu.unlock(io);
         if (!marked) continue;
         // expectedHash loads the origin manifest lazily; with no manifest
         // and no hashes learned from a live daemon, there is no reference
@@ -1687,7 +1687,7 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         const expect = store.expectedHash(file, i, now_ms) orelse continue;
         const ln = piece.len(size, i, piece_size);
         if (ln == 0) continue;
-        const n = store.readCache(file, buf[0..ln], piece.offset(i, piece_size), sys.monoSec(dummy_io.io()));
+        const n = store.readCache(file, buf[0..ln], piece.offset(i, piece_size), sys.monoSec(io));
         if (n < 0 or @as(u64, @intCast(n)) != ln) {
             if (!builtin.is_test) std.log.warn("verify read failed for {s} piece {d}; leaving mark", .{ rel, i });
             continue;
@@ -2602,17 +2602,15 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     // Publish the manifest the way a writer's release does: fill the cache
     // from origin, then publish the learned hashes.
     {
-        var dummy_io = std.Io.Threaded.init(gpa, .{});
-        defer dummy_io.deinit();
-        var store = store_mod.Store.init(gpa, dummy_io.io(), origin_d, cache_d, 16);
+        var store = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
         defer store.deinit();
         try std.testing.expectEqual(@as(i32, 0), store.ensureLayout());
-        const f = try store.get("m.bin", 16, sys.monoSec(dummy_io.io()));
+        const f = try store.get("m.bin", 16, sys.monoSec(std.testing.io));
         defer store.releaseFile(f);
         var h: [piece.digest_len]u8 = undefined;
         piece.digest("0123456789abcdef", &h);
-        try std.testing.expectEqual(@as(u32, 16), (try store.beginFill(f, 0, sys.monoSec(dummy_io.io()))).len);
-        try std.testing.expectEqual(@as(i32, 0), store.completeFill(f, 0, "0123456789abcdef", h, sys.monoSec(dummy_io.io())));
+        try std.testing.expectEqual(@as(u32, 16), (try store.beginFill(f, 0, sys.monoSec(std.testing.io))).len);
+        try std.testing.expectEqual(@as(i32, 0), store.completeFill(f, 0, "0123456789abcdef", h, sys.monoSec(std.testing.io)));
         store.publishManifest(f);
     }
 

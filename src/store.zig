@@ -1132,8 +1132,13 @@ pub const Store = struct {
                 if (now_sec -| f.last_access.load(.monotonic) < min_idle_secs) continue;
                 _ = f.refs.fetchAdd(1, .monotonic);
                 cands.append(self.gpa, f) catch {
+                    // A partial list is HashMap iteration order. Drop every
+                    // pin and skip the round so an OOM cannot reap a
+                    // hash-order prefix; the next tick retries the full set.
                     _ = f.refs.fetchSub(1, .monotonic);
-                    continue;
+                    for (cands.items) |pinned| _ = pinned.refs.fetchSub(1, .monotonic);
+                    cands.clearRetainingCapacity();
+                    return;
                 };
             }
         }
@@ -4047,6 +4052,40 @@ test "forget evicts after release and reapIdle frees idle empty entries" {
     try std.testing.expect(f2b.bits.get(0));
     f2b.mu.unlock(std.testing.io);
     st.releaseFile(f2b);
+}
+
+test "reapIdle allocation failure leaves the idle set intact" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-reap-oom");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-reap-oom");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var st = Store.init(failing.allocator(), std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const t0: i64 = 1_000_000;
+    const a = try st.get("a.bin", 64, t0);
+    st.releaseFile(a);
+    const b = try st.get("b.bin", 64, t0);
+    st.releaseFile(b);
+    try std.testing.expectEqual(@as(usize, 2), st.files.count());
+
+    // Next allocation is the candidate list: abort rather than reap a
+    // HashMap-iteration prefix of the idle set.
+    failing.fail_index = failing.alloc_index;
+    st.reapIdle(t0 + 3600, 60);
+    try std.testing.expectEqual(@as(usize, 2), st.files.count());
+    try std.testing.expect(st.files.contains("a.bin"));
+    try std.testing.expect(st.files.contains("b.bin"));
+
+    failing.fail_index = std.math.maxInt(usize);
+    st.reapIdle(t0 + 3600, 60);
+    try std.testing.expectEqual(@as(usize, 0), st.files.count());
 }
 
 test "distrust drops sidecar and live marks but keeps data bytes and pins" {

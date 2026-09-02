@@ -13,6 +13,12 @@ until the next tag.
 - **`sidecarPieceSize` is asserted against an independent 8-byte oracle.** `modelfs verify` sizes its grid from this header on a cache sidecar; a truncated, foreign, or zero-size blob stays null, extra bytes past the prefix are ignored, and a decoded size re-encodes to the same header.
 - **Accepted `/have` replies now pin `HaveBits.hasPiece` and `X-Stage`.** A peer-advertised grid that is not ours cannot look like a hit, an index past the bitmap stays unset, and only the exact `X-Stage: 1` token advertises a staged data plane (`true` does not).
 
+### Pin and verify run on the injected Io - 2026-09-02
+- **`cmdPin` and `cmdVerify` use the process `std.Io` the CLI already holds.** They constructed a fresh `std.Io.Threaded` for the Store, so recency stamps, mutex waits, and `expectedHash` retry instants were a second wall clock a simulator could not drive. `cmdDupes` already used the passed Io.
+
+### Idle reap aborts on allocation failure - 2026-09-02
+- **A failed candidate append skips the reap instead of keeping a hash-map prefix.** `reapIdle` already sorted collected entries so a crash mid-unlink left a deterministic remainder, but an OOM while pinning still kept whichever idle files HashMap iteration had visited first. The next tick retries the full set.
+
 ### FUSE unlink retry of a gone file is success - 2026-09-02
 - **`Store.unlinkOrigin` treats ENOENT as success.** `mkdir` of an existing
   directory and `rmdir` of a gone directory already converged so a FUSE

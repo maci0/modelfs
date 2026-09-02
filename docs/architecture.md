@@ -121,7 +121,7 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 
 `main` → `fuse_fs` → `peer` → (`store`, `discover`, `rdma`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
 
-CLI commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`) import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`, `manifestsDirPath`) rather than reconstructing those joins.
+CLI commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`) import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`, `manifestsDirPath`) rather than reconstructing those joins. Pin, verify, and dupes pass the process `std.Io` into Store so recency and retry instants stay on the injected clock.
 
 ---
 
