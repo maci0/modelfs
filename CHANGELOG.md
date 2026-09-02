@@ -26,6 +26,10 @@ until the next tag.
   a second consumer does not reimplement the merge. `manifestOverlap`
   returns an error on allocation failure instead of reporting empty overlap.
 
+### CLI I/O errors stay off stdout - 2026-09-02
+- **`modelfs peers` prints an unreadable `.cluster` on stderr.** The listing is stdout; mixing the error into it made `modelfs peers | grep live` see a diagnostic as a row. Exit 1 is unchanged. A missing `.cluster` is still an empty cluster on stdout (exit 0).
+- **`modelfs dupes --all` exits 1 when `origin/.cluster/manifests` is unreadable** (EIO, ENOTDIR, EACCES). A missing dir is still an empty scan (exit 0). Any opendir failure used to print `no manifests to compare` and exit 0. `modelfs help` names the 0/1/2 exit split.
+
 ### FUSE unlink retry of a gone file is success - 2026-09-02
 - **`Store.unlinkOrigin` treats ENOENT as success.** `mkdir` of an existing
   directory and `rmdir` of a gone directory already converged so a FUSE
@@ -83,7 +87,8 @@ and default-behavior changes: the next tag is a minor, not a patch
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused**, matching the rest of Default_Ignorable.
 - **FUSE `readdir` omits names `relOk` would refuse** (control bytes, ZWSP, bidi). Those names already failed open/getattr; they no longer appear in `ls /models`. NFC/NFD and non-UTF-8 names still list.
 - **Discovery skips lease JSON whose `id` fails `validId`.** A planted `"id":"spark1\u200b"` is no longer a peer. `modelfs peers` still lists the document.
-- **`modelfs peers` exits 1 when `origin/.cluster` is unreadable** (EIO, ENOTDIR, EACCES). A missing `.cluster` is still an empty cluster (exit 0). An origin I/O failure used to print `no cluster leases` and exit 0.
+- **`modelfs peers` exits 1 when `origin/.cluster` is unreadable** (EIO, ENOTDIR, EACCES), with the reason on stderr. A missing `.cluster` is still an empty cluster on stdout (exit 0). An origin I/O failure used to print `no cluster leases` on stdout and exit 0.
+- **`modelfs dupes --all` exits 1 when `origin/.cluster/manifests` is unreadable** (EIO, ENOTDIR, EACCES). A missing dir is still an empty scan (exit 0). Any opendir failure used to print `no manifests to compare` and exit 0.
 
 ### Idle origin outages and metadata failures reach the tick line - 2026-09-02
 - **Lease publish and unreadable `.cluster` walks raise `origin_down`.** Discovery already wrote the origin every 10 s, but a node with no FUSE traffic left `origin_down` at 0 until the first getattr. `tickCluster` feeds the publish/refresh errno into `Store.noteOriginIo`. Write/rename and walk failures are edge-triggered (one warn, then `lease publish recovered` / `cluster leases recovered`) so a dead NFS cannot warn every tick.

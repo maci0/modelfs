@@ -83,7 +83,9 @@ const usage =
     \\list; mount-only options are refused on the rest. Every command also
     \\accepts -h/--help and -V/--version. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
-    \\accept --name VALUE or --name=VALUE.
+    \\accept --name VALUE or --name=VALUE. Usage errors exit 2 with one
+    \\named line on stderr; other failures exit 1. Help, version, and
+    \\command results print on stdout.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID (mount only, like --id) MODELFS_LOG set the same values
@@ -1496,7 +1498,11 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             // EIO/ENOTDIR/EACCES: the origin is there but .cluster cannot
             // be listed. Printing the empty-cluster line would look like a
             // healthy fleet of zero, which is the wrong incident start.
-            _ = printOut(io, gpa, "cannot read cluster leases at {s}/{s} (errno {d})\n", .{ origin, discover.cluster_dir, e });
+            // Stdout is the listing a pipe consumes (`modelfs peers | grep
+            // live`); the reason belongs on stderr, like status's "cannot
+            // read" / "not running" lines.
+            if (!builtin.is_test)
+                std.debug.print("cannot read cluster leases at {s}/{s} (errno {d})\n", .{ origin, discover.cluster_dir, e });
             return 1;
         },
     }
@@ -2384,6 +2390,8 @@ test "cmdPeers separates unreachable origins from empty clusters" {
 
     // A regular file at origin/.cluster is unreadable, not an empty
     // cluster: listing must fail instead of printing "no cluster leases".
+    // The reason is on stderr (operator diagnostic), not stdout (the
+    // listing a pipe consumes).
     var zb2: [256]u8 = undefined;
     var fb2: [192]u8 = undefined;
     const cluster_fp = try std.fmt.bufPrint(&fb2, "{s}/.cluster", .{origin_d});
@@ -2393,8 +2401,7 @@ test "cmdPeers separates unreachable origins from empty clusters" {
     captured_stdout = &out2;
     defer captured_stdout = null;
     try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
-    try std.testing.expect(std.mem.indexOf(u8, out2.items, "cannot read cluster leases") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out2.items, "no cluster leases") == null);
+    try std.testing.expectEqual(@as(usize, 0), out2.items.len);
 }
 
 test "verify and dupes refuse a file origin instead of scanning empty" {
@@ -2652,7 +2659,9 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
 /// name the files behind them; the aggregates are what the dedup decision
 /// needs (design.md section 14), and the per-path form `modelfs dupes
 /// <rel>...` names specific pairs. Reads manifests only, never model
-/// bytes. A missing manifests dir is an empty scan, not an error.
+/// bytes. A missing manifests dir is an empty scan, not an error; an
+/// unreadable one (EIO, ENOTDIR, EACCES) exits 1 like `modelfs peers` on
+/// an unreadable `.cluster`.
 fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     const origin_raw = opts.origin orelse {
         std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
@@ -2670,8 +2679,21 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // O_NOFOLLOW like lease walks: a planted .cluster/manifests symlink
     // must not list or parse names under its target.
     const dir = sys.opendirNoFollow(dirz) orelse {
-        if (!printOut(io, gpa, "no manifests to compare\n", .{})) return 1;
-        return 0;
+        const e = sys.errno();
+        if (e == sys.c.ENOENT) {
+            // Missing manifests dir is a fresh/empty origin, not an error:
+            // same exit-0 empty report as a dir with no files.
+            if (!printOut(io, gpa, "no manifests to compare\n", .{})) return 1;
+            return 0;
+        }
+        // EIO/ENOTDIR/EACCES: the origin is there but manifests cannot be
+        // listed. Printing the empty-scan line would look like a healthy
+        // store of zero, which is the wrong incident start. Same split
+        // walkLeases / cmdPeers apply to origin/.cluster. Stdout is the
+        // report a pipe consumes; the reason belongs on stderr.
+        if (!builtin.is_test)
+            std.debug.print("cannot read manifests at {s}/{s} (errno {d})\n", .{ origin, store_mod.Store.manifests_dir, e });
+        return 1;
     };
     defer sys.closedir(dir);
 
@@ -2943,6 +2965,20 @@ test "cmdDupesAll scans the manifest store and --all is dupes-only" {
     out.clearRetainingCapacity();
     try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, .{ .origin = empty_origin }));
     try std.testing.expect(std.mem.indexOf(u8, out.items, "no manifests to compare") != null);
+
+    // A regular file at origin/.cluster/manifests is unreadable, not an
+    // empty scan: must fail instead of printing "no manifests to compare"
+    // on stdout (the report a pipe consumes).
+    var zb: [256]u8 = undefined;
+    var cb: [192]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cb, "{s}/.cluster", .{empty_origin});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+    var mb: [192]u8 = undefined;
+    const manifests_fp = try std.fmt.bufPrint(&mb, "{s}/manifests", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, manifests_fp), "not-a-dir"));
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 1), try cmdDupesAll(std.testing.io, gpa, .{ .origin = empty_origin }));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 
     // --all parses on dupes and is refused anywhere else.
     var env = std.process.Environ.Map.init(gpa);
@@ -3367,6 +3403,7 @@ test "usage lists exclusive dupes forms and interpolates the default port" {
     // Combined `[--all]` next to the path list implied `dupes a --all` was
     // legal; that combination is refused (exit 2).
     try std.testing.expect(std.mem.indexOf(u8, text, "[--all]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Usage errors exit 2") != null);
     var port_buf: [8]u8 = undefined;
     const port = try std.fmt.bufPrint(&port_buf, "{d}", .{proto.default_port});
     try std.testing.expect(std.mem.indexOf(u8, text, port) != null);
