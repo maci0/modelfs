@@ -399,7 +399,7 @@ fn parseSize(s: []const u8) !u64 {
 /// form here, so `-f=x` stays a single unknown token.
 fn splitFlag(a: []const u8) struct { name: []const u8, value: ?[]const u8 } {
     if (a.len >= 3 and a[0] == '-' and a[1] == '-') {
-        if (std.mem.indexOfScalar(u8, a, '=')) |eq| {
+        if (std.mem.findScalar(u8, a, '=')) |eq| {
             return .{ .name = a[0..eq], .value = a[eq + 1 ..] };
         }
     }
@@ -1978,48 +1978,48 @@ test "badIdLine renders refused ids through the displayName echo gate" {
     var buf: [512]u8 = undefined;
     {
         const line = badIdLine(&buf, "\x1b]0;pwned\x07");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "\n2026-08-26 forged") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\x1b") == null);
+        try std.testing.expect(std.mem.find(u8, line, "\n2026-08-26 forged") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     // The UTF-8 C1 spellings ride in as 0xC2 0x80..0xC2 0x9F and get the same
     // withholding as their raw C0 counterparts.
     {
         const line = badIdLine(&buf, "\xc2\x9d0;pwned\xc2\x9c");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\xc2\x9d") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\xc2\x9d") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     // U+2028 splits Unicode-aware terminals; the refusal must not echo it.
     {
         const line = badIdLine(&buf, "spark1\u{2028}ERROR forged");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{2028}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{2028}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     {
         const line = badIdLine(&buf, "spark1\u{202e}gnp");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{202e}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{202e}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     {
         const line = badIdLine(&buf, "spark1\u{200b}");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{200b}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{200b}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     {
         const line = badIdLine(&buf, "spark1\u{ad}");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{ad}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{ad}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     {
         const line = badIdLine(&buf, "spark1\u{e0100}");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{e0100}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{e0100}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     // A printable but invalid id (quote) still names itself verbatim, so the
     // operator sees which value was refused.
     {
         const line = badIdLine(&buf, "a\"b");
-        try std.testing.expect(std.mem.indexOf(u8, line, "--id \"a\"b\":") != null);
+        try std.testing.expect(std.mem.find(u8, line, "--id \"a\"b\":") != null);
     }
     // An id that cannot fit the staging buffer degrades to the generic line:
     // the refusal stays unconditional either way.
@@ -2307,41 +2307,41 @@ test "unknownEnvLine renders refused names through the displayName echo gate" {
     var buf: [512]u8 = undefined;
     {
         const line = unknownEnvLine(&buf, "MODELFS_\x1b]0;pwned\x07");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\x1b") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\x1b") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     // The UTF-8 C1 spellings get the same withholding as their raw C0
     // counterparts.
     {
         const line = unknownEnvLine(&buf, "MODELFS_\xc2\x9d0;pwned\xc2\x9c");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\xc2\x9d") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\xc2\x9d") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     {
         const line = unknownEnvLine(&buf, "MODELFS_\u{2028}ERROR");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{2028}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{2028}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     {
         const line = unknownEnvLine(&buf, "MODELFS_\u{200b}X");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{200b}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{200b}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     {
         const line = unknownEnvLine(&buf, "MODELFS_\u{ad}X");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{ad}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{ad}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     {
         const line = unknownEnvLine(&buf, "MODELFS_\u{e0100}X");
-        try std.testing.expect(std.mem.indexOf(u8, line, "\u{e0100}") == null);
-        try std.testing.expect(std.mem.indexOf(u8, line, "<name withheld: control bytes>") != null);
+        try std.testing.expect(std.mem.find(u8, line, "\u{e0100}") == null);
+        try std.testing.expect(std.mem.find(u8, line, "<name withheld: control bytes>") != null);
     }
     // A printable misspelling still names itself verbatim, so the operator
     // sees which variable was refused.
     {
         const line = unknownEnvLine(&buf, "MODELFS_CACHEE");
-        try std.testing.expect(std.mem.indexOf(u8, line, "unknown environment variable MODELFS_CACHEE") != null);
+        try std.testing.expect(std.mem.find(u8, line, "unknown environment variable MODELFS_CACHEE") != null);
     }
     // A name that cannot fit the staging buffer degrades to the generic
     // line: the refusal stays unconditional either way.
@@ -2508,7 +2508,7 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
         captured_stderr = &err;
         defer captured_stderr = null;
         try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
-        try std.testing.expect(std.mem.indexOf(u8, err.items, "not running") != null);
+        try std.testing.expect(std.mem.find(u8, err.items, "not running") != null);
     }
 
     {
@@ -2519,8 +2519,8 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
         captured_stderr = &err;
         defer captured_stderr = null;
         try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
-        try std.testing.expect(std.mem.indexOf(u8, err.items, "not running") != null);
-        try std.testing.expect(std.mem.indexOf(u8, err.items, "exited pid") != null);
+        try std.testing.expect(std.mem.find(u8, err.items, "not running") != null);
+        try std.testing.expect(std.mem.find(u8, err.items, "exited pid") != null);
     }
 
     {
@@ -2532,8 +2532,8 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
         captured_stderr = &err;
         defer captured_stderr = null;
         try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
-        try std.testing.expect(std.mem.indexOf(u8, err.items, "not serving") != null);
-        try std.testing.expect(std.mem.indexOf(u8, err.items, "stale") != null);
+        try std.testing.expect(std.mem.find(u8, err.items, "not serving") != null);
+        try std.testing.expect(std.mem.find(u8, err.items, "stale") != null);
     }
 
     const script = try std.fmt.allocPrint(gpa,
@@ -2581,13 +2581,13 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
     captured_stdout = &out;
     defer captured_stdout = null;
     try std.testing.expectEqual(@as(u8, 0), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "updated pid") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "updated pid") != null);
     var reqp: [192]u8 = undefined;
     const req_path = try std.fmt.bufPrint(&reqp, "{s}/{s}", .{ cache_d, handover.req_file });
     const req_blob = try sys.readFileAlloc(gpa, try sys.toZ(&zbuf, req_path), 4096);
     defer gpa.free(req_blob);
-    try std.testing.expect(std.mem.indexOf(u8, req_blob, "\"bin\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req_blob, "\"token\"") != null);
+    try std.testing.expect(std.mem.find(u8, req_blob, "\"bin\"") != null);
+    try std.testing.expect(std.mem.find(u8, req_blob, "\"token\"") != null);
 }
 
 const seed_status_live = fuzzcorpus.entry("{\"id\":\"me\",\"pid\":1,\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"now_s\":1710000060,\"mono_s\":100,\"stats\":{}}\n");
@@ -2717,9 +2717,9 @@ test "cmdPeers separates unreachable origins from empty clusters" {
         captured_stdout = &out;
         defer captured_stdout = null;
         try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
-        try std.testing.expect(std.mem.indexOf(u8, out.items, "no cluster leases") != null);
-        try std.testing.expect(std.mem.indexOf(u8, out.items, discover.cluster_dir) != null);
-        try std.testing.expect(std.mem.indexOf(u8, out.items, "spark") == null);
+        try std.testing.expect(std.mem.find(u8, out.items, "no cluster leases") != null);
+        try std.testing.expect(std.mem.find(u8, out.items, discover.cluster_dir) != null);
+        try std.testing.expect(std.mem.find(u8, out.items, "spark") == null);
     }
 
     // A typo'd/unreachable path must not read as "no leases": same exit-1
@@ -3249,7 +3249,7 @@ test "cmdDupes reports manifest overlap and gates its paths" {
     captured_stdout = &out;
     defer captured_stdout = null;
     try std.testing.expectEqual(@as(u8, 0), try cmdDupes(std.testing.io, gpa, opts, &.{"missing.bin"}));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "no manifests to compare") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "no manifests to compare") != null);
     // Path gates match verify's; a missing origin is a usage error.
     try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{"../escape.bin"}));
     try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{".cluster/spark1.json"}));
@@ -3302,10 +3302,10 @@ test "cmdDupesAll scans the manifest store and --all is dupes-only" {
     defer captured_stdout = null;
     try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, opts));
     const report = out.items;
-    try std.testing.expect(std.mem.indexOf(u8, report, "scanned 3 manifest(s), 6 piece(s) total") != null);
-    try std.testing.expect(std.mem.indexOf(u8, report, "byte-identical pairs: 1") != null);
+    try std.testing.expect(std.mem.find(u8, report, "scanned 3 manifest(s), 6 piece(s) total") != null);
+    try std.testing.expect(std.mem.find(u8, report, "byte-identical pairs: 1") != null);
     // a-b (identical + shared), a-c (shared), b-c (shared) = 3 shared pairs.
-    try std.testing.expect(std.mem.indexOf(u8, report, "pairs sharing any digest: 3") != null);
+    try std.testing.expect(std.mem.find(u8, report, "pairs sharing any digest: 3") != null);
 
     // A missing manifests dir is an empty scan, not an error.
     var nb: [128]u8 = undefined;
@@ -3313,7 +3313,7 @@ test "cmdDupesAll scans the manifest store and --all is dupes-only" {
     defer sys.deleteTree(std.testing.io, empty_origin);
     out.clearRetainingCapacity();
     try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, .{ .origin = empty_origin }));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "no manifests to compare") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "no manifests to compare") != null);
 
     // A regular file at origin/.cluster/manifests is unreadable, not an
     // empty scan: must fail instead of printing "no manifests to compare"
@@ -3365,8 +3365,8 @@ test "cmdDupesAll skips a control-byte manifest name and still scans the rest" {
     captured_stdout = &out;
     defer captured_stdout = null;
     try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, opts));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "scanned 1 manifest(s), 1 piece(s) total") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "forged") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "scanned 1 manifest(s), 1 piece(s) total") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "forged") == null);
 }
 
 fn freeParsed(p: anytype, gpa: std.mem.Allocator) void {
@@ -3790,7 +3790,7 @@ test "cmdPull names a bad repo, revision, or destination and never opens a socke
         // Exit 2, the usage code: these are all argument mistakes, and none
         // of them may cost a DNS lookup or a TLS handshake first.
         try std.testing.expectEqual(@as(u8, 2), try cmdPull(std.testing.io, gpa, &environ, case.opts, case.repo));
-        try std.testing.expect(std.mem.indexOf(u8, err.items, case.want) != null);
+        try std.testing.expect(std.mem.find(u8, err.items, case.want) != null);
     }
 }
 
@@ -3841,20 +3841,20 @@ test "classifyMeta answers help/version and refuses real extras" {
 test "usage lists exclusive dupes forms and interpolates the default port" {
     var buf: [usage.len + 16]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, usage, .{proto.default_port});
-    try std.testing.expect(std.mem.indexOf(u8, text, "modelfs update [--cache PATH]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "modelfs pull <owner/repo> --origin PATH") != null);
+    try std.testing.expect(std.mem.find(u8, text, "modelfs update [--cache PATH]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "modelfs pull <owner/repo> --origin PATH") != null);
     // The token has no flag on purpose; help has to say where it comes from
     // or the only documented way to reach a private repo is guesswork.
-    try std.testing.expect(std.mem.indexOf(u8, text, hf.token_env) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "modelfs dupes <relpath>... --origin PATH") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "modelfs dupes --all --origin PATH") != null);
+    try std.testing.expect(std.mem.find(u8, text, hf.token_env) != null);
+    try std.testing.expect(std.mem.find(u8, text, "modelfs dupes <relpath>... --origin PATH") != null);
+    try std.testing.expect(std.mem.find(u8, text, "modelfs dupes --all --origin PATH") != null);
     // Combined `[--all]` next to the path list implied `dupes a --all` was
     // legal; that combination is refused (exit 2).
-    try std.testing.expect(std.mem.indexOf(u8, text, "[--all]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Usage errors exit 2") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[--all]") == null);
+    try std.testing.expect(std.mem.find(u8, text, "Usage errors exit 2") != null);
     var port_buf: [8]u8 = undefined;
     const port = try std.fmt.bufPrint(&port_buf, "{d}", .{proto.default_port});
-    try std.testing.expect(std.mem.indexOf(u8, text, port) != null);
+    try std.testing.expect(std.mem.find(u8, text, port) != null);
 }
 
 test "splitFlag splits --name=VALUE and leaves short flags whole" {

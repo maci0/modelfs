@@ -3595,7 +3595,7 @@ test "manifestsDirPath and manifestPath join under origin/.cluster/manifests" {
     const p = try st.manifestPath(&buf, "a.bin");
     const span = std.mem.span(p);
     try std.testing.expect(std.mem.startsWith(u8, span, "/o/.cluster/manifests/"));
-    try std.testing.expect(std.mem.indexOf(u8, span, "a.bin") == null);
+    try std.testing.expect(std.mem.find(u8, span, "a.bin") == null);
 }
 
 test "sidecarPieceSize reads the cache meta header and ignores a missing sidecar" {
@@ -5561,9 +5561,9 @@ test "walkData never samples or descends planted symlinks" {
         if (std.mem.eql(u8, got, "real.bin")) saw_real = true;
         if (std.mem.eql(u8, got, "hidden/target.bin")) saw_hidden = true;
         // Neither link may appear, in sampled or traversed form.
-        try std.testing.expect(std.mem.indexOf(u8, got, "sneaky") == null);
-        try std.testing.expect(std.mem.indexOf(u8, got, "dirlink") == null);
-        try std.testing.expect(std.mem.indexOf(u8, got, "escaped") == null);
+        try std.testing.expect(std.mem.find(u8, got, "sneaky") == null);
+        try std.testing.expect(std.mem.find(u8, got, "dirlink") == null);
+        try std.testing.expect(std.mem.find(u8, got, "escaped") == null);
     }
     try std.testing.expect(saw_real and saw_hidden);
 }

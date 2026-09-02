@@ -2114,7 +2114,7 @@ fn fuzzParseV4One(_: void, smith: *std.testing.Smith) anyerror!void {
     const s = buf[0..smith.slice(&buf)];
     // inet_pton reads a C string and stops at the first NUL, so inputs
     // carrying one have no reference answer to differ against.
-    if (std.mem.indexOfScalar(u8, s, 0) != null) return;
+    if (std.mem.findScalar(u8, s, 0) != null) return;
 
     var quad: [4]u8 = undefined;
     const ours = parseV4(s, &quad);

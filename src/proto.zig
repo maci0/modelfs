@@ -591,12 +591,12 @@ test "url codec round-trips multi-byte UTF-8 names byte for byte" {
     const enc = try urlEncode(&ebuf, name);
     // Round-trip alone would still pass if reserved or high bytes rode
     // through unescaped; the wire form must be percent-encoded.
-    try std.testing.expect(std.mem.indexOf(u8, enc, " ") == null);
-    try std.testing.expect(std.mem.indexOf(u8, enc, "/") == null);
-    try std.testing.expect(std.mem.indexOf(u8, enc, "\xe6") == null);
-    try std.testing.expect(std.mem.indexOf(u8, enc, "%20") != null);
-    try std.testing.expect(std.mem.indexOf(u8, enc, "%2F") != null);
-    try std.testing.expect(std.mem.indexOf(u8, enc, "%E6") != null);
+    try std.testing.expect(std.mem.find(u8, enc, " ") == null);
+    try std.testing.expect(std.mem.find(u8, enc, "/") == null);
+    try std.testing.expect(std.mem.find(u8, enc, "\xe6") == null);
+    try std.testing.expect(std.mem.find(u8, enc, "%20") != null);
+    try std.testing.expect(std.mem.find(u8, enc, "%2F") != null);
+    try std.testing.expect(std.mem.find(u8, enc, "%E6") != null);
     try std.testing.expectEqualStrings(name, try urlDecode(&dbuf, enc));
 }
 
@@ -611,11 +611,11 @@ test "url codec round-trips bytes that are not valid UTF-8" {
     const enc = try urlEncode(&ebuf, name);
     // A pass-through encoder still round-trips; the encoded form must not
     // contain the raw high bytes or the space.
-    try std.testing.expect(std.mem.indexOf(u8, enc, " ") == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, enc, 0xff) == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, enc, 0xfe) == null);
-    try std.testing.expect(std.mem.indexOf(u8, enc, "%FF") != null);
-    try std.testing.expect(std.mem.indexOf(u8, enc, "%FE") != null);
+    try std.testing.expect(std.mem.find(u8, enc, " ") == null);
+    try std.testing.expect(std.mem.findScalar(u8, enc, 0xff) == null);
+    try std.testing.expect(std.mem.findScalar(u8, enc, 0xfe) == null);
+    try std.testing.expect(std.mem.find(u8, enc, "%FF") != null);
+    try std.testing.expect(std.mem.find(u8, enc, "%FE") != null);
     try std.testing.expectEqualStrings(name, try urlDecode(&dbuf, enc));
 }
 
@@ -1011,10 +1011,10 @@ fn refHeaderGet(head: []const u8, name: []const u8) ?[]const u8 {
     // Manual offset walk instead of splitSequence: skip the status/request
     // line, then scan lines until the blank terminator, honoring exact-name
     // case-insensitive matches and space/tab-only OWS trimming.
-    const first_end = std.mem.indexOf(u8, head, "\r\n") orelse return null;
+    const first_end = std.mem.find(u8, head, "\r\n") orelse return null;
     var pos: usize = first_end + 2;
     while (pos <= head.len) {
-        const rel_end = std.mem.indexOf(u8, head[pos..], "\r\n") orelse head.len - pos;
+        const rel_end = std.mem.find(u8, head[pos..], "\r\n") orelse head.len - pos;
         const line = head[pos .. pos + rel_end];
         if (line.len == 0) return null;
         if (std.mem.findScalar(u8, line, ':')) |colon| {
@@ -1031,12 +1031,12 @@ fn refHeaderGet(head: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn refQueryGet(target: []const u8, key: []const u8) ?[]const u8 {
-    const q = std.mem.indexOfScalar(u8, target, '?') orelse return null;
+    const q = std.mem.findScalar(u8, target, '?') orelse return null;
     var rest = target[q + 1 ..];
     while (rest.len > 0) {
-        const amp = std.mem.indexOfScalar(u8, rest, '&') orelse rest.len;
+        const amp = std.mem.findScalar(u8, rest, '&') orelse rest.len;
         const pair = rest[0..amp];
-        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+        if (std.mem.findScalar(u8, pair, '=')) |eq| {
             if (eq == key.len and std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
         }
         if (amp == rest.len) break;
@@ -1062,7 +1062,7 @@ fn refParseRange(h: []const u8) ?Range {
     const prefix = "bytes=";
     if (!std.mem.startsWith(u8, s, prefix)) return null;
     const body = s[prefix.len..];
-    const dash = std.mem.indexOfScalar(u8, body, '-') orelse return null;
+    const dash = std.mem.findScalar(u8, body, '-') orelse return null;
     const start = refDigitsU64(body[0..dash]) orelse return null;
     const tail = body[dash + 1 ..];
     const end: u64 = if (tail.len == 0) std.math.maxInt(u64) else refDigitsU64(tail) orelse return null;
@@ -1075,9 +1075,9 @@ fn refParseContentRange(h: []const u8) ?ContentRange {
     const prefix = "bytes ";
     if (!std.mem.startsWith(u8, s, prefix)) return null;
     const body = s[prefix.len..];
-    const dash = std.mem.indexOfScalar(u8, body, '-') orelse return null;
+    const dash = std.mem.findScalar(u8, body, '-') orelse return null;
     const rest = body[dash + 1 ..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const slash = std.mem.findScalar(u8, rest, '/') orelse return null;
     const start = refDigitsU64(body[0..dash]) orelse return null;
     const end = refDigitsU64(rest[0..slash]) orelse return null;
     if (end < start) return null;
@@ -1291,7 +1291,7 @@ fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
     }
 
     {
-        const status_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+        const status_end = std.mem.find(u8, head, "\r\n") orelse head.len;
         const status_line = head[0..status_end];
         for ([_]u16{ 200, 206, 404 }) |code| {
             try std.testing.expectEqual(refHttpStatusIs(status_line, code), httpStatusIs(status_line, code));
@@ -1388,7 +1388,7 @@ fn fuzzExtractorsOne(_: void, smith: *std.testing.Smith) anyerror!void {
     // Drawn after the five framed slices so existing corpus entries keep
     // their field mapping; 200/206/404 already ran on the status line.
     {
-        const status_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
+        const status_end = std.mem.find(u8, head, "\r\n") orelse head.len;
         const drawn: u16 = @truncate(smith.value(u64));
         try std.testing.expectEqual(refHttpStatusIs(head[0..status_end], drawn), httpStatusIs(head[0..status_end], drawn));
     }

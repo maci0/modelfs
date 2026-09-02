@@ -6,32 +6,34 @@
 | Scope | `src/`, `build.zig`, `build.zig.zon` against the Zig 0.16.0 release notes |
 | Pinned toolchain | `minimum_zig_version = "0.16.0"` |
 | Date | 2026-09-02, against `v0.7.0` (`f28e89b`) |
-| Result | 1 P2, deferred as its own scoped change. No P0 or P1 |
+| Result | 1 P2, fixed in a follow-up pass on 2026-09-03. No P0 or P1 |
 
 ## Findings
 
 | # | Changelog item | Status | Sev | Outcome |
 |---|---|---|---|---|
-| 1 | `mem: rename "index of" to "find"` | Both spellings live side by side | P2 | **Deferred** |
+| 1 | `mem: rename "index of" to "find"` | Both spellings lived side by side | P2 | **Fixed** 2026-09-03 |
 
-### 1. `std.mem.find*` and `std.mem.indexOf*` are both in use
+### 1. `std.mem.find*` and `std.mem.indexOf*` were both in use (fixed 2026-09-03)
 
-Measured 2026-09-02 across `src/`:
+The stdlib marks the old spellings "Deprecated in favor of" and keeps them as plain aliases
+(`pub const indexOf = find;`), so mixed use compiled and could not diverge in behavior. It was
+readability, and it was getting worse rather than better: the modules `v0.7.0` added used the
+old spelling in three of their four call sites, because the surrounding code did.
 
-| Spelling | Call sites | Where the bulk sits |
+Measured before, on 2026-09-02:
+
+| Spelling | Call sites | Where the bulk sat |
 |---|---|---|
 | `std.mem.find*` (0.16) | 31 | `peer.zig` 16, `proto.zig` 8 |
-| `std.mem.indexOf*` / `lastIndexOf*` | 111 | `main.zig` 57, `peer.zig` 19, `proto.zig` 21 |
+| `std.mem.indexOf*` / `lastIndexOf*` (deprecated) | 111 | `main.zig` 57, `proto.zig` 21, `peer.zig` 19 |
 
-Both families exist in the 0.16 stdlib and behave identically, so this compiles and cannot
-diverge: it is readability, not a defect. That is also why it is not fixed here. A tree-wide
-rename touches 111 call sites across nine files, well past the guide's 200-line single-file
-budget, and mixing it into another finding's diff would bury both. It wants one scoped change
-with `./scripts/check.sh` run against it alone.
+The mapping is one-to-one and total, which is what made a mechanical rename safe:
+`indexOf` to `find` (92 sites), `indexOfScalar` to `findScalar` (18), `lastIndexOfScalar` to
+`findScalarLast` (1). After: 142 `find*` call sites, no deprecated ones. The compiler and the
+353-test suite are the check that nothing was renamed into the wrong function.
 
-Worth noting the drift is getting worse rather than better: the modules `v0.7.0` added
-(`handover.zig`, `hf.zig`) use the old spelling in three of their four call sites, because the
-surrounding code does.
+Done as its own change rather than folded into another finding, per the guide.
 
 ## Checked and clean
 

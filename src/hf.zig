@@ -52,7 +52,7 @@ fn idOk(s: []const u8, max: usize, extra: []const u8) bool {
     if (s.len == 0 or s.len > max) return false;
     for (s) |ch| {
         if (unreserved(ch)) continue;
-        if (std.mem.indexOfScalar(u8, extra, ch) != null) continue;
+        if (std.mem.findScalar(u8, extra, ch) != null) continue;
         return false;
     }
     return true;
@@ -73,8 +73,8 @@ fn segmentsOk(s: []const u8) bool {
 pub fn repoOk(repo: []const u8) bool {
     if (!idOk(repo, max_repo_bytes, "/")) return false;
     if (!segmentsOk(repo)) return false;
-    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return false;
-    return std.mem.lastIndexOfScalar(u8, repo, '/').? == slash;
+    const slash = std.mem.findScalar(u8, repo, '/') orelse return false;
+    return std.mem.findScalarLast(u8, repo, '/').? == slash;
 }
 
 /// A branch, a tag, or a commit sha. Branches may hold '/'.

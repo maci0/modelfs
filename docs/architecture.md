@@ -162,10 +162,16 @@ Marks are only trusted while they provably describe the object currently at the 
 ### Reads
 
 `read` (`fileForRead` in src/fuse_fs.zig) uses a live cache entry without restatting the
-origin: `open` and `getattr` already sampled it, and a getattr on every 128 KiB FUSE read would
+origin: `open` and `getattr` already sampled it, and a getattr on every FUSE read would
 make the warm NVMe path pay NFS. Size changes through the mount update the entry in place, and
 an external origin rewrite becomes visible on the next open (NFS close-to-open). A cold read,
 with no live entry, still stats the origin.
+
+The reply buffer comes from a fixed pool (`claimReadBuf`), not the allocator: the kernel asks
+for at most `max_pages * PAGE_SIZE`, which libfuse caps at 1 MiB, so a slot that size never
+forces a short reply. There are `read_slots` (16, the same bound `peer.Server.max_inflight`
+uses), filled on first use so an idle mount holds none and a single reader holds one. A burst
+past the last slot falls back to the allocator rather than blocking a reader.
 
 ### Hidden and refused names
 

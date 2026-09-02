@@ -409,7 +409,7 @@ test "handover encode/decode round-trips knobs and keeps the PSK off argv" {
     // The whole point of the memfd: /proc/<pid>/cmdline is world-readable.
     var w: usize = 0;
     while (argv_z[w]) |word| : (w += 1) {
-        try std.testing.expect(std.mem.indexOf(u8, std.mem.span(word), psk) == null);
+        try std.testing.expect(std.mem.find(u8, std.mem.span(word), psk) == null);
     }
 
     const fd = try writeStateFd(blob);

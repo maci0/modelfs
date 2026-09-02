@@ -42,14 +42,15 @@ listening, refuses one carrying `SO_REUSEPORT`, and re-arms CLOEXEC so a later `
 helper cannot inherit the port. There is a regression test that a second bind against a live
 port still fails loudly rather than silently splitting connections.
 
-## Observation, not a finding
+## Observation, since closed
 
-`ll_read`'s ENOMEM path replies without moving a counter, because the allocation fails before
-`mf_read` runs and `reads_err` is incremented inside it. In practice a failed allocation of a
-read-sized buffer means the process is already out of memory and the tick line will be the least
-of the operator's problems. Recorded because the guide's rule is that every failure branch moves
-something, and this one does not; it is bundled with the `ll_read` allocation finding in the
-[idiom review](ZIG_IDIOM_REVIEW.md), since removing the allocation removes this branch too.
+`ll_read`'s ENOMEM path replied without moving a counter, because the allocation failed before
+`mf_read` ran and `reads_err` is incremented inside it. The guide's rule is that every failure
+branch moves something, and this one did not.
+
+Closed on 2026-09-03 by the read-buffer pool: the branch now increments `reads_err`, and the
+allocation it guarded only happens on the documented fallback past the last pool slot. See the
+[idiom review](ZIG_IDIOM_REVIEW.md).
 
 ## Suites run
 

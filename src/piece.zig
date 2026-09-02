@@ -788,9 +788,9 @@ test "manifestName is flat, fixed-length, and deterministic" {
     try std.testing.expectEqual(@as(usize, 64), a.len);
     // No slash or dot can survive the mapping: the name stays flat under
     // .cluster/manifests/ and never collides with lease names.
-    try std.testing.expect(std.mem.indexOfScalar(u8, a, '/') == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, a, '.') == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, a, 'a') != null);
+    try std.testing.expect(std.mem.findScalar(u8, a, '/') == null);
+    try std.testing.expect(std.mem.findScalar(u8, a, '.') == null);
+    try std.testing.expect(std.mem.findScalar(u8, a, 'a') != null);
 }
 
 test "tailValidBits survives the max-clamped final word" {

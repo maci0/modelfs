@@ -62,6 +62,12 @@ pub const State = struct {
     next_fh: u64 = 1,
     /// Handshake token from `update.req`, acked once the new image serves.
     update_token: ?[]const u8 = null,
+    /// Reply buffers for FUSE reads, claimed per request (`claimReadBuf`)
+    /// so the read path never allocates. `read_taken` is the claim bitmask;
+    /// a set bit means the matching `read_bufs` slot is owned by one
+    /// handler, which is what lets the lazy fill below be race-free.
+    read_taken: std.atomic.Value(u16) = .init(0),
+    read_bufs: [read_slots]?[]u8 = @splat(null),
 
     /// `path` is owned here and aliased as the `paths` key.
     const Node = struct { path: []u8, nlookup: u64 };
@@ -175,6 +181,9 @@ pub const State = struct {
         var o_it = self.opens.iterator();
         while (o_it.next()) |e| self.gpa.free(e.value_ptr.*);
         self.opens.deinit(self.gpa);
+        for (self.read_bufs) |slot| {
+            if (slot) |b| self.gpa.free(b);
+        }
         if (self.update_token) |t| self.gpa.free(t);
     }
 };
@@ -514,8 +523,8 @@ test "readdir omits names relOk would refuse" {
     for (got.items) |n| {
         try std.testing.expect(store_mod.relOk(n));
         try std.testing.expect(!std.mem.eql(u8, n, discover.cluster_dir));
-        try std.testing.expect(std.mem.indexOfScalar(u8, n, '\n') == null);
-        try std.testing.expect(std.mem.indexOf(u8, n, "\u{200b}") == null);
+        try std.testing.expect(std.mem.findScalar(u8, n, '\n') == null);
+        try std.testing.expect(std.mem.find(u8, n, "\u{200b}") == null);
         if (std.mem.eql(u8, n, "ok.bin")) seen_ok = true;
         if (std.mem.eql(u8, n, "caf\u{e9}.bin")) seen_nfc = true;
         if (std.mem.eql(u8, n, "cafe\u{301}.bin")) seen_nfd = true;
@@ -1932,6 +1941,66 @@ export fn ll_create(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]con
     _ = fuse.fuse_reply_create(req, &e, fi);
 }
 
+/// One FUSE read reply buffer. The kernel asks for at most
+/// `max_pages * PAGE_SIZE`, which libfuse caps at 1 MiB on the default
+/// negotiation; measured against this tree, a `direct_io` read arrives as
+/// exactly 1 MiB and a page-cache read at 512 KiB or less. A slot that size
+/// therefore never forces a short reply, which on the page-cache path the
+/// kernel would read as a hole.
+const read_slot_bytes: usize = 1 << 20;
+
+/// Mirrors `peer.Server.max_inflight`, the concurrency this daemon already
+/// bounds on its other serving path. Slots fill on first use, so an idle
+/// mount holds no buffers and a single reader holds one; a burst past the
+/// last slot falls back to the allocator rather than blocking a reader.
+const read_slots: usize = 16;
+
+comptime {
+    // `State.read_taken` is the claim bitmask, so the pool cannot outgrow
+    // its bits. Compile time, because the shift would otherwise be a safe
+    // -build panic on the read path and a silent wrap in ReleaseFast.
+    const Mask = @typeInfo(@FieldType(State, "read_taken")).@"struct".fields[0].type;
+    std.debug.assert(read_slots <= @bitSizeOf(Mask));
+}
+
+const ReadBuf = struct {
+    st: *State,
+    /// Null when this buffer came from the allocator, not a slot.
+    slot: ?usize,
+    bytes: []u8,
+
+    fn release(self: ReadBuf) void {
+        const slot = self.slot orelse {
+            self.st.gpa.free(self.bytes);
+            return;
+        };
+        _ = self.st.read_taken.fetchAnd(~(@as(u16, 1) << @intCast(slot)), .release);
+    }
+};
+
+/// A buffer of exactly `want` bytes, from a slot when one fits and is free.
+/// Null only when the fallback allocation also fails.
+fn claimReadBuf(st: *State, want: usize) ?ReadBuf {
+    if (want <= read_slot_bytes) {
+        for (0..read_slots) |i| {
+            const bit = @as(u16, 1) << @intCast(i);
+            // The fetchOr is the claim: the thread that observes the bit
+            // clear owns the slot until it releases, so the lazy fill below
+            // cannot race another handler.
+            if (st.read_taken.fetchOr(bit, .acq_rel) & bit != 0) continue;
+            if (st.read_bufs[i] == null) {
+                st.read_bufs[i] = st.gpa.alloc(u8, read_slot_bytes) catch {
+                    _ = st.read_taken.fetchAnd(~bit, .release);
+                    break;
+                };
+            }
+            return .{ .st = st, .slot = i, .bytes = st.read_bufs[i].?[0..want] };
+        }
+    }
+    const heap = st.gpa.alloc(u8, want) catch return null;
+    return .{ .st = st, .slot = null, .bytes = heap };
+}
+
 export fn ll_read(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
     const st = llEnter(req);
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
@@ -1939,15 +2008,17 @@ export fn ll_read(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, size: usize, off: 
     var zbuf: [sys.c.PATH_MAX]u8 = undefined;
     const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
     const want = @min(size, @as(usize, std.math.maxInt(c_int)));
-    // One buffer per read request, sized by the kernel's ask. libfuse's
-    // high-level layer did the same malloc on this path; the no-hot-path
-    // -allocation rule covers piece hydration and request parsing, which
-    // still run on stack or on the one reusable piece buffer.
-    const buf = st.gpa.alloc(u8, want) catch return replyErr(req, sys.c.ENOMEM);
-    defer st.gpa.free(buf);
-    const n = mf_read(z, buf.ptr, want, off, fi);
+    const buf = claimReadBuf(st, want) orelse {
+        // Counted like any other service-side read failure, so a mount
+        // dropping reads under memory pressure moves the tick line rather
+        // than failing silently.
+        _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
+        return replyErr(req, sys.c.ENOMEM);
+    };
+    defer buf.release();
+    const n = mf_read(z, buf.bytes.ptr, want, off, fi);
     if (n < 0) return replyErr(req, n);
-    _ = fuse.fuse_reply_buf(req, buf.ptr, @intCast(n));
+    _ = fuse.fuse_reply_buf(req, buf.bytes.ptr, @intCast(n));
 }
 
 export fn ll_write(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, buf: [*c]const u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
@@ -2516,6 +2587,56 @@ fn freeTables(st: *State) void {
     var o = st.opens.iterator();
     while (o.next()) |e| st.gpa.free(e.value_ptr.*);
     st.opens.deinit(st.gpa);
+}
+
+test "read buffers come from slots, are reused, and fall back past the last one" {
+    const gpa = std.testing.allocator;
+    var st = tableFixture(gpa);
+    defer {
+        for (st.read_bufs) |slot| {
+            if (slot) |b| gpa.free(b);
+        }
+        freeTables(&st);
+    }
+
+    // A slot is claimed exclusively and handed back, so the same read size
+    // twice in a row costs one allocation, not two.
+    const first = claimReadBuf(&st, 4096).?;
+    try std.testing.expectEqual(@as(?usize, 0), first.slot);
+    try std.testing.expectEqual(@as(usize, 4096), first.bytes.len);
+    first.release();
+    const again = claimReadBuf(&st, 8192).?;
+    try std.testing.expectEqual(@as(?usize, 0), again.slot);
+    try std.testing.expectEqual(@as(usize, 8192), again.bytes.len);
+
+    // Concurrent readers take distinct slots; the whole pool is usable.
+    var held: [read_slots]ReadBuf = undefined;
+    held[0] = again;
+    for (1..read_slots) |i| {
+        held[i] = claimReadBuf(&st, read_slot_bytes).?;
+        try std.testing.expectEqual(@as(?usize, i), held[i].slot);
+    }
+
+    // Past the last slot a reader still gets a buffer, from the allocator,
+    // rather than blocking or replying short.
+    const overflow = claimReadBuf(&st, 4096).?;
+    try std.testing.expectEqual(@as(?usize, null), overflow.slot);
+    try std.testing.expectEqual(@as(usize, 4096), overflow.bytes.len);
+    overflow.release();
+
+    // A request larger than a slot skips the pool entirely: a slot-sized
+    // reply would be short, which the page-cache path reads as a hole.
+    const huge = claimReadBuf(&st, read_slot_bytes + 1).?;
+    try std.testing.expectEqual(@as(?usize, null), huge.slot);
+    try std.testing.expectEqual(read_slot_bytes + 1, huge.bytes.len);
+    huge.release();
+
+    // Releasing frees the bit, not the buffer, so the next claim reuses it.
+    for (held) |h| h.release();
+    try std.testing.expectEqual(@as(u16, 0), st.read_taken.load(.acquire));
+    const reused = claimReadBuf(&st, 16).?;
+    try std.testing.expectEqual(@as(?usize, 0), reused.slot);
+    reused.release();
 }
 
 test "childPath joins under the root without doubling the slash" {

@@ -2181,7 +2181,7 @@ test "readHeadFullDeadline expires an injected budget without waiting real time"
 test "haveFromHeadDeadline pairs refusal at an expired budget with success at a live one" {
     const gpa = std.testing.allocator;
     const wire = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nok";
-    const head_len = std.mem.indexOf(u8, wire, "\r\n\r\n").? + 4;
+    const head_len = std.mem.find(u8, wire, "\r\n\r\n").? + 4;
     // Drains exactly the head bytes off the socket, leaving only the bitmap
     // body staged -- the state fetchHave hands to this function.
     const drainHead = struct {
@@ -3123,7 +3123,7 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         var res = try roundTrip(port, "GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 200 OK\r\n"));
-        try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Type: text/plain\r\n") != null);
+        try std.testing.expect(std.mem.find(u8, res.items, "Content-Type: text/plain\r\n") != null);
         try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\nok"));
         // /ping is liveness, not a piece transfer: it must not inflate http_ok
         // or http_nanos (a health-check poll must not fire an idle tick).
@@ -3136,7 +3136,7 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         var res = try roundTrip(port, "POST /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 405 Method Not Allowed\r\n"));
-        try std.testing.expect(std.mem.indexOf(u8, res.items, "Allow: GET\r\n") != null);
+        try std.testing.expect(std.mem.find(u8, res.items, "Allow: GET\r\n") != null);
         try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_405.load(.monotonic));
         try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
         try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_unauthorized.load(.monotonic));
@@ -3152,7 +3152,7 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         var res = try roundTrip(port, "FOO\nforged GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 405 Method Not Allowed\r\n"));
-        try std.testing.expect(std.mem.indexOf(u8, res.items, "Allow: GET\r\n") != null);
+        try std.testing.expect(std.mem.find(u8, res.items, "Allow: GET\r\n") != null);
         try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_405.load(.monotonic));
     }
     // A missing bearer token is a 401 that names the scheme to retry with
@@ -3167,11 +3167,11 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         var res = try roundTrip(port, "GET /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 401 Unauthorized\r\n"));
-        try std.testing.expect(std.mem.indexOf(u8, res.items, "WWW-Authenticate: Bearer\r\n") != null);
+        try std.testing.expect(std.mem.find(u8, res.items, "WWW-Authenticate: Bearer\r\n") != null);
         var post = try roundTrip(port, "POST /ping HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
         defer post.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, post.items, "HTTP/1.1 401 Unauthorized\r\n"));
-        try std.testing.expect(std.mem.indexOf(u8, post.items, "Allow: GET") == null);
+        try std.testing.expect(std.mem.find(u8, post.items, "Allow: GET") == null);
         // Auth runs before the method gate: both missing-bearer requests
         // count as 401, and the earlier 405s (POST, then the CR/LF method)
         // must not move.
@@ -3234,7 +3234,7 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
             var res = try roundTrip(port, "GET /data?path=r.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-3\r\nConnection: close\r\n\r\n");
             defer res.deinit(gpa);
             try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 206 Partial Content\r\n"));
-            try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Type: application/octet-stream\r\n") != null);
+            try std.testing.expect(std.mem.find(u8, res.items, "Content-Type: application/octet-stream\r\n") != null);
             try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\ndata"));
             // Dual of /ping above: a data-plane 206 must count in http_ok
             // and http_nanos, or ping's zeros would still pass if every
@@ -3666,7 +3666,7 @@ test "serveData refuses ranges starting past EOF with 416" {
     var res = try roundTrip(port, "GET /data?path=tiny.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=3-9\r\nConnection: close\r\n\r\n");
     defer res.deinit(gpa);
     try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 416 Range Not Satisfiable\r\n"));
-    try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Range: bytes */3\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, res.items, "Content-Range: bytes */3\r\n") != null);
 }
 
 test "fillFromPeers probes concurrently and streams piece into out" {
@@ -4126,12 +4126,12 @@ fn refHttpStatusIs(status_line: []const u8, code: u16) bool {
 /// end], and Content-Length (missing reads as 0) must equal the selected
 /// window size.
 fn refCheckRangeReply(head: []const u8, start: u64, end: u64) !void {
-    const status_end = std.mem.indexOf(u8, head, "\r\n") orelse return error.BadHttp;
+    const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     if (!refHttpStatusIs(head[0..status_end], 206)) return error.HttpStatus;
     const cr = blk: {
         var pos: usize = status_end + 2;
         while (pos <= head.len) {
-            const rel_end = std.mem.indexOf(u8, head[pos..], "\r\n") orelse head.len - pos;
+            const rel_end = std.mem.find(u8, head[pos..], "\r\n") orelse head.len - pos;
             const line = head[pos .. pos + rel_end];
             if (line.len == 0) break;
             if (std.mem.findScalar(u8, line, ':')) |colon| {
@@ -4150,9 +4150,9 @@ fn refCheckRangeReply(head: []const u8, start: u64, end: u64) !void {
     const prefix = "bytes ";
     if (!std.mem.startsWith(u8, s, prefix)) return error.BadContentRange;
     const body = s[prefix.len..];
-    const dash = std.mem.indexOfScalar(u8, body, '-') orelse return error.BadContentRange;
+    const dash = std.mem.findScalar(u8, body, '-') orelse return error.BadContentRange;
     const rest = body[dash + 1 ..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.BadContentRange;
+    const slash = std.mem.findScalar(u8, rest, '/') orelse return error.BadContentRange;
     const a = refDigitsU64(body[0..dash]) orelse return error.BadContentRange;
     const b = refDigitsU64(rest[0..slash]) orelse return error.BadContentRange;
     if (b < a) return error.BadContentRange;
@@ -4164,7 +4164,7 @@ fn refCheckRangeReply(head: []const u8, start: u64, end: u64) !void {
     const cl_str = blk: {
         var pos: usize = status_end + 2;
         while (pos <= head.len) {
-            const rel_end = std.mem.indexOf(u8, head[pos..], "\r\n") orelse head.len - pos;
+            const rel_end = std.mem.find(u8, head[pos..], "\r\n") orelse head.len - pos;
             const line = head[pos .. pos + rel_end];
             if (line.len == 0) break;
             if (std.mem.findScalar(u8, line, ':')) |colon| {
@@ -4617,7 +4617,7 @@ fn serveConnCheck(head: []const u8) anyerror!void {
     }
     try std.testing.expect(got.len > 0);
     // Header block must terminate before any body bytes (/ping's "ok").
-    try std.testing.expect(std.mem.indexOf(u8, got, "\r\n\r\n") != null);
+    try std.testing.expect(std.mem.find(u8, got, "\r\n\r\n") != null);
     switch (want) {
         .dropped => unreachable,
         .method_not_allowed => try std.testing.expectEqualStrings(
@@ -4897,7 +4897,7 @@ fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
         return;
     }
     try std.testing.expect(got.len > 0);
-    const body_at = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.NoHeaderEnd;
+    const body_at = std.mem.find(u8, got, "\r\n\r\n") orelse return error.NoHeaderEnd;
     const rep_head = got[0..body_at];
     const body = got[body_at + 4 ..];
 
@@ -5122,7 +5122,7 @@ fn serveDataCheckOk(srv: *Server, head: []const u8) !i32 {
     var rbuf: [4096]u8 = undefined;
     const got = try stageRequest(srv, head, &rbuf);
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 206 Partial Content\r\n"));
-    const body_at = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.NoHeaderEnd;
+    const body_at = std.mem.find(u8, got, "\r\n\r\n") orelse return error.NoHeaderEnd;
     const body = got[body_at + 4 ..];
     try std.testing.expectEqual(@as(usize, 16), body.len);
     try std.testing.expectEqualSlices(u8, data_pattern[0..16], body);
@@ -5147,7 +5147,7 @@ test "serveStage answers 501 without a staging backend and gates its params" {
     defer fixture.srv.store.releaseFile(f);
     try std.testing.expect(!fixture.srv.store.hasPiece(f, 0, 0));
     resp = try stageRequest(&fixture.srv, "GET /have?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Stage: 1") == null);
+    try std.testing.expect(std.mem.find(u8, resp, "X-Stage: 1") == null);
 
     // Param gates: missing/oversized piece, cluster path, wrong method,
     // no auth -- the same shape as /data's.
@@ -5184,7 +5184,7 @@ test "serveStage stages a verified piece and the backend read lands the bytes" {
     var resp_buf: [4096]u8 = undefined;
     var resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=1 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
-    const body_at = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoHeaderEnd;
+    const body_at = std.mem.find(u8, resp, "\r\n\r\n") orelse return error.NoHeaderEnd;
     const body = resp[body_at + 4 ..];
     try std.testing.expectEqual(@as(usize, rdma.window_len), body.len);
     const win = rdma.decodeWindow(body).?;
@@ -5194,7 +5194,7 @@ test "serveStage stages a verified piece and the backend read lands the bytes" {
     try std.testing.expectEqualSlices(u8, data_pattern[16..32], &out);
     // /have advertises the staged plane while the backend is available.
     resp = try stageRequest(&fixture.srv, "GET /have?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Stage: 1") != null);
+    try std.testing.expect(std.mem.find(u8, resp, "X-Stage: 1") != null);
 }
 
 test "serveStage refuses to stage a piece whose cached bytes fail verification" {
