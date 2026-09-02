@@ -38,7 +38,15 @@ echo "=== Test 1: Invalid PSK Auth Rejection ==="
 # would fail every modelfs invocation in the same shell.
 PEER_HOST="${MF_TEST_HOST:-127.0.0.1}"
 PEER_PORT="${MF_TEST_PORT:-19081}"
-python3 "${SCRIPTS_DIR}/peer_auth_probe.py" "${PEER_HOST}" "${PEER_PORT}"
+AUTH_OUT="$(python3 "${SCRIPTS_DIR}/peer_auth_probe.py" "${PEER_HOST}" "${PEER_PORT}")" || {
+    echo "Error: PSK auth probe failed"
+    exit 1
+}
+echo "${AUTH_OUT}"
+AUTH_SKIPPED=0
+if echo "${AUTH_OUT}" | grep -q '^SKIP:'; then
+    AUTH_SKIPPED=1
+fi
 
 echo "=== Test 2: Expired Cluster Lease Marking ==="
 # Write an expired lease file directly to .cluster, then require the peers
@@ -62,4 +70,8 @@ else
     exit 1
 fi
 
-echo "=== All Fault Tolerance Tests Passed Successfully ==="
+if [[ "${AUTH_SKIPPED}" -eq 1 ]]; then
+    echo "=== Fault tolerance: expired-lease passed; PSK auth skipped (no peer) ==="
+else
+    echo "=== All Fault Tolerance Tests Passed Successfully ==="
+fi

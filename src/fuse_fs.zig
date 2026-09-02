@@ -183,12 +183,19 @@ test "resolveRel denies cluster and traversal paths" {
     var rel: []const u8 = "";
     try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), resolveRel("/.cluster", -sys.c.ENOENT, &rel));
     try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), resolveRel("/.cluster/spark1.json", -sys.c.ENOENT, &rel));
+    // Mutation-shaped handlers pass EPERM: cluster stays hidden, and the
+    // errno is the caller's, not a hardcoded ENOENT.
+    try std.testing.expectEqual(@as(c_int, -sys.c.EPERM), resolveRel("/.cluster", -sys.c.EPERM, &rel));
+    try std.testing.expectEqual(@as(c_int, -sys.c.EPERM), resolveRel("/.cluster/spark1.json", -sys.c.EPERM, &rel));
     // Prefix, not substring: a model named .clusterfoo is not the lease dir.
     try std.testing.expectEqual(@as(c_int, 0), resolveRel("/.clusterfoo", -sys.c.ENOENT, &rel));
+    try std.testing.expectEqualStrings(".clusterfoo", rel);
+    try std.testing.expectEqual(@as(c_int, 0), resolveRel("/.clusterfoo", -sys.c.EPERM, &rel));
     try std.testing.expectEqualStrings(".clusterfoo", rel);
     try std.testing.expectEqual(@as(c_int, 0), resolveRel("/gguf/a.gguf", -sys.c.ENOENT, &rel));
     try std.testing.expectEqualStrings("gguf/a.gguf", rel);
     try std.testing.expectEqual(@as(c_int, -sys.c.EPERM), resolveRel("/../etc", -sys.c.ENOENT, &rel));
+    try std.testing.expectEqual(@as(c_int, -sys.c.EPERM), resolveRel("/../etc", -sys.c.EPERM, &rel));
 }
 
 test "relFromFuse rejects .." {
@@ -1593,6 +1600,8 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // carry live stats, not a frozen snapshot.
     _ = st.store.stats.fills_peer.fetchAdd(1, .monotonic);
     _ = st.store.stats.bytes_from_peer.fetchAdd(4096, .monotonic);
+    _ = st.store.stats.http_405.fetchAdd(3, .monotonic);
+    _ = st.store.stats.getattr_nanos.fetchAdd(2000, .monotonic);
     st.store.origin_io_down.store(true, .monotonic);
     try statusJson(&st);
     const blob2 = try sys.readFileAlloc(gpa, fp, 4096);
@@ -1603,6 +1612,10 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expectEqual(@as(u64, 1), doc2.value.stats.fills_peer);
     try std.testing.expectEqual(@as(u64, 4096), doc2.value.stats.bytes_from_peer);
     try std.testing.expectEqual(@as(i32, 1), doc2.value.origin_down);
+    // Snap fields default to 0, so a missing JSON key would still parse.
+    // These two must actually be in the published document.
+    try std.testing.expectEqual(@as(u64, 3), doc2.value.stats.http_405);
+    try std.testing.expectEqual(@as(u64, 2000), doc2.value.stats.getattr_nanos);
 
     // A leftover world-readable status.json (older daemon, or a 0644 tmp
     // that was renamed in) is tightened on the next publish: O_CREAT's
@@ -1687,6 +1700,15 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
     try std.testing.expectEqual(@as(u64, 4096), prev.bytes_from_origin);
     try std.testing.expectEqual(@as(u64, 1), prev.http_ok);
     try std.testing.expectEqual(@as(u64, 1000), prev.http_nanos);
+
+    // Metadata-only and 405-only intervals must still advance prev: they
+    // are Snap fields, so a tick that only moved those cannot leave the
+    // snapshot behind (the next real increment would then look like 0).
+    _ = st.store.stats.getattr_nanos.fetchAdd(2000, .monotonic);
+    _ = st.store.stats.http_405.fetchAdd(2, .monotonic);
+    logStatsTick(&st, &prev);
+    try std.testing.expectEqual(@as(u64, 2000), prev.getattr_nanos);
+    try std.testing.expectEqual(@as(u64, 2), prev.http_405);
 }
 
 test "hydratePiece fails closed when write generation keeps discarding fills" {

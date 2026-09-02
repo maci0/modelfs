@@ -557,8 +557,14 @@ test "url codec round-trips multi-byte UTF-8 names byte for byte" {
     var ebuf: [128]u8 = undefined;
     var dbuf: [128]u8 = undefined;
     const enc = try urlEncode(&ebuf, name);
+    // Round-trip alone would still pass if reserved or high bytes rode
+    // through unescaped; the wire form must be percent-encoded.
     try std.testing.expect(std.mem.indexOf(u8, enc, " ") == null);
     try std.testing.expect(std.mem.indexOf(u8, enc, "/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, enc, "\xe6") == null);
+    try std.testing.expect(std.mem.indexOf(u8, enc, "%20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enc, "%2F") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enc, "%E6") != null);
     try std.testing.expectEqualStrings(name, try urlDecode(&dbuf, enc));
 }
 
@@ -571,6 +577,13 @@ test "url codec round-trips bytes that are not valid UTF-8" {
     var ebuf: [64]u8 = undefined;
     var dbuf: [64]u8 = undefined;
     const enc = try urlEncode(&ebuf, name);
+    // A pass-through encoder still round-trips; the encoded form must not
+    // contain the raw high bytes or the space.
+    try std.testing.expect(std.mem.indexOf(u8, enc, " ") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, enc, 0xff) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, enc, 0xfe) == null);
+    try std.testing.expect(std.mem.indexOf(u8, enc, "%FF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enc, "%FE") != null);
     try std.testing.expectEqualStrings(name, try urlDecode(&dbuf, enc));
 }
 

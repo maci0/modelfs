@@ -5600,7 +5600,8 @@ test "forget racing the last releaseFile cannot double-free" {
             }
         }
     }.run, .{ &st, &done });
-    defer forgetter.join();
+    var joined = false;
+    defer if (!joined) forgetter.join();
 
     var i: usize = 0;
     while (i < 100_000) : (i += 1) {
@@ -5608,6 +5609,13 @@ test "forget racing the last releaseFile cannot double-free" {
         st.releaseFile(f);
     }
     done.store(true, .release);
+    forgetter.join();
+    joined = true;
+    // The allocator abort is the double-free check; the store must still
+    // serve the path once the race has stopped.
+    const f = try st.get("race.bin", 64, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expectEqual(@as(u64, 64), f.size);
 }
 
 test "completeFill records the trusted digest; expectedHash and clearHashes obey" {

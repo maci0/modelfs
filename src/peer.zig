@@ -217,6 +217,18 @@ test "claimAuthWarn allows one line per gap window" {
     try std.testing.expect(!claimAuthWarn(&srv, 2_500));
 }
 
+test "claimMethodWarn allows one line per gap window" {
+    // Same window as 401: the counter stays exact, the journal is capped.
+    var srv = Server{ .gpa = std.testing.allocator, .io = std.testing.io, .psk = "x", .store = undefined };
+    try std.testing.expect(claimMethodWarn(&srv, 1_000));
+    try std.testing.expect(!claimMethodWarn(&srv, 1_500));
+    try std.testing.expect(!claimMethodWarn(&srv, 1_999));
+    try std.testing.expect(claimMethodWarn(&srv, 2_000));
+    try std.testing.expect(!claimMethodWarn(&srv, 2_500));
+    // The two warn clocks are independent: a 405 must not starve a 401.
+    try std.testing.expect(claimAuthWarn(&srv, 1_000));
+}
+
 /// SO_RCVBUF/SO_SNDBUF for every peer socket. The server accept path and the
 /// outbound dial must agree: a lopsided pair turns throughput into the small
 /// side's default window.
@@ -2898,6 +2910,9 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 405 Method Not Allowed\r\n"));
         try std.testing.expect(std.mem.indexOf(u8, res.items, "Allow: GET\r\n") != null);
+        try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_405.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_unauthorized.load(.monotonic));
     }
     // A missing bearer token is a 401 that names the scheme to retry with
     // (RFC 9110 §15.5.2). The expected rejection warning stays off the
@@ -2916,6 +2931,10 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         defer post.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, post.items, "HTTP/1.1 401 Unauthorized\r\n"));
         try std.testing.expect(std.mem.indexOf(u8, post.items, "Allow: GET") == null);
+        // Auth runs before the method gate: both missing-bearer requests
+        // count as 401, and the earlier POST /ping 405 must not move.
+        try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_unauthorized.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_405.load(.monotonic));
     }
     // Unknown paths are 404 regardless of the query string behind them.
     // Regression: routing used to run after path-parameter decoding, so an
@@ -3093,8 +3112,13 @@ test "acceptLoop exits instead of spinning when the listen fd is unusable" {
     // A fd number that is not open makes accept fail with EBADF every time.
     // Regression: the loop used to retry that forever at 50 Hz with the port
     // silently unserved; it must return so the failure stays observable.
+    const t0 = sys.monoMs(std.testing.io);
     const t = try std.Thread.spawn(.{}, acceptLoop, .{ &server, @as(c_int, 0x4000_0000) });
     t.join();
+    try std.testing.expectEqual(@as(u32, 0), server.accept_loops.load(.monotonic));
+    // Returned because the fd is dead, not because stop() cleared running.
+    try std.testing.expect(server.running.load(.acquire));
+    try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
 }
 
 test "acceptLoop closes connections beyond the inflight handler cap" {
