@@ -47,7 +47,8 @@ const usage =
     \\  modelfs pin <relpath> [--cache PATH]
     \\  modelfs unpin <relpath> [--cache PATH]
     \\  modelfs verify <relpath> --origin PATH [--cache PATH]
-    \\  modelfs dupes <relpath>... [--all] --origin PATH
+    \\  modelfs dupes <relpath>... --origin PATH
+    \\  modelfs dupes --all --origin PATH
     \\  modelfs version
     \\  modelfs help
     \\
@@ -56,7 +57,7 @@ const usage =
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
     \\  --id NAME             Override node id (default: short hostname)
     \\  --listen [IP:]PORT    Peer HTTP port (default {d}, 1-65535); binds all interfaces
-    \\  --advertise ADDRS     Lease addresses IP[:PORT], comma separated
+    \\  --advertise ADDRS     Lease addresses IP[:PORT], comma separated, repeatable
     \\                        (replaces auto-detect; a defaulted port follows
     \\                        --listen; default: every local IPv4 except
     \\                        loopback and 169.254; none -> 127.0.0.1;
@@ -77,11 +78,10 @@ const usage =
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
     \\
     \\status/peers/pin/unpin/verify/dupes take only the flags shown on their
-    \\Usage line plus the shared --origin/--cache/--psk/--log values; dupes
-    \\adds --all (scan every manifest on the origin instead of a path list)
-    \\and refuses it elsewhere; mount-only options are refused on the rest.
-    \\Every command also accepts -h/--help,
-    \\and -V/--version prints the release. "--" ends flag parsing: later
+    \\Usage line plus the shared --origin/--cache/--psk/--log values.
+    \\dupes --all scans every manifest on the origin and refuses a path
+    \\list; mount-only options are refused on the rest. Every command also
+    \\accepts -h/--help and -V/--version. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
     \\accept --name VALUE or --name=VALUE.
     \\
@@ -99,6 +99,7 @@ const usage =
     \\  modelfs pin gguf/foo.gguf
     \\  modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models
     \\  modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models
+    \\  modelfs dupes --all --origin /net/192.168.0.100/models
     \\
     \\Cluster leases live on the origin at .cluster/<id>.json, not under the
     \\FUSE mount. Same PSK on every node. Desktop can stay on plain NFS.
@@ -141,10 +142,14 @@ pub fn main(init: std.process.Init) !u8 {
         error.Version => return if (printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
         // Usage errors exit 2, like every other bad invocation in this CLI
         // (missing subcommand argument, unknown command). Each one is named
-        // at its own flag site inside parseArgs; only a failure before any
-        // site could report (allocation) still needs a line here.
+        // at its own flag site inside parseArgs. Allocation failure is not a
+        // bad invocation: monitors treat exit 2 as "fix the flags", so OOM
+        // must not look like a usage error.
         else => {
-            if (err == error.OutOfMemory) std.log.err("out of memory parsing arguments", .{});
+            if (err == error.OutOfMemory) {
+                std.log.err("out of memory parsing arguments", .{});
+                return 1;
+            }
             return 2;
         },
     };
@@ -3481,6 +3486,19 @@ test "classifyMeta answers help/version and refuses real extras" {
     try std.testing.expectEqual(.bad, classifyMeta(&.{ "version", "junk" }));
     try std.testing.expectEqual(.none, classifyMeta(&.{"mount"}));
     try std.testing.expectEqual(.none, classifyMeta(&.{}));
+}
+
+test "usage lists exclusive dupes forms and interpolates the default port" {
+    var buf: [usage.len + 16]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, usage, .{proto.default_port});
+    try std.testing.expect(std.mem.indexOf(u8, text, "modelfs dupes <relpath>... --origin PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "modelfs dupes --all --origin PATH") != null);
+    // Combined `[--all]` next to the path list implied `dupes a --all` was
+    // legal; that combination is refused (exit 2).
+    try std.testing.expect(std.mem.indexOf(u8, text, "[--all]") == null);
+    var port_buf: [8]u8 = undefined;
+    const port = try std.fmt.bufPrint(&port_buf, "{d}", .{proto.default_port});
+    try std.testing.expect(std.mem.indexOf(u8, text, port) != null);
 }
 
 test "splitFlag splits --name=VALUE and leaves short flags whole" {

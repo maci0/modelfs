@@ -40,7 +40,7 @@ echo "=== Test 1: Invalid PSK Auth Rejection ==="
 PEER_HOST="${MF_TEST_HOST:-127.0.0.1}"
 PEER_PORT="${MF_TEST_PORT:-19081}"
 AUTH_OUT="$(python3 "${SCRIPTS_DIR}/peer_auth_probe.py" "${PEER_HOST}" "${PEER_PORT}")" || {
-    echo "Error: PSK auth probe failed"
+    echo "Error: PSK auth probe failed" >&2
     exit 1
 }
 echo "${AUTH_OUT}"
@@ -59,15 +59,15 @@ EXPIRED_LEASE="${CLUSTER_DIR}/dead_node.json"
 echo '{"id":"dead_node","until":100,"addrs":[{"ip":"127.0.0.1","port":19999,"mbps":1000}]}' > "${EXPIRED_LEASE}"
 
 PEERS_OUT="$("${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}" --psk "${PSK_FILE}" 2>&1)" || {
-    echo "Error: peers command failed"
+    echo "Error: peers command failed" >&2
     exit 1
 }
 echo "${PEERS_OUT}"
-echo "${PEERS_OUT}" | grep -q "dead_node" || { echo "Error: dead_node lease missing from peers output"; exit 1; }
+echo "${PEERS_OUT}" | grep -q "dead_node" || { echo "Error: dead_node lease missing from peers output" >&2; exit 1; }
 if echo "${PEERS_OUT}" | grep "dead_node" | grep -q "expired"; then
     echo "✓ Expired lease correctly marked as expired"
 else
-    echo "Error: expired dead_node lease was not marked expired"
+    echo "Error: expired dead_node lease was not marked expired" >&2
     exit 1
 fi
 

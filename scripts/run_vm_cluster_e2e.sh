@@ -211,7 +211,7 @@ SSH_READY_DEADLINE=$((SECONDS + 180))
 for vm in "${VMS[@]}"; do
     while ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${VM_IP[$vm]}" true 2>/dev/null; do
         if ((SECONDS >= SSH_READY_DEADLINE)); then
-            echo "Error: ${vm} never became reachable over SSH"
+            echo "Error: ${vm} never became reachable over SSH" >&2
             exit 1
         fi
         sleep 2
@@ -223,14 +223,14 @@ done
 # wait for it to finish so the checks below see a fully provisioned guest.
 for vm in "${VMS[@]}"; do
     if ! timeout 300 ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${VM_IP[$vm]}" "cloud-init status --wait >/dev/null 2>&1"; then
-        echo "Error: cloud-init did not finish on ${vm}"
+        echo "Error: cloud-init did not finish on ${vm}" >&2
         exit 1
     fi
 done
 
 echo "=== provisioning ==="
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "systemctl is-active nfs-server"; then
-    echo "Error: NFS server not active on ${NFS_VM}"
+    echo "Error: NFS server not active on ${NFS_VM}" >&2
     exit 1
 fi
 echo "✓ NFS server active"
@@ -255,18 +255,18 @@ zig_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
 ) | ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "mkdir -p /home/ubuntu/src && tar xzf - -C /home/ubuntu/src"
 zig_cmd="test -x /home/ubuntu/zig/zig || { mkdir -p /home/ubuntu/zig && curl -fSL -o /home/ubuntu/zig/zig.tar.xz https://ziglang.org/download/${zig_ver}/zig-x86_64-linux-${zig_ver}.tar.xz && echo '${zig_sha256}  /home/ubuntu/zig/zig.tar.xz' | sha256sum -c - && tar -xJ --strip-components=1 -f /home/ubuntu/zig/zig.tar.xz -C /home/ubuntu/zig && rm /home/ubuntu/zig/zig.tar.xz; }"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${zig_cmd}"; then
-    echo "Error: could not fetch zig ${zig_ver} into the NFS VM"
+    echo "Error: could not fetch zig ${zig_ver} into the NFS VM" >&2
     exit 1
 fi
 build_cmd="cd /home/ubuntu/src && PATH=/home/ubuntu/zig:\$PATH zig build -Doptimize=ReleaseFast"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${build_cmd}"; then
-    echo "Error: modelfs build failed inside the NFS VM"
+    echo "Error: modelfs build failed inside the NFS VM" >&2
     exit 1
 fi
 # Share the binary over the origin mount so every client picks it up.
 publish_cmd="mkdir -p /export/models/.build && cp /home/ubuntu/src/zig-out/bin/modelfs /export/models/.build/modelfs && chmod 755 /export/models/.build/modelfs"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${publish_cmd}"; then
-    echo "Error: could not place the built binary on the origin"
+    echo "Error: could not place the built binary on the origin" >&2
     exit 1
 fi
 echo "✓ modelfs built in-VM and shared via the NFS origin"
@@ -274,31 +274,31 @@ echo "✓ modelfs built in-VM and shared via the NFS origin"
 for vm in "${C1_VM}" "${C2_VM}" "${C3_VM}"; do
     ip="${VM_IP[$vm]}"
     if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "test -e /dev/fuse && command -v fusermount3"; then
-        echo "Error: ${vm} missing /dev/fuse or fusermount3"
+        echo "Error: ${vm} missing /dev/fuse or fusermount3" >&2
         exit 1
     fi
     scp -q -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "${PSK_FILE}" "ubuntu@${ip}:modelfs.psk"
     if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "chmod 600 modelfs.psk && mkdir -p cache"; then
-        echo "Error: ${vm} could not stage the modelfs.psk"
+        echo "Error: ${vm} could not stage the modelfs.psk" >&2
         exit 1
     fi
     # The origin is real NFS from the separate NFS VM: mount it, then prove
     # the mount is NFS before any daemon starts.
     mount_cmd="sudo mkdir -p /net/origin /models && sudo chown ubuntu:ubuntu /models && sudo mount -t nfs ${NFS_IP}:/export/models /net/origin"
     if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "${mount_cmd}"; then
-        echo "Error: ${vm} could not mount the NFS origin"
+        echo "Error: ${vm} could not mount the NFS origin" >&2
         exit 1
     fi
     fstype="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "findmnt -n -o FSTYPE /net/origin")"
     if [[ "${fstype}" != "nfs"* ]]; then
-        echo "Error: ${vm} origin ${fstype} is not NFS"
+        echo "Error: ${vm} origin ${fstype} is not NFS" >&2
         exit 1
     fi
     # The binary is built inside the NFS VM and shared over the origin
     # mount (see "building modelfs" above); copy it off the NFS tree now
     # that the mount is up.
     if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "cp /net/origin/.build/modelfs modelfs && chmod +x modelfs"; then
-        echo "Error: ${vm} could not fetch the built modelfs binary"
+        echo "Error: ${vm} could not fetch the built modelfs binary" >&2
         exit 1
     fi
     echo "✓ ${vm} provisioned (origin is ${fstype})"
@@ -323,12 +323,12 @@ while :; do
         break
     fi
     if ((SECONDS >= LEASE_DEADLINE)); then
-        echo "Error: only ${leases}/3 peer leases published; dumping client state"
+        echo "Error: only ${leases}/3 peer leases published; dumping client state" >&2
         for vm in "${C1_VM}" "${C2_VM}" "${C3_VM}"; do
             ip="${VM_IP[$vm]}"
-            echo "--- ${vm} (${ip}) ---"
+            echo "--- ${vm} (${ip}) ---" >&2
             ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" \
-                "pgrep -af modelfs; echo '--- log ---'; tail -30 /home/ubuntu/modelfs.log 2>/dev/null; echo '--- mount ---'; mount | grep -E '/net/origin|/models' || true; echo '--- origin ---'; ls -la /net/origin/.cluster 2>/dev/null || true" 2>&1
+                "pgrep -af modelfs; echo '--- log ---'; tail -30 /home/ubuntu/modelfs.log 2>/dev/null; echo '--- mount ---'; mount | grep -E '/net/origin|/models' || true; echo '--- origin ---'; ls -la /net/origin/.cluster 2>/dev/null || true" >&2
         done
         exit 1
     fi
@@ -341,7 +341,7 @@ PEERS_OUT="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFi
 echo "${PEERS_OUT}"
 PEER_ROWS="$(grep -c "spark" <<<"${PEERS_OUT}" || true)"
 if [[ "${PEER_ROWS}" -lt 3 ]]; then
-    echo "Error: peers listing shows ${PEER_ROWS}/3 nodes"
+    echo "Error: peers listing shows ${PEER_ROWS}/3 nodes" >&2
     exit 1
 fi
 echo "✓ peers listing shows ${PEER_ROWS} nodes"
@@ -352,7 +352,7 @@ ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 
 
 echo "=== client 1 reads the model (fills from NFS origin) ==="
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${C1_IP}" "cmp /models/big.gguf /net/origin/big.gguf"; then
-    echo "Error: client 1 read of big.gguf does not match the origin"
+    echo "Error: client 1 read of big.gguf does not match the origin" >&2
     exit 1
 fi
 echo "✓ client 1 served big.gguf matching origin"
@@ -365,7 +365,7 @@ while :; do
         break
     fi
     if ((SECONDS >= MANIFEST_DEADLINE)); then
-        echo "Error: no piece-hash manifest published after 30s"
+        echo "Error: no piece-hash manifest published after 30s" >&2
         exit 1
     fi
     sleep 1
@@ -376,7 +376,7 @@ echo "=== clients 2 and 3 read the model (verified peer fills from client 1) ===
 for vm in "${C2_VM}" "${C3_VM}"; do
     ip="${VM_IP[$vm]}"
     if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "cmp /models/big.gguf /net/origin/big.gguf"; then
-        echo "Error: ${vm} read of big.gguf does not match the origin"
+        echo "Error: ${vm} read of big.gguf does not match the origin" >&2
         exit 1
     fi
     echo "✓ ${vm} served big.gguf matching origin"
@@ -392,21 +392,21 @@ while :; do
         break
     fi
     if ((SECONDS >= PEER_FILL_DEADLINE)); then
-        echo "Error: client 2 reported no peer fills; dumping cluster state"
+        echo "Error: client 2 reported no peer fills; dumping cluster state" >&2
         for vm in "${C1_VM}" "${C2_VM}" "${C3_VM}"; do
             ip="${VM_IP[$vm]}"
-            echo "--- ${vm} (${ip}) status ---"
+            echo "--- ${vm} (${ip}) status ---" >&2
             ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" \
-                "/home/ubuntu/modelfs status --cache /home/ubuntu/cache 2>/dev/null || echo 'no status'; echo '--- log ---'; tail -20 /home/ubuntu/modelfs.log 2>/dev/null; echo '--- cache ---'; du -sk /home/ubuntu/cache 2>/dev/null || true" 2>&1
+                "/home/ubuntu/modelfs status --cache /home/ubuntu/cache 2>/dev/null || echo 'no status'; echo '--- log ---'; tail -20 /home/ubuntu/modelfs.log 2>/dev/null; echo '--- cache ---'; du -sk /home/ubuntu/cache 2>/dev/null || true" >&2
         done
-        echo "--- client 1 /have bitmap for big.gguf ---"
+        echo "--- client 1 /have bitmap for big.gguf ---" >&2
         # Read the token on the guest into a 0600 header file; curl takes
         # -H @file so the bearer is not on curl's argv. Expanding
         # Authorization: Bearer $(cat …psk) into -H used to leak it through
         # /proc/<pid>/cmdline (world-readable on the guest, as the ssh
         # command string is on this host).
         have_cmd="printf \"Authorization: Bearer %s\\n\" \"\$(cat /home/ubuntu/modelfs.psk)\" > /home/ubuntu/have.hdr && chmod 600 /home/ubuntu/have.hdr && curl -s -D - -o /dev/null -H @/home/ubuntu/have.hdr \"http://127.0.0.1:18080/have?path=big.gguf\" | head -8; echo; curl -s -H @/home/ubuntu/have.hdr \"http://127.0.0.1:18080/have?path=big.gguf\" | xxd | head -5; rm -f /home/ubuntu/have.hdr"
-        ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${C1_IP}" "${have_cmd}" 2>&1
+        ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${C1_IP}" "${have_cmd}" >&2
         exit 1
     fi
     sleep 1
@@ -419,7 +419,7 @@ for vm in "${C1_VM}" "${C2_VM}" "${C3_VM}"; do
     VERIFY_FAIL="$(python3 -c 'import json,sys; print(int(json.load(sys.stdin)["stats"]["fill_err_verify"]))' <<<"${STATUS_OUT}" 2>/dev/null || echo n/a)"
     SERVE_FAIL="$(python3 -c 'import json,sys; print(int(json.load(sys.stdin)["stats"]["serve_verify_fail"]))' <<<"${STATUS_OUT}" 2>/dev/null || echo n/a)"
     if [[ "${VERIFY_FAIL}" != "0" || "${SERVE_FAIL}" != "0" ]]; then
-        echo "Error: ${vm} integrity counters nonzero (fill_err_verify=${VERIFY_FAIL}, serve_verify_fail=${SERVE_FAIL})"
+        echo "Error: ${vm} integrity counters nonzero (fill_err_verify=${VERIFY_FAIL}, serve_verify_fail=${SERVE_FAIL})" >&2
         exit 1
     fi
     echo "✓ ${vm} fill_err_verify=0 serve_verify_fail=0"
@@ -429,7 +429,7 @@ echo "=== modelfs verify on client 2 (cached pieces vs origin manifest) ==="
 VERIFY_OUT="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${C2_IP}" "/home/ubuntu/modelfs verify big.gguf --origin /net/origin --cache /home/ubuntu/cache")"
 echo "${VERIFY_OUT}"
 if ! grep -q "0 mismatch(es)" <<<"${VERIFY_OUT}"; then
-    echo "Error: modelfs verify reported mismatches on client 2"
+    echo "Error: modelfs verify reported mismatches on client 2" >&2
     exit 1
 fi
 echo "✓ client 2 cache verifies clean"
@@ -438,7 +438,7 @@ echo "=== modelfs dupes --all from client 1 (whole manifest store) ==="
 DUPES_OUT="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${C1_IP}" "/home/ubuntu/modelfs dupes --all --origin /net/origin")"
 echo "${DUPES_OUT}"
 if ! grep -q "scanned 1 manifest(s), ${TOTAL_PIECES} piece(s) total" <<<"${DUPES_OUT}"; then
-    echo "Error: dupes --all did not scan the expected single manifest"
+    echo "Error: dupes --all did not scan the expected single manifest" >&2
     exit 1
 fi
 echo "✓ dupes --all scanned the published manifest"
@@ -449,7 +449,7 @@ for vm in "${C1_VM}" "${C2_VM}" "${C3_VM}"; do
     du_out="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "du -sk /home/ubuntu/cache 2>/dev/null | cut -f1")"
     usage_mb=$((du_out / 1024))
     if [[ "${usage_mb}" -gt "${FILE_SIZE_MB}" ]]; then
-        echo "Error: ${vm} cache (${usage_mb} MB) exceeds the ${FILE_SIZE_MB} MB file"
+        echo "Error: ${vm} cache (${usage_mb} MB) exceeds the ${FILE_SIZE_MB} MB file" >&2
         exit 1
     fi
     echo "✓ ${vm} cache ${usage_mb} MB within the ${FILE_SIZE_MB} MB bound"

@@ -33,6 +33,10 @@ and default-behavior changes: the next tag is a minor, not a patch
 ### Same-size rewrite ignores a stale piece-hash manifest - 2026-09-02
 - **A piece-hash manifest carries the origin identity (mtime/ino) of the file it describes.** After a same-size rewrite, `expectedHash` reloaded the previous object's hashes from `.cluster/manifests/<hex>` (keyed only by path and size), so a peer still holding the old pieces could pass verification and land as the new file. The optional 24-byte trailer is the same layout as the sidecar identity; older manifests omit it and keep their prior behavior until the next publish. A manifest whose identity does not match this node's origin stat is ignored and retried, the same as a missing artifact.
 
+### CLI help and harness stderr - 2026-09-02
+- **`modelfs help` lists `dupes --all` as its own usage line.** The previous `dupes <relpath>... [--all]` form implied `--all` could combine with a path list; that combination is refused (exit 2). `--advertise` is documented as repeatable, matching `--seed`. Argument-parse OOM exits 1, not 2: usage errors stay 2.
+- **Harness `Error:` lines go to stderr.** `run_e2e_tests.sh`, `run_cluster_e2e_9nodes.sh`, `run_vm_cluster_e2e.sh`, and `test_fault_tolerance.sh` printed failures on stdout, so a redirected run hid the reason.
+
 ### /stage window and origin manifest fuzz seeds reach the decode path - 2026-09-02
 - **The `/stage` window and piece-hash manifest fuzz corpora now use `fuzzcorpus.entry` framing.** `Smith.slice` reads a u32 length prefix; the raw codec bytes were consumed as that prefix, so a well-formed window or `MFSM` blob never decoded during corpus replay. Truncated, empty, over-long, and structurally corrupt seeds now sit next to a clean one; a decoded manifest re-encodes to the same blob.
 
@@ -106,7 +110,8 @@ and default-behavior changes: the next tag is a minor, not a patch
   `manifest_retry_at`, not when the wall clock does. `tryLoadManifest`
   stamps the next attempt from the same sample. Tests drive the miss,
   the still-too-soon lookup, and the due load with virtual instants and
-  no sleep.
+  no sleep. The same-size rewrite and local-hash-keep cases pass that
+  instant too.
 - **`noteStageDown` overflow evicts expired lines by soonest expiry then
   (ip, port)**, and `noteProbeDown`/`noteFetchDown` overflow evicts the
   (ip, port)-least line, so have_mu lock order cannot choose the casualty.

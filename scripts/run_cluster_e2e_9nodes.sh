@@ -98,7 +98,7 @@ while :; do
         break
     fi
     if ((SECONDS >= LEASE_DEADLINE)); then
-        echo "Error: only ${leases}/${NUM_NODES} peer leases published after 30s"
+        echo "Error: only ${leases}/${NUM_NODES} peer leases published after 30s" >&2
         exit 1
     fi
     sleep 0.5
@@ -120,7 +120,7 @@ done
 # bit i set, not an all-zero field of the right length.
 for i in $(seq 1 "${NUM_NODES}"); do
     if ! cmp -s "${ORIGIN_DIR}/${TEST_FILE}" "${TEMP_DIR}/mount_${i}/${TEST_FILE}"; then
-        echo "Error: mount_${i} read of ${TEST_FILE} does not match origin"
+        echo "Error: mount_${i} read of ${TEST_FILE} does not match origin" >&2
         exit 1
     fi
 done
@@ -141,7 +141,7 @@ while :; do
         break
     fi
     if ((SECONDS >= PEER_FILL_DEADLINE)); then
-        echo "Error: node spark_2 reported no peer fills; piece exchange did not happen"
+        echo "Error: node spark_2 reported no peer fills; piece exchange did not happen" >&2
         exit 1
     fi
     sleep 0.5
@@ -162,7 +162,7 @@ for i in $(seq 1 "${NUM_NODES}"); do
     USAGE_KB=$(du -sk "${CACHE_DIR}" 2>/dev/null | cut -f1 || echo "0")
     USAGE_MB=$((USAGE_KB / 1024))
     if [ "${USAGE_MB}" -gt "${FILE_SIZE_MB}" ]; then
-        echo "Error: Node spark_${i} cache exceeds file size!"
+        echo "Error: Node spark_${i} cache exceeds file size!" >&2
         exit 1
     fi
     # du rounds to whole KB, so an exact fit is a legitimate pass; above the
