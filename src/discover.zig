@@ -450,17 +450,21 @@ pub const Catalog = struct {
 
     /// Records a failed staged fetch from (ip, port), refreshing any
     /// existing entry's expiry (a persistently failing peer stays down, a
-    /// one-off failure clears after the TTL). Bounded like the have cache:
-    /// an entry that cannot fit evicts an expired one, else is dropped --
-    /// worst case the peer gets one /stage retry, which falls back anyway.
-    pub fn noteStageDown(self: *Catalog, ip: []const u8, port: u16, now_ms: i64) void {
+    /// one-off failure clears after the TTL). True only for a newly inserted
+    /// entry (the caller logs that one); a refresh returns false so a broken
+    /// data plane cannot flood the journal the way per-piece fetch logs
+    /// would. Bounded like the have cache: an entry that cannot fit evicts
+    /// an expired one, else is dropped -- worst case the peer gets one
+    /// /stage retry, which falls back anyway.
+    pub fn noteStageDown(self: *Catalog, ip: []const u8, port: u16, now_ms: i64) bool {
         const gpa = self.gpa;
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
         for (self.stage_down.items) |*e| {
             if (e.port != port or !std.mem.eql(u8, e.ip, ip)) continue;
+            const was_live = now_ms < e.expires_ms;
             e.expires_ms = now_ms +| have_ttl_ms;
-            return;
+            return !was_live;
         }
         if (self.stage_down.items.len >= stage_down_cap) {
             var victim: ?usize = null;
@@ -473,12 +477,14 @@ pub const Catalog = struct {
             if (victim) |vi| {
                 gpa.free(self.stage_down.items[vi].ip);
                 _ = self.stage_down.orderedRemove(vi);
-            } else return;
+            } else return false;
         }
-        const ip_own = gpa.dupe(u8, ip) catch return;
+        const ip_own = gpa.dupe(u8, ip) catch return false;
         self.stage_down.append(gpa, .{ .ip = ip_own, .port = port, .expires_ms = now_ms +| have_ttl_ms }) catch {
             gpa.free(ip_own);
+            return false;
         };
+        return true;
     }
 
     /// Records a failed /have probe from (ip, port). True only for the first
@@ -2610,7 +2616,7 @@ test "stageDown tracks a failed staged fetch for the have TTL" {
     defer cat.deinit();
     const t0: i64 = 1000;
     try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0));
-    cat.noteStageDown("10.0.0.9", 18080, t0);
+    try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, t0));
     try std.testing.expect(cat.stageDown("10.0.0.9", 18080, t0));
     // Same address, different port: not down.
     try std.testing.expect(!cat.stageDown("10.0.0.9", 19090, t0));
@@ -2618,11 +2624,13 @@ test "stageDown tracks a failed staged fetch for the have TTL" {
     try std.testing.expect(!cat.stageDown("10.0.0.8", 18080, t0));
     // Expiry: a recovered backend is retried after the TTL.
     try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms));
-    // A refresh extends the entry (persistent failure stays down).
-    cat.noteStageDown("10.0.0.9", 18080, t0);
-    cat.noteStageDown("10.0.0.9", 18080, t0 + 100);
+    // A refresh while the entry is still live is not a first-failure log.
+    try std.testing.expect(!cat.noteStageDown("10.0.0.9", 18080, t0));
+    try std.testing.expect(!cat.noteStageDown("10.0.0.9", 18080, t0 + 100));
     try std.testing.expect(cat.stageDown("10.0.0.9", 18080, t0 + 100));
     try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms + 100));
+    // After the TTL a new failure is a new outage and logs again.
+    try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms + 100));
 }
 
 test "probeDown edge-triggers /have failures and clears on recovery" {

@@ -318,4 +318,16 @@ test "fake backend stages and reads one window" {
     var too_small: [8]u8 = undefined;
     try std.testing.expect(!small.read(w_again, &too_small));
     try std.testing.expect(small.stage(data, &d) != null);
+    // Length mismatch must consume the window (tombstone the buffer): a
+    // window the fetcher cannot use used to leak the staged copy until
+    // process exit. Addr stays stable so the cap is items.len, not live
+    // slots; the leak that matters is the dupe'd bytes.
+    var mismatch: Backend = .{ .kind = .fake, .gpa = gpa, .fake_cap = 1 };
+    defer {
+        for (mismatch.staged.items) |buf| gpa.free(buf);
+        mismatch.staged.deinit(gpa);
+    }
+    const wm = mismatch.stage(data, &d).?;
+    try std.testing.expect(!mismatch.read(wm, &too_small));
+    try std.testing.expectEqual(@as(usize, 0), mismatch.staged.items[@intCast(wm.addr)].len);
 }

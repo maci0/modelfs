@@ -40,6 +40,27 @@
 - **shellcheck walks every `scripts/**/*.sh`**, so a nested script cannot
   skip the top-level `scripts/*.sh` glob.
 
+### Origin I/O failures keep their errno; FIFOs cannot hang a worker - 2026-09-02
+- **`preadAll`, `pwriteAll`, and `writeAll` return `-errno`.** libc returns
+  `-1` and sets `errno`; these wrappers used to pass that `-1` through, so
+  every caller that treats a negative as an errno (FUSE replies,
+  `noteOriginIo`, journal lines) reported EPERM and never classified
+  EIO/ESTALE/ETIMEDOUT as an origin outage. `sendfileAll` already returned
+  `-errno`. A bad-fd test pins EBADF.
+- **Origin data-plane opens take `O_NONBLOCK`**, matching lease reads and
+  `opendirNoFollow`. A FIFO planted at a model path used to hang
+  `originPread`/`originPwrite`, `mf_create`, and `mf_truncate` until a
+  counterpart appeared. `readFileAllocNoFollowOpenErrno` and the nofollow
+  write helpers get the same flag so a FIFO sidecar, manifest, or lease
+  staging name cannot wedge a fill or the discovery thread. A FIFO at a
+  model path now fails ESPIPE on read and ENXIO on write.
+- **Failure paths that used to stay silent now log:** a piece-manifest path
+  that does not fit, a disk-punch fstat or unusable size, a `/have` or
+  `/data` header send that dies before the body, a staged-fetch first
+  failure (same edge trigger as `/have` and `/data` downs), and a
+  `getifaddrs` failure at start (it no longer reads as "no NICs"). A
+  length-mismatch staged read frees the pool slot instead of pinning it.
+
 ## [0.5.0] - 2026-08-31
 
 Observability release on top of 0.4.0: the FUSE metadata handlers and the

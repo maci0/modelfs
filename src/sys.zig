@@ -239,8 +239,11 @@ pub fn preadAll(fd: c_int, buf: []u8, off: u64) isize {
         if (n < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll: a
             // stray signal must not end a multi-chunk transfer midway.
+            // libc returns -1 and sets errno; callers treat a negative as
+            // -errno (FUSE, noteOriginIo), so a raw -1 would surface as
+            // EPERM and hide EIO/ESTALE/ETIMEDOUT.
             if (errno() == c.EINTR) continue;
-            return n;
+            return @as(isize, negErrno());
         }
         if (n == 0) break;
         got += @intCast(n);
@@ -270,8 +273,10 @@ pub fn pwriteAll(fd: c_int, buf: []const u8, off: u64) isize {
         if (n < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll; a
             // partial write must never be mistaken for a completed one.
+            // Same -errno contract as preadAll: a raw -1 is EPERM to every
+            // caller that logs or returns the negative as an errno.
             if (errno() == c.EINTR) continue;
-            return n;
+            return @as(isize, negErrno());
         }
         if (n == 0) return -c.EIO;
         put += @intCast(n);
@@ -440,8 +445,9 @@ pub fn writeAll(fd: c_int, buf: []const u8) isize {
         if (n < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll: a
             // stray signal must not truncate a response or file write midway.
+            // Same -errno contract as preadAll/pwriteAll and sendfileAll.
             if (errno() == c.EINTR) continue;
-            return n;
+            return @as(isize, negErrno());
         }
         if (n == 0) return -c.EIO;
         put += @intCast(n);
@@ -498,10 +504,12 @@ pub fn writeFile(path: [*:0]const u8, data: []const u8) i32 {
 /// writeFile for daemon-owned artifacts that other cluster members must
 /// read (lease staging under origin/.cluster). O_NOFOLLOW: a local writer
 /// who can plant a symlink at one of those names must not redirect a
-/// truncate-and-write onto an arbitrary file as the daemon user. Cache
-/// data/meta/pin and `status.json` use the owner-only helpers.
+/// truncate-and-write onto an arbitrary file as the daemon user. O_NONBLOCK:
+/// a FIFO at the name must not hang the discovery thread or a FUSE worker
+/// (same contract as readFileAllocNoFollowOpenErrno). Cache data/meta/pin
+/// and `status.json` use the owner-only helpers.
 pub fn writeFileNoFollow(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFull(path, data, c.O_NOFOLLOW, false, 0o644);
+    return writeFileFull(path, data, c.O_NOFOLLOW | c.O_NONBLOCK, false, 0o644);
 }
 
 /// writeFileNoFollow at 0600. For cache-root artifacts that sit next to a
@@ -511,14 +519,14 @@ pub fn writeFileNoFollow(path: [*:0]const u8, data: []const u8) i32 {
 /// Leftover 0644 files are tightened on the fd that was written, the same
 /// leftover-open as cache data.
 pub fn writeFileOwnerOnly(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFull(path, data, c.O_NOFOLLOW, false, 0o600);
+    return writeFileFull(path, data, c.O_NOFOLLOW | c.O_NONBLOCK, false, 0o600);
 }
 
 /// writeFileOwnerOnly plus fsync-before-close: for owner-only writes whose
 /// durability orders them against a later destructive step on the same key
 /// (the bitfield cleared ahead of a hole punch).
 pub fn writeFileOwnerOnlyDurable(path: [*:0]const u8, data: []const u8) i32 {
-    return writeFileFull(path, data, c.O_NOFOLLOW, true, 0o600);
+    return writeFileFull(path, data, c.O_NOFOLLOW | c.O_NONBLOCK, true, 0o600);
 }
 
 pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![]u8 {
@@ -538,11 +546,13 @@ pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: 
 }
 
 /// readFileAllocOpenErrno for daemon-owned artifacts (cache sidecars,
-/// status.json, origin leases). O_NOFOLLOW: a planted symlink must not turn
+/// status.json, origin manifests). O_NOFOLLOW: a planted symlink must not turn
 /// the read into an arbitrary file as the daemon user, or load a crafted
-/// sidecar/lease from outside the tree.
+/// sidecar from outside the tree. O_NONBLOCK: a FIFO at the name must not
+/// hang a FUSE worker or the discovery thread (same contract as lease
+/// reads and opendirNoFollow); the flag is ignored on regular files.
 pub fn readFileAllocNoFollowOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32) ![]u8 {
-    return readFileAllocFlags(gpa, path, max, c.O_NOFOLLOW, open_errno_out, null);
+    return readFileAllocFlags(gpa, path, max, c.O_NOFOLLOW | c.O_NONBLOCK, open_errno_out, null);
 }
 
 fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, extra_flags: c_int, open_errno_out: ?*i32, mode_out: ?*c.mode_t) ![]u8 {
@@ -762,6 +772,16 @@ test "mkdirAll twice converges and refuses a file or symlink at the name" {
 test "errno follows a failed libc call" {
     try std.testing.expectEqual(@as(c_int, -1), c.close(-1));
     try std.testing.expectEqual(@as(i32, c.EBADF), errno());
+}
+
+test "preadAll pwriteAll writeAll surface the libc errno" {
+    // libc returns -1 and sets errno; callers treat a negative as -errno
+    // (FUSE replies, noteOriginIo, journal lines). A raw -1 is EPERM and
+    // would hide EIO/ESTALE/ETIMEDOUT as a permission error.
+    var buf: [1]u8 = .{0};
+    try std.testing.expectEqual(@as(isize, -c.EBADF), preadAll(0x4000_0000, &buf, 0));
+    try std.testing.expectEqual(@as(isize, -c.EBADF), pwriteAll(0x4000_0000, &buf, 0));
+    try std.testing.expectEqual(@as(isize, -c.EBADF), writeAll(0x4000_0000, &buf));
 }
 
 test "closeWrite reports a bad fd and succeeds after a write" {

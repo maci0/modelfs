@@ -577,7 +577,11 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
         replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
-    if (sys.writeAll(fd, h) < 0) return;
+    const hw = sys.writeAll(fd, h);
+    if (hw < 0) {
+        std.log.warn("have header send failed for {s} (errno {d}); dropping peer transfer", .{ rel, -hw });
+        return;
+    }
     // Counted once the 200 is on the wire, Content-Length included: a
     // serving node must be visible in status.json even when every transfer
     // succeeds (http_5xx stays 0). Truncated bodies keep the count and the
@@ -689,18 +693,20 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, target: []cons
         replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
-    if (sys.writeAll(fd, h) < 0) {
+    const hw = sys.writeAll(fd, h);
+    if (hw < 0) {
         rdma.backend.release(win);
-        std.log.warn("stage head send failed for {s} piece {d}; dropping peer transfer", .{ file.rel, idx });
+        std.log.warn("stage head send failed for {s} piece {d} (errno {d}); dropping peer transfer", .{ file.rel, idx, -hw });
         return;
     }
     // Counted like serveHave/serveData: a node staging pieces must be
     // visible in status.json even when every transfer succeeds.
     _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
     _ = self.store.stats.bytes_to_peer.fetchAdd(win.len, .monotonic);
-    if (sys.writeAll(fd, enc) < 0) {
+    const bw = sys.writeAll(fd, enc);
+    if (bw < 0) {
         rdma.backend.release(win);
-        std.log.warn("stage window send failed for {s} piece {d}; dropping peer transfer", .{ file.rel, idx });
+        std.log.warn("stage window send failed for {s} piece {d} (errno {d}); dropping peer transfer", .{ file.rel, idx, -bw });
     }
 }
 
@@ -732,8 +738,8 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
             // Claim and completion take separate samples, like the FUSE
             // hydration path: a fill that streamed for minutes must land a
             // fresh recency stamp at completion, not the claim's.
-            const cl = self.store.beginFill(file, pi, sys.monoSec(self.io)) catch {
-                std.log.warn("fill claim failed for {s} piece {d}; replying 500", .{ file.rel, pi });
+            const cl = self.store.beginFill(file, pi, sys.monoSec(self.io)) catch |err| {
+                std.log.warn("fill claim failed for {s} piece {d} ({t}); replying 500", .{ file.rel, pi, err });
                 replyStatus(self, fd, "500 Internal Server Error");
                 return false;
             };
@@ -1002,7 +1008,11 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
         replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
-    if (sys.writeAll(fd, h) < 0) return;
+    const hw = sys.writeAll(fd, h);
+    if (hw < 0) {
+        std.log.warn("data header send failed for {s} (errno {d}); dropping peer transfer", .{ rel, -hw });
+        return;
+    }
     // Same as serveHave: the 206 going out is the success this node's
     // http_ok / bytes_to_peer must see, or a busy serving node looks idle
     // in status.json. Counted before the body so a client that has already
@@ -1672,7 +1682,14 @@ fn fetchFromCands(
             !cat.stageDown(win.ip, win.port, now_ms);
         const staged_ok = if (can_stage) blk: {
             const ok = fetchPieceStaged(gpa, cat.io, psk, win.ip, win.port, rel, idx, out);
-            if (!ok) cat.noteStageDown(win.ip, win.port, sys.monoMs(cat.io));
+            if (!ok) {
+                // Edge-triggered like probe_down/fetch_down: the first
+                // staged failure names the peer, later ones ride the
+                // TTL backoff so a broken data plane cannot flood the
+                // journal with one warn per piece.
+                if (cat.noteStageDown(win.ip, win.port, sys.monoMs(cat.io)))
+                    std.log.warn("staged fetch failed on {s}:{d} for {s} piece {d}; falling back to HTTP", .{ win.ip, win.port, rel, idx });
+            }
             break :blk ok;
         } else false;
         if (staged_ok) {

@@ -1136,7 +1136,10 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     const id = try gpa.dupe(u8, opts.id orelse discover.hostname(&id_buf));
     defer gpa.free(id);
 
-    const local_ips = discover.localIpv4(gpa) catch &.{};
+    const local_ips = discover.localIpv4(gpa) catch |err| blk: {
+        std.log.warn("cannot enumerate local IPv4 ({t}); advertise may be empty", .{err});
+        break :blk @as([][]const u8, &.{});
+    };
     defer {
         if (local_ips.len > 0) {
             for (local_ips) |s| gpa.free(s);

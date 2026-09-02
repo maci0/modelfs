@@ -516,7 +516,8 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     // O_NOFOLLOW like every daemon write into a tree someone else can plant
     // names in: a symlink staged at this name on the shared origin must not
     // turn the create's O_TRUNC into a truncate of the link's target.
-    const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC | sys.c.O_NOFOLLOW, clientCreateMode(mode));
+    // O_NONBLOCK: an existing FIFO at the name must not hang this handler.
+    const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK, clientCreateMode(mode));
     if (fd < 0) return sys.negErrno();
     const cr = sys.closeWrite(fd);
     // O_TRUNC replaced the origin bytes at this path. Cache identity is the
@@ -944,7 +945,8 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
     const op = st.store.originPath(&buf, rel) catch return -sys.c.ENAMETOOLONG;
     // O_NOFOLLOW: the ftruncate below must land on the named origin file,
     // never on a planted symlink's target (arbitrary daemon-writable file).
-    const fd = sys.open(op, sys.c.O_WRONLY | sys.c.O_NOFOLLOW, 0);
+    // O_NONBLOCK: a FIFO at the name must not hang this handler.
+    const fd = sys.open(op, sys.c.O_WRONLY | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK, 0);
     if (fd < 0) return sys.negErrno();
     const origin_tr = sys.ftruncate(fd, new_size);
     const cr = sys.closeWrite(fd);

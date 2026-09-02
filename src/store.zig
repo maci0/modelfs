@@ -1257,6 +1257,10 @@ pub const Store = struct {
     fn tryLoadManifest(self: *Store, file: *Cached) void {
         var pbuf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.manifestPath(&pbuf, file.rel) catch {
+            // Path-too-long will not shrink; remembering it avoids retrying
+            // a join that cannot succeed, but the operator must still see
+            // why peer fills for this file stay unverified.
+            std.log.warn("piece manifest path does not fit for {s}; peer fills unverified", .{file.rel});
             file.mu.lockUncancelable(self.io);
             file.manifest_size = file.size;
             file.mu.unlock(self.io);
@@ -1546,7 +1550,10 @@ pub const Store = struct {
         // O_NOFOLLOW: a symlink planted at this name on the shared origin
         // would otherwise have the daemon read the link's target (resolved
         // client-side) and serve those bytes to peers. ELOOP fails closed.
-        const fd = sys.open(p, c.O_RDONLY | c.O_NOFOLLOW, 0);
+        // O_NONBLOCK: a FIFO at the name must not hang a FUSE worker or
+        // peer /data hydration (same contract as lease reads); ignored on
+        // regular files.
+        const fd = sys.open(p, c.O_RDONLY | c.O_NOFOLLOW | c.O_NONBLOCK, 0);
         if (fd < 0) {
             const rc = sys.negErrno();
             self.noteOriginIo(rel, rc, "read");
@@ -1564,8 +1571,10 @@ pub const Store = struct {
         // Same O_NOFOLLOW contract as every other daemon write into a tree
         // someone else can plant names in (writeFileNoFollow, openCache): a
         // planted symlink must not redirect this truncate-and-write onto an
-        // arbitrary daemon-writable file.
-        const fd = sys.open(p, c.O_WRONLY | c.O_NOFOLLOW, 0);
+        // arbitrary daemon-writable file. O_NONBLOCK: a FIFO at the name
+        // must not hang the FUSE write path; O_WRONLY of a reader-less
+        // FIFO then fails ENXIO instead of blocking.
+        const fd = sys.open(p, c.O_WRONLY | c.O_NOFOLLOW | c.O_NONBLOCK, 0);
         if (fd < 0) {
             const rc = sys.negErrno();
             self.noteOriginIo(rel, rc, "write");
@@ -2176,7 +2185,10 @@ pub const Store = struct {
     fn punchDisk(self: *Store, rel: []const u8) bool {
         if (self.pinExists(rel)) return false;
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const dp = self.cacheDataPath(&dbuf, rel) catch return false;
+        const dp = self.cacheDataPath(&dbuf, rel) catch {
+            std.log.warn("disk punch skipped for {s}; cache path does not fit; bytes stay cached", .{rel});
+            return false;
+        };
         const fd = sys.open(dp, c.O_RDWR | c.O_NOFOLLOW, 0);
         if (fd < 0) {
             const e = sys.errno();
@@ -2186,8 +2198,14 @@ pub const Store = struct {
         }
         defer sys.close(fd);
         var st: c.struct_stat = undefined;
-        if (sys.fstat(fd, &st) != 0) return false;
-        const size = sys.sizeFromStat(st.st_size) orelse return false;
+        if (sys.fstat(fd, &st) != 0) {
+            std.log.warn("disk punch skipped for {s} (fstat errno {d}); bytes stay cached", .{ rel, sys.errno() });
+            return false;
+        }
+        const size = sys.sizeFromStat(st.st_size) orelse {
+            std.log.warn("disk punch skipped for {s}; data file size unusable; bytes stay cached", .{rel});
+            return false;
+        };
         // Builder-contract sample: if any artifact mutation (forget, reap
         // purge, another punch) lands between this and the critical section
         // below, the bits loaded here describe artifacts that no longer
@@ -5516,6 +5534,33 @@ test "origin access refuses a symlink planted at the model path" {
     try std.testing.expectEqualStrings("model", rbuf[0..5]);
     try std.testing.expectEqual(@as(i32, 0), st.originStatvfs("real.bin", &vs));
     try std.testing.expect(vs.f_blocks > 0);
+}
+
+test "origin access refuses a FIFO planted at the model path" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-origfifo");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-origfifo");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // A FIFO at a model name would hang open(2) without O_NONBLOCK and
+    // wedge a FUSE worker (or peer /data hydration) until a reader/writer
+    // appears. The flag is ignored on regular files; on a FIFO, O_RDONLY
+    // returns immediately and pread fails ESPIPE, O_WRONLY fails ENXIO
+    // when no reader is waiting.
+    var lb: [sys.c.PATH_MAX]u8 = undefined;
+    const lp = try st.originPath(&lb, "fifo.gguf");
+    try std.testing.expectEqual(@as(c_int, 0), c.mkfifo(lp, 0o600));
+
+    var rbuf: [8]u8 = undefined;
+    try std.testing.expectEqual(-c.ESPIPE, st.originPread("fifo.gguf", &rbuf, 0));
+    try std.testing.expectEqual(-c.ENXIO, st.originPwrite("fifo.gguf", rbuf[0..5], 0));
 }
 
 test "late finisher on a forgotten entry does not resurrect the sidecar" {
