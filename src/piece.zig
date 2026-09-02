@@ -1,10 +1,22 @@
 //! Piece arithmetic (count/offset/cover/trackedEnd) and the persisted cache bitfield
-//! codec, including pad-bit defenses against corrupt sidecars.
+//! codec, including pad-bit defenses against corrupt sidecars and the sidecar
+//! header piece-size reader (`sidecarPieceSize`).
 const std = @import("std");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 
 pub const default_size: u32 = 16 * 1024 * 1024;
 pub const magic = "MFS1";
+
+/// Piece size recorded in a sidecar header (`magic` then little-endian u32).
+/// Null when the blob is shorter than that prefix, the magic does not match,
+/// or the recorded size is 0 (`--piece 0` is refused at mount, so a zero on
+/// disk is unusable the same way a missing sidecar is).
+pub fn sidecarPieceSize(blob: []const u8) ?u32 {
+    if (blob.len < 8) return null;
+    if (!std.mem.eql(u8, blob[0..4], magic)) return null;
+    const ps = std.mem.readInt(u32, blob[4..8], .little);
+    return if (ps != 0) ps else null;
+}
 
 /// Saturating ceil(n / d). `d` must be nonzero. The add saturates so a
 /// maxInt(u64) numerator cannot wrap before the divide (which would
@@ -414,6 +426,18 @@ pub fn manifestName(rel: []const u8, out: *[2 * digest_len]u8) []const u8 {
     const hexed = digestHex(h);
     @memcpy(out, &hexed);
     return out[0..hexed.len];
+}
+
+test "sidecarPieceSize reads the header and refuses a zero or foreign blob" {
+    var hdr: [8]u8 = undefined;
+    @memcpy(hdr[0..4], magic);
+    std.mem.writeInt(u32, hdr[4..8], 4096, .little);
+    try std.testing.expectEqual(@as(?u32, 4096), sidecarPieceSize(&hdr));
+    std.mem.writeInt(u32, hdr[4..8], 0, .little);
+    try std.testing.expect(sidecarPieceSize(&hdr) == null);
+    try std.testing.expect(sidecarPieceSize("MFS1") == null);
+    try std.testing.expect(sidecarPieceSize("XXXX\x00\x10\x00\x00") == null);
+    try std.testing.expect(sidecarPieceSize("") == null);
 }
 
 test "digest matches published blake3 vectors" {

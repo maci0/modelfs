@@ -1523,33 +1523,45 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     return 0;
 }
 
-fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: bool) !u8 {
+/// Strip the `/models/` convenience prefix operators paste from the default
+/// mountpoint, then a leftover leading slash. The result is origin-relative;
+/// callers still run `relOk` / `relIsCluster`.
+fn mountRel(path: []const u8) []const u8 {
     var rel = path;
     if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
     if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
-    // The pin path joins cache/pin below; ".." would write outside it.
-    // Gate before ensureLayout so a refused path cannot create cache dirs.
+    return rel;
+}
+
+/// True when `rel` is refused at a CLI trust boundary (pin/verify/dupes).
+/// Prints the same refusal those commands used to inline. Call before any
+/// cache or origin I/O so a refused path cannot create dirs or read.
+fn refuseCliRel(cmd: []const u8, rel: []const u8) bool {
     if (!store_mod.relOk(rel)) {
         // Suppressed under test like every usage print here, so the refusal
         // stays assertable without tripping the runner's error-log counter.
         // `/models/` strips to empty (the prefix convenience for the default
-        // mountpoint) and `..` would write outside cache/pin: name which.
+        // mountpoint) and `..` would write outside the tree: name which.
         if (!builtin.is_test) {
             if (rel.len == 0)
-                std.debug.print("{s}: empty path (need a path relative to the mount, not /models itself)\n", .{if (on) "pin" else "unpin"})
+                std.debug.print("{s}: empty path (need a path relative to the mount, not /models itself)\n", .{cmd})
             else
-                std.debug.print("{s}: refusing path outside the mount root\n", .{if (on) "pin" else "unpin"});
+                std.debug.print("{s}: refusing path outside the mount root\n", .{cmd});
         }
-        return 1;
+        return true;
     }
-    // Same control-plane hide FUSE and peer HTTP apply: a pin of `.cluster`
-    // would mark lease files uncullable if they ever landed in the cache.
-    // Gate before ensureLayout so a refused path cannot create cache dirs.
+    // Same control-plane hide FUSE and peer HTTP apply.
     if (discover.relIsCluster(rel)) {
-        if (!builtin.is_test)
-            std.debug.print("{s}: refusing cluster control path\n", .{if (on) "pin" else "unpin"});
-        return 1;
+        if (!builtin.is_test) std.debug.print("{s}: refusing cluster control path\n", .{cmd});
+        return true;
     }
+    return false;
+}
+
+fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: bool) !u8 {
+    const rel = mountRel(path);
+    // Gate before ensureLayout so a refused path cannot create cache dirs.
+    if (refuseCliRel(if (on) "pin" else "unpin", rel)) return 1;
     var dummy_io = std.Io.Threaded.init(gpa, .{});
     defer dummy_io.deinit();
     var store = store_mod.Store.init(gpa, dummy_io.io(), opts.origin orelse "", opts.cache, opts.piece);
@@ -1601,53 +1613,20 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         std.debug.print("verify needs --cache (or MODELFS_CACHE)\n", .{});
         return 2;
     }
-    var rel = path;
-    if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
-    if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
-    if (!store_mod.relOk(rel)) {
-        if (!builtin.is_test) {
-            if (rel.len == 0)
-                std.debug.print("verify: empty path (need a path relative to the mount, not /models itself)\n", .{})
-            else
-                std.debug.print("verify: refusing path outside the mount root\n", .{});
-        }
-        return 1;
-    }
-    if (discover.relIsCluster(rel)) {
-        if (!builtin.is_test) std.debug.print("verify: refusing cluster control path\n", .{});
-        return 1;
-    }
+    const rel = mountRel(path);
+    if (refuseCliRel("verify", rel)) return 1;
+    var dummy_io = std.Io.Threaded.init(gpa, .{});
+    defer dummy_io.deinit();
+    var store = store_mod.Store.init(gpa, dummy_io.io(), origin, cache, opts.piece);
+    defer store.deinit();
     // The piece grid comes from the cache's own sidecar header, not a flag:
     // the daemon that wrote the marks chose the grid, and verifying against
     // a different one would misread every mark (a mismatched grid decodes as
     // an empty field, so verify would report nothing checked). A missing or
     // unreadable sidecar falls back to the default grid -- there is nothing
     // cached to verify anyway.
-    var piece_size = opts.piece;
-    {
-        var mbuf: [sys.c.PATH_MAX]u8 = undefined;
-        var mid: [sys.c.PATH_MAX]u8 = undefined;
-        if (sys.joinZ(&mid, cache, "meta")) |md| {
-            if (sys.joinZ(&mbuf, std.mem.span(md), rel)) |mp| {
-                var ext: [sys.c.PATH_MAX]u8 = undefined;
-                if (sys.appendExt(&ext, mp, ".pieces")) |z| {
-                    const fd = sys.open(z, sys.c.O_RDONLY | sys.c.O_NOFOLLOW, 0);
-                    if (fd >= 0) {
-                        defer sys.close(fd);
-                        var hdr: [8]u8 = undefined;
-                        if (sys.preadAll(fd, &hdr, 0) == 8 and std.mem.eql(u8, hdr[0..4], piece.magic)) {
-                            const ps = std.mem.readInt(u32, hdr[4..8], .little);
-                            if (ps != 0) piece_size = ps;
-                        }
-                    }
-                } else |_| {}
-            } else |_| {}
-        } else |_| {}
-    }
-    var dummy_io = std.Io.Threaded.init(gpa, .{});
-    defer dummy_io.deinit();
-    var store = store_mod.Store.init(gpa, dummy_io.io(), origin, cache, piece_size);
-    defer store.deinit();
+    if (store.sidecarPieceSize(rel)) |ps| store.piece_size = ps;
+    const piece_size = store.piece_size;
     const layout_rc = store.ensureLayout();
     if (layout_rc != 0) {
         if (!builtin.is_test) std.log.err("cannot create cache dirs under {s} (errno {d})", .{ cache, -layout_rc });
@@ -2513,6 +2492,14 @@ test "cmdPeers skips a planted lease symlink instead of ingesting its target" {
     try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
 }
 
+test "mountRel strips the default mount prefix" {
+    try std.testing.expectEqualStrings("gguf/a.gguf", mountRel("/models/gguf/a.gguf"));
+    try std.testing.expectEqualStrings("gguf/a.gguf", mountRel("gguf/a.gguf"));
+    try std.testing.expectEqualStrings("a.bin", mountRel("/a.bin"));
+    try std.testing.expectEqualStrings("", mountRel("/models/"));
+    try std.testing.expectEqualStrings(".cluster/spark1.json", mountRel("/models/.cluster/spark1.json"));
+}
+
 test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     const gpa = std.testing.allocator;
     var cb: [128]u8 = undefined;
@@ -2608,7 +2595,9 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     try std.testing.expectEqual(@as(u8, 0), try cmdVerify(std.testing.io, gpa, opts, "m.bin"));
 
     // Corrupt the cached piece; verify must find the mismatch, clear the
-    // mark, and exit 1 so scripts can react.
+    // mark, and exit 1 so scripts can react. A mismatched --piece must not
+    // decode the sidecar as empty and skip the check: the grid is the
+    // daemon's recorded header, not the flag.
     var dpb: [256]u8 = undefined;
     const dp = try std.fmt.bufPrint(&dpb, "{s}/data/m.bin", .{cache_d});
     const cfd = sys.open(try sys.toZ(&zb, dp), sys.c.O_WRONLY, 0);
@@ -2616,7 +2605,11 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     defer sys.close(cfd);
     const junk = [_]u8{0xAA} ** 16;
     try std.testing.expectEqual(@as(isize, 16), sys.pwriteAll(cfd, &junk, 0));
-    try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, opts, "m.bin"));
+    try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, .{
+        .origin = origin_d,
+        .cache = cache_d,
+        .piece = 4096,
+    }, "m.bin"));
 
     // The cleared mark persisted: a second verify finds nothing to check
     // (the piece refills from a verified source on the next read).
@@ -2644,8 +2637,10 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     };
     const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
     defer gpa.free(origin);
+    var store = store_mod.Store.init(gpa, io, origin, opts.cache, opts.piece);
+    defer store.deinit();
     var dbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const dirz = sys.joinZ(&dbuf, origin, store_mod.Store.manifests_dir) catch {
+    const dirz = store.manifestsDirPath(&dbuf) catch {
         if (!builtin.is_test) std.log.err("manifest dir path too long at {s}", .{origin});
         return 1;
     };
@@ -2736,23 +2731,10 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
     // Gate every rel before any origin I/O (same refusals as verify): a
     // bad path must not create cache dirs or read anything.
     for (paths) |path| {
-        var rel = path;
-        if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
-        if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
-        if (!store_mod.relOk(rel)) {
-            if (!builtin.is_test) {
-                if (rel.len == 0)
-                    std.debug.print("dupes: empty path (need a path relative to the mount, not /models itself)\n", .{})
-                else
-                    std.debug.print("dupes: refusing path outside the mount root\n", .{});
-            }
-            return 1;
-        }
-        if (discover.relIsCluster(rel)) {
-            if (!builtin.is_test) std.debug.print("dupes: refusing cluster control path\n", .{});
-            return 1;
-        }
+        if (refuseCliRel("dupes", mountRel(path))) return 1;
     }
+    var store = store_mod.Store.init(gpa, io, origin, opts.cache, opts.piece);
+    defer store.deinit();
 
     const File = struct {
         rel: []const u8,
@@ -2770,18 +2752,9 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
         files.deinit(gpa);
     }
     for (paths) |path| {
-        var rel = path;
-        if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
-        if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
-        var mname: [2 * piece.digest_len]u8 = undefined;
-        const name = piece.manifestName(rel, &mname);
+        const rel = mountRel(path);
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
-        var mid: [sys.c.PATH_MAX]u8 = undefined;
-        const mdir = sys.joinZ(&mid, origin, store_mod.Store.manifests_dir) catch {
-            if (!builtin.is_test) std.log.err("manifest dir path too long at {s}", .{origin});
-            return 1;
-        };
-        const mp = sys.joinZ(&mbuf, std.mem.span(mdir), name) catch {
+        const mp = store.manifestPath(&mbuf, rel) catch {
             if (!builtin.is_test) std.log.err("manifest path too long for {s}", .{rel});
             return 1;
         };

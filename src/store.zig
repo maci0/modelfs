@@ -1,6 +1,8 @@
 //! Local piece cache: the origin-relative path gate (`relOk`), per-file
-//! bitfields with persisted sidecars, hydration claims, pinning, and
-//! hole-punch culling (in-memory and disk-only victims).
+//! bitfields with persisted sidecars, hydration claims, pinning, hole-punch
+//! culling (in-memory and disk-only victims), and the cache/origin artifact
+//! path helpers CLI verify/dupes use (`cacheMetaPath`, `sidecarPieceSize`,
+//! `manifestPath`).
 const std = @import("std");
 const piece = @import("piece.zig");
 const proto = @import("proto.zig");
@@ -507,6 +509,20 @@ pub const Store = struct {
         var mid: [sys.c.PATH_MAX]u8 = undefined;
         const n = try self.cacheSubPath(&mid, "meta", rel);
         return sys.appendExt(buf, n, ".pieces");
+    }
+
+    /// Piece size recorded in `meta/<rel>.pieces`, or null when the sidecar
+    /// is missing, unreadable, or not a usable header. `modelfs verify` uses
+    /// this so it checks against the grid the daemon wrote, not `--piece`.
+    pub fn sidecarPieceSize(self: *const Store, rel: []const u8) ?u32 {
+        var buf: [sys.c.PATH_MAX]u8 = undefined;
+        const z = self.cacheMetaPath(&buf, rel) catch return null;
+        const fd = sys.open(z, c.O_RDONLY | c.O_NOFOLLOW, 0);
+        if (fd < 0) return null;
+        defer sys.close(fd);
+        var hdr: [8]u8 = undefined;
+        if (sys.preadAll(fd, &hdr, 0) != 8) return null;
+        return piece.sidecarPieceSize(&hdr);
     }
 
     pub fn cachePinPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
@@ -1334,12 +1350,17 @@ pub const Store = struct {
     /// unbounded allocation from an untrusted artifact.
     pub const max_manifest_bytes: usize = 64 * 1024 * 1024;
 
+    /// `<origin>/.cluster/manifests`.
+    pub fn manifestsDirPath(self: *const Store, buf: []u8) ![*:0]u8 {
+        return sys.joinZ(buf, self.origin, manifests_dir);
+    }
+
     /// `<origin>/.cluster/manifests/<hex(blake3(rel))>`.
     pub fn manifestPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
         var mname: [2 * piece.digest_len]u8 = undefined;
         const name = piece.manifestName(rel, &mname);
         var mid: [sys.c.PATH_MAX]u8 = undefined;
-        const d = try sys.joinZ(&mid, self.origin, manifests_dir);
+        const d = try self.manifestsDirPath(&mid);
         return sys.joinZ(buf, std.mem.span(d), name);
     }
 
@@ -1549,7 +1570,7 @@ pub const Store = struct {
             // lease publish (an unconditional mkdirAll would cost one failed
             // mkdir per publish for the life of the cluster).
             var mid: [sys.c.PATH_MAX]u8 = undefined;
-            if (sys.joinZ(&mid, self.origin, manifests_dir)) |d| {
+            if (self.manifestsDirPath(&mid)) |d| {
                 _ = sys.mkdirAll(std.mem.span(d), 0o755);
             } else |_| {}
             w = sys.writeFileNoFollow(ztmp, enc);
@@ -3414,6 +3435,37 @@ test "originPath and cacheDataPath refuse a rel that fails relOk" {
     try std.testing.expect(std.mem.endsWith(u8, std.mem.span(ok), "/o/a.bin"));
     const root = try st.originPath(&buf, "");
     try std.testing.expectEqualStrings("/o", std.mem.span(root));
+}
+
+test "manifestsDirPath and manifestPath join under origin/.cluster/manifests" {
+    const gpa = std.testing.allocator;
+    var st = Store.init(gpa, std.testing.io, "/o", "/c", 16);
+    defer st.deinit();
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    const d = try st.manifestsDirPath(&buf);
+    try std.testing.expectEqualStrings("/o/.cluster/manifests", std.mem.span(d));
+    const p = try st.manifestPath(&buf, "a.bin");
+    const span = std.mem.span(p);
+    try std.testing.expect(std.mem.startsWith(u8, span, "/o/.cluster/manifests/"));
+    try std.testing.expect(std.mem.indexOf(u8, span, "a.bin") == null);
+}
+
+test "sidecarPieceSize reads the cache meta header and ignores a missing sidecar" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-sps");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-sps");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+    try std.testing.expect(st.sidecarPieceSize("a.bin") == null);
+    try writeFilledSidecar(&st, "a.bin", 64, &.{0});
+    try std.testing.expectEqual(@as(?u32, 16), st.sidecarPieceSize("a.bin"));
+    try std.testing.expect(st.sidecarPieceSize("../x") == null);
 }
 
 test "relOk rejects traversal and absolute paths" {

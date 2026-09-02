@@ -110,15 +110,17 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 | `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`) |
 | `cull.zig` | Free-space watermark policy |
 | `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
-| `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names |
+| `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`) |
 | `discover.zig` | Cluster leases (`walkLeases`, Catalog), `/have` probe cache, path scoring |
 | `rdma.zig` | RDMA data-plane transport seam: `/stage` window codec and the backend interface (null until the verbs tail; see design.md section 15) |
 | `peer.zig` | Peer HTTP server and fetch client |
 | `fuse_fs.zig` | FUSE handlers, daemon `State` (`init`/`spawnWorkers`/`deinit`/`run`), discovery/cull loops |
-| `main.zig` | CLI and mount wiring into `State.init` / `State.deinit`; mount-time `disableCoreDumps` / `scrubPskEnv` |
+| `main.zig` | CLI and mount wiring into `State.init` / `State.deinit`; mount-time `disableCoreDumps` / `scrubPskEnv`. Pin/verify/dupes share `mountRel` then `relOk`/`relIsCluster` |
 | `root.zig` | Test aggregator for `zig build test` |
 
 `main` → `fuse_fs` → `peer` → (`store`, `discover`, `rdma`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
+
+CLI commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`) import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`, `manifestsDirPath`) rather than reconstructing those joins.
 
 ---
 
