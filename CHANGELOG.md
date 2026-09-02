@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Review-pass fixes - 2026-09-02
+- **`modelfs update` now fails loudly when the kernel cannot supply random bytes.** The handshake token that matches an `update.req` to its `update.ack` fell back to a pid-derived value if `getrandom` failed, and a derivable token lets a same-uid racer ack an update it did not request. The raw syscall stays (`std.crypto.random` and `std.posix.getrandom` are both gone in Zig 0.16) but now lives behind `sys.randomBytes` with EINTR retry and short-read looping, and `cmdUpdate` names the failure and exits 1 rather than proceeding with a weak token.
+- **The inode and handle layer gained unit tests.** `v0.7.0` moved the daemon to libfuse's low-level API, so modelfs owns the ino/path table, the lookup counts, and the fh/path table; the nine functions carrying that were covered only by `scripts/test_hot_reload.sh`, which needs `/dev/fuse` and so never runs in CI. No behavior change.
+- **The Hugging Face token cap and the handover state cap are named constants** (`hf.max_token_bytes`, `handover.max_state_bytes`) rather than bare literals. Both are bounds on parsed input. No behavior change.
+
 ## [0.7.0] - 2026-09-02
 
 Feature release on top of 0.6.0. `modelfs update` replaces a live mount's
