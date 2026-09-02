@@ -6,6 +6,9 @@ Work since `v0.5.0`. Upgrading a node or a script written against that tag:
 start at **Upgrade from v0.5.0** below. The binary still prints `0.5.0`
 until the next tag.
 
+### Concurrent fills of one file share one /have probe - 2026-09-02
+- **A cold or TTL-expired have cache no longer probes the cluster once per concurrent piece.** `fillFromPeers` used to call `probeCandidates` per FUSE worker per piece, so a large read covering many holes (or a 2 s TTL expiry under several workers) stampeded every peer's `/have` and filled the 16 inflight slots, after which fetches dropped to origin. `Catalog.probeTryClaim` is the same singleflight `beginFill` uses per piece: one owner walks the cluster, waiters retry the have cache. Cap overflow still probes so a many-file cold start cannot wait on a slot that will never name that rel.
+
 ### FUSE unlink retry of a gone file is success - 2026-09-02
 - **`Store.unlinkOrigin` treats ENOENT as success.** `mkdir` of an existing
   directory and `rmdir` of a gone directory already converged so a FUSE

@@ -1789,20 +1789,39 @@ pub fn fillFromPeers(
 ) !void {
     // Sequential fills of one file spend the 2s TTL here after the first
     // piece: every live peer already has a cache line (hit or healthy 404),
-    // so there is no snapshot, no grouping, and no probe thread.
+    // so there is no snapshot, no grouping, and no probe thread. Concurrent
+    // fills of the same file (a large FUSE read covering many pieces, or a
+    // TTL expiry under several workers) share one probe walk: without
+    // probeTryClaim each worker would /have every peer at once and
+    // saturate the 16 inflight slots.
     var cand_buf: [discover.Catalog.cached_cand_cap]discover.PathCand = undefined;
     var ip_buf: [discover.Catalog.cached_cand_cap][discover.Catalog.ip4_text_max]u8 = undefined;
-    const now_ms = sys.monoMs(cat.io);
-    if (cat.collectCachedCands(rel, idx, piece_size, now_ms, &cand_buf, &ip_buf)) |cached| {
-        return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cached, stats);
+    while (true) {
+        const now_ms = sys.monoMs(cat.io);
+        if (cat.collectCachedCands(rel, idx, piece_size, now_ms, &cand_buf, &ip_buf)) |cached| {
+            return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cached, stats);
+        }
+        if (cat.probeTryClaim(rel)) {
+            defer cat.probeRelease(rel);
+            // The previous owner may have populated the cache while we
+            // claimed; skip the wire if so.
+            const now2 = sys.monoMs(cat.io);
+            if (cat.collectCachedCands(rel, idx, piece_size, now2, &cand_buf, &ip_buf)) |cached| {
+                return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cached, stats);
+            }
+            const cands = try probeCandidates(gpa, psk, cat, rel, idx, piece_size, stats);
+            defer {
+                for (cands) |cand| gpa.free(cand.ip);
+                gpa.free(cands);
+            }
+            return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cands, stats);
+        }
+        // Another filler of this file owns the walk. Yield like beginFill's
+        // in-flight claim spin: the owner fills the have cache, then this
+        // loop hits collectCachedCands. The injected Io lets a simulator
+        // interleave instead of blocking wall time.
+        sys.sleepMs(cat.io, 2);
     }
-
-    const cands = try probeCandidates(gpa, psk, cat, rel, idx, piece_size, stats);
-    defer {
-        for (cands) |cand| gpa.free(cand.ip);
-        gpa.free(cands);
-    }
-    return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cands, stats);
 }
 
 test "rangeBps" {

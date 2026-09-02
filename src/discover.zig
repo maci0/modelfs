@@ -285,6 +285,13 @@ pub const Catalog = struct {
     arena: std.heap.ArenaAllocator,
     have_mu: std.Io.Mutex = .init,
     have_cache: std.ArrayList(HaveEntry) = .empty,
+    /// rels with a /have probe in flight. Concurrent fillFromPeers of the
+    /// same file share one cluster walk (the same singleflight beginFill
+    /// uses per piece): a cold or TTL-expired have cache otherwise probes
+    /// every peer once per FUSE worker per piece and saturates the 16
+    /// inflight slots. Guarded by have_mu like the have cache. Bounded so
+    /// a many-file cold start cannot grow it with the live map.
+    probe_inflight: std.ArrayList(ProbeInflight) = .empty,
     /// Addresses whose staged (RDMA) data plane failed a fetch recently,
     /// keyed by (ip, port) and guarded by have_mu like the have cache. A
     /// peer that advertises X-Stage and then fails /stage must not cost an
@@ -334,6 +341,11 @@ pub const Catalog = struct {
     /// the next piece.
     const have_ttl_ms: i64 = 2000;
     const have_cache_cap: usize = 32;
+    const probe_inflight_cap: usize = 32;
+
+    const ProbeInflight = struct {
+        rel: []u8,
+    };
 
     const stage_down_cap: usize = 32;
 
@@ -660,6 +672,42 @@ pub const Catalog = struct {
         };
     }
 
+    /// True when this caller owns the in-flight /have probe for `rel` and
+    /// must run probeCandidates (then probeRelease). False when another
+    /// filler of this file is already walking the cluster: wait and retry
+    /// collectCachedCands. Cap or OOM returns true without recording so a
+    /// many-file cold start still probes (the pre-singleflight behavior)
+    /// instead of waiting on a slot that will never name this rel.
+    pub fn probeTryClaim(self: *Catalog, rel: []const u8) bool {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (self.probe_inflight.items) |e| {
+            if (std.mem.eql(u8, e.rel, rel)) return false;
+        }
+        if (self.probe_inflight.items.len >= probe_inflight_cap) return true;
+        const rel_own = gpa.dupe(u8, rel) catch return true;
+        self.probe_inflight.append(gpa, .{ .rel = rel_own }) catch {
+            gpa.free(rel_own);
+            return true;
+        };
+        return true;
+    }
+
+    /// Drops the in-flight claim probeTryClaim recorded for `rel`. A no-op
+    /// when the claim was the cap/OOM overflow path (nothing recorded).
+    pub fn probeRelease(self: *Catalog, rel: []const u8) void {
+        const gpa = self.gpa;
+        self.have_mu.lockUncancelable(self.io);
+        defer self.have_mu.unlock(self.io);
+        for (self.probe_inflight.items, 0..) |e, i| {
+            if (!std.mem.eql(u8, e.rel, rel)) continue;
+            gpa.free(self.probe_inflight.items[i].rel);
+            _ = self.probe_inflight.orderedRemove(i);
+            return;
+        }
+    }
+
     /// IPv4 dotted-quad cap (INET_ADDRSTRLEN minus the NUL). pushPath only
     /// admits parseV4 addresses, so every live path fits.
     pub const ip4_text_max: usize = 15;
@@ -747,6 +795,8 @@ pub const Catalog = struct {
     pub fn deinit(self: *Catalog) void {
         for (self.have_cache.items) |e| freeHaveEntry(self.gpa, e);
         self.have_cache.deinit(self.gpa);
+        for (self.probe_inflight.items) |e| self.gpa.free(e.rel);
+        self.probe_inflight.deinit(self.gpa);
         for (self.stage_down.items) |e| self.gpa.free(e.ip);
         self.stage_down.deinit(self.gpa);
         for (self.probe_down.items) |e| self.gpa.free(e.ip);
@@ -1506,6 +1556,54 @@ test "collectCachedCands answers from the have cache and skips incomplete cluste
     // Empty bits still occupy a cache line: haveHas is false, not null.
     try std.testing.expectEqual(@as(?bool, false), cat.haveHas("m.bin", "10.1.0.1", 1, 0, 4096, t0));
     try std.testing.expectEqual(@as(?bool, true), cat.haveHas("m.bin", "10.0.0.1", 1, 0, 4096, t0));
+}
+
+test "probeTryClaim singleflights one rel and isolates another" {
+    const gpa = std.testing.allocator;
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+
+    try std.testing.expect(cat.probeTryClaim("a.bin"));
+    try std.testing.expect(!cat.probeTryClaim("a.bin"));
+    try std.testing.expect(cat.probeTryClaim("b.bin"));
+    try std.testing.expect(!cat.probeTryClaim("b.bin"));
+    cat.probeRelease("a.bin");
+    try std.testing.expect(cat.probeTryClaim("a.bin"));
+    try std.testing.expect(!cat.probeTryClaim("b.bin"));
+    cat.probeRelease("a.bin");
+    cat.probeRelease("b.bin");
+    // A release of a rel that was never recorded (cap/OOM overflow path)
+    // is a no-op, including a double release.
+    cat.probeRelease("a.bin");
+    try std.testing.expect(cat.probeTryClaim("a.bin"));
+    cat.probeRelease("a.bin");
+}
+
+test "probeTryClaim cap overflow still lets the caller probe" {
+    const gpa = std.testing.allocator;
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+
+    var i: usize = 0;
+    while (i < Catalog.probe_inflight_cap) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "f{d}.bin", .{i}) catch unreachable;
+        try std.testing.expect(cat.probeTryClaim(name));
+    }
+    // Past the cap the caller still probes (true) rather than waiting on a
+    // slot that will never name this rel. The overflow path records nothing,
+    // so a second claim of the same overflow rel also probes.
+    try std.testing.expect(cat.probeTryClaim("spill.bin"));
+    try std.testing.expect(cat.probeTryClaim("spill.bin"));
+    cat.probeRelease("spill.bin");
+    i = 0;
+    while (i < Catalog.probe_inflight_cap) : (i += 1) {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "f{d}.bin", .{i}) catch unreachable;
+        cat.probeRelease(name);
+    }
 }
 
 test "printable gates lease names and ids for log echo" {
