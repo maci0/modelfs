@@ -18,6 +18,9 @@ until the next tag.
 ### Replica pull follows child datasets - 2026-09-02
 - **Syncoid recurses like sanoid.** `sanoid.conf` already set `recursive = yes` so a later `zfs create tank/models/gguf` is snapshotted, but `syncoid-models.service` copied only the parent, so pool-loss restore would miss the new dataset. The replica unit and `dr_pool_restore.sh --from` pass `--recursive`. `hold_monthlies.sh` lists snapshots with `-r` so a child monthly gets `modelfs-dr` too. After a pool-loss recv, the restore script holds monthlies on DEST (holds do not travel with `zfs send`). Syncoid restore SSH uses `BatchMode=yes` and `ConnectTimeout=30` like the daily pull. `modelfs-offsite-age.service` requires `zfs-import.target`. The restore drill age-checks each child dataset so a layout that grew past the parent is an hourly alarm, not a silent gap.
 
+### NAS backup drop-ins survive a reinstall - 2026-09-02
+- **Re-running `install_nas_backup.sh --install` no longer wipes the replica SSH target or drill/offsite environment.** `systemctl edit --full` wrote the same path the installer copies, so the next `--install` restored the `nas:tank/models` placeholder and dropped `MF_DRILL_REPLICA`. Syncoid now takes `MF_SYNCOID_SRC` / `MF_SYNCOID_DEST` from the unit environment (a `systemctl edit` drop-in survives), and the runbook uses `systemctl edit` instead of `--full`. The snapshot-age, drill-log, and offsite-age units are sandboxed like `notify-admin@.service`.
+
 ### Peer goodput samples ignore sub-resolution clock ticks - 2026-09-02
 - **A piece fetch whose elapsed time is 1 ns no longer records ~10 PB/s.** `rangeBps` already returned 0 for a same-ns tick (which pulled the EWMA toward a dead path). A 1 ns tick on a 16 MiB piece is finite (~1.7e16 B/s) and pulled the EWMA the other way, so `pickBest` stuck on that path until tens of real samples decayed it. Samples above 1 TB/s now keep the prior, like a non-positive interval.
 

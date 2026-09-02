@@ -5,5 +5,10 @@ OnFailure=notify-admin@%n.service
 
 [Service]
 Type=oneshot
+# Reads the drill log only.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
 Environment=MF_DRILL_LOG=/var/log/modelfs-drill.log
 ExecStart=/usr/local/sbin/modelfs-check-drill-log

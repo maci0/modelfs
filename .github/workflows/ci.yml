@@ -72,15 +72,18 @@ jobs:
 
       # Python tooling exactly as pinned in requirements-dev.lock.txt
       # (hash-verified install, per README). activate-environment creates
-      # .venv and puts it on PATH. Cache key includes .python-version so a
-      # pin bump cannot restore a venv built for the previous interpreter;
-      # requirements*.txt is the lock plus the un-hashed bounds file (the
-      # action's default also lists **/uv.lock, which this repo does not
-      # have, and pyproject.toml, whose tool-config edits must not bust
-      # the package cache).
+      # a venv and puts it on PATH. venv-path is explicit: check.sh
+      # requires ROOT_DIR/.venv/bin (a setup-uv default change would
+      # otherwise pass PATH but fail the existence check). Cache key
+      # includes .python-version so a pin bump cannot restore a venv
+      # built for the previous interpreter; requirements*.txt is the lock
+      # plus the un-hashed bounds file (the action's default also lists
+      # **/uv.lock, which this repo does not have, and pyproject.toml,
+      # whose tool-config edits must not bust the package cache).
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           activate-environment: true
+          venv-path: .venv
           python-version: ${{ steps.py.outputs.version }}
           cache-dependency-glob: |
             requirements*.txt

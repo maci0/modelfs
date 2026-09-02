@@ -15,5 +15,13 @@ Requires=zfs-import.target
 
 [Service]
 Type=oneshot
+# Read-only zfs list. Keep /dev visible (/dev/zfs); do not set
+# PrivateDevices=yes. Set MF_OFFSITE_DATASET with `systemctl edit`
+# (a drop-in); --full is overwritten by --install. Leave it unset
+# here so a live-NAS default cannot bless production as the offsite copy.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
 # Environment=MF_OFFSITE_DATASET=tank/models
 ExecStart=/usr/local/sbin/modelfs-check-offsite

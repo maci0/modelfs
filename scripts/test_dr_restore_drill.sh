@@ -1013,6 +1013,12 @@ elif ! grep -q "modelfs-check-offsite" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing check-offsite: ${DRY_OUT}"
 elif ! grep -q "modelfs-offsite-age.timer" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing offsite-age timer: ${DRY_OUT}"
+elif grep -qE '^[[:space:]]+systemctl edit --full' <<<"${DRY_OUT}"; then
+    fail "installer next steps use systemctl edit --full (overwritten by --install): ${DRY_OUT}"
+elif ! grep -q "systemctl edit syncoid-models.service" <<<"${DRY_OUT}"; then
+    fail "installer next steps missing drop-in edit for syncoid source: ${DRY_OUT}"
+elif ! grep -q "systemctl edit modelfs-offsite-age.service" <<<"${DRY_OUT}"; then
+    fail "installer next steps missing drop-in edit for offsite dataset: ${DRY_OUT}"
 else
     pass "installer dry-run lists the NAS units"
 fi
@@ -1067,6 +1073,18 @@ else
     elif ! grep -q "BatchMode=yes" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost SSH BatchMode"
+    elif ! grep -q "^Environment=MF_SYNCOID_SRC=nas:tank/models$" \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit lost MF_SYNCOID_SRC default"
+    elif ! grep -Fq "\${MF_SYNCOID_SRC}" \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid ExecStart lost \${MF_SYNCOID_SRC}"
+    elif grep -qE '^ExecStart=.*nas:tank/models' \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid ExecStart still hardcodes nas:tank/models"
+    elif grep -qE '^ProtectHome=yes' \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit gained ProtectHome=yes (breaks /root/.ssh)"
     elif ! grep -q "Requires=zfs-import.target" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost Requires=zfs-import.target"
@@ -1085,6 +1103,15 @@ else
     elif ! grep -q -- "--age-only" \
         "${INSTALL_DEST}/etc/systemd/system/modelfs-snap-age.service"; then
         fail "installer --install snap-age unit lost --age-only"
+    elif ! grep -Fq "\${MF_DRILL_DATASET}" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-snap-age.service"; then
+        fail "installer --install snap-age ExecStart lost \${MF_DRILL_DATASET}"
+    elif ! grep -q "ProtectSystem=strict" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-snap-age.service"; then
+        fail "installer --install snap-age unit lost ProtectSystem=strict"
+    elif ! grep -q "ProtectSystem=strict" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-drill-log.service"; then
+        fail "installer --install drill-log unit lost ProtectSystem=strict"
     elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-hold-monthlies" ]]; then
         fail "installer --install hold wrapper is not executable"
     elif ! grep -q "recursive = yes" "${INSTALL_DEST}/etc/sanoid/sanoid.conf"; then
@@ -1104,6 +1131,12 @@ else
     elif ! grep -q -- "--recursive" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost --recursive"
+    elif ! grep -q "ProtectSystem=strict" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-offsite-age.service"; then
+        fail "installer --install offsite-age unit lost ProtectSystem=strict"
+    elif ! grep -Fq "\${MF_DRILL_DATASET}" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-drill.service"; then
+        fail "installer --install drill ExecStart lost \${MF_DRILL_DATASET}"
     else
         nas_list="${TEMP}/nas-files"
         if ! find "${SCRIPTS_DIR}/nas" -type f >"${nas_list}.raw"; then
@@ -1127,6 +1160,29 @@ else
             fi
         fi
     fi
+fi
+
+# A drop-in override must survive a second --install (`systemctl edit`,
+# not --full). The unit file is refreshed; override.conf is not.
+OVERRIDE_DIR="${INSTALL_DEST}/etc/systemd/system/syncoid-models.service.d"
+mkdir -p "${OVERRIDE_DIR}"
+printf '%s\n' '[Service]' 'Environment=MF_SYNCOID_SRC=replica@nas:tank/models' \
+    >"${OVERRIDE_DIR}/override.conf"
+REINSTALL_OUT=""
+REINSTALL_RC=0
+REINSTALL_OUT="$(MF_NAS_DEST="${INSTALL_DEST}" "${INSTALLER}" --install 2>&1)" || REINSTALL_RC=$?
+if [[ "${REINSTALL_RC}" -ne 0 ]]; then
+    fail "installer second --install: expected success, rc=${REINSTALL_RC}: ${REINSTALL_OUT}"
+elif [[ ! -f "${OVERRIDE_DIR}/override.conf" ]]; then
+    fail "installer --install removed syncoid drop-in override.conf"
+elif ! grep -q "Environment=MF_SYNCOID_SRC=replica@nas:tank/models" \
+    "${OVERRIDE_DIR}/override.conf"; then
+    fail "installer --install clobbered syncoid drop-in override.conf"
+elif ! grep -q "BatchMode=yes" \
+    "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+    fail "installer second --install lost syncoid BatchMode"
+else
+    pass "installer --install leaves a syncoid drop-in override in place"
 fi
 
 # --- check_offsite.sh: site-loss copy freshness

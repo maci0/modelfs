@@ -7,8 +7,10 @@ Requires=zfs-import.target
 Wants=network-online.target
 # Pull, not push: this unit runs on the replica host so NAS root cannot
 # destroy the pool-loss copy with the same credential that can destroy
-# tank/models. Replace nas:tank/models with the SSH target after a
-# dedicated replica-user key can zfs send from the NAS.
+# tank/models. Override MF_SYNCOID_SRC with `systemctl edit` (a drop-in)
+# after a dedicated replica-user key can zfs send from the NAS. Do not
+# use `systemctl edit --full`: that replaces this file, and the next
+# install_nas_backup.sh --install would restore the placeholder.
 
 [Service]
 Type=oneshot
@@ -16,16 +18,19 @@ Type=oneshot
 # systemd defaults give Type=oneshot. infinity is explicit so a Rocky
 # host whose DefaultTimeoutStartSec is still 90 s cannot kill the recv.
 TimeoutStartSec=infinity
+# SSH keys live in /root/.ssh; do not set ProtectHome=yes.
+Environment=MF_SYNCOID_SRC=nas:tank/models
+Environment=MF_SYNCOID_DEST=tank/models
 # BatchMode: fail the unit on a missing host key or a password prompt
 # instead of hanging until TimeoutStartSec=infinity. ConnectTimeout
 # bounds a blackholed NAS so the daily timer can fire OnFailure.
 # --recursive matches sanoid.conf recursive = yes: a later
 # `zfs create tank/models/gguf` is snapshotted and must also land
 # on the replica, or pool-loss restore silently drops the new dataset.
-ExecStart=/usr/bin/syncoid --recursive --no-privilege-elevation --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 nas:tank/models tank/models
+ExecStart=/usr/bin/syncoid --recursive --no-privilege-elevation --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 ${MF_SYNCOID_SRC} ${MF_SYNCOID_DEST}
 # Monthlies survive a recursive destroy only until `zfs release`.
 # Already-held is success; any other hold failure fails this unit
 # (scripts/hold_monthlies.sh). The previous `|| true` swallowed a
 # missing hold as a green pull.
-ExecStartPost=/usr/local/sbin/modelfs-hold-monthlies tank/models
+ExecStartPost=/usr/local/sbin/modelfs-hold-monthlies ${MF_SYNCOID_DEST}
 

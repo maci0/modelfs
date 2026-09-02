@@ -14,8 +14,10 @@ TimeoutStartSec=infinity
 UMask=0077
 Environment=MF_DRILL_SCRATCH=/var/tmp/modelfs-drill
 Environment=MF_DRILL_LOG=/var/log/modelfs-drill.log
-# Set MF_DRILL_REPLICA to the local replica dataset when this host holds
-# the pool-loss copy; leave unset on the NAS (the log then records
-# replica=unchecked and the replica host runs this same unit).
+Environment=MF_DRILL_DATASET=tank/models
+# Set MF_DRILL_REPLICA via `systemctl edit` (a drop-in) when this host
+# holds the pool-loss copy; leave unset on the NAS (the log then records
+# replica=unchecked and the replica host runs this same unit). Do not
+# use `systemctl edit --full`: the next --install would drop it.
 # Environment=MF_DRILL_REPLICA=tank/models
-ExecStart=/usr/local/sbin/modelfs-restore-drill tank/models
+ExecStart=/usr/local/sbin/modelfs-restore-drill ${MF_DRILL_DATASET}

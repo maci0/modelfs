@@ -10,7 +10,13 @@ Requires=zfs-import.target
 
 [Service]
 Type=oneshot
-# Set MF_DRILL_REPLICA to the local replica dataset when this host holds
-# the pool-loss copy; leave unset on the NAS.
+# Read-only zfs list. Keep /dev visible (/dev/zfs); do not set
+# PrivateDevices=yes. Override MF_DRILL_DATASET / MF_DRILL_REPLICA with
+# `systemctl edit` (a drop-in); --full is overwritten by --install.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+Environment=MF_DRILL_DATASET=tank/models
 # Environment=MF_DRILL_REPLICA=tank/models
-ExecStart=/usr/local/sbin/modelfs-restore-drill --age-only tank/models
+ExecStart=/usr/local/sbin/modelfs-restore-drill --age-only ${MF_DRILL_DATASET}
