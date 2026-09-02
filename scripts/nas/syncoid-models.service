@@ -3,6 +3,8 @@ Description=Pull tank/models from the NAS onto this replica host
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 OnFailure=notify-admin@%n.service
 After=zfs-import.target network-online.target
+Requires=zfs-import.target
+Wants=network-online.target
 # Pull, not push: this unit runs on the replica host so NAS root cannot
 # destroy the pool-loss copy with the same credential that can destroy
 # tank/models. Replace nas:tank/models with the SSH target after a
@@ -14,7 +16,10 @@ Type=oneshot
 # systemd defaults give Type=oneshot. infinity is explicit so a Rocky
 # host whose DefaultTimeoutStartSec is still 90 s cannot kill the recv.
 TimeoutStartSec=infinity
-ExecStart=/usr/bin/syncoid --no-privilege-elevation nas:tank/models tank/models
+# BatchMode: fail the unit on a missing host key or a password prompt
+# instead of hanging until TimeoutStartSec=infinity. ConnectTimeout
+# bounds a blackholed NAS so the daily timer can fire OnFailure.
+ExecStart=/usr/bin/syncoid --no-privilege-elevation --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 nas:tank/models tank/models
 # Monthlies survive a recursive destroy only until `zfs release`.
 # Already-held is success; any other hold failure fails this unit
 # (scripts/hold_monthlies.sh). The previous `|| true` swallowed a

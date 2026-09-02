@@ -5,6 +5,7 @@ Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 [Timer]
 OnCalendar=daily
 Persistent=true
+RandomizedDelaySec=5min
 
 [Install]
 WantedBy=timers.target

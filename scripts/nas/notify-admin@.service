@@ -10,4 +10,10 @@ Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 
 [Service]
 Type=oneshot
+# logger only needs the journal/syslog socket. Keep /dev visible
+# (/dev/log); do not set PrivateDevices=yes.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
 ExecStart=/bin/logger -t modelfs-backup -p daemon.err -- "unit %i failed; snapshot, replica, or restore drill needs attention (docs/recovery.md)"

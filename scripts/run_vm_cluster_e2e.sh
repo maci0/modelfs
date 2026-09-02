@@ -76,17 +76,29 @@ for vm in "${VMS[@]}"; do
 done
 
 # --- cloud image (cached across runs, checksum-verified every run) -----
+# Pin the 24.04 release serial, not noble/current (a moving daily whose
+# bytes will not match EXPECTED_SHA256). Serial 20260826 is the image
+# whose amd64.img digest is recorded below (SHA256SUMS in that directory).
 IMG_DIR="${SCRATCH_DIR}/vmcluster-image"
 IMG="${IMG_DIR}/noble-server-cloudimg-amd64.img"
-mkdir -p "${IMG_DIR}"
-if [[ ! -f "${IMG}" ]]; then
-    echo "=== downloading Ubuntu 24.04 cloud image (cached at ${IMG}) ==="
-    curl -fL -o "${IMG}.part" "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-    mv "${IMG}.part" "${IMG}"
-fi
+IMG_URL="https://cloud-images.ubuntu.com/releases/24.04/release-20260826/ubuntu-24.04-server-cloudimg-amd64.img"
 EXPECTED_SHA256="d0fe84bb5f80853425fa6be28e2c106f30104c3cfe8611933f2e65c9b63f0e30"
-echo "${EXPECTED_SHA256} *${IMG}" | sha256sum -c - >/dev/null \
-    || fail "cloud image ${IMG} failed checksum; delete it to re-download"
+mkdir -p "${IMG_DIR}"
+download_cloud_img() {
+    echo "=== downloading Ubuntu 24.04 cloud image (cached at ${IMG}) ==="
+    curl -fL -o "${IMG}.part" "${IMG_URL}"
+    mv "${IMG}.part" "${IMG}"
+}
+if [[ ! -f "${IMG}" ]]; then
+    download_cloud_img
+fi
+if ! echo "${EXPECTED_SHA256} *${IMG}" | sha256sum -c - >/dev/null; then
+    echo "cloud image ${IMG} failed checksum; re-downloading from the pinned release" >&2
+    rm -f "${IMG}"
+    download_cloud_img
+    echo "${EXPECTED_SHA256} *${IMG}" | sha256sum -c - >/dev/null \
+        || fail "cloud image ${IMG} failed checksum after re-download from ${IMG_URL}"
+fi
 
 # --- scratch -----------------------------------------------------------
 TEMP_DIR="$(mktemp -d "${SCRATCH_DIR}/vmcluster-e2e-XXXXXX")"
@@ -119,7 +131,8 @@ ssh-keygen -q -t ed25519 -N "" -f "${SSH_KEY}"
 PUBKEY="$(cat "${SSH_KEY}.pub")"
 
 # Ensure the libvirt default NAT network exists and is up (creates it on a
-# host where libvirt was never used).
+# host where libvirt was never used). DHCP starts at .128 so it cannot
+# hand out the static .10-.13 addresses the guests use.
 if ! sudo virsh net-info default >/dev/null 2>&1; then
     sudo virsh net-define /dev/stdin >/dev/null <<'EOF'
 <network>
@@ -127,7 +140,7 @@ if ! sudo virsh net-info default >/dev/null 2>&1; then
   <forward mode='nat'/>
   <bridge name='virbr0' stp='on' delay='0'/>
   <ip address='192.168.122.1' netmask='255.255.255.0'>
-    <dhcp><range start='192.168.122.2' end='192.168.122.254'/></dhcp>
+    <dhcp><range start='192.168.122.128' end='192.168.122.254'/></dhcp>
   </ip>
 </network>
 EOF

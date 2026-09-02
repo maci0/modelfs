@@ -3,6 +3,7 @@ Description=Monthly ModelFS restore drill for tank/models
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 OnFailure=notify-admin@%n.service
 After=zfs-import.target
+Requires=zfs-import.target
 
 [Service]
 Type=oneshot
@@ -10,6 +11,7 @@ Type=oneshot
 # Type=oneshot default on some systemd versions. The clone is CoW and
 # fast; the compare is not.
 TimeoutStartSec=infinity
+UMask=0077
 Environment=MF_DRILL_SCRATCH=/var/tmp/modelfs-drill
 Environment=MF_DRILL_LOG=/var/log/modelfs-drill.log
 # Set MF_DRILL_REPLICA to the local replica dataset when this host holds

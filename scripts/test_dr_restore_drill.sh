@@ -968,6 +968,21 @@ else
     elif ! grep -q "TimeoutStartSec=infinity" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost TimeoutStartSec=infinity"
+    elif ! grep -q "BatchMode=yes" \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit lost SSH BatchMode"
+    elif ! grep -q "Requires=zfs-import.target" \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit lost Requires=zfs-import.target"
+    elif ! grep -q "Requires=zfs-import.target" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-drill.service"; then
+        fail "installer --install drill unit lost Requires=zfs-import.target"
+    elif ! grep -q "ProtectSystem=strict" \
+        "${INSTALL_DEST}/etc/systemd/system/notify-admin@.service"; then
+        fail "installer --install notify-admin unit lost ProtectSystem=strict"
+    elif ! grep -q "RandomizedDelaySec=5min" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-drill-log.timer"; then
+        fail "installer --install drill-log timer lost RandomizedDelaySec"
     elif ! grep -q "modelfs-hold-monthlies" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost hold ExecStartPost"

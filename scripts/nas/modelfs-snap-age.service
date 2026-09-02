@@ -3,6 +3,7 @@ Description=Alarm if tank/models newest snapshot is older than the claimed RPO
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 OnFailure=notify-admin@%n.service
 After=zfs-import.target
+Requires=zfs-import.target
 # Hourly, not the monthly clone: a disabled sanoid.timer never fails the
 # sanoid.service unit (OnFailure never fires), so snapshot age is the
 # alarm. --age-only does not append the drill log.
