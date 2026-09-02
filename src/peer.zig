@@ -4933,23 +4933,10 @@ test "serveData verifies cached pieces against their trusted digest before strea
     // the peer falls through to another path (then the origin), and this
     // node's serve_verify_fail counter makes the corruption visible.
     const before = fixture.st.stats.serve_verify_fail.load(.monotonic);
-    var fds: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(i32, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds));
-    defer sys.close(fds[0]);
-    defer sys.close(fds[1]);
     const head = "GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-15\r\n\r\n";
-    try std.testing.expectEqual(@as(isize, @intCast(head.len)), sys.writeAll(fds[0], head));
-    _ = c.shutdown(fds[0], c.SHUT_WR);
-    _ = fixture.srv.http_inflight.fetchAdd(1, .monotonic);
-    handleConn(&fixture.srv, fds[1], std.mem.zeroes(c.struct_sockaddr_in));
     var rbuf: [256]u8 = undefined;
-    var got_len: usize = 0;
-    while (got_len < rbuf.len) {
-        const r = c.recv(fds[0], &rbuf[got_len], rbuf.len - got_len, c.MSG_DONTWAIT);
-        if (r <= 0) break;
-        got_len += @intCast(r);
-    }
-    try std.testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", rbuf[0..got_len]);
+    const got = try stageRequest(&fixture.srv, head, &rbuf);
+    try std.testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", got);
     try std.testing.expectEqual(before + 1, fixture.st.stats.serve_verify_fail.load(.monotonic));
     // Self-heal: the refused piece's mark is cleared for an origin refill.
     file.mu.lockUncancelable(std.testing.io);
@@ -4961,25 +4948,8 @@ test "serveData verifies cached pieces against their trusted digest before strea
 /// One-shot /data request against the fixture server, asserting a 206 whose
 /// body matches the origin bytes. Returns the handleConn status.
 fn serveDataCheckOk(srv: *Server, head: []const u8) !i32 {
-    var fds: [2]c_int = undefined;
-    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.Socket;
-    defer sys.close(fds[0]);
-    defer sys.close(fds[1]);
-    if (sys.writeAll(fds[0], head) < 0) return error.Write;
-    _ = c.shutdown(fds[0], c.SHUT_WR);
-    const prev_log_level = std.testing.log_level;
-    std.testing.log_level = .err;
-    defer std.testing.log_level = prev_log_level;
-    _ = srv.http_inflight.fetchAdd(1, .monotonic);
-    handleConn(srv, fds[1], std.mem.zeroes(c.struct_sockaddr_in));
     var rbuf: [4096]u8 = undefined;
-    var got_len: usize = 0;
-    while (got_len < rbuf.len) {
-        const r = c.recv(fds[0], &rbuf[got_len], rbuf.len - got_len, c.MSG_DONTWAIT);
-        if (r <= 0) break;
-        got_len += @intCast(r);
-    }
-    const got = rbuf[0..got_len];
+    const got = try stageRequest(srv, head, &rbuf);
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 206 Partial Content\r\n"));
     const body_at = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.NoHeaderEnd;
     const body = got[body_at + 4 ..];
@@ -4996,17 +4966,12 @@ test "serveStage answers 501 without a staging backend and gates its params" {
     rdma.backend = .{ .kind = .none };
     defer rdma.backend = saved;
 
-    // No backend: /have never advertises X-Stage and /stage refuses cleanly
-    // (the fetching peer falls back to /data). The 501 is a capability
-    // answer: it must not have hydrated the piece first.
+    // No backend: /stage answers 501 without hydrating, /have does not
+    // advertise X-Stage, and 501 is not a node-health 5xx.
     var resp_buf: [4096]u8 = undefined;
     var resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
     try std.testing.expectEqualStrings("HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", resp);
-    // 501 is a capability answer, not a node-health 5xx: an HTTP-only node
-    // probed on /stage must not look failing in status.json.
     try std.testing.expectEqual(@as(u64, 0), fixture.st.stats.http_5xx.load(.monotonic));
-    // The 501 is a capability answer, not a hydration side effect: the piece
-    // must not have been filled from the origin just to say "no backend".
     const f = try fixture.srv.store.get("m.bin", data_file_size, 0);
     defer fixture.srv.store.releaseFile(f);
     try std.testing.expect(!fixture.srv.store.hasPiece(f, 0, 0));

@@ -558,10 +558,8 @@ pub const Catalog = struct {
         return self.noteAddrDown(&self.probe_down, ip, port);
     }
 
-    /// Clears a /have probe failure for (ip, port) after the peer answered
-    /// (a 200 bitmap or a healthy 404). True when an entry was removed: the
-    /// caller logs the recovery so a returning peer is visible in the journal
-    /// without anyone watching counters.
+    /// True when a /have probe-down mark was removed so the caller can log
+    /// recovery.
     pub fn clearProbeDown(self: *Catalog, ip: []const u8, port: u16) bool {
         return self.clearAddrDown(&self.probe_down, ip, port);
     }
@@ -580,10 +578,8 @@ pub const Catalog = struct {
         return self.noteAddrDown(&self.fetch_down, ip, port);
     }
 
-    /// Clears a /data fetch failure for (ip, port) after a piece fetch from
-    /// that peer succeeded. True when an entry was removed: the caller logs
-    /// the recovery so a returning peer is visible in the journal without
-    /// anyone watching counters.
+    /// True when a /data fetch-down mark was removed so the caller can log
+    /// recovery.
     pub fn clearFetchDown(self: *Catalog, ip: []const u8, port: u16) bool {
         return self.clearAddrDown(&self.fetch_down, ip, port);
     }
@@ -2696,40 +2692,29 @@ test "stageDown cap evicts expired by expiry then addr, never insert order" {
     try std.testing.expect(Fill.hasPort(&cat_lo, 99));
 }
 
-test "probeDown edge-triggers /have failures and clears on recovery" {
+fn expectEdgeTriggeredDown(
+    note: *const fn (*Catalog, []const u8, u16) bool,
+    clear: *const fn (*Catalog, []const u8, u16) bool,
+) !void {
     const gpa = std.testing.allocator;
     var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
     defer cat.deinit();
     // First failure logs (true); repeats ride the counter (false).
-    try std.testing.expect(cat.noteProbeDown("10.0.0.9", 18080));
-    try std.testing.expect(!cat.noteProbeDown("10.0.0.9", 18080));
-    // Same address, different port: independent.
-    try std.testing.expect(cat.noteProbeDown("10.0.0.9", 19090));
-    // Different address: independent.
-    try std.testing.expect(cat.noteProbeDown("10.0.0.8", 18080));
-    // Recovery clears only the matching entry and logs once.
-    try std.testing.expect(cat.clearProbeDown("10.0.0.9", 18080));
-    try std.testing.expect(!cat.clearProbeDown("10.0.0.9", 18080));
-    // Cleared peer can fail again (new outage logs again).
-    try std.testing.expect(cat.noteProbeDown("10.0.0.9", 18080));
+    try std.testing.expect(note(&cat, "10.0.0.9", 18080));
+    try std.testing.expect(!note(&cat, "10.0.0.9", 18080));
+    try std.testing.expect(note(&cat, "10.0.0.9", 19090));
+    try std.testing.expect(note(&cat, "10.0.0.8", 18080));
+    try std.testing.expect(clear(&cat, "10.0.0.9", 18080));
+    try std.testing.expect(!clear(&cat, "10.0.0.9", 18080));
+    try std.testing.expect(note(&cat, "10.0.0.9", 18080));
+}
+
+test "probeDown edge-triggers /have failures and clears on recovery" {
+    try expectEdgeTriggeredDown(Catalog.noteProbeDown, Catalog.clearProbeDown);
 }
 
 test "fetchDown edge-triggers /data fetch failures and clears on recovery" {
-    const gpa = std.testing.allocator;
-    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
-    defer cat.deinit();
-    // First failure logs (true); repeats ride the fill_err_peer counter.
-    try std.testing.expect(cat.noteFetchDown("10.0.0.9", 18080));
-    try std.testing.expect(!cat.noteFetchDown("10.0.0.9", 18080));
-    // Same address, different port: independent.
-    try std.testing.expect(cat.noteFetchDown("10.0.0.9", 19090));
-    // Different address: independent.
-    try std.testing.expect(cat.noteFetchDown("10.0.0.8", 18080));
-    // Recovery clears only the matching entry and logs once.
-    try std.testing.expect(cat.clearFetchDown("10.0.0.9", 18080));
-    try std.testing.expect(!cat.clearFetchDown("10.0.0.9", 18080));
-    // Cleared peer can fail again (new outage logs again).
-    try std.testing.expect(cat.noteFetchDown("10.0.0.9", 18080));
+    try expectEdgeTriggeredDown(Catalog.noteFetchDown, Catalog.clearFetchDown);
 }
 
 test "probeDown and fetchDown cap evict by addr, never insert order" {
