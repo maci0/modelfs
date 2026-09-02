@@ -3,8 +3,12 @@ Description=Daily check that the ModelFS restore drill has run
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 
 [Timer]
-OnCalendar=daily
-Persistent=true
+# Elapsed-time cadence, not midnight local. OnCalendar=daily follows the
+# host TZ; a DST fall-back night is 25 h of wall clock and would delay
+# this alarm. The check is "newest UTC log stamp inside 35 days".
+# OnBootSec covers a reboot: Persistent= is OnCalendar-only.
+OnBootSec=10min
+OnUnitActiveSec=1d
 RandomizedDelaySec=5min
 
 [Install]

@@ -21,6 +21,9 @@ until the next tag.
 ### NAS backup drop-ins survive a reinstall - 2026-09-02
 - **Re-running `install_nas_backup.sh --install` no longer wipes the replica SSH target or drill/offsite environment.** `systemctl edit --full` wrote the same path the installer copies, so the next `--install` restored the `nas:tank/models` placeholder and dropped `MF_DRILL_REPLICA`. Syncoid now takes `MF_SYNCOID_SRC` / `MF_SYNCOID_DEST` from the unit environment (a `systemctl edit` drop-in survives), and the runbook uses `systemctl edit` instead of `--full`. The snapshot-age, drill-log, and offsite-age units are sandboxed like `notify-admin@.service`.
 
+### NAS backup timers keep cadence across DST - 2026-09-02
+- **Watchdog timers tick elapsed time, and the replica/drill calendars are UTC.** `OnCalendar=hourly` in `America/Los_Angeles` (and `Europe/Berlin`) skips 02:00 on spring-forward and fires once across the fall-back doubled hour, so `modelfs-snap-age.timer` could sit idle for 2 h that night. Age checks (`modelfs-snap-age.timer`, `modelfs-drill-log.timer`, `modelfs-offsite-age.timer`) now use `OnBootSec`/`OnUnitActiveSec`; `Persistent=` is OnCalendar-only, so those units cover a reboot via `OnBootSec`. `syncoid-models.timer` is `daily UTC` and `modelfs-drill.timer` is `monthly UTC`, so a host TZ cannot move the pull or the monthly clone.
+
 ### Peer goodput samples ignore sub-resolution clock ticks - 2026-09-02
 - **A piece fetch whose elapsed time is 1 ns no longer records ~10 PB/s.** `rangeBps` already returned 0 for a same-ns tick (which pulled the EWMA toward a dead path). A 1 ns tick on a 16 MiB piece is finite (~1.7e16 B/s) and pulled the EWMA the other way, so `pickBest` stuck on that path until tens of real samples decayed it. Samples above 1 TB/s now keep the prior, like a non-positive interval.
 

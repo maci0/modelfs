@@ -3,8 +3,14 @@ Description=Hourly check that tank/models snapshots are inside the claimed RPO
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 
 [Timer]
-OnCalendar=hourly
-Persistent=true
+# Elapsed-time cadence, not local-hour calendar. OnCalendar=hourly in a
+# DST zone skips the spring-forward gap (02:00 America/Los_Angeles,
+# Europe/Berlin) and fires once across the fall-back doubled hour, so
+# this watchdog would sit idle for 2 h that night. The check is "has a
+# snapshot landed in the last 25 h"; it must keep ticking through those
+# transitions. OnBootSec covers a reboot: Persistent= is OnCalendar-only.
+OnBootSec=5min
+OnUnitActiveSec=1h
 RandomizedDelaySec=5min
 
 [Install]

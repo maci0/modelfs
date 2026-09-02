@@ -73,7 +73,7 @@ case "${SNAP_CTIME}" in
     *)
         ;;
 esac
-NOW="$(date +%s)"
+NOW="$(date -u +%s)"
 SNAP_AGE=$((NOW - SNAP_CTIME))
 if [[ "${SNAP_AGE}" -lt 0 ]]; then
     die "offsite newest snapshot ${SNAP} has creation ${SNAP_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"

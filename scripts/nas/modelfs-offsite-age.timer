@@ -3,8 +3,13 @@ Description=Weekly check that the ModelFS offsite copy is inside the claimed sit
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 
 [Timer]
-OnCalendar=weekly
-Persistent=true
+# Elapsed-time cadence, not Monday-midnight local. OnCalendar=weekly
+# follows the host TZ, so a DST transition moves the check by an hour
+# and a host in UTC vs America/Los_Angeles disagrees on which morning
+# it ran. The check is "newest snapshot inside 8 days".
+# OnBootSec covers a reboot: Persistent= is OnCalendar-only.
+OnBootSec=15min
+OnUnitActiveSec=7d
 RandomizedDelaySec=1h
 
 [Install]

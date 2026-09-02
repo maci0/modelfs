@@ -342,7 +342,7 @@ expect_fail() {
     pass "${name}"
 }
 
-NOW="$(date +%s)"
+NOW="$(date -u +%s)"
 FRESH=$((NOW - 60))
 STALE=$((NOW - 200000))
 
@@ -992,6 +992,24 @@ expect_check "padded MF_DRILL_LOG_MAX_AGE=0120 is 120 seconds, not octal 80" 0 "
 expect_check "overlong MF_DRILL_LOG_MAX_AGE is an alarm" 1 "whole number of seconds" \
     MF_DRILL_LOG="${TEMP}/fresh-drill.log" MF_DRILL_LOG_MAX_AGE="12345678901"
 
+# 02:30 America/Los_Angeles on 2026-03-08 does not exist (spring-forward).
+# GNU date without a Z suffix rejects that wall time under that TZ. A UTC
+# stamp with Z must still parse. Max age is ~31 y so the fixture cannot
+# go stale.
+echo "2026-03-08T02:30:00Z tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+    >"${TEMP}/dst-gap-drill.log"
+expect_check "spring-forward UTC stamp ages under America/Los_Angeles" 0 "drill-log OK" \
+    TZ=America/Los_Angeles MF_DRILL_LOG="${TEMP}/dst-gap-drill.log" MF_DRILL_LOG_MAX_AGE="999999999"
+
+# Fall-back 01:30 America/Los_Angeles occurs twice (PDT then PST). A Z
+# stamp is one instant; GNU date under that TZ must not pick the other
+# 01:30 and disagree with UTC age. 2025-11-02T09:30:00Z is the second
+# 01:30 (PST).
+echo "2025-11-02T09:30:00Z tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+    >"${TEMP}/dst-fold-drill.log"
+expect_check "fall-back UTC stamp ages under America/Los_Angeles" 0 "drill-log OK" \
+    TZ=America/Los_Angeles MF_DRILL_LOG="${TEMP}/dst-fold-drill.log" MF_DRILL_LOG_MAX_AGE="999999999"
+
 # --- install_nas_backup.sh: dry-run writes nothing; --install lands files under dest
 INSTALLER="${SCRIPTS_DIR}/install_nas_backup.sh"
 DRY_OUT=""
@@ -1097,6 +1115,30 @@ else
     elif ! grep -q "RandomizedDelaySec=5min" \
         "${INSTALL_DEST}/etc/systemd/system/modelfs-drill-log.timer"; then
         fail "installer --install drill-log timer lost RandomizedDelaySec"
+    elif ! grep -q "OnUnitActiveSec=1h" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-snap-age.timer"; then
+        fail "installer --install snap-age timer lost elapsed-time hourly cadence"
+    elif grep -q "^OnCalendar=" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-snap-age.timer"; then
+        fail "installer --install snap-age timer is calendar hourly (DST can skip or double a local hour)"
+    elif ! grep -q "OnUnitActiveSec=1d" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-drill-log.timer"; then
+        fail "installer --install drill-log timer lost elapsed-time daily cadence"
+    elif grep -q "^OnCalendar=" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-drill-log.timer"; then
+        fail "installer --install drill-log timer is calendar daily (host TZ / DST)"
+    elif ! grep -q "OnUnitActiveSec=7d" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-offsite-age.timer"; then
+        fail "installer --install offsite-age timer lost elapsed-time weekly cadence"
+    elif grep -q "^OnCalendar=" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-offsite-age.timer"; then
+        fail "installer --install offsite-age timer is calendar weekly (host TZ / DST)"
+    elif ! grep -q "OnCalendar=daily UTC" \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.timer"; then
+        fail "installer --install syncoid timer is not daily UTC"
+    elif ! grep -q "OnCalendar=monthly UTC" \
+        "${INSTALL_DEST}/etc/systemd/system/modelfs-drill.timer"; then
+        fail "installer --install drill timer is not monthly UTC"
     elif ! grep -q "modelfs-hold-monthlies" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost hold ExecStartPost"

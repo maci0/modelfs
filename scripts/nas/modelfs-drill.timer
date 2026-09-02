@@ -3,7 +3,11 @@ Description=Monthly ModelFS restore drill
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 
 [Timer]
-OnCalendar=monthly
+# UTC calendar: the 1st of the month at 00:00 UTC, not host-local
+# midnight. A NAS in America/Sao_Paulo (historically midnight DST) or
+# a replica whose TZ differs from the NAS would otherwise move or skip
+# the clone. Persistent= catches a month missed while the host was down.
+OnCalendar=monthly UTC
 Persistent=true
 RandomizedDelaySec=1h
 

@@ -164,7 +164,7 @@ case "${SNAP_CTIME}" in
     *)
         ;;
 esac
-NOW="$(date +%s)"
+NOW="$(date -u +%s)"
 SNAP_AGE=$((NOW - SNAP_CTIME))
 MAX_SNAP_AGE="${MF_DRILL_MAX_SNAP_AGE:-90000}"
 case "${MAX_SNAP_AGE}" in

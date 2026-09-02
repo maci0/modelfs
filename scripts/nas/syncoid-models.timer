@@ -3,7 +3,11 @@ Description=Daily pull of tank/models onto this replica host
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 
 [Timer]
-OnCalendar=daily
+# UTC calendar: the same instant on every replica host, and a DST
+# spring-forward cannot skip the local midnight this would otherwise
+# inherit from the host TZ. Persistent= catches a pull missed while
+# the replica was powered off.
+OnCalendar=daily UTC
 Persistent=true
 RandomizedDelaySec=15min
 
