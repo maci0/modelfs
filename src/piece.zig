@@ -336,19 +336,29 @@ pub const ManifestEntry = struct {
     hash: [digest_len]u8,
 };
 
+/// Optional origin-identity trailer after the entry table: mtime_sec,
+/// mtime_nsec, ino (little-endian i64/i64/u64). Same layout as
+/// `store.OriginId`. Older manifests omit it; a same-size rewrite then
+/// has no stamp for the loader to refuse.
+pub const manifest_identity_len: usize = 24;
+
 /// A decoded piece-hash manifest from shared storage (untrusted input, like
 /// lease JSON): the grid its hashes index against, the file size those
 /// pieces belong to, and the entries in strictly ascending idx order.
-/// `entries` is owned by the caller (gpa.free). The blob is NOT owned.
+/// `identity` is the optional origin mtime/ino trailer; null when the blob
+/// predates that field. `entries` is owned by the caller (gpa.free). The
+/// blob is NOT owned.
 pub const Manifest = struct {
     piece_size: u32,
     file_size: u64,
     entries: []ManifestEntry,
+    identity: ?[manifest_identity_len]u8 = null,
 };
 
 const manifest_magic = "MFSM";
 
-/// Serialized length of a manifest with n entries.
+/// Serialized length of a manifest with n entries, without the identity
+/// trailer. A published blob is this or this plus `manifest_identity_len`.
 pub fn manifestLen(n: usize) usize {
     return 4 + 4 + 8 + 4 + n * (4 + digest_len);
 }
@@ -391,8 +401,15 @@ pub fn manifestDecode(gpa: std.mem.Allocator, blob: []const u8) !?Manifest {
     const n = std.mem.readInt(u32, blob[16..20], .little);
     if (ps == 0) return error.BadManifest;
     // Exact length: a torn write (crash mid-publish) or a hostile blob must
-    // not decode half its entries.
-    if (manifestLen(n) != blob.len) return error.BadManifest;
+    // not decode half its entries. Two legal sizes: the entry table alone
+    // (older publishers) or the table plus a 24-byte origin-identity trailer.
+    const body = manifestLen(n);
+    const has_id = if (blob.len == body)
+        false
+    else if (blob.len == body + manifest_identity_len)
+        true
+    else
+        return error.BadManifest;
     const entries = try gpa.alloc(ManifestEntry, n);
     errdefer gpa.free(entries);
     var o: usize = 20;
@@ -412,7 +429,11 @@ pub fn manifestDecode(gpa: std.mem.Allocator, blob: []const u8) !?Manifest {
         if (e.idx >= max_idx) return error.BadManifest;
         prev = e.idx;
     }
-    return .{ .piece_size = ps, .file_size = fs, .entries = entries };
+    const identity: ?[manifest_identity_len]u8 = if (has_id)
+        blob[body..][0..manifest_identity_len].*
+    else
+        null;
+    return .{ .piece_size = ps, .file_size = fs, .entries = entries, .identity = identity };
 }
 
 /// Deterministic origin manifest name for a rel: lowercase hex of
@@ -466,8 +487,34 @@ test "manifest encode decode round trip" {
     try std.testing.expectEqual(@as(u32, 3), m.entries[1].idx);
     try std.testing.expectEqual(@as(u32, 7), m.entries[2].idx);
     try std.testing.expectEqualSlices(u8, &([_]u8{0x33} ** digest_len), &m.entries[2].hash);
+    try std.testing.expect(m.identity == null);
     // encode must reject an undersized buffer without a partial write.
     try std.testing.expectError(error.NoSpaceLeft, manifestEncode(4096, 40960, &entries, buf[0..10]));
+}
+
+test "manifest identity trailer round trips; other extras are corrupt" {
+    const gpa = std.testing.allocator;
+    const entries = [_]ManifestEntry{.{ .idx = 0, .hash = [_]u8{0x11} ** digest_len }};
+    var body_buf: [256]u8 = undefined;
+    const body = try manifestEncode(1, 8, &entries, &body_buf);
+    var id: [manifest_identity_len]u8 = undefined;
+    @memset(&id, 0);
+    std.mem.writeInt(i64, id[0..8], 100, .little);
+    std.mem.writeInt(i64, id[8..16], 5, .little);
+    std.mem.writeInt(u64, id[16..24], 7, .little);
+    var full: [256]u8 = undefined;
+    @memcpy(full[0..body.len], body);
+    @memcpy(full[body.len..][0..manifest_identity_len], &id);
+    var m = (try manifestDecode(gpa, full[0 .. body.len + manifest_identity_len])).?;
+    defer gpa.free(m.entries);
+    try std.testing.expectEqualSlices(u8, &id, &m.identity.?);
+    try std.testing.expectEqual(@as(u32, 0), m.entries[0].idx);
+    // 23 or 25 extra bytes are neither a body nor a body-plus-trailer.
+    try std.testing.expectError(error.BadManifest, manifestDecode(gpa, full[0 .. body.len + 23]));
+    var too: [256]u8 = undefined;
+    @memcpy(too[0 .. body.len + manifest_identity_len], full[0 .. body.len + manifest_identity_len]);
+    too[body.len + manifest_identity_len] = 0;
+    try std.testing.expectError(error.BadManifest, manifestDecode(gpa, too[0 .. body.len + manifest_identity_len + 1]));
 }
 
 test "manifest decode rejects corrupt and non-manifest blobs" {
@@ -1045,6 +1092,15 @@ const seed_manifest_oob_idx = fuzzcorpus.entry(&manifestSeed(1, 8, &.{
     .{ .idx = 8, .hash = [_]u8{0x11} ** digest_len },
 }));
 const seed_manifest_absent = fuzzcorpus.entry("");
+const seed_manifest_with_id = fuzzcorpus.entry(&blk: {
+    const body = manifestSeed(1, 8, &.{.{ .idx = 0, .hash = [_]u8{0x11} ** digest_len }});
+    var b: [body.len + manifest_identity_len]u8 = undefined;
+    @memcpy(b[0..body.len], &body);
+    @memset(b[body.len..], 0);
+    std.mem.writeInt(i64, b[body.len..][0..8], 100, .little);
+    std.mem.writeInt(u64, b[body.len + 16 ..][0..8], 7, .little);
+    break :blk b;
+});
 
 const fuzz_manifest_corpus = [_][]const u8{
     &seed_manifest_clean,
@@ -1056,16 +1112,17 @@ const fuzz_manifest_corpus = [_][]const u8{
     &seed_manifest_desc_idx,
     &seed_manifest_oob_idx,
     &seed_manifest_absent,
+    &seed_manifest_with_id,
 };
 
 /// Manifests ride on shared storage like sidecars, and a corrupt or hostile
 /// one must never yield a trust reference: the harness asserts the codec's
 /// full oracle -- null for a non-manifest, BadManifest for structural
 /// corruption, and, for a clean decode, strictly ascending in-grid indices
-/// with an exact-length body that re-encodes identically -- not just
-/// crash-freedom. Seeds go through fuzzcorpus.entry so Smith.slice feeds
-/// the codec bytes rather than treating the MFSM magic as a length prefix,
-/// which would skip every well-formed manifest.
+/// with an exact-length body (or body plus identity trailer) that re-encodes
+/// identically -- not just crash-freedom. Seeds go through fuzzcorpus.entry
+/// so Smith.slice feeds the codec bytes rather than treating the MFSM magic
+/// as a length prefix, which would skip every well-formed manifest.
 fn fuzzManifestDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const gpa = std.testing.allocator;
     var blob_buf: [160]u8 = undefined;
@@ -1077,7 +1134,12 @@ fn fuzzManifestDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
     try std.testing.expect(m.?.piece_size != 0);
     const max_idx = count(m.?.file_size, m.?.piece_size);
-    try std.testing.expectEqual(manifestLen(m.?.entries.len), blob.len);
+    const body = manifestLen(m.?.entries.len);
+    if (m.?.identity == null) {
+        try std.testing.expectEqual(body, blob.len);
+    } else {
+        try std.testing.expectEqual(body + manifest_identity_len, blob.len);
+    }
     var prev: ?u32 = null;
     for (m.?.entries) |e| {
         if (prev) |p| try std.testing.expect(e.idx > p);
@@ -1086,10 +1148,15 @@ fn fuzzManifestDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
     }
 
     // Persistence pair: a decoded blob must re-encode to the same bytes
-    // the origin reader just trusted.
+    // the origin reader just trusted, identity trailer included.
     var out_buf: [160]u8 = undefined;
-    const enc = try manifestEncode(m.?.piece_size, m.?.file_size, m.?.entries, out_buf[0..blob.len]);
-    try std.testing.expectEqualSlices(u8, blob, enc);
+    const enc = try manifestEncode(m.?.piece_size, m.?.file_size, m.?.entries, out_buf[0..body]);
+    if (m.?.identity) |id| {
+        @memcpy(out_buf[body..][0..manifest_identity_len], &id);
+        try std.testing.expectEqualSlices(u8, blob, out_buf[0..blob.len]);
+    } else {
+        try std.testing.expectEqualSlices(u8, blob, enc);
+    }
 }
 
 test "fuzz manifest decode honors the codec oracle" {

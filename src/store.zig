@@ -219,15 +219,16 @@ fn unlinkOrWarn(path_z: [*:0]const u8, what: []const u8, rel: []const u8) void {
 
 /// Origin file identity used to detect a same-size rewrite that size-only
 /// reconciliation cannot see (another node's FUSE write, or a direct write
-/// into the origin tree). Trailer on `meta/*.pieces`; optional, so older
-/// sidecars still load. An unknown identity skips the check.
+/// into the origin tree). Trailer on `meta/*.pieces` and on origin
+/// piece-hash manifests; optional, so older sidecars and manifests still
+/// load. An unknown identity skips the check.
 pub const OriginId = struct {
     mtime_sec: i64 = 0,
     mtime_nsec: i64 = 0,
     ino: u64 = 0,
     known: bool = false,
 
-    pub const encoded_len: usize = 24;
+    pub const encoded_len: usize = piece.manifest_identity_len;
 
     pub fn fromStat(st: c.struct_stat) OriginId {
         return .{
@@ -247,6 +248,15 @@ pub const OriginId = struct {
         if (observed.mtime_sec != recorded.mtime_sec)
             return observed.mtime_sec > recorded.mtime_sec;
         return observed.mtime_nsec > recorded.mtime_nsec;
+    }
+
+    /// Both sides named and the same object at the same mtime. Manifest
+    /// load uses this (not contentChanged): a newer published identity
+    /// is a rewrite this node has not observed yet, and must not mix
+    /// those hashes into the current entry.
+    pub fn eql(a: OriginId, b: OriginId) bool {
+        if (!a.known or !b.known) return false;
+        return a.ino == b.ino and a.mtime_sec == b.mtime_sec and a.mtime_nsec == b.mtime_nsec;
     }
 
     fn write(self: OriginId, out: *[encoded_len]u8) void {
@@ -1394,9 +1404,11 @@ pub const Store = struct {
     }
 
     /// Fetches and merges the origin piece-hash manifest for file.rel, once
-    /// per entry size. A manifest whose grid or size disagrees with this
-    /// node contributes nothing (peer fills stay unverifiable -> origin);
-    /// a missing or oversized artifact is the same. The load attempt is
+    /// per entry size. A manifest whose grid, size, or origin identity
+    /// disagrees with this node contributes nothing (peer fills stay
+    /// unverifiable -> origin); a missing or oversized artifact is the
+    /// same. Identity mismatch retries like a missing file: the writer
+    /// publishes the new object's trailer at close. The load attempt is
     /// remembered in manifest_size so a failed fetch is not retried on
     /// every miss (the entry's size or the origin artifact can change, and
     /// a fresh entry or size reconcile retries).
@@ -1475,6 +1487,20 @@ pub const Store = struct {
             file.manifest_size = file.size;
             return;
         }
+        // A same-size rewrite leaves the previous object's manifest at
+        // this path's hex name. Without the identity trailer that blob
+        // still matches grid and size, and its hashes would admit the
+        // old peer pieces as the new file. Older manifests omit the
+        // trailer and keep that prior behavior until the next publish.
+        // Mismatch retries: the writer publishes the new identity at
+        // close, the same window a missing manifest waits for.
+        if (mf.identity) |raw| {
+            const mid = OriginId.read(&raw);
+            if (file.origin_id.known and !OriginId.eql(mid, file.origin_id)) {
+                file.manifest_retry_at = now_ms +| self.manifest_retry_ms;
+                return;
+            }
+        }
         // Manifest entries fill gaps only: a local origin fill or
         // write-through is the trust root for that piece, and a later
         // load (or a stale same-size manifest) must not replace it.
@@ -1521,12 +1547,14 @@ pub const Store = struct {
         // the just-written blob does not hold it and the flag must stay set
         // for the next release to publish it.
         var snap_count: usize = 0;
+        var snap_id = OriginId{};
         file.mu.lockUncancelable(self.io);
         {
             defer file.mu.unlock(self.io);
             if (file.dead.load(.acquire)) return;
             if (!file.manifest_dirty) return;
             snap_count = file.hashes.count();
+            snap_id = file.origin_id;
             var it = file.hashes.iterator();
             while (it.next()) |e| {
                 if (e.key_ptr.* >= max_idx) continue;
@@ -1542,15 +1570,22 @@ pub const Store = struct {
                 return a.idx < b.idx;
             }
         }.lessThan);
-        const need = piece.manifestLen(entries.items.len);
+        const id_extra: usize = if (snap_id.known) OriginId.encoded_len else 0;
+        const need = piece.manifestLen(entries.items.len) + id_extra;
         const blob = self.gpa.alloc(u8, need) catch |err| {
             std.log.warn("piece manifest build failed for {s} ({t}); retried on next close", .{ file.rel, err });
             return;
         };
         defer self.gpa.free(blob);
-        const enc = piece.manifestEncode(self.piece_size, fsize, entries.items, blob) catch |err| {
+        const enc_body = piece.manifestEncode(self.piece_size, fsize, entries.items, blob) catch |err| {
             std.log.warn("piece manifest build failed for {s} ({t}); retried on next close", .{ file.rel, err });
             return;
+        };
+        const enc: []const u8 = if (!snap_id.known) enc_body else blk: {
+            var trailer: [OriginId.encoded_len]u8 = undefined;
+            snap_id.write(&trailer);
+            @memcpy(blob[enc_body.len..][0..OriginId.encoded_len], &trailer);
+            break :blk blob[0..need];
         };
 
         var pbuf: [sys.c.PATH_MAX]u8 = undefined;
@@ -6212,6 +6247,12 @@ test "OriginId.contentChanged is newer mtime or ino, never older mtime" {
     try std.testing.expect(!OriginId.contentChanged(a, a));
     try std.testing.expect(!OriginId.contentChanged(a, unknown));
     try std.testing.expect(!OriginId.contentChanged(unknown, newer_sec));
+    try std.testing.expect(OriginId.eql(a, a));
+    try std.testing.expect(!OriginId.eql(a, newer_sec));
+    try std.testing.expect(!OriginId.eql(a, older));
+    try std.testing.expect(!OriginId.eql(a, other_ino));
+    try std.testing.expect(!OriginId.eql(a, unknown));
+    try std.testing.expect(!OriginId.eql(unknown, unknown));
 }
 
 test "same-size rewrite with newer mtime wipes cache marks and hashes" {
@@ -6236,14 +6277,14 @@ test "same-size rewrite with newer mtime wipes cache marks and hashes" {
     try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, t0)).len);
     try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", h, t0));
     try std.testing.expect(st.hasPiece(f, 0, t0));
-    try std.testing.expect(st.expectedHash(f, 0) != null);
+    try std.testing.expect(st.expectedHash(f, 0, 0) != null);
 
     const f2 = try st.getIdentified("rw.bin", 16, id2, t0);
     defer st.releaseFile(f2);
     try std.testing.expectEqual(f, f2);
     st.releaseFile(f);
     try std.testing.expect(!st.hasPiece(f2, 0, t0));
-    try std.testing.expect(st.expectedHash(f2, 0) == null);
+    try std.testing.expect(st.expectedHash(f2, 0, 0) == null);
 }
 
 test "older origin mtime does not wipe (NFS attribute lag)" {
@@ -6369,6 +6410,53 @@ test "manifest load does not replace a local origin-fill hash" {
     f.manifest_size = null;
     f.manifest_retry_at = 0;
     f.mu.unlock(std.testing.io);
-    const got = st.expectedHash(f, 0).?;
+    const got = st.expectedHash(f, 0, 0).?;
     try std.testing.expectEqualSlices(u8, &h_local, &got);
+}
+
+test "same-size rewrite does not load a stale origin manifest" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-id-stale-mf");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-id-stale-mf");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const t0: i64 = 1_000;
+    const id1 = OriginId{ .mtime_sec = 100, .mtime_nsec = 0, .ino = 7, .known = true };
+    const id2 = OriginId{ .mtime_sec = 200, .mtime_nsec = 0, .ino = 7, .known = true };
+    const f = try st.getIdentified("stale.bin", 16, id1, t0);
+    var h: [piece.digest_len]u8 = undefined;
+    piece.digest("0123456789abcdef", &h);
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, t0)).len);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", h, t0));
+    st.publishManifest(f);
+    try std.testing.expect(st.expectedHash(f, 0, 0) != null);
+
+    {
+        var rcb: [128]u8 = undefined;
+        const reader_cache = try sys.scratchDir(&rcb, "modelfs-c-id-stale-mf-r");
+        defer sys.deleteTree(std.testing.io, reader_cache);
+        var reader = Store.init(gpa, std.testing.io, origin_d, reader_cache, 16);
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(i32, 0), reader.ensureLayout());
+        const rf = try reader.getIdentified("stale.bin", 16, id1, t0);
+        defer reader.releaseFile(rf);
+        const got = reader.expectedHash(rf, 0, 0).?;
+        try std.testing.expectEqualSlices(u8, &h, &got);
+    }
+
+    const f2 = try st.getIdentified("stale.bin", 16, id2, t0);
+    defer st.releaseFile(f2);
+    try std.testing.expectEqual(f, f2);
+    st.releaseFile(f);
+    // The origin still holds id1's manifest (same path, same size). Its
+    // hashes must not become the trust reference for id2: a peer that
+    // still has the old piece would then verify and land as the new file.
+    try std.testing.expect(st.expectedHash(f2, 0, 0) == null);
 }

@@ -267,8 +267,9 @@ The trusted digests come from two places:
   load failure (an NFS negative cache hiding the writer's just-published
   manifest) is retried after `manifest_retry_ms` against the caller's
   monotonic instant instead of disabling peer fills for the entry's
-  lifetime, and a manifest whose grid or size disagrees
-  with the reader's is ignored (origin fills, no peer verification). A file with no manifest anywhere has no trust
+  lifetime, and a manifest whose grid, size, or origin identity (mtime/ino
+  trailer) disagrees with the reader's is ignored (origin fills, no peer
+  verification). A file with no manifest anywhere has no trust
   reference, so its fills stay origin-only -- the cost of never serving
   unverified bytes (THREAT_MODEL.md, former gap R2).
 
@@ -276,7 +277,10 @@ Digests survive a punch (they are the expectation a refill must meet) and
 are dropped together with the marks on size change, same-size rewrite
 (mtime/ino), distrust, and forget (`Store.clearHashes`). The sidecar
 bitfield prefix is unchanged; an optional origin-identity trailer follows
-the bits so a restart can still detect a same-size rewrite. Hashes ride
+the bits so a restart can still detect a same-size rewrite. The same
+identity is an optional trailer on the origin manifest, so a rewrite
+cannot keep the previous object's hashes as the trust reference for
+peer fills. Hashes ride
 in memory and in the manifest, not in the bit bytes. Manifest blobs
 are bounded (64 MiB, `Store.max_manifest_bytes`), parsed by a fuzzed
 codec (`piece.manifestDecode`), and published atomically (tmp + rename,
