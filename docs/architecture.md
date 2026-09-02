@@ -289,21 +289,10 @@ UMA: kernel page cache is off (`direct_io`). mmap of FUSE files will fail; engin
 
 ## What did not ship
 
-Canonical status is [design.md](design.md) sections 2.1 (G1–G10) and 13 (key decisions):
+Canonical status is [design.md](design.md) sections 2.1 (G1–G10) and 13 (key decisions). Do not treat this list as a second copy of those rows.
 
 - Origin-less two-node (no shared dir)
-- Content-addressed dedup as a blob store (Level 2) and CDC chunking
-  inside pieces (Level 3) are **shelved/dormant**, not merely unbuilt: the
-  staged data plane (design.md section 15) made Level 2's headline win
-  (transfer dedup) moot, and the path-keyed integrity layer conflicts with
-  a CAS rewrite. The decision is telemetry-gated: `modelfs dupes` compares
-  piece-hash manifests across paths (`--all` scans the whole manifest
-  store; aligned/shared/shifted overlap) and answers "do we want dedup?"
-  with a number; see design.md section 14.
-  Shipped instead is Level 1 -- per-piece blake3 digests for integrity
-  (`verifyRange`/`expectedHash`), the origin piece-hash manifest,
-  verify-before-admit, and `modelfs verify`; see the Piece integrity
-  section above.
+- Content-addressed dedup (Level 2) and CDC (Level 3): **shelved/dormant**, not merely unbuilt; see design.md section 14. Level 1 integrity shipped (Piece integrity above).
 - Full-file background stripe
 - Sparse-file hydrate / FUSE passthrough (the agent stays in the I/O path; `direct_io` is the default)
 - cachefilesd stacked on FUSE (FUSE is not an FS-Cache client)

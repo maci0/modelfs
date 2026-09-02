@@ -3,20 +3,20 @@
 | Field | Value |
 |---|---|
 | Status | Historical design. Goals (section 2.1) and decisions (section 13) carry ship status. Shipped behavior is [architecture.md](architecture.md) |
-| Date | 2026-08-30 (goals/decisions/security rows and overview/targets/path notes re-verified against `src/`) |
+| Date | 2026-09-02 (goals/decisions/security rows re-verified against `src/`) |
 | Audience | Implementation |
 
-Original architecture notes. Several items here did not ship: origin-less two-node, CAS/blake3 chunks, S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rule 6 in section 4.8 (rationale: UMA OOM, see architecture.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`, `/stage`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
+Original architecture notes. Several items here did not ship: origin-less two-node, content-addressed chunks (G9, shelved in section 14; blake3 itself shipped as per-piece integrity), S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rules 1 and 6 in section 4.8 (getattr/readdir hit the origin; UMA OOM, see architecture.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`, `/stage`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
 
 ModelFS is a POSIX mount for LLM weights. Nodes see a normal directory. llama.cpp, vLLM, and SGLang open files. Bytes come from a local NVMe cache, from peers over a piece protocol, or from a network origin.
 
-This is not a general-purpose distributed filesystem. Model files are huge, written rarely, and almost immutable. The sketch was a content-addressed blob store with a POSIX facade, a local cache, and datacenter P2P (G9 did not ship: the cache is path-keyed pieces, not CAS).
+This is not a general-purpose distributed filesystem. Model files are huge, written rarely, and almost immutable. The sketch was a content-addressed blob store with a POSIX facade, a local cache, and datacenter P2P (G9 did not ship, shelved in section 14: the cache is path-keyed pieces, not CAS).
 
 ---
 
 ## 1. Overview
 
-Original object model (namespace, manifests, content-addressed chunks). G9 did not ship; the diagram's optional S3 origin did not ship. Shipped topology is [architecture.md](architecture.md).
+Original object model (namespace, manifests, content-addressed chunks). G9 did not ship (shelved, section 14); the diagram's optional S3 origin did not ship. Shipped topology is [architecture.md](architecture.md).
 
 Three kinds of data, three consistencies:
 
@@ -61,7 +61,7 @@ flowchart TB
 
 ### 2.1 Goals
 
-Status is against the shipped code and [architecture.md](architecture.md) (2026-08-27).
+Status is against the shipped code and [architecture.md](architecture.md).
 
 | ID | Requirement | Status |
 |---|---|---|
@@ -70,10 +70,10 @@ Status is against the shipped code and [architecture.md](architecture.md) (2026-
 | G3 | Each node that uses a file caches its bytes locally ("cache everything" of the working set). | Partial: pieces cache locally on read; no full-file prefetch. |
 | G4 | Nodes exchange missing pieces with each other, torrent-style, in the background. | Partial: peers serve miss pieces on demand; no background swarm. |
 | G5 | Mount is immediately usable: names and sizes exist before bytes arrive. | Shipped (origin `stat`/`readdir`; no local catalog). |
-| G6 | Optional pin: pinned chunks are never LRU-evicted. | Shipped (path-level pin marker; chunk-level pin was G9 and did not ship). |
+| G6 | Optional pin: pinned chunks are never LRU-evicted. | Shipped (path-level `pin/` marker; not per-chunk). |
 | G7 | Ingest on any node (download, `cp`, `modelfs pull`). Replicate back to origin. | Partial: writes are write-through to origin; no `modelfs pull`. |
-| G8 | Two-node mode with no extra store. Replication factor 2. No Redis, no etcd required. | Not shipped (origin required); "no Redis, no etcd" still holds. |
-| G9 | Content-addressed dedup across files and nodes. | Not shipped. |
+| G8 | Two-node mode with no extra store. Replication factor 2. No Redis, no etcd required. | Not shipped (origin-less RF=2; section 13 Two-node). "No Redis, no etcd" still holds. |
+| G9 | Content-addressed dedup across files and nodes. | Not shipped (shelved: Level 1 integrity shipped; CAS/CDC wait on `modelfs dupes`; section 14). |
 | G10 | llama.cpp, vLLM, SGLang consume a path. No engine plugins. | Shipped. |
 
 ### 2.2 Non-goals
@@ -757,39 +757,42 @@ Resolved by the shipped code and recorded in section 13 (not re-decided here):
 - **Passthrough vs bind-mount**: section 13 Frontend.
 - **Default piece size** (4 vs 16 MiB): section 13 v1 chunking.
 - **k8s in v1** vs systemd: section 13 Kubernetes.
+- **Pin granularity** (chunk refcount vs path marker): section 13 Pin. Cluster pin stays open in (1).
 
 ---
 
 ## 13. Key decisions
 
-Status values: **Accepted** (still in force), **Partial** (part shipped), **Superseded** (replaced; the cell names what replaced it), **Not shipped** (never implemented). What runs is [architecture.md](architecture.md).
+Status values: **Accepted** (still in force), **Partial** (part shipped), **Superseded** (replaced; the cell names what replaced it), **Not shipped** (never implemented). Section 14 uses **shelved** / **dormant** for CAS/CDC that were designed then paused; that is not a fifth column value here. What runs is [architecture.md](architecture.md).
 
-| Decision | Choice | Why | Status (2026-08-30) |
+| Decision | Choice | Why | Status (2026-09-02) |
 |---|---|---|---|
-| Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partial: POSIX piece cache shipped; no content-addressed store (path-keyed) |
+| Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partial: POSIX piece cache shipped; no content-addressed store (path-keyed; CAS shelved, section 14) |
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Accepted |
-| Frontend | Sparse-file hydrate, then leave the I/O path | mmap for llama.cpp / vLLM | Superseded: FUSE read path with `direct_io`; agent stays in the I/O path (UMA OOM; reverses section 4.8 rule 6) |
-| Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partial: fixed 16 MiB transfer pieces; chunks/CDC absent |
-| Hash | blake3 | Fast, enough collision resistance for this | Accepted: Level 1 shipped (per-piece digests, manifests, verify); content-addressed storage and wire-level identity did not (section 14, Levels 2-3) |
+| Pin | Chunk refcount; optional cluster pin | Keep the working set off LRU | Partial: path-level `pin/` marker (`modelfs pin`/`unpin`); no chunk refcount, no cluster pin |
+| Frontend | Sparse-file hydrate, then leave the I/O path | mmap for llama.cpp / vLLM | Superseded: FUSE read path with `direct_io`; agent stays in the I/O path (UMA OOM; reverses section 4.8 rules 1 and 6: getattr/readdir hit the origin, no passthrough) |
+| Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partial: fixed 16 MiB transfer pieces; CDC dormant (section 14) |
+| Hash | blake3 | Fast, enough collision resistance for this | Accepted: Level 1 shipped (per-piece digests, manifests, verify); content-addressed storage and wire-level identity shelved (section 14, Levels 2-3) |
 | Two-node | Embedded metadata, RF=2 | No extra store | Not shipped (origin-less RF=2). Membership is origin `.cluster/<id>.json` leases (see Origin row) |
 | Origin | Optional peer that never evicts | Same protocol | Superseded: origin is required (POSIX dir); "never evicts" holds |
 | Transport | QUIC or HTTP/2 Have/Want/Piece | One port; inspectable | Superseded: plaintext HTTP/1.1 `GET /ping`, `/have`, `/data`, `/stage` (see architecture.md) |
 | Auth | static shared secret or mTLS | No anonymous P2P | Partial: bearer PSK on plaintext HTTP; mTLS did not ship (section 9) |
 | Engines | POSIX directory | No plugins | Accepted |
 | v1 language | Go | Protocol/state bound, not CPU bound | Superseded: Zig |
-| v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 16 MiB pieces (`--piece` overrides); no chunking |
+| v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 16 MiB pieces (`--piece` overrides); CDC dormant (section 14) |
 | Kubernetes | Not required for v1 | Two-node first | Accepted: no Kubernetes; one foreground binary, systemd `Type=simple` |
 
 ## 14. Content identity: shipped Level 1; Levels 2-3 shelved pending telemetry
 
 `architecture.md` "Piece integrity" is shipped behavior; this section is the
 roadmap the design reserved (C.3/C.4) expressed as three levels, and the
-status of each. The motivating question is dedup: "second copy of a model:
-new path" costs disk and origin reads, and a same-snapshot-under-two-names
-(or a re-export that edits a few tensors) stores the same bytes twice. The
-answer is content identity, and Level 1 already builds the primitive every
-higher level needs: a blake3 digest per piece, with the origin as the trust
-reference.
+status of each. G9 in section 2.1 is Levels 2-3 here (CAS dedup / CDC), not
+Level 1: Level 1 is integrity, not the CAS requirement. The motivating
+question is dedup: "second copy of a model: new path" costs disk and origin
+reads, and a same-snapshot-under-two-names (or a re-export that edits a few
+tensors) stores the same bytes twice. The answer is content identity, and
+Level 1 already builds the primitive every higher level needs: a blake3
+digest per piece, with the origin as the trust reference.
 
 ### Level 1 -- content identity at rest (shipped)
 
