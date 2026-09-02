@@ -21,6 +21,14 @@
   `discover.displayName` the way lease names already do. The 405 reply and
   the dupes scan are unchanged.
 
+### Staged-piece pool reuses consumed slots - 2026-09-02
+- **The in-memory `/stage` pool treats `fake_cap` as concurrent occupancy.**
+  Consumed windows were tombstoned but `stage` still keyed off the array
+  length, so the 16th successful stage exhausted the pool for the rest of
+  the process. Tombstones are reused; a live window still occupies its
+  slot until `read` or `release`. A length-mismatch `read` consumes the
+  slot too, so a failed fetch cannot pin the cap until exit.
+
 ## [0.5.0] - 2026-08-31
 
 Observability release on top of 0.4.0: the FUSE metadata handlers and the

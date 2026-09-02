@@ -77,7 +77,8 @@ pub const Backend = struct {
     /// Fake backend state: staged buffers indexed by Window.addr.
     staged: std.ArrayList([]u8) = .empty,
     /// The fake's bounded pool: at most this many pieces staged at once
-    /// (the verbs tail's registered-buffer pool has the same bound).
+    /// (consumed slots are reused; the verbs tail's registered-buffer
+    /// pool has the same occupancy bound).
     fake_cap: usize = 16,
     /// Fake-only: successful window reads (the staged-fetch path), so
     /// tests can tell a staged fetch from the HTTP fallback.
@@ -146,8 +147,10 @@ pub const Backend = struct {
 
     /// Copies the staged window's bytes into out (the RDMA Read). False on
     /// any failure; the fetching node then falls back to /data. A window
-    /// is single-use: a successful read consumes the staged buffer (the
-    /// verbs tail would pair release with the fetcher's completion/ACK).
+    /// is single-use: touching a live slot consumes it, success or not
+    /// (the verbs tail would pair release with the fetcher's completion
+    /// or a failed-read NAK). A length mismatch that left the buffer
+    /// sitting would pin the slot until process exit.
     pub fn read(self: *Backend, window: Window, out: []u8) bool {
         switch (self.kind) {
             .none => return false,
@@ -156,7 +159,11 @@ pub const Backend = struct {
                 defer self.lock.unlock();
                 if (window.addr >= self.staged.items.len) return false;
                 const buf = self.staged.items[@intCast(window.addr)];
-                if (buf.len != out.len or window.len != out.len) return false;
+                if (buf.len == 0) return false;
+                if (buf.len != out.len or window.len != out.len) {
+                    self.releaseLocked(window);
+                    return false;
+                }
                 @memcpy(out, buf);
                 self.releaseLocked(window);
                 self.reads_done += 1;
@@ -288,7 +295,9 @@ test "fake backend stages and reads one window" {
     try std.testing.expect(!none.available());
     try std.testing.expect(none.stage(data, &d) == null);
     try std.testing.expect(!none.read(w, &out));
-    // Pool bound: more stages than the cap refuse cleanly.
+    // Pool bound is occupancy: a live window fills the only seat, a
+    // consumed one frees it, a mismatched read still consumes so the
+    // slot cannot pin the cap until process exit.
     var small: Backend = .{ .kind = .fake, .gpa = gpa, .fake_cap = 1 };
     defer {
         for (small.staged.items) |buf| gpa.free(buf);
@@ -305,4 +314,8 @@ test "fake backend stages and reads one window" {
     const w_reuse = small.stage(data, &d).?;
     try std.testing.expect(small.stage(data, &d) == null);
     try std.testing.expect(small.read(w_reuse, &out_cap));
+    const w_again = small.stage(data, &d).?;
+    var too_small: [8]u8 = undefined;
+    try std.testing.expect(!small.read(w_again, &too_small));
+    try std.testing.expect(small.stage(data, &d) != null);
 }

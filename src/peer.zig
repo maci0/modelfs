@@ -1191,7 +1191,9 @@ fn fetchPieceStaged(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []c
         rdma.backend.release(win);
         return false;
     }
-    return rdma.backend.read(win, out);
+    if (rdma.backend.read(win, out)) return true;
+    rdma.backend.release(win);
+    return false;
 }
 
 /// Binds a 206 body to the range we asked for. Content-Length alone cannot
