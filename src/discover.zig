@@ -2644,6 +2644,24 @@ test "stageDown tracks a failed staged fetch for the have TTL" {
     try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms + 100));
 }
 
+test "stageDown TTL from an attempt-start stamp is dead after a dial timeout" {
+    // fetchPieceStaged's connect budget is 15s; have_ttl_ms is 2s. A
+    // noteStageDown stamped at attempt start is expired by the time a
+    // blackholed /stage returns, so the next piece would retry /stage.
+    // fetchFromCands (src/peer.zig) stamps at the failure instant instead.
+    const gpa = std.testing.allocator;
+    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    const attempt_start: i64 = 1000;
+    const after_dial: i64 = attempt_start + 15_000;
+    try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, attempt_start));
+    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, after_dial));
+    try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, after_dial));
+    try std.testing.expect(cat.stageDown("10.0.0.9", 18080, after_dial));
+    try std.testing.expect(cat.stageDown("10.0.0.9", 18080, after_dial + Catalog.have_ttl_ms - 1));
+    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, after_dial + Catalog.have_ttl_ms));
+}
+
 test "stageDown cap evicts expired by expiry then addr, never insert order" {
     const gpa = std.testing.allocator;
     const t0: i64 = 1000;

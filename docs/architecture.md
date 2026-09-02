@@ -183,9 +183,13 @@ whose backend can stage advertises `X-Stage: 1` on `/have`, and a fetching
 node then stages one piece at a time -- hydrate, at-rest verify, register
 the bytes, and reply with a 52-byte window (`len`/`rkey`/`addr` plus the
 piece digest, advisory) that its backend reads. Any `/stage` failure (501
-= this node cannot stage, malformed reply, backend read error) falls back
-to the existing `/data` path on the same peer; a fleet without verbs never
-pays the probe because the capability rides the have-cache line. The
+= this node cannot stage, malformed reply, backend read error, dial/head
+timeout) falls back to the existing `/data` path on the same peer and
+marks the address down for 2 s from the failure instant
+(`Catalog.noteStageDown` in src/discover.zig, stamped in `fetchFromCands`
+after `fetchPieceStaged` returns) so a sequential fill does not retry the
+extra round trip on every piece. A fleet without verbs never pays the
+probe because the capability rides the have-cache line. The
 shipped backend is null, so this plane is protocol-and-pipeline only until
 the verbs tail lands (design.md section 15).
 

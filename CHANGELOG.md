@@ -30,6 +30,9 @@ and default-behavior changes: the next tag is a minor, not a patch
 - **A FIFO at a model path fails ESPIPE on read and ENXIO on write** (used to hang the FUSE worker until a counterpart appeared).
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused**, matching the rest of Default_Ignorable.
 
+### /stage backoff TTL starts at the failure, not the attempt - 2026-09-02
+- **A failed `/stage` is marked down from the instant it returns.** `fetchFromCands` used to stamp `Catalog.noteStageDown` with the clock sample taken before `fetchPieceStaged`. That function's dial/head budget is 15 s + 10 s against a 2 s TTL, so a blackholed `/stage` left `expires_ms` in the past and every later piece of the same file retried the extra round trip. Fast 501s still get the same 2 s window.
+
 ### Warm FUSE reads skip origin getattr; cull samples a bounded LRU set - 2026-09-02
 - **A FUSE read of a live cache entry no longer stats the origin.** `fileForRead` reuses the entry `open`/`getattr` already reconciled; a getattr RTT on every 128 KiB read made the warm NVMe path pay NFS. Size changes through the mount still update the entry in place. An external origin rewrite is visible on the next open (NFS close-to-open). A cold read (no live entry, or after `reapIdle` dropped it) still stats origin.
 - **`cullOne` keeps a 32-oldest idle sample instead of sorting every idle file.** Punching one piece used to allocate and pin the whole live map. Equal-recency ties still break by rel bytes. `Bitfield.allSet` checks a covered span word-at-a-time so `rangeFilled` and write-through retries do not walk each bit; `containsControl` skips leading printable-ASCII 8-byte words; a manifest load reserves hash-map capacity once.

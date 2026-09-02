@@ -1716,11 +1716,14 @@ fn fetchFromCands(
         const staged_ok = if (can_stage) blk: {
             const ok = fetchPieceStaged(gpa, cat.io, psk, win.ip, win.port, rel, idx, out);
             if (!ok) {
-                // Edge-triggered like probe_down/fetch_down: the first
-                // staged failure names the peer, later ones ride the
-                // TTL backoff so a broken data plane cannot flood the
-                // journal with one warn per piece.
-                if (cat.noteStageDown(win.ip, win.port, now_ms))
+                // Stamp the backoff at the failure, not the attempt start:
+                // fetchPieceStaged's dial/head budget is 15s+10s against a
+                // 2s TTL, so a start-of-attempt stamp leaves expires_ms in
+                // the past and every later piece retries /stage (the extra
+                // round trip this mark exists to skip). A fast 501 still
+                // lands the same 2s window. Edge-triggered like
+                // probe_down/fetch_down: the first failure names the peer.
+                if (cat.noteStageDown(win.ip, win.port, sys.monoMs(cat.io)))
                     std.log.warn("staged fetch failed on {s}:{d} for {s} piece {d}; falling back to HTTP", .{ win.ip, win.port, rel, idx });
             }
             break :blk ok;
@@ -3706,9 +3709,10 @@ test "fillFromPeers fetches staged pieces when the peer advertises X-Stage" {
 }
 
 test "fillFromPeers backs off /stage after a staged fetch fails" {
-    // A peer that advertises X-Stage but fails every /stage (broken backend)
-    // must not cost an extra round trip per piece: the first failure marks
-    // the address down for the TTL, and later pieces go straight to /data.
+    // A peer that advertises X-Stage but fails every /stage (broken backend,
+    // including a dial that outruns the 2s TTL) must not cost an extra
+    // round trip per piece: the first failure marks the address down from
+    // the failure instant, and later pieces go straight to /data.
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;
