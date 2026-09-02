@@ -22,9 +22,10 @@ pub const status_file = "status.json";
 /// while cache keys are byte-exact: `"a//b"` and `"a/b"` are distinct keys
 /// that name the same data/meta/pin artifacts, and a fill or cull through
 /// one would alias the other's marks onto shared bytes.
-/// Applied to every externally supplied path before it joins a root (FUSE,
-/// peer HTTP, CLI pin); without it a peer request can escape the origin/cache
-/// trees or forge multi-line entries in operator logs via \n in a path.
+/// Applied to every externally supplied path before it joins a root (FUSE
+/// handlers and FUSE readdir components, peer HTTP, CLI pin); without it a
+/// peer request can escape the origin/cache trees or forge multi-line
+/// entries in operator logs via \n in a path.
 /// `.cluster` is a sibling policy (`discover.relIsCluster`), not part of
 /// this gate: a leading-dot component is a legal model name.
 /// Control characters are proto.containsControl's set (C0, DEL, UTF-8 C1,
@@ -2446,6 +2447,10 @@ pub const Store = struct {
             // watermarks. Lease walks skip every leading-dot name because
             // validId refuses those ids; this tree is user paths.
             if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            // Same component gate FUSE readdir uses: a planted cache name
+            // with a newline or ZWSP is not a path this daemon would create,
+            // and joining it would put control bytes in a cull-victim rel.
+            if (!relOk(name)) continue;
             var child: [sys.c.PATH_MAX]u8 = undefined;
             const cp = sys.joinZ(&child, dir_path, name) catch continue;
             var st: c.struct_stat = undefined;

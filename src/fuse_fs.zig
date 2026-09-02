@@ -407,6 +407,67 @@ test "readdir resume splits a large listing without duplicates or gaps" {
     }
 }
 
+test "readdir omits names relOk would refuse" {
+    // Origin filenames are bytes: a co-tenant can plant `a\nERROR.bin` or
+    // `model\u{200b}.bin`. open/getattr already EPERM those via relOk; the
+    // listing must not emit them either, or `ls /models` splits / spoofs.
+    // NFC/NFD spellings and non-UTF-8 names stay visible (byte-exact identity).
+    const gpa = std.testing.allocator;
+    var db: [128]u8 = undefined;
+    const scratch = try sys.scratchDir(&db, "modelfs-readdir-ctl");
+    defer sys.deleteTree(std.testing.io, scratch);
+
+    const files = [_][]const u8{
+        "ok.bin",
+        "a\nb.bin",
+        "model\u{200b}.bin",
+        "caf\u{e9}.bin",
+        "cafe\u{301}.bin",
+        "\xff\xfe.bin",
+    };
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    for (files) |name| {
+        const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ scratch, name });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "x"));
+    }
+    const cluster_p = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ scratch, discover.cluster_dir });
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_p, 0o755));
+
+    const dir = sys.opendirNoFollow(try sys.toZ(&zbuf, scratch)) orelse
+        return error.TestUnexpectedResult;
+    defer sys.closedir(dir);
+    var names = OriginDirNames{ .dir = dir, .hide_cluster = true };
+    var got: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (got.items) |n| gpa.free(n);
+        got.deinit(gpa);
+    }
+    while (names.next()) |n| {
+        try got.append(gpa, try gpa.dupe(u8, n));
+    }
+
+    var seen_ok = false;
+    var seen_nfc = false;
+    var seen_nfd = false;
+    var seen_raw = false;
+    for (got.items) |n| {
+        try std.testing.expect(store_mod.relOk(n));
+        try std.testing.expect(!std.mem.eql(u8, n, discover.cluster_dir));
+        try std.testing.expect(std.mem.indexOfScalar(u8, n, '\n') == null);
+        try std.testing.expect(std.mem.indexOf(u8, n, "\u{200b}") == null);
+        if (std.mem.eql(u8, n, "ok.bin")) seen_ok = true;
+        if (std.mem.eql(u8, n, "caf\u{e9}.bin")) seen_nfc = true;
+        if (std.mem.eql(u8, n, "cafe\u{301}.bin")) seen_nfd = true;
+        if (std.mem.eql(u8, n, "\xff\xfe.bin")) seen_raw = true;
+    }
+    try std.testing.expect(seen_ok);
+    try std.testing.expect(seen_nfc);
+    try std.testing.expect(seen_nfd);
+    try std.testing.expect(seen_raw);
+    try std.testing.expectEqual(@as(usize, 4), got.items.len);
+}
+
 test "rename flag passthrough keeps NOREPLACE and EXCHANGE semantics" {
     // The flags libfuse forwards ride unchanged into the origin's
     // renameat2: NOREPLACE must refuse an existing destination instead of
@@ -1161,8 +1222,11 @@ fn readdirResume(names: anytype, emit: anytype, off: fuse.off_t) void {
 }
 
 /// The origin-side entry stream of an mf_readdir walk: everything invisible
-/// to the mount (dot entries, the control dir at the root) is filtered here,
-/// so the resume ordinals count only emittable names.
+/// to the mount (dot entries, the control dir at the root, and names
+/// `store.relOk` would refuse) is filtered here, so the resume ordinals
+/// count only emittable names. A planted origin file `a\nERROR.bin` or
+/// `model\u{200b}.bin` cannot be opened through the mount (resolveRel
+/// returns EPERM); listing it would still inject into `ls` / readdir(3).
 const OriginDirNames = struct {
     dir: *anyopaque,
     hide_cluster: bool,
@@ -1172,6 +1236,7 @@ const OriginDirNames = struct {
             const name = sys.dirName(ent);
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             if (self.hide_cluster and std.mem.eql(u8, name, discover.cluster_dir)) continue;
+            if (!store_mod.relOk(name)) continue;
             return name;
         }
         return null;

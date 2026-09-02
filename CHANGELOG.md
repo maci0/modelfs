@@ -18,6 +18,10 @@ until the next tag.
 ### Peer goodput samples ignore sub-resolution clock ticks - 2026-09-02
 - **A piece fetch whose elapsed time is 1 ns no longer records ~10 PB/s.** `rangeBps` already returned 0 for a same-ns tick (which pulled the EWMA toward a dead path). A 1 ns tick on a 16 MiB piece is finite (~1.7e16 B/s) and pulled the EWMA the other way, so `pickBest` stuck on that path until tens of real samples decayed it. Samples above 1 TB/s now keep the prior, like a non-positive interval.
 
+### FUSE listings and lease ids refuse the same control set as open - 2026-09-02
+- **FUSE `readdir` omits names `relOk` would refuse.** A planted origin file `a\nERROR.bin` or `model\u200B.bin` still failed open/getattr (EPERM) but appeared in `ls /models` and split or spoofed the listing. NFC/NFD spellings and non-UTF-8 names still list; identity stays byte-exact.
+- **Discovery ignores lease JSON whose `id` fails `validId`.** A planted `.cluster/x.json` with `"id":"spark1\u200b"` (JSON `\u200b`), `"id":"spark1\n"`, or `"id":"café"` used to become a distinct catalog key that rendered as the unadorned name. `modelfs peers` still lists the document. Publish-side `--id` was already this gate.
+
 
 ### Upgrade from v0.5.0 - 2026-09-02
 
@@ -38,6 +42,8 @@ and default-behavior changes: the next tag is a minor, not a patch
 - **Origin I/O failures return the libc errno** (FUSE replies and `noteOriginIo` used to report EPERM because the wrappers passed through libc's `-1`).
 - **A FIFO at a model path fails ESPIPE on read and ENXIO on write** (used to hang the FUSE worker until a counterpart appeared).
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused**, matching the rest of Default_Ignorable.
+- **FUSE `readdir` omits names `relOk` would refuse** (control bytes, ZWSP, bidi). Those names already failed open/getattr; they no longer appear in `ls /models`. NFC/NFD and non-UTF-8 names still list.
+- **Discovery skips lease JSON whose `id` fails `validId`.** A planted `"id":"spark1\u200b"` is no longer a peer. `modelfs peers` still lists the document.
 - **`modelfs peers` exits 1 when `origin/.cluster` is unreadable** (EIO, ENOTDIR, EACCES). A missing `.cluster` is still an empty cluster (exit 0). An origin I/O failure used to print `no cluster leases` and exit 0.
 
 ### Idle origin outages and metadata failures reach the tick line - 2026-09-02

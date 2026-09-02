@@ -920,6 +920,12 @@ pub const Catalog = struct {
                 const lease = parsed.value;
                 if (lease.until < acc.now_sec) return;
                 if (std.mem.eql(u8, lease.id, acc.cat.self_id)) return;
+                // Publish-side validId is ASCII without quote/slash/controls;
+                // incoming JSON is not. A planted document with
+                // `"id":"spark1\u200b"` (JSON `\u200b`) or `"id":"caf\u00e9"`
+                // would otherwise become a distinct catalog key that renders
+                // as the unadorned name. Skip like expired and self.
+                if (!validId(lease.id)) return;
                 for (lease.addrs) |a| {
                     acc.cat.pushPath(acc.paths, acc.arena, lease.id, a);
                 }
@@ -2376,6 +2382,44 @@ test "refresh drops undialable lease addresses" {
     defer Catalog.freeSnapshot(gpa, snap);
     try std.testing.expectEqual(@as(usize, 1), snap.len);
     try std.testing.expectEqualStrings("10.0.0.9", snap[0].ip);
+}
+
+test "refresh skips lease ids that fail validId" {
+    // Incoming lease JSON is not gated by validId at parse: a planted
+    // document can smuggle a ZWSP via `\u200b`, a newline via `\n`, or a
+    // non-ASCII id (`caf\u00e9`). Those would be distinct catalog keys
+    // that render as the unadorned name. Only the ASCII id is kept.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-id");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    const leases = [_]struct { name: []const u8, json: []const u8 }{
+        .{ .name = "spark9.json", .json = "{\"id\":\"spark9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.1\",\"port\":18080,\"mbps\":0}]}" },
+        .{ .name = "zwsp.json", .json = "{\"id\":\"spark1\\u200b\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.2\",\"port\":18080,\"mbps\":0}]}" },
+        .{ .name = "nl.json", .json = "{\"id\":\"spark1\\n\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.3\",\"port\":18080,\"mbps\":0}]}" },
+        .{ .name = "nfc.json", .json = "{\"id\":\"caf\\u00e9\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.4\",\"port\":18080,\"mbps\":0}]}" },
+    };
+    var zbuf: [192]u8 = undefined;
+    for (leases) |l| {
+        var pbuf: [192]u8 = undefined;
+        const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ cluster_d, l.name });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), l.json));
+    }
+
+    const addrs = [_]proto.LeaseAddr{};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
+    defer cat.deinit();
+    cat.refresh(sys.nowSec(std.testing.io));
+
+    const snap = try cat.snapshot(gpa);
+    defer Catalog.freeSnapshot(gpa, snap);
+    try std.testing.expectEqual(@as(usize, 1), snap.len);
+    try std.testing.expectEqualStrings("spark9", snap[0].peer_id);
+    try std.testing.expectEqualStrings("10.0.0.1", snap[0].ip);
 }
 
 test "refresh keeps the previous peer list while .cluster is unreadable" {
