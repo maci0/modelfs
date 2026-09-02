@@ -31,6 +31,9 @@ until the next tag.
 - **A FUSE write-through no longer pwrites the cache fd under a peer sendfile or FUSE read of the same file.** `copyIntoCache` skipped that `Cached.xfer` check, so a local write during `/data` mixed new bytes into the in-flight copy and the fetching peer marked the mix filled. A retry of bytes already in the cache is still a no-op; any other overlapping range is unmarked so readers refill from origin.
 - **A FUSE read holds `xfer` from the bit sample through the cache pread.** Recency stamping alone could not cover a 128 KiB read that straddles a piece boundary while the next piece hydrates past the 10s cull window: `punchPiece` holed the first piece and the pread served zeros as cached data. Peer `/data` and `/stage` take the same claim under the content lock so a write-through cannot start between the load and the copy.
 
+### Socket options and listen use std.c like bind/accept - 2026-09-02
+- **Peer listen, poll, fcntl, and socket options no longer go through translate-c.** `bind`/`connect`/`accept4`/`getsockname` already used `std.c` so musl headers (and a glibc field-name change) cannot break the ABI. `listen`, `setsockopt`, `getsockopt`, `poll`, and `fcntl` now share that door; `sys.listen` and `sys.setReuseAddr` are the shared wrappers. `dirName` reads `d_name[0]` so a musl flexible-array dirent still names the first byte.
+
 ### Peer goodput samples ignore sub-resolution clock ticks - 2026-09-02
 - **A piece fetch whose elapsed time is 1 ns no longer records ~10 PB/s.** `rangeBps` already returned 0 for a same-ns tick (which pulled the EWMA toward a dead path). A 1 ns tick on a 16 MiB piece is finite (~1.7e16 B/s) and pulled the EWMA the other way, so `pickBest` stuck on that path until tens of real samples decayed it. Samples above 1 TB/s now keep the prior, like a non-positive interval.
 

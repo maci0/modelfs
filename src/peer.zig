@@ -56,19 +56,18 @@ pub const Server = struct {
         sockaddrV4(ip, port, &addr) catch return error.BadIp;
         const fd = sys.socket(c.AF_INET, c.SOCK_STREAM, 0);
         if (fd < 0) return error.Socket;
-        var yes: c_int = 1;
         // SO_REUSEADDR alone keeps restarts fast (TIME_WAIT leftovers from
         // accepted connections do not block the rebind). SO_REUSEPORT would
         // let a second modelfs bind the same live port and silently split
         // connections between the old and new process -- usually different
         // PSKs, so peers see random 401s -- instead of failing the duplicate
         // start loudly like the FUSE mount side does.
-        _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
+        sys.setReuseAddr(fd);
         if (sys.bind(fd, &addr) != 0) {
             sys.close(fd);
             return error.Bind;
         }
-        if (c.listen(fd, 128) != 0) {
+        if (sys.listen(fd, 128) != 0) {
             sys.close(fd);
             return error.Listen;
         }

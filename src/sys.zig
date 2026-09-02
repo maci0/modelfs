@@ -12,8 +12,11 @@ pub fn errno() i32 {
 }
 
 /// Borrowed name of a readdir entry; valid until the next readdir on its DIR.
+/// Indexes `d_name[0]` so the pointer is the first byte on both glibc
+/// (`char d_name[256]`) and musl (`char d_name[]` flexible array); `&d_name`
+/// on a pointer-typed field would be the address of the pointer instead.
 pub fn dirName(ent: *c.struct_dirent) []const u8 {
-    return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.d_name)), 0);
+    return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.d_name[0])), 0);
 }
 
 pub fn negErrno() i32 {
@@ -182,6 +185,18 @@ pub fn open(path: [*:0]const u8, flags: c_int, mode: c.mode_t) c_int {
 /// after Server.stop, and the next start fails Bind.
 pub fn socket(domain: c_int, type_: c_int, protocol: c_int) c_int {
     return c.socket(domain, type_ | c.SOCK_CLOEXEC, protocol);
+}
+
+/// listen(2). Same std.c door as bind/accept: one ABI for every Linux
+/// libc Zig ships, rather than translate-c of glibc headers.
+pub fn listen(fd: c_int, backlog: c_uint) c_int {
+    return std.c.listen(fd, backlog);
+}
+
+/// SO_REUSEADDR on a listen socket so a restart is not blocked by TIME_WAIT.
+pub fn setReuseAddr(fd: c_int) void {
+    var yes: c_int = 1;
+    setsockoptMem(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes);
 }
 
 /// Accept with SOCK_CLOEXEC (accept4). Same inherit contract as socket.
@@ -622,13 +637,23 @@ fn readFileBufFlags(buf: []u8, path: [*:0]const u8, extra_flags: c_int, open_err
     return buf[0..@intCast(n)];
 }
 
+fn setsockoptMem(fd: c_int, level: c_int, optname: c_int, val: anytype) void {
+    _ = std.c.setsockopt(
+        fd,
+        level,
+        @intCast(optname),
+        @ptrCast(val),
+        @intCast(@sizeOf(@TypeOf(val.*))),
+    );
+}
+
 pub fn setSockTimeout(fd: c_int, ms: u32) void {
     var tv = c.timeval{
         .tv_sec = @intCast(@divFloor(ms, 1000)),
         .tv_usec = @intCast((ms % 1000) * 1000),
     };
-    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv, @sizeOf(c.timeval));
-    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_SNDTIMEO, &tv, @sizeOf(c.timeval));
+    setsockoptMem(fd, c.SOL_SOCKET, c.SO_RCVTIMEO, &tv);
+    setsockoptMem(fd, c.SOL_SOCKET, c.SO_SNDTIMEO, &tv);
 }
 
 /// connect(2) with a bounded wait. A blocking connect can sit for minutes on
@@ -640,13 +665,13 @@ pub fn connectIn(fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
 }
 
 pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
-    const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    const fl = std.c.fcntl(fd, c.F_GETFL);
     if (fl < 0) return negErrno();
-    if (c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK) < 0) return negErrno();
+    if (std.c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK) < 0) return negErrno();
     // Restore the caller's flags on every path, including connect/poll
     // errors: leaving O_NONBLOCK set would make a later blocking read on
     // this fd return EAGAIN instead of honoring SO_RCVTIMEO.
-    defer _ = c.fcntl(fd, c.F_SETFL, fl);
+    defer _ = std.c.fcntl(fd, c.F_SETFL, fl);
     const rc = std.c.connect(fd, @ptrCast(addr), @intCast(@sizeOf(c.struct_sockaddr_in)));
     if (rc == 0) return 0;
     const e0 = errno();
@@ -657,11 +682,11 @@ pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in,
     // would make remain_ms 0 (or a huge wait) instead of "as long as we can".
     const deadline_ms = monoMs(io) +| @as(i64, ms);
     while (true) {
-        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
+        var pfd = std.c.pollfd{ .fd = fd, .events = @intCast(c.POLLOUT), .revents = 0 };
         const remain_ms: i64 = deadline_ms -| monoMs(io);
         if (remain_ms <= 0) return -c.ETIMEDOUT;
         const wait: c_int = @intCast(@min(remain_ms, @as(i128, std.math.maxInt(c_int))));
-        const prc = c.poll(@ptrCast(&pfd), 1, wait);
+        const prc = std.c.poll(@ptrCast(&pfd), 1, wait);
         if (prc < 0) {
             if (errno() == c.EINTR) continue;
             return negErrno();
@@ -670,15 +695,16 @@ pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in,
         break;
     }
     var soerr: c_int = 0;
-    var slen: c.socklen_t = @sizeOf(c_int);
-    if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_ERROR, &soerr, &slen) != 0) return negErrno();
+    var slen: std.c.socklen_t = @intCast(@sizeOf(c_int));
+    if (std.c.getsockopt(fd, c.SOL_SOCKET, @intCast(c.SO_ERROR), &soerr, &slen) != 0) return negErrno();
     if (soerr != 0) return -soerr;
     return 0;
 }
 
 pub fn setSockBuffers(fd: c_int, size_bytes: c_int) void {
-    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_RCVBUF, &size_bytes, @sizeOf(c_int));
-    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_SNDBUF, &size_bytes, @sizeOf(c_int));
+    var n = size_bytes;
+    setsockoptMem(fd, c.SOL_SOCKET, c.SO_RCVBUF, &n);
+    setsockoptMem(fd, c.SOL_SOCKET, c.SO_SNDBUF, &n);
 }
 
 fn dottedQuad(out_ip: []u8, s_addr_be: u32) ?[]const u8 {
@@ -738,7 +764,7 @@ pub fn resolveIpv4(host: []const u8, out_ip: []u8) ?[]const u8 {
 
 pub fn setTcpNoDelay(fd: c_int) void {
     var flag: c_int = 1;
-    _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_NODELAY, &flag, @sizeOf(c_int));
+    setsockoptMem(fd, c.IPPROTO_TCP, c.TCP_NODELAY, &flag);
 }
 
 /// Best-effort recursive delete for test scratch trees under .zig-cache/tmp.
@@ -883,7 +909,7 @@ test "parentOf" {
 }
 
 fn fdIsCloexec(fd: c_int) bool {
-    const flags = c.fcntl(fd, c.F_GETFD, @as(c_int, 0));
+    const flags = std.c.fcntl(fd, c.F_GETFD);
     return flags >= 0 and (flags & c.FD_CLOEXEC) != 0;
 }
 
@@ -902,14 +928,13 @@ test "open, socket, and accept are close-on-exec" {
     if (lfd < 0) return error.SkipZigTest;
     defer close(lfd);
     try std.testing.expect(fdIsCloexec(lfd));
-    var yes: c_int = 1;
-    _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
+    setReuseAddr(lfd);
     var addr = std.mem.zeroes(c.struct_sockaddr_in);
     addr.sin_family = c.AF_INET;
     addr.sin_port = 0;
     addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
     if (bind(lfd, &addr) != 0) return error.SkipZigTest;
-    if (c.listen(lfd, 1) != 0) return error.SkipZigTest;
+    if (listen(lfd, 1) != 0) return error.SkipZigTest;
     var got = std.mem.zeroes(c.struct_sockaddr_in);
     if (getsockname(lfd, &got) != 0) return error.SkipZigTest;
 
@@ -930,14 +955,13 @@ test "connectIn succeeds against a local listener" {
     const lfd = socket(c.AF_INET, c.SOCK_STREAM, 0);
     if (lfd < 0) return error.SkipZigTest;
     defer close(lfd);
-    var yes: c_int = 1;
-    _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
+    setReuseAddr(lfd);
     var addr = std.mem.zeroes(c.struct_sockaddr_in);
     addr.sin_family = c.AF_INET;
     addr.sin_port = 0;
     addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7F000001); // 127.0.0.1
     if (bind(lfd, &addr) != 0) return error.SkipZigTest;
-    if (c.listen(lfd, 1) != 0) return error.SkipZigTest;
+    if (listen(lfd, 1) != 0) return error.SkipZigTest;
     // Port 0 lets the kernel pick; read the assigned port back before dial.
     var got = std.mem.zeroes(c.struct_sockaddr_in);
     if (getsockname(lfd, &got) != 0) return error.SkipZigTest;
@@ -945,7 +969,7 @@ test "connectIn succeeds against a local listener" {
     try std.testing.expect(cfd >= 0);
     defer close(cfd);
     try std.testing.expectEqual(@as(i32, 0), connectIn(cfd, &got, 5000));
-    const fl = c.fcntl(cfd, c.F_GETFL, @as(c_int, 0));
+    const fl = std.c.fcntl(cfd, c.F_GETFL);
     try std.testing.expect(fl >= 0);
     try std.testing.expectEqual(@as(c_int, 0), fl & c.O_NONBLOCK);
 }
@@ -968,7 +992,7 @@ test "connectIn bounds a dead dial" {
     // Failure must still restore the caller's flags: leaving O_NONBLOCK
     // would make a later blocking read return EAGAIN instead of honoring
     // SO_RCVTIMEO. socket() is blocking by default.
-    const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    const fl = std.c.fcntl(fd, c.F_GETFL);
     try std.testing.expect(fl >= 0);
     try std.testing.expectEqual(@as(c_int, 0), fl & c.O_NONBLOCK);
 }
