@@ -102,6 +102,7 @@ SSH_KEY="${TEMP_DIR}/vmkey"
 PSK_FILE="${TEMP_DIR}/modelfs.psk"
 PSK_VALUE="clusterpsk_secret_key_1234567890"
 echo "${PSK_VALUE}" > "${PSK_FILE}"
+chmod 600 "${PSK_FILE}"
 
 cleanup() {
     echo "=== tearing down VMs ==="
@@ -196,9 +197,9 @@ echo "=== creating 4 VM disks and cloud-init seeds ==="
 # under the pool keeps libvirt-qemu from needing access into .scratch.
 sudo cp "${IMG}" "${DISK_DIR}/base.img"
 make_vm "${NFS_VM}" "${NFS_IP}" "52:54:00:4d:46:50" "nfs-kernel-server libfuse3-dev curl xz-utils"
-make_vm "${C1_VM}" "${C1_IP}" "52:54:00:4d:46:51" "fuse3 libfuse3-3 nfs-common"
-make_vm "${C2_VM}" "${C2_IP}" "52:54:00:4d:46:52" "fuse3 libfuse3-3 nfs-common"
-make_vm "${C3_VM}" "${C3_IP}" "52:54:00:4d:46:53" "fuse3 libfuse3-3 nfs-common"
+make_vm "${C1_VM}" "${C1_IP}" "52:54:00:4d:46:51" "fuse3 libfuse3-3 nfs-common curl"
+make_vm "${C2_VM}" "${C2_IP}" "52:54:00:4d:46:52" "fuse3 libfuse3-3 nfs-common curl"
+make_vm "${C3_VM}" "${C3_IP}" "52:54:00:4d:46:53" "fuse3 libfuse3-3 nfs-common curl"
 
 echo "=== booting 4 VMs (KVM) ==="
 for vm in "${VMS[@]}"; do
@@ -399,10 +400,12 @@ while :; do
                 "/home/ubuntu/modelfs status --cache /home/ubuntu/cache 2>/dev/null || echo 'no status'; echo '--- log ---'; tail -20 /home/ubuntu/modelfs.log 2>/dev/null; echo '--- cache ---'; du -sk /home/ubuntu/cache 2>/dev/null || true" 2>&1
         done
         echo "--- client 1 /have bitmap for big.gguf ---"
-        # Read the token from the PSK file on the remote host instead of
-        # interpolating it here: an ssh command string is this harness's
-        # argv, and /proc/<pid>/cmdline is world-readable.
-        have_cmd="auth=\"Authorization: Bearer \$(cat /home/ubuntu/modelfs.psk)\"; curl -s -D - -o /dev/null -H \"\$auth\" 'http://127.0.0.1:18080/have?path=big.gguf' | head -8; echo; curl -s -H \"\$auth\" 'http://127.0.0.1:18080/have?path=big.gguf' | xxd | head -5"
+        # Read the token on the guest into a 0600 header file; curl takes
+        # -H @file so the bearer is not on curl's argv. Expanding
+        # Authorization: Bearer $(cat …psk) into -H used to leak it through
+        # /proc/<pid>/cmdline (world-readable on the guest, as the ssh
+        # command string is on this host).
+        have_cmd="printf \"Authorization: Bearer %s\\n\" \"\$(cat /home/ubuntu/modelfs.psk)\" > /home/ubuntu/have.hdr && chmod 600 /home/ubuntu/have.hdr && curl -s -D - -o /dev/null -H @/home/ubuntu/have.hdr \"http://127.0.0.1:18080/have?path=big.gguf\" | head -8; echo; curl -s -H @/home/ubuntu/have.hdr \"http://127.0.0.1:18080/have?path=big.gguf\" | xxd | head -5; rm -f /home/ubuntu/have.hdr"
         ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${C1_IP}" "${have_cmd}" 2>&1
         exit 1
     fi

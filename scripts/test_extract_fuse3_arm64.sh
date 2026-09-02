@@ -32,6 +32,11 @@ echo stale >"${OUT}/root/leftover-from-previous-extract/STALE"
 [[ -f "${OUT}/root/usr/include/fuse3/fuse.h" ]] || fail "missing fuse.h after extract"
 [[ -L "${OUT}/lib/libfuse3.so" ]] || fail "missing libfuse3.so linker symlink"
 [[ -L "${OUT}/lib/libfuse3.so.3" ]] || fail "missing libfuse3.so.3 soname symlink"
+# -L is true for a dangling link; -e follows it. A hardcoded soname left
+# behind after a .deb refresh used to pass the extract suite and fail only
+# in the aarch64 job.
+[[ -e "${OUT}/lib/libfuse3.so" ]] || fail "dangling libfuse3.so linker symlink"
+[[ -e "${OUT}/lib/libfuse3.so.3" ]] || fail "dangling libfuse3.so.3 soname symlink"
 
 echo "=== extract_fuse3_arm64 hermetic extract ok ==="
 

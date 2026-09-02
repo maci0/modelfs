@@ -120,8 +120,17 @@ done <<<"${names}"
 [[ "${extracted}" -gt 0 ]] || fail "${SUMS} lists no files"
 
 # Convenience symlinks so -Dfuse-lib resolves libfuse3.so (-n replaces an
-# existing link, so a re-run after a refresh cannot fail on it).
+# existing link, so a re-run after a refresh cannot fail on it). The
+# soname target is whatever the .deb unpacked, not a version string
+# copied here: a SHA256SUMS bump used to leave libfuse3.so.3 dangling.
 ln -sfn libfuse3.so.3 "${OUT}/lib/libfuse3.so"
-ln -sfn ../root/lib/aarch64-linux-gnu/libfuse3.so.3.14.0 "${OUT}/lib/libfuse3.so.3"
+so_real=""
+for cand in "${OUT}/root/lib/aarch64-linux-gnu"/libfuse3.so.3.*; do
+    [[ -f "${cand}" ]] || continue
+    so_real="${cand}"
+    break
+done
+[[ -n "${so_real}" ]] || fail "extracted tree has no libfuse3.so.3.* under root/lib/aarch64-linux-gnu"
+ln -sfn "../root/lib/aarch64-linux-gnu/$(basename "${so_real}")" "${OUT}/lib/libfuse3.so.3"
 
 echo "Extracted vendored arm64 libfuse3 into ${OUT}/{root,lib}"
