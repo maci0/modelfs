@@ -486,9 +486,17 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         return;
     }
     if (std.mem.eql(u8, path, "/stage")) {
+        // Same gate as Range on /data: the required parameter is a client
+        // error answered before any storage touch or handler timer, so a
+        // missing piece cannot 404 on an absent path the way a missing
+        // Range never does.
+        const idx = parseStagePiece(target) orelse {
+            replyStatus(self, fd, "400 Bad Request");
+            return;
+        };
         const t0 = sys.monoNs(self.io);
         defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
-        serveStage(self, fd, rel, target);
+        serveStage(self, fd, rel, idx);
         return;
     }
     {
@@ -506,14 +514,24 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
     }
 }
 
+/// Required `piece=N` query on /stage: unsigned decimal that fits u32.
+/// Missing, empty, signed, grouped, or over-wide values are the same
+/// client error a missing Range is on /data.
+fn parseStagePiece(target: []const u8) ?u32 {
+    const piece_str = proto.queryGet(target, "piece") orelse return null;
+    const piece_n = proto.parseU64Fast(piece_str) orelse return null;
+    return std.math.cast(u32, piece_n);
+}
+
 fn decodePath(target: []const u8, out: []u8) ![]u8 {
     const q = proto.queryGet(target, "path") orelse return error.NoPath;
     return proto.urlDecode(out, q);
 }
 
 /// Origin size of a regular file at `rel`, or null after sending the matching
-/// error reply. /have and /data share this so a directory cannot 404 on one
-/// route and 502 on the other, and an unusable st_size stays 502 on both.
+/// error reply. /have, /data, and /stage share this so a directory cannot 404
+/// on one route and 502 on another, and an unusable st_size stays 502 on
+/// every route.
 fn originRegularSize(self: *Server, fd: std.posix.fd_t, rel: []const u8) ?u64 {
     var st: sys.c.struct_stat = undefined;
     const rc = self.store.statOrigin(rel, &st);
@@ -538,9 +556,9 @@ fn originRegularSize(self: *Server, fd: std.posix.fd_t, rel: []const u8) ?u64 {
     };
 }
 
-/// Live cache entry for `rel`, or null after a 500. Shared by /have and
-/// /data so an open failure cannot 500 on one route and drop the connection
-/// on the other.
+/// Live cache entry for `rel`, or null after a 500. Shared by /have, /data,
+/// and /stage so an open failure cannot 500 on one route and drop the
+/// connection on the other.
 fn cacheEntry(self: *Server, fd: std.posix.fd_t, rel: []const u8, size: u64) ?*store_mod.Store.Cached {
     return self.store.get(rel, size, sys.monoSec(self.io)) catch |err| {
         // The fetching peer only sees 500; without this line the serving
@@ -610,19 +628,7 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
 /// peer falls back to /data. The xfer guard covers hydration and the read
 /// into the staging buffer; once the bytes are in the backend's registered
 /// copy the cache fd no longer matters, so a punch after stage is safe.
-fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, target: []const u8) void {
-    const piece_str = proto.queryGet(target, "piece") orelse {
-        replyStatus(self, fd, "400 Bad Request");
-        return;
-    };
-    const piece_n = proto.parseU64Fast(piece_str) orelse {
-        replyStatus(self, fd, "400 Bad Request");
-        return;
-    };
-    const idx = std.math.cast(u32, piece_n) orelse {
-        replyStatus(self, fd, "400 Bad Request");
-        return;
-    };
+fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, idx: u32) void {
     const size = originRegularSize(self, fd, rel) orelse return;
     const file = cacheEntry(self, fd, rel, size) orelse return;
     defer self.store.releaseFile(file);
@@ -1027,11 +1033,13 @@ fn reply(fd: std.posix.fd_t, s: []const u8) void {
     _ = sys.writeAll(fd, s);
 }
 
-/// Empty-body response; every error path shares this framing. 5xx replies
+/// Empty-body response; every error path shares this framing. 500 and 502
 /// feed the store's http_5xx counter so a failing node is visible in
-/// status.json without grepping the journal.
+/// status.json without grepping the journal. 501 is a capability answer
+/// (/stage without a data-plane backend): the fetching peer falls back to
+/// /data, and counting it would make an HTTP-only node look failing.
 fn replyStatus(self: *Server, fd: std.posix.fd_t, status: []const u8) void {
-    if (status.len > 0 and status[0] == '5')
+    if (status.len >= 3 and status[0] == '5' and !std.mem.startsWith(u8, status, "501"))
         _ = self.store.stats.http_5xx.fetchAdd(1, .monotonic);
     var buf: [96]u8 = undefined;
     const res = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{status}) catch return;
@@ -2356,7 +2364,7 @@ test "fault tolerance: traversal path is rejected with 400" {
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "correct_secret", "127.0.0.1", port, "/etc/passwd"));
 }
 
-test "peer /have and /data hide .cluster the way FUSE does" {
+test "peer /have, /data, and /stage hide .cluster the way FUSE does" {
     // A PSK holder used to fetch origin/.cluster/<id>.json through the piece
     // protocol (relOk admits a leading-dot component), hydrating lease JSON
     // into the cache and advertising it via /have. FUSE lookup is ENOENT;
@@ -2394,6 +2402,9 @@ test "peer /have and /data hide .cluster the way FUSE does" {
     var data = try roundTrip(port, "GET /data?path=.cluster%2Fspark1.json HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-15\r\nConnection: close\r\n\r\n");
     defer data.deinit(gpa);
     try std.testing.expect(std.mem.startsWith(u8, data.items, "HTTP/1.1 404 Not Found\r\n"));
+    var staged = try roundTrip(port, "GET /stage?path=.cluster%2Fspark1.json&piece=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+    defer staged.deinit(gpa);
+    try std.testing.expect(std.mem.startsWith(u8, staged.items, "HTTP/1.1 404 Not Found\r\n"));
     // Missing Range on a cluster path is still 404, not 400: the resource
     // is not a piece, so the Range gate never runs.
     var norange = try roundTrip(port, "GET /data?path=.cluster HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
@@ -2437,19 +2448,24 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
-    // /have and /data must report the origin as unavailable (502, surfacing
-    // here as HttpStatus), never as a healthy miss: a fetching peer and an
-    // operator must be able to tell "nobody has this file" from "the origin
-    // is broken" -- fillFromPeers keys probe_err and its fallback tier on
-    // exactly this distinction.
+    // /have, /data, and /stage must report the origin as unavailable (502,
+    // surfacing here as HttpStatus), never as a healthy miss: a fetching
+    // peer and an operator must be able to tell "nobody has this file" from
+    // "the origin is broken" -- fillFromPeers keys probe_err and its
+    // fallback tier on exactly this distinction.
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "secret", "127.0.0.1", port, "loop/x.bin"));
     try std.testing.expectError(error.HttpStatus, fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "loop/x.bin", 0, 8));
+    {
+        var res = try roundTrip(port, "GET /stage?path=loop%2Fx.bin&piece=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 502 Bad Gateway\r\n"));
+    }
 
-    // Both failures are server-side trouble: each must land in the http_5xx
-    // counter status.json publishes (one per reply, bumped before the head
-    // the client above already read), or an origin outage is indistinguishable
-    // from ordinary traffic between discovery ticks.
-    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_5xx.load(.monotonic));
+    // All three failures are server-side trouble: each must land in the
+    // http_5xx counter status.json publishes (one per reply, bumped before
+    // the head the client above already read), or an origin outage is
+    // indistinguishable from ordinary traffic between discovery ticks.
+    try std.testing.expectEqual(@as(u64, 3), srv.store.stats.http_5xx.load(.monotonic));
 
     // A genuinely absent path stays a healthy miss (404 => PeerMiss), the
     // shape fillFromPeers relies on to keep probe_err clean on skewed fleets.
@@ -2457,10 +2473,10 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
 
     // The healthy miss must not have fed the failure gauge: 404s are fleet
     // skew, not broken nodes.
-    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_5xx.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 3), srv.store.stats.http_5xx.load(.monotonic));
 }
 
-test "a path too long for the origin answers 400 on /have and /data alike" {
+test "a path too long for the origin answers 400 on /have, /data, and /stage alike" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;
@@ -2496,8 +2512,15 @@ test "a path too long for the origin answers 400 on /have and /data alike" {
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
     }
+    {
+        var req_buf: [8192]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET /stage?path={s}&piece=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n", .{long_rel});
+        var res = try roundTrip(port, req);
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+    }
 
-    // And neither reply may pollute the 5xx health gauge status.json
+    // And none of the replies may pollute the 5xx health gauge status.json
     // publishes: nothing server-side failed here.
     try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
 }
@@ -2992,6 +3015,7 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
     // A routed path without its ?path= parameter is a client error answered
     // before any storage touch, not a 404 and not a crash. /data is the same
     // even when a Range is present: missing path is not a missing Range.
+    // /stage is the same even when piece= is present.
     {
         var res = try roundTrip(port, "GET /have HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
@@ -2999,6 +3023,11 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
     }
     {
         var res = try roundTrip(port, "GET /data HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n");
+        defer res.deinit(gpa);
+        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+    {
+        var res = try roundTrip(port, "GET /stage?piece=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
     }
@@ -4174,14 +4203,22 @@ fn fuzzRequestHeadOne(_: void, smith: *std.testing.Smith) anyerror!void {
     try std.testing.expectEqual(refBearerOk(formed, tok), proto.bearerOk(formed, tok));
 
     const path = proto.pathOnly(target);
-    if (!std.mem.eql(u8, path, "/have") and !std.mem.eql(u8, path, "/data")) return;
+    if (!std.mem.eql(u8, path, "/have") and !std.mem.eql(u8, path, "/data") and !std.mem.eql(u8, path, "/stage")) return;
     var rel_buf: [4096]u8 = undefined;
     const q = proto.queryGet(target, "path") orelse return;
     const rel = proto.urlDecode(&rel_buf, q) catch return;
     try std.testing.expect(rel.len <= q.len);
     const routed_ok = store_mod.relOk(rel);
     try std.testing.expectEqual(refRelOk(rel), routed_ok);
-    if (!routed_ok or path[1] != 'd') return;
+    if (!routed_ok) return;
+    if (std.mem.eql(u8, path, "/stage")) {
+        const idx = parseStagePiece(target) orelse return;
+        var canon: [32]u8 = undefined;
+        const canon_s = std.fmt.bufPrint(&canon, "{d}", .{idx}) catch return;
+        try std.testing.expectEqual(@as(u64, idx), proto.parseU64Fast(canon_s) orelse return error.PieceRoundTripFailed);
+        return;
+    }
+    if (path[1] != 'd') return;
     const rh = proto.headerGet(head, "Range") orelse return;
     const rg = proto.parseRange(rh) orelse return;
     try std.testing.expect(rg.start <= rg.end);
@@ -4203,8 +4240,8 @@ test "fuzz request head parsing pipeline gates auth paths and ranges" {
 // This harness drives the real handleConn over a socketpair instead and
 // pins the published routing contract end to end: auth before method gate,
 // method gate before routing, unknown routes 404 ahead of query validation,
-// traversal/control paths refused, ranges required on /data, and every
-// outcome landed in the counter status.json publishes.
+// traversal/control paths refused, Range required on /data and piece=N on
+// /stage, and every outcome landed in the counter status.json publishes.
 
 const seed_serve_ping_ok = fuzzcorpus.entry("GET /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_serve_post_ping = fuzzcorpus.entry("POST /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
@@ -4219,6 +4256,10 @@ const seed_serve_data_bad_range = fuzzcorpus.entry("GET /data?path=a.bin HTTP/1.
 const seed_serve_data_no_path = fuzzcorpus.entry("GET /data HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-0\r\n\r\n");
 const seed_serve_empty_path = fuzzcorpus.entry("GET /have?path= HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_serve_cluster_path = fuzzcorpus.entry("GET /have?path=.cluster%2Fspark1.json HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_stage_no_piece = fuzzcorpus.entry("GET /stage?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_stage_bad_piece = fuzzcorpus.entry("GET /stage?path=a.bin&piece=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_stage_no_path = fuzzcorpus.entry("GET /stage?piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_serve_stage_ok = fuzzcorpus.entry("GET /stage?path=a.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 
 const fuzz_serve_corpus = [_][]const u8{
     &seed_req_have_ok,
@@ -4244,13 +4285,17 @@ const fuzz_serve_corpus = [_][]const u8{
     &seed_serve_data_no_path,
     &seed_serve_empty_path,
     &seed_serve_cluster_path,
+    &seed_serve_stage_no_piece,
+    &seed_serve_stage_bad_piece,
+    &seed_serve_stage_no_path,
+    &seed_serve_stage_ok,
 };
 
 /// Every outcome handleConn's published order can produce for a head whose
 /// origin lookups all miss. `dropped` covers both unroutable shapes: a head
 /// that never terminates (EOF before \r\n\r\n) and one whose request line
 /// names no target; neither earns a reply, only the malformed counter.
-const ServeClass = enum { dropped, unauthorized, method_not_allowed, ping_ok, no_route, bad_path, bad_range, miss };
+const ServeClass = enum { dropped, unauthorized, method_not_allowed, ping_ok, no_route, bad_path, bad_range, bad_piece, miss };
 
 /// Independent walk of handleConn's decision order over the head the
 /// handler will actually see (everything up to and including the blank
@@ -4268,18 +4313,23 @@ fn classifyServedHead(head: []const u8) ServeClass {
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
     const is_have = std.mem.eql(u8, path, "/have");
-    if (!is_have and !std.mem.eql(u8, path, "/data")) return .no_route;
+    const is_data = std.mem.eql(u8, path, "/data");
+    const is_stage = std.mem.eql(u8, path, "/stage");
+    if (!is_have and !is_data and !is_stage) return .no_route;
     var rel_buf: [4096]u8 = undefined;
     const q = proto.queryGet(target, "path") orelse return .bad_path;
     const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
     if (!store_mod.relOk(rel)) return .bad_path;
     if (discover.relIsCluster(rel)) return .miss;
-    if (!is_have) {
+    if (is_data) {
         const rh = proto.headerGet(served, "Range") orelse return .bad_range;
         _ = proto.parseRange(rh) orelse return .bad_range;
     }
-    // Both routed requests stop at statOrigin's ENOENT in the fixture
-    // below and answer the healthy-miss 404.
+    if (is_stage) {
+        _ = parseStagePiece(target) orelse return .bad_piece;
+    }
+    // Routed requests stop at statOrigin's ENOENT in the fixture below
+    // and answer the healthy-miss 404.
     return .miss;
 }
 
@@ -4369,7 +4419,7 @@ fn serveConnCheck(head: []const u8) anyerror!void {
                 got,
             );
         },
-        .bad_path, .bad_range => {
+        .bad_path, .bad_range, .bad_piece => {
             try std.testing.expectEqualStrings(
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 got,
@@ -4454,17 +4504,23 @@ const DataClass = union(enum) {
     no_route,
     bad_path,
     bad_range,
+    bad_piece,
     /// Absent paths and non-regular files answer one identical 404, on
-    /// /have and /data alike.
+    /// /have, /data, and /stage alike.
     not_found,
     have_bits: struct { bits_bytes: usize, nbits: u32 },
     not_satisfiable: u64,
     partial: struct { start: u64, end: u64 },
+    /// /stage on a file that exists, with a piece that is in range, when
+    /// this node has no data-plane backend. Capability, not a 5xx failure.
+    not_implemented,
 };
 
-/// Independent restatement of handleConn's gate order plus serveData's and
-/// serveHave's decisions over the fixture. Must stay a pure function of the
-/// head: no store state, no clocks.
+/// Independent restatement of handleConn's gate order plus serveData's,
+/// serveHave's, and serveStage's decisions over the fixture. Must stay a
+/// pure function of the head: no store state, no clocks. Required params
+/// (Range on /data, piece on /stage) are classified before origin kind, so
+/// a missing Range on an absent path is 400, not 404.
 fn classifyDataHead(head: []const u8) DataClass {
     const done = std.mem.find(u8, head, "\r\n\r\n") orelse return .dropped;
     const served = head[0 .. done + 4];
@@ -4478,35 +4534,40 @@ fn classifyDataHead(head: []const u8) DataClass {
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
     const is_have = std.mem.eql(u8, path, "/have");
-    if (!is_have and !std.mem.eql(u8, path, "/data")) return .no_route;
+    const is_data = std.mem.eql(u8, path, "/data");
+    const is_stage = std.mem.eql(u8, path, "/stage");
+    if (!is_have and !is_data and !is_stage) return .no_route;
     var rel_buf: [4096]u8 = undefined;
     const q = proto.queryGet(target, "path") orelse return .bad_path;
     const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
     if (!store_mod.relOk(rel)) return .bad_path;
     if (discover.relIsCluster(rel)) return .not_found;
-    switch (dataKindOf(rel)) {
-        .dir, .absent => return .not_found,
-        .file48 => {},
-        .file0 => {},
-    }
-    if (is_have) {
+    if (is_data) {
+        const rh = proto.headerGet(served, "Range") orelse return .bad_range;
+        const rg = proto.parseRange(rh) orelse return .bad_range;
         return switch (dataKindOf(rel)) {
-            .file48 => .{ .have_bits = .{ .bits_bytes = 1, .nbits = 3 } },
-            .file0 => .{ .have_bits = .{ .bits_bytes = 0, .nbits = 0 } },
             .dir, .absent => .not_found,
+            .file48 => if (rg.start >= data_file_size)
+                .{ .not_satisfiable = data_file_size }
+            else
+                .{ .partial = .{ .start = rg.start, .end = @min(rg.end, data_file_size - 1) } },
+            // size 0: every start satisfies start >= size, so every range is 416
+            .file0 => .{ .not_satisfiable = 0 },
         };
     }
-    const rh = proto.headerGet(served, "Range") orelse return .bad_range;
-    const rg = proto.parseRange(rh) orelse return .bad_range;
-    switch (dataKindOf(rel)) {
-        .dir, .absent => return .not_found,
-        .file48 => {
-            if (rg.start >= data_file_size) return .{ .not_satisfiable = data_file_size };
-            return .{ .partial = .{ .start = rg.start, .end = @min(rg.end, data_file_size - 1) } };
-        },
-        // size 0: every start satisfies start >= size, so every range is 416
-        .file0 => return .{ .not_satisfiable = 0 },
+    if (is_stage) {
+        const idx = parseStagePiece(target) orelse return .bad_piece;
+        return switch (dataKindOf(rel)) {
+            .dir, .absent => .not_found,
+            .file48 => if (piece.len(data_file_size, idx, 16) == 0) .bad_piece else .not_implemented,
+            .file0 => if (piece.len(0, idx, 16) == 0) .bad_piece else .not_implemented,
+        };
     }
+    return switch (dataKindOf(rel)) {
+        .file48 => .{ .have_bits = .{ .bits_bytes = 1, .nbits = 3 } },
+        .file0 => .{ .have_bits = .{ .bits_bytes = 0, .nbits = 0 } },
+        .dir, .absent => .not_found,
+    };
 }
 
 /// Bits the server hands out must never carry uninitialized pad bits: the
@@ -4639,8 +4700,12 @@ fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             got,
         ),
-        .bad_path, .bad_range => try std.testing.expectEqualStrings(
+        .bad_path, .bad_range, .bad_piece => try std.testing.expectEqualStrings(
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            got,
+        ),
+        .not_implemented => try std.testing.expectEqualStrings(
+            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             got,
         ),
         .not_satisfiable => |size| {
@@ -4688,6 +4753,11 @@ const seed_data_escape = fuzzcorpus.entry("GET /data?path=%zz HTTP/1.1\r\nAuthor
 const seed_data_traversal = fuzzcorpus.entry("GET /data?path=..%2Fsecret HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-1\r\n\r\n");
 const seed_have_cached = fuzzcorpus.entry("GET /have?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_have_empty = fuzzcorpus.entry("GET /have?path=empty.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_stage_mbin = fuzzcorpus.entry("GET /stage?path=m.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_stage_past_eof = fuzzcorpus.entry("GET /stage?path=m.bin&piece=3 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_stage_empty = fuzzcorpus.entry("GET /stage?path=empty.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_stage_dir = fuzzcorpus.entry("GET /stage?path=d.gguf&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
+const seed_stage_absent_norange = fuzzcorpus.entry("GET /data?path=nope.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 
 const fuzz_data_corpus = [_][]const u8{
     &seed_data_full,
@@ -4718,6 +4788,15 @@ const fuzz_data_corpus = [_][]const u8{
     &seed_serve_ping_unauthed,
     &seed_serve_unknown_route,
     &seed_serve_cluster_path,
+    &seed_serve_stage_no_piece,
+    &seed_serve_stage_bad_piece,
+    &seed_serve_stage_no_path,
+    &seed_serve_stage_ok,
+    &seed_stage_mbin,
+    &seed_stage_past_eof,
+    &seed_stage_empty,
+    &seed_stage_dir,
+    &seed_stage_absent_norange,
 };
 
 fn fuzzServeDataOne(fixture: *DataFixture, smith: *std.testing.Smith) anyerror!void {
@@ -4729,6 +4808,11 @@ test "fuzz data path serves attacker ranges within the published contract" {
     const gpa = std.testing.allocator;
     const fixture = try DataFixture.create(gpa);
     defer fixture.destroy();
+    // Classifier treats a well-formed /stage as 501 (no backend). Pin that
+    // so a sibling test's fake backend cannot turn those heads into 200s.
+    const saved = rdma.backend;
+    rdma.backend = .{ .kind = .none };
+    defer rdma.backend = saved;
     try std.testing.fuzz(fixture, fuzzServeDataOne, .{ .corpus = &fuzz_data_corpus });
 }
 
@@ -4740,6 +4824,9 @@ test "fuzz data path contract holds for mutated corpus heads" {
     const gpa = std.testing.allocator;
     const fixture = try DataFixture.create(gpa);
     defer fixture.destroy();
+    const saved = rdma.backend;
+    rdma.backend = .{ .kind = .none };
+    defer rdma.backend = saved;
     var prng = std.Random.DefaultPrng.init(20260827);
     const rand = prng.random();
     const specials = "\r\n ?=&%.-09";
@@ -4867,6 +4954,9 @@ test "serveStage answers 501 without a staging backend and gates its params" {
     var resp_buf: [4096]u8 = undefined;
     var resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
     try std.testing.expectEqualStrings("HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", resp);
+    // 501 is a capability answer, not a node-health 5xx: an HTTP-only node
+    // probed on /stage must not look failing in status.json.
+    try std.testing.expectEqual(@as(u64, 0), fixture.st.stats.http_5xx.load(.monotonic));
     // The 501 is a capability answer, not a hydration side effect: the piece
     // must not have been filled from the origin just to say "no backend".
     const f = try fixture.srv.store.get("m.bin", data_file_size, 0);

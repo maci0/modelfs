@@ -86,7 +86,7 @@ pub const Stats = struct {
     fills_origin: std.atomic.Value(u64) = .init(0),
     bytes_from_peer: std.atomic.Value(u64) = .init(0),
     bytes_from_origin: std.atomic.Value(u64) = .init(0),
-    /// Content-Length of accepted /have 200 and /data 206 replies. Counted
+    /// Content-Length of accepted /have 200, /data 206, and /stage 200 replies. Counted
     /// when the status goes on the wire, not after the body drain, so a
     /// client that has already read the reply cannot race the bump. Truncated
     /// sends keep the count and a warn. A serving node is otherwise
@@ -117,9 +117,11 @@ pub const Stats = struct {
     /// degraded to NFS-only shows here while reads keep succeeding.
     probe_err: std.atomic.Value(u64) = .init(0),
     pieces_culled: std.atomic.Value(u64) = .init(0),
-    /// Peer HTTP server: accepted /have 200 and /data 206 replies, rejected
-    /// bearer tokens, and 5xx replies served. http_ok is the missing half of
-    /// the error rate: without it a node serving pieces looks idle.
+    /// Peer HTTP server: accepted /have 200, /data 206, and /stage 200
+    /// replies, rejected bearer tokens, and 5xx replies served. http_ok is
+    /// the missing half of the error rate: without it a node serving pieces
+    /// looks idle. 501 (no staging backend) is a capability answer, not a
+    /// 5xx for this gauge.
     http_ok: std.atomic.Value(u64) = .init(0),
     http_unauthorized: std.atomic.Value(u64) = .init(0),
     http_5xx: std.atomic.Value(u64) = .init(0),
@@ -136,10 +138,10 @@ pub const Stats = struct {
     /// Unsupported HTTP methods (non-GET). Deduplicated at warn level; every
     /// occurrence still counts here so a probing campaign is not silent.
     http_405: std.atomic.Value(u64) = .init(0),
-    /// Cumulative wall time inside /have and /data handlers. http_us on the
-    /// tick line is the serving-side twin of rd_us: without it a node whose
-    /// peer replies are slow looks healthy (http_ok climbing, inflight low
-    /// between requests). /ping, 401, and malformed heads stay untimed.
+    /// Cumulative wall time inside /have, /data, /stage, and /ping handlers.
+    /// http_us on the tick line is the serving-side twin of rd_us: without it
+    /// a node whose peer replies are slow looks healthy (http_ok climbing,
+    /// inflight low between requests). 401 and malformed heads stay untimed.
     http_nanos: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks

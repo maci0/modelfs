@@ -61,6 +61,19 @@
   `getifaddrs` failure at start (it no longer reads as "no NICs"). A
   length-mismatch staged read frees the pool slot instead of pinning it.
 
+### Peer /stage matches /have and /data - 2026-09-02
+- **`/stage` required `piece=N` is gated like `/data` Range.** Missing,
+  malformed, or over-wide `piece` answers 400 before any origin or cache
+  touch, the same order a missing Range uses, so an absent path cannot
+  404 a request that never named a piece. Past-EOF piece indexes stay 400
+  after the origin stat, as before.
+- **A 501 from `/stage` does not increment `http_5xx`.** It is a
+  capability answer (this node has no data-plane backend); counting it
+  made an HTTP-only node look failing. 500 and 502 still feed the gauge.
+- **The status table names `piece` as a 400 cause** and lists it with the
+  other unsigned-decimal wire integers. The routing-contract fuzz oracles
+  now treat `/stage` as a routed path.
+
 ## [0.5.0] - 2026-08-31
 
 Observability release on top of 0.4.0: the FUSE metadata handlers and the
