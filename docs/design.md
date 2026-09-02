@@ -6,7 +6,19 @@
 | Date | 2026-09-02 (goals/decisions/security rows re-verified against `src/`) |
 | Audience | Implementation |
 
-Original architecture notes. Several items here did not ship: origin-less two-node, content-addressed chunks (G9, shelved in section 14; blake3 itself shipped as per-piece integrity), S3, mmap-hydrate passthrough. The origin became **required** (any POSIX dir both nodes see), and the mount defaults to `direct_io`, so mmap fails without `--kernel-cache`: this reverses rules 1 and 6 in section 4.8 (getattr/readdir hit the origin; UMA OOM, see architecture.md). What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig, not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`, `/stage`) rather than Have/Want/Piece frames, and membership lives in `.cluster/<id>.json` lease files on the origin instead of an embedded metadata store.
+Original architecture notes. Several items here did not ship: origin-less two-node,
+content-addressed chunks (G9, shelved in section 14; blake3 itself shipped as per-piece
+integrity), S3, mmap-hydrate passthrough.
+
+The origin became **required** (any POSIX dir both nodes see), and the mount defaults to
+`direct_io`, so mmap fails without `--kernel-cache`. That reverses rules 1 and 6 in section 4.8:
+getattr and readdir hit the origin, and the page cache is off because of UMA OOM (see
+architecture.md).
+
+What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig,
+not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`, `/stage`) rather than
+Have/Want/Piece frames; and membership lives in `.cluster/<id>.json` lease files on the origin
+instead of an embedded metadata store.
 
 ModelFS is a POSIX mount for LLM weights. Nodes see a normal directory. llama.cpp, vLLM, and SGLang open files. Bytes come from a local NVMe cache, from peers over a piece protocol, or from a network origin.
 
@@ -33,7 +45,18 @@ Transfer units are not the same as dedup units:
 - **Chunks** (64 KiB to 1 MiB, content-defined): dedup and integrity.
 - **Pieces** (4 MiB to 16 MiB, concatenated chunks): what the swarm moves.
 
-Mount is immediately usable because the namespace is tiny. This sketch assumed `ls /models` and `stat` are local after catalog sync, and that the 140 GiB payload would hydrate in the background and on demand and, once on NVMe, leave the agent out of the I/O path so mmap went native. What shipped: `stat` / `readdir` hit the origin (no local catalog; `mf_getattr` / `mf_readdir` in src/fuse_fs.zig); on-demand per piece only (a miss blocks until that one piece fills, no background stripe); `direct_io` by default, so FUSE mmap fails unless `--kernel-cache` is set (see architecture.md).
+Mount is immediately usable because the namespace is tiny. This sketch assumed `ls /models` and
+`stat` are local after catalog sync, and that the 140 GiB payload would hydrate in the
+background and on demand and, once on NVMe, leave the agent out of the I/O path so mmap went
+native.
+
+What shipped instead:
+
+- `stat` and `readdir` hit the origin. There is no local catalog (`mf_getattr` / `mf_readdir` in
+  src/fuse_fs.zig).
+- On-demand per piece only: a miss blocks until that one piece fills, with no background stripe.
+- `direct_io` by default, so FUSE mmap fails unless `--kernel-cache` is set (see
+  architecture.md).
 
 ```mermaid
 flowchart TB
@@ -696,7 +719,19 @@ Kill-risk is step 4 with real llama.cpp and a real vLLM directory. If that is wr
 
 Threat model: trusted LAN cluster, untrusted origin possible (public S3, Hub).
 
-The table below is the original sketch. Only three of its mitigations had a shipped counterpart when this note was first written; as of the 0.3.x integrity work, per-piece content hashing ships in Level 1 form (below and in architecture.md "Piece integrity"): peer fills verify against a trusted digest before admit, cached bytes verify before every /data serve, and `modelfs verify` audits the cache on demand. mTLS still did not ship (bearer PSK over plaintext HTTP), origin tampering is still outside the trust model (the manifest trusts the origin exactly as the file bytes do), and local cache-artifact tampering is still THREAT_MODEL.md R7. The current threat model is [THREAT_MODEL.md](THREAT_MODEL.md); do not cite rows below as shipped posture.
+The table below is the original sketch. Only three of its mitigations had a shipped counterpart
+when this note was first written.
+
+As of the 0.3.x integrity work, per-piece content hashing ships in Level 1 form (below, and in
+architecture.md "Piece integrity"): peer fills verify against a trusted digest before admit,
+cached bytes verify before every `/data` serve, and `modelfs verify` audits the cache on demand.
+
+Still unshipped from this table: mTLS (what exists is a bearer PSK over plaintext HTTP), origin
+tampering (which stays outside the trust model, since the manifest trusts the origin exactly as
+the file bytes do), and local cache-artifact tampering (THREAT_MODEL.md R7).
+
+The current threat model is [THREAT_MODEL.md](THREAT_MODEL.md). Do not cite rows below as
+shipped posture.
 
 | Risk | Mitigation (sketch) | Shipped? |
 |---|---|---|
@@ -875,24 +910,28 @@ fabric speed, with HTTP remaining the negotiation and fallback channel.
 
 ### Shipped: the seam, the protocol, and the fallback (Level 0)
 
-`src/rdma.zig` is the seam between the two planes. The `/stage` endpoint
-(`serveStage` in src/peer.zig) hydrates and at-rest-verifies one piece
-(the same `hydrateRange`/`expectedHash` pipeline as `serveData`), reads it
-into a staging buffer, and -- only after verification -- hands it to the
-data-plane backend (`rdma.Backend.stage`), which replies with a 52-byte
-window: `len u64 + rkey u32 + addr u64 + digest [32]`, the opaque address
-of the piece in registered memory plus its digest (advisory: the fetching
-node verifies the landed bytes against its own trusted digest, never
-against the serving node's claim). A node whose backend cannot stage
-answers 501 and never advertises `X-Stage` on `/have`, so fetchers never
-probe `/stage` against it. The fetch side (`fetchPieceStaged` in
-src/peer.zig) issues `/stage` only when the have-cache line carries the
-capability, reads the window through the backend, and falls back to the
-existing `/data` path on any failure -- per-piece, per-peer, exactly like
-the existing next-path fallback. The shipped backend is the null one
-(`rdma.backend = .none`), so production behavior is byte-identical to the
-HTTP-only tree; the in-memory fake exists so the whole pipeline runs under
-`zig build test` without verbs hardware.
+`src/rdma.zig` is the seam between the two planes.
+
+**Serving.** The `/stage` endpoint (`serveStage` in src/peer.zig) hydrates and
+at-rest-verifies one piece through the same `hydrateRange`/`expectedHash`
+pipeline as `serveData`, reads it into a staging buffer, and only then hands
+it to the data-plane backend (`rdma.Backend.stage`). The backend replies with
+a 52-byte window: `len u64 + rkey u32 + addr u64 + digest [32]`, the opaque
+address of the piece in registered memory plus its digest. That digest is
+advisory: the fetching node verifies the landed bytes against its own trusted
+digest, never against the serving node's claim.
+
+**Capability.** A node whose backend cannot stage answers 501 and never
+advertises `X-Stage` on `/have`, so fetchers never probe `/stage` against it.
+
+**Fetching.** `fetchPieceStaged` (src/peer.zig) issues `/stage` only when the
+have-cache line carries the capability, reads the window through the backend,
+and falls back to the existing `/data` path on any failure: per-piece and
+per-peer, exactly like the existing next-path fallback.
+
+**What ships.** The null backend (`rdma.backend = .none`), so production
+behavior is byte-identical to the HTTP-only tree. The in-memory fake exists so
+the whole pipeline runs under `zig build test` without verbs hardware.
 
 ### Not shipped: the verbs tail
 

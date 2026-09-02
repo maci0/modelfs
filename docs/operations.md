@@ -1,11 +1,16 @@
-# ZFS + NFS + FS-Cache
+# Operations: the ZFS, NFS, and FS-Cache layers under the mount
 
 | Field | Value |
 |---|---|
 | Status | Ops runbook for this cluster; pairs with [architecture.md](architecture.md) |
 | Date | 2026-08-27 |
 
-NAS (Rocky/RHEL) exports `tank/models`. Desktop (Arch/Cachy) mounts it at `/models` with `cachefilesd`. Sparks (Ubuntu/DGX) mount it at `/net/192.168.0.100/models` **without** `fsc`; `modelfs` FUSE owns `/models`. UID **1000**, mode **755**.
+The NAS (Rocky/RHEL) exports `tank/models`. Everything is uid **1000**, mode **755**.
+
+| Host | Mounts the export at | With |
+|---|---|---|
+| Desktop (Arch/Cachy) | `/models` | `cachefilesd`, `fsc` on |
+| Sparks (Ubuntu/DGX) | `/net/192.168.0.100/models` | **no** `fsc`; `modelfs` FUSE owns `/models` instead |
 
 ```mermaid
 flowchart LR
@@ -53,16 +58,19 @@ section 3, installed from `scripts/nas/` via `scripts/install_nas_backup.sh`.
 Until those timers are enabled, a deleted or overwritten weight is gone.
 Scrub and smartd do not replace them.
 
-`*` on `showmount` is world-writable as root. The firewall rich rules are
-what actually limits NFS to `192.168.0.0/24` (`--add-service=nfs` would
-open the default zone globally and ignore the source filter). Or
-`sharenfs=off` and `/etc/exports`:
+A `*` in the `showmount -e` output means the export accepts every source, and with
+`no_root_squash` that is root-writable from anywhere. The firewall rich rules above are what
+actually limits NFS to `192.168.0.0/24`: `--add-service=nfs` would open the default zone
+globally and make a later source filter a no-op. The alternative is `sharenfs=off` plus
+`/etc/exports`:
 
 ```
 /export/models  192.168.0.0/24(rw,async,no_root_squash,no_subtree_check)
 ```
 
-`ss -lntp | grep 2049` on the client-facing NIC. SELinux `EACCES`: `setsebool -P nfs_export_all_rw 1`. `dedup=off`. LoRAs share one base; copies use `cp --reflink=auto`.
+Odds and ends: confirm the listener with `ss -lntp | grep 2049` on the client-facing NIC; an
+SELinux `EACCES` wants `setsebool -P nfs_export_all_rw 1`; keep `dedup=off`; and since LoRAs
+share one base, copy with `cp --reflink=auto`.
 
 ---
 
@@ -100,11 +108,15 @@ sudo mkdir -p /net/192.168.0.100/models /models /var/cache/modelfs
 sudo chown 1000:1000 /net/192.168.0.100/models /models /var/cache/modelfs
 ```
 
-Then [architecture.md](architecture.md). No autofs package; `/net/...` is just a directory name.
+Then start the daemon per the [README](../README.md) quickstart. There is no autofs package
+involved: `/net/...` is just a directory name.
 
-`soft` + `nofail` + automount: boot cannot hang. `hard` waits forever. `timeo` is tenths of a second.
+The mount options are chosen so boot cannot hang: `soft` plus `nofail` plus automount. `hard`
+would wait forever, and `timeo` is in tenths of a second.
 
-On the **origin** (desktop `/models` or spark `/net/.../models`), after it is mounted:
+### Origin directory layout
+
+On the **origin** (desktop `/models`, spark `/net/.../models`), after it is mounted:
 
 ```bash
 chown 1000:1000 /net/192.168.0.100/models   # or /models on desktop
@@ -116,11 +128,22 @@ chown -R 1000:1000 /net/192.168.0.100/models/hf \
                    /net/192.168.0.100/models/lora
 ```
 
-Download as uid 1000, not sudo. `nobody:nobody`: `echo Y > /sys/module/nfs/parameters/nfs4_disable_idmapping` (a kernel module parameter, not a sysctl; persist with `options nfs nfs4_disable_idmapping=Y` in `/etc/modprobe.d/nfs.conf`).
+Download as uid 1000, never with sudo. If files show up as `nobody:nobody`, that is NFSv4
+idmapping: `echo Y > /sys/module/nfs/parameters/nfs4_disable_idmapping`. It is a kernel module
+parameter, not a sysctl, so persist it with `options nfs nfs4_disable_idmapping=Y` in
+`/etc/modprobe.d/nfs.conf`.
 
-Desktop: `pgrep -a cachefilesd` must show a process. `findmnt /models | grep fsc`. Default `dir /var/cache/fscache`. `iflag=direct` skips FS-Cache. Cull is LRU at ~7% free.
+### Checks
 
-Mount stuck: `umount -l` the mountpoint. `timeout 5 bash -c "echo >/dev/tcp/192.168.0.100/2049"` (firewall) vs `timeout 10 showmount -e 192.168.0.100`.
+| Question | Command |
+|---|---|
+| Is cachefilesd running (desktop)? | `pgrep -a cachefilesd` must show a process |
+| Is FS-Cache actually attached (desktop)? | `findmnt /models \| grep fsc` |
+| Is the NFS port reachable, or is it the firewall? | `timeout 5 bash -c "echo >/dev/tcp/192.168.0.100/2049"`, then `timeout 10 showmount -e 192.168.0.100` |
+| Mount wedged? | `umount -l` the mountpoint |
+
+The desktop FS-Cache defaults to `dir /var/cache/fscache` and culls LRU at about 7% free.
+`iflag=direct` skips it entirely, which is how to measure the NAS rather than the cache.
 
 ---
 
@@ -134,11 +157,17 @@ Mount stuck: `umount -l` the mountpoint. `timeout 5 bash -c "echo >/dev/tcp/192.
 /models/lora/          adapters
 ```
 
-On sparks those paths are the FUSE `/models` (bytes from NVMe/peers/NFS). On the desktop they are the NFS mount.
+On sparks those paths are the FUSE `/models`, with bytes from NVMe, peers, or NFS. On the
+desktop they are the NFS mount.
 
-Hub cache snapshot trees are symlink farms into `blobs/`. The mount does not follow a symlink at a model path (`O_NOFOLLOW` on `originPread` / `originPwrite` in src/store.zig), so engines on a spark must open regular files: `hf download ... --local-dir` (below) or llama.cpp's `LLAMA_CACHE`, not a snapshot path under `HF_HUB_CACHE`. Desktop NFS still follows links in the kernel.
+**Weights on a spark must be regular files.** Hub cache snapshot trees are symlink farms into
+`blobs/`, and the mount does not follow a symlink at a model path (`O_NOFOLLOW` on
+`originPread`/`originPwrite` in src/store.zig). So engines on a spark open what `modelfs pull`,
+`hf download --local-dir`, or llama.cpp's `LLAMA_CACHE` wrote, never a snapshot path under
+`HF_HUB_CACHE`. Desktop NFS still follows links in the kernel.
 
-Token stays in `$HOME`. Triton / inductor / CUDA / vLLM compile caches stay local.
+The Hugging Face token stays in `$HOME`, and Triton, inductor, CUDA, and vLLM compile caches
+stay local.
 
 `/etc/profile.d/models-hf.sh` (systemd needs the same `Environment=`):
 
@@ -153,6 +182,18 @@ export TORCHINDUCTOR_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/torchinductor"
 ```
 
 Do **not** set `XDG_CACHE_HOME=/models`; that dumps pip and browsers onto NFS. llama.cpp `-hf` uses **`LLAMA_CACHE`**, not `HF_HUB_CACHE` (default is `~/.cache/llama.cpp`).
+
+`modelfs pull` is the option that needs no HF client and no mount: it writes the origin
+directly, from any node, and every mount then serves what landed.
+
+```bash
+# straight onto the origin, as regular files, no symlink farm
+modelfs pull bartowski/Llama-3.2-3B-Instruct-GGUF --origin /net/192.168.0.100/models
+modelfs pull meta-llama/Meta-Llama-3-70B-Instruct --origin /net/192.168.0.100/models \
+  --dest hf/Meta-Llama-3-70B-Instruct
+```
+
+Or use the Hugging Face tooling:
 
 ```bash
 source /etc/profile.d/models-hf.sh
@@ -225,4 +266,11 @@ manifest store for byte-identical and digest-sharing pairs. Run either
 before deciding whether duplicate models cost disk worth engineering for
 (design.md section 14).
 
-Durability caveat kept as-is on purpose: `sharenfs="rw,async"` lets the NAS acknowledge writes before stable storage (bounded by the txg interval), so a crash can lose writes clients saw succeed; the `soft` client mounts turn NAS trouble into `EIO` after 2 retrans instead of hanging. Synced exports would trade ingest throughput for that window; not changed here.
+### Durability caveat, kept as-is on purpose
+
+`sharenfs="rw,async"` lets the NAS acknowledge writes before they reach stable storage, bounded
+by the txg interval, so a crash can lose writes clients already saw succeed. The `soft` client
+mounts turn NAS trouble into `EIO` after 2 retrans rather than hanging.
+
+Synced exports would close that window at the cost of ingest throughput. That trade is not made
+here. [recovery.md](recovery.md) section 2 records it as the one gap no snapshot RPO covers.

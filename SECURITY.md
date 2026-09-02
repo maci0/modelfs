@@ -2,15 +2,18 @@
 
 ## Supported versions
 
-`v0.6.0` is the current release (tag `v0.6.0`, matching `.version = "0.6.0"`
-in [build.zig.zon](build.zig.zon), which `modelfs version` prints), and the
-`0.6.x` line receives security fixes. Fixes land on `main`; a fix concerning
-a released line is noted in [CHANGELOG.md](CHANGELOG.md) with the affected
-and fixed versions named, and shipped as the next `v<version>` tag per the
-release procedure in [CONTRIBUTING.md](CONTRIBUTING.md). If you build from an
-intermediate revision rather than a tag, pin the commit hash it came from
-(see the README) so you know exactly what you are running and can rebuild
-from a fixed revision.
+`v0.6.0` is the current release: tag `v0.6.0`, matching `.version = "0.6.0"` in
+[build.zig.zon](build.zig.zon), which `modelfs version` prints. The `0.6.x` line
+receives security fixes.
+
+Fixes land on `main`. One concerning a released line is noted in
+[CHANGELOG.md](CHANGELOG.md) with the affected and fixed versions named, and ships
+as the next `v<version>` tag per the release procedure in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+If you build from an intermediate revision rather than a tag, pin the commit hash it
+came from, so you know exactly what you are running and can rebuild from a fixed
+revision.
 
 ## Reporting a vulnerability
 

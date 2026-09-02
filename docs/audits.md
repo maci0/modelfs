@@ -5,7 +5,14 @@
 | Status | Historical record. Current behavior is [architecture.md](architecture.md) |
 | Covers | 2026-08-22 review passes; the 2026-08-23 and later passes are in [../CHANGELOG.md](../CHANGELOG.md) |
 
-Six review passes were run against the guides in [review-guides/](review-guides/), one pass per guide. Every finding below was fixed and covered by a regression test in the same pass; the fixes are in the code, so this file is kept for the reasoning, not as a to-do list. Descriptions are as recorded at the time: some name APIs that later changed (`@cImport` in `src/c.zig` moved into `build.zig`'s `translateC` step; `nowSec`/`sleepMs` went from `std.time` to `std.os.linux`), and some name mechanisms since lifted outright (the 64 MiB `/data` transfer cap; current behavior is [architecture.md](architecture.md)).
+Six review passes, one per guide in [review-guides/](review-guides/). Every finding below was
+fixed and covered by a regression test in the same pass, so this file is kept for the reasoning,
+not as a to-do list.
+
+Descriptions are as recorded at the time. Some name APIs that have since changed (`@cImport` in
+`src/c.zig` moved into `build.zig`'s `translateC` step; `nowSec`/`sleepMs` went from `std.time`
+to `std.os.linux`), and some name mechanisms lifted outright, such as the 64 MiB `/data`
+transfer cap. Current behavior is [architecture.md](architecture.md).
 
 ---
 
@@ -43,7 +50,13 @@ Six review passes were run against the guides in [review-guides/](review-guides/
 
 ## Zig 0.16 conformance
 
-`build.zig` gave the executable module its FUSE include path and library but not `test_mod`, so FUSE callbacks would not compile under `root.zig`; both are configured now. Beyond that the pass replaced libc calls with standard-library equivalents (`std.os.linux.clock_gettime`, `std.os.linux.nanosleep`, `std.posix.gethostname`, `std.posix` socket calls, `std.crypto.timing_safe.eql` for bearer comparison) and moved hand-rolled JSON formatting in `proto.zig` and `main.zig` onto `std.Io.Writer.fixed`.
+`build.zig` gave the executable module its FUSE include path and library but not `test_mod`, so
+FUSE callbacks would not compile under `root.zig`. Both are configured now.
+
+Beyond that the pass replaced libc calls with standard-library equivalents
+(`std.os.linux.clock_gettime`, `std.os.linux.nanosleep`, `std.posix.gethostname`, `std.posix`
+socket calls, and `std.crypto.timing_safe.eql` for the bearer comparison), and moved hand-rolled
+JSON formatting in `proto.zig` and `main.zig` onto `std.Io.Writer.fixed`.
 
 ## Fault tolerance coverage added
 

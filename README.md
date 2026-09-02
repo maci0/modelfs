@@ -39,8 +39,9 @@ Writes: **origin first → then fill the local cache**.
 A read that misses blocks until that one piece is filled from a single source. If the local cache cannot land the fill (full or broken cache disk), that one read is served from the origin and the piece stays unmarked. There is no background whole-file striping: it OOMed the unified memory on the target hardware.
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
-
-Releases: `v0.6.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since then is under `[Unreleased]` and a build from this tree still prints `0.6.0` until the next tag. Upgrading a running node or a script written against that tag: start at **Upgrade from v0.5.0** in that file (`verify`/`dupes` origin gate, `http_5xx` no longer counts 501, origin I/O errno, `/stage` `piece` 400, FUSE `readdir` omits `relOk`-refused names, discovery skips non-`validId` lease ids). Older tags: **Upgrade from v0.2.0** (origin-only fills without manifests, `/stage`, `verify`/`dupes`) and **Upgrade from v0.1.0**. How to report a security issue: [SECURITY.md](SECURITY.md).
+Current release `v0.6.0`; a build from this tree still prints `0.6.0` until the next tag.
+Upgrade notes per release, including the breaking ones, are in [CHANGELOG.md](CHANGELOG.md).
+Security reports: [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -54,14 +55,15 @@ Releases: `v0.6.0` is the current tag ([CHANGELOG.md](CHANGELOG.md)); work since
 
 ```bash
 zig build -Doptimize=ReleaseFast          # ./zig-out/bin/modelfs
-zig build test --summary all              # unit tests
+./scripts/cross_aarch64.sh                # aarch64 ReleaseFast, the recipe CI runs
 ```
 
-Non-default libfuse3 locations, e.g. when cross-compiling: the vendored arm64 tree ships as `.deb` files only. `./scripts/cross_aarch64.sh` extracts them into `.scratch/fuse3-arm64/` (hash-checked against [.deps/fuse3-arm64/SHA256SUMS](.deps/fuse3-arm64/SHA256SUMS); provenance is [.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md)) and builds ReleaseFast aarch64, the same recipe CI runs. On hosts without dpkg the extractor falls back to `ar` plus `zstd` or `tar --zstd`:
-
-```bash
-./scripts/cross_aarch64.sh                # extract + ReleaseFast aarch64
-```
+The aarch64 build needs an arm64 libfuse3, which ships here as `.deb` files only.
+`cross_aarch64.sh` extracts them into `.scratch/fuse3-arm64/`, hash-checked against
+[.deps/fuse3-arm64/SHA256SUMS](.deps/fuse3-arm64/SHA256SUMS) (provenance:
+[.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md)); without `dpkg` it falls
+back to `ar` plus `zstd` or `tar --zstd`. For any other libfuse3 location, point
+`-Dfuse-include=` / `-Dfuse-lib=` at it.
 
 ## Quickstart
 
@@ -76,21 +78,65 @@ umask 077; openssl rand -hex 32 | sudo tee /etc/modelfs.psk
 modelfs mount /models --origin /net/192.168.0.100/models
 ```
 
-`mount` stays in the foreground (drop it in a systemd `Type=simple` unit; `--detach` to background it). Then:
+`mount` stays in the foreground (drop it in a systemd `Type=simple` unit; `--detach` to background it).
+
+Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no
+broker and no multicast. Every node needs the same PSK. `--seed HOST[:PORT]` bootstraps
+while `.cluster` has no live lease.
+
+## Commands
 
 ```bash
-modelfs status                                    # liveness, peers, origin_down, and lifetime counters (reads, fills by source, errors)
+modelfs status                                    # liveness, peers, origin_down, lifetime counters
 modelfs peers --origin /net/192.168.0.100/models  # cluster leases, each marked live or expired
 modelfs pin gguf/foo.gguf                         # keep a file out of the cull
 modelfs unpin gguf/foo.gguf
-modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models  # rehash cached pieces against the origin manifest, clear mismatches
-modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models  # compare piece-hash manifests: how much do two files share?
-modelfs dupes --all --origin /net/192.168.0.100/models  # whole-store duplicate scan
+modelfs verify gguf/foo.gguf --origin ...         # rehash cached pieces, clear mismatches
+modelfs dupes gguf/a.gguf gguf/b.gguf --origin .. # how much do two files share?
+modelfs dupes --all --origin ...                  # whole-store duplicate scan
+modelfs pull unsloth/Qwen3-8B-GGUF --origin ...   # download a Hugging Face revision onto the origin
+modelfs update                                    # swap the running binary without unmounting
 ```
 
-Nodes find each other through lease files the origin holds at `.cluster/<id>.json`, so no broker and no multicast; `--seed HOST[:PORT]` bootstraps while `.cluster` has no live lease. Every node needs the same PSK. `modelfs help` documents every flag, including `--cache`, `--id`, `--listen`, `--advertise` (replaces the auto-detected NIC list, not additive), `--piece`, `--kernel-cache`, `--allow-other` (needs `user_allow_other`; the only way another uid reaches the mount), `--detach`, `--log` (`err`, `warn`, `info`, `debug`; mount/status/peers/pin/unpin/verify/dupes), and the `--brun`/`--bcull`/`--bstop` cull watermarks. `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID` (mount only, like `--id`), and `MODELFS_LOG` set the same values from the environment, `MODELFS_PSK_VALUE` carries an inline secret that no flag accepts (argv is world-readable through `/proc`) and cannot be combined with `--psk` or `MODELFS_PSK` on mount; an explicit flag wins, every `MODELFS_*` value is trimmed of surrounding whitespace, and an empty or whitespace-only environment value counts as unset except a whitespace-only `MODELFS_PSK_VALUE`, which is refused as empty (like the PSK file). `--advertise`/`--seed` refuse `0.0.0.0` and `255.255.255.255`.
+`modelfs update` replaces a live mount's process image: the kernel connection and the peer
+port stay, so an fd an engine already holds keeps reading across the swap. It finds the
+daemon the same way `status` does, through `--cache`.
 
-Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS ([docs/operations.md](docs/operations.md)).
+`modelfs pull` downloads a Hugging Face revision onto the origin, where every node's mount
+then serves it. Files already there at the listed size are skipped, so a rerun resumes.
+
+`modelfs help` documents every flag. The ones that come up most:
+
+| Flag | Default | What it does |
+| :--- | :--- | :--- |
+| `--origin PATH` | required | the shared directory that owns the bytes |
+| `--cache PATH` | `/var/cache/modelfs` | local piece cache |
+| `--id NAME` | short hostname | node id in the lease |
+| `--listen [IP:]PORT` | `18080` | peer port; the IP is ignored, binding is always all interfaces |
+| `--advertise IP[:PORT],...` | every non-loopback IPv4 | replaces the auto-detected list, not additive |
+| `--seed HOST[:PORT]` | none | peer to try while `.cluster` has no live lease; repeatable |
+| `--piece SIZE` | `16M` | piece size |
+| `--direct-io` / `--kernel-cache` | `--direct-io` | the page cache is off by default because it is UMA RAM shared with the GPU; turning it on permits mmap and can OOM |
+| `--allow-other` | off | the only way a uid other than the mounter reaches the mount; needs `user_allow_other` |
+| `--detach` / `-f` | `-f` | background after mount, or stay in the foreground |
+| `--brun` / `--bcull` / `--bstop` | `10` / `7` / `3` | cull watermarks, percent free |
+| `--log LEVEL` | `info` | `err`, `warn`, `info`, `debug` |
+
+Secrets never take a flag, because argv is world-readable through `/proc`:
+
+| Secret | Sources, in order |
+| :--- | :--- |
+| cluster PSK | `--psk FILE` (default `/etc/modelfs.psk`, mode 0600), `MODELFS_PSK`, or `MODELFS_PSK_VALUE` for the inline form |
+| Hugging Face token | `HF_TOKEN`, then `$HF_HOME/token`, then `~/.cache/huggingface/token` |
+
+`MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID`, and `MODELFS_LOG` set the same
+values as their flags; an explicit flag wins, values are whitespace-trimmed, and an empty one
+counts as unset. Any other `MODELFS_*` name is refused as a typo. Full rules, including the
+`MODELFS_PSK_VALUE` exclusivity and the address gates, are in
+[docs/architecture.md](docs/architecture.md).
+
+Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS
+([docs/operations.md](docs/operations.md)).
 
 ---
 
@@ -109,68 +155,30 @@ The piece-size sweep is why the default piece is 16 MiB: past it the gain is sma
 
 ## Tests
 
-The blocking gate and clone setup (Zig, libfuse3 headers, shellcheck, uv):
-[CONTRIBUTING.md](CONTRIBUTING.md). `./scripts/check.sh --help` lists the rest.
-
 ```bash
-zig build test -Dtest-filter=relOk        # only tests whose names contain this substring
-zig build test --watch                    # rebuild and re-run on change
-zig build fmt                             # apply zig fmt
-./scripts/check.sh                        # fmt, changelog headings, root.zig imports, unit tests, restore-drill stub, vendored fuse extract, script --help, shellcheck, ruff check+format, mypy, sbom
-./scripts/ci.sh                           # every CI job: check, aarch64 cross, repro
-./scripts/repro_check.sh                  # build twice, require byte-identical output
-./scripts/run_e2e_tests.sh                # CLI and peer protocol end to end
-./scripts/run_cluster_e2e_9nodes.sh       # 9-instance block exchange
-./scripts/run_vm_cluster_e2e.sh           # 4 VMs (NFS server + 3 clients) on libvirt/KVM
-./scripts/test_fault_tolerance.sh         # peer loss and lease expiry
-./scripts/dr_restore_drill.sh             # monthly restore drill, on the NAS (docs/recovery.md)
-./scripts/dr_restore_drill.sh --age-only  # fail if newest snapshot is older than 25 h
-./scripts/check_drill_log.sh              # fail if that drill's log is missing or older than 35 days
-./scripts/check_offsite.sh                # fail if the site-loss copy is missing or older than 8 days
-./scripts/dr_pool_restore.sh              # pool-loss recv (dry-run; --execute pulls from the replica)
-./scripts/hold_monthlies.sh               # hold monthly snapshots on the replica
-./scripts/install_nas_backup.sh           # copy NAS snapshot/replica/drill units (dry-run; --install writes)
-./scripts/test_dr_restore_drill.sh        # restore drill against stub zfs (also in check.sh)
-python3 scripts/run_benchmarks_and_plots.py  # live benchmarks -> .scratch/benchmarks/
+zig build test --summary all              # unit tests
+./scripts/check.sh                        # the blocking gate, exactly what CI runs
+./scripts/ci.sh                           # that gate plus the aarch64 and reproducibility jobs
 ```
 
-The benchmark script measures the machine it runs on: it writes to gitignored
-`.scratch/benchmarks/` unless you pass `--update-docs`, which is how
-[docs/benchmarks.md](docs/benchmarks.md) and its figures are regenerated from
-representative hardware.
+Setup from a fresh clone, the edit-test loop, the end-to-end suites, and what each
+script does: [CONTRIBUTING.md](CONTRIBUTING.md). `./scripts/check.sh --help` lists every
+contributor command, and each script answers `--help` itself.
 
-Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt); install the hash-verified lock with `uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt`. The CycloneDX inventory of that lock, the vendored libfuse3 debs, the SHA-pinned GitHub Actions (licenses and commit hashes), and the Zig `minimum_zig_version` pin is [sbom.cdx.json](sbom.cdx.json) (`python3 scripts/sbom.py --check` in the gate; `--self-test` covers the parsers).
-
-## Source layout
-
-| Module | Role |
-| :--- | :--- |
-| `main.zig` | CLI, command dispatch, mount wiring |
-| `fuse_fs.zig` | libfuse handlers, read hydration, write-through |
-| `store.zig` | local piece cache, persisted bitfields |
-| `piece.zig` | piece arithmetic and the bitfield itself |
-| `peer.zig` | peer HTTP server (`/ping`, `/have`, `/data`, `/stage`) and fetch client |
-| `proto.zig` | wire helpers: sizes, ranges, URL codec, bearer auth |
-| `discover.zig` | origin-side lease files, `/have` probe cache, path scoring |
-| `rdma.zig` | RDMA data-plane seam: `/stage` window codec and backend interface (null until the verbs tail) |
-| `cull.zig` | cache eviction watermarks |
-| `sys.zig` | syscall wrappers |
-| `c.zig` | the single door to libfuse3/libc |
-| `fuzzcorpus.zig` | shared seed-corpus framing for the `std.testing.fuzz` harnesses |
-| `root.zig` | test aggregator: pulls every module's tests into the test binary |
-
-`@cImport` is deprecated in Zig 0.16, so C declarations are translated once from `src/c.h` by `build.zig`; `c.zig` re-exports that module and every other module goes through it. `build.zig.zon` declares no package dependencies: the binary links only `libfuse3`, libc, and pthread.
+Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt) and installed from
+the hash-verified lock. [sbom.cdx.json](sbom.cdx.json) is the CycloneDX inventory of that
+lock, the vendored libfuse3 debs, the SHA-pinned GitHub Actions, and the Zig version pin;
+`python3 scripts/sbom.py --check` holds it to them in the gate.
 
 ## Documentation
 
-[docs/](docs/) has the index. Shortest path in:
+Start at [docs/architecture.md](docs/architecture.md) for how it actually behaves.
+[docs/](docs/) has the full index, including operations, disaster recovery, benchmarks,
+the threat model, and the original design sketch.
 
-* [docs/architecture.md](docs/architecture.md): how it actually behaves: cache layers, discovery, path scoring, auth, culling, write races.
-* [docs/operations.md](docs/operations.md): the ZFS/NFS/FS-Cache setup underneath, and Hugging Face downloads.
-* [docs/recovery.md](docs/recovery.md): what survives which disaster: backups, per-case restore steps, RPO/RTO, restore drills.
-* [docs/benchmarks.md](docs/benchmarks.md): numbers, with the caveats that qualify them.
-* [docs/audits.md](docs/audits.md): review findings and their fixes; [docs/review-guides/](docs/review-guides/) holds the checklists they came from.
-* [docs/design.md](docs/design.md): the original sketch, kept for history. It marks what never shipped.
+Source is a flat `src/*.zig`; the module map is in
+[docs/architecture.md](docs/architecture.md#modules). `build.zig.zon` declares no package
+dependencies: the binary links only `libfuse3`, libc, and pthread.
 
 ## Contributing
 

@@ -2,7 +2,7 @@
 
 You are a senior prompt engineer whose task is to review this repository's own agent rule file (`AGENTS.md`, with `CLAUDE.md` as its pointer) as instructions consumed by AI coding agents.
 
-Your goal is to evaluate whether `AGENTS.md` works as a rubric an agent can apply: whether it names what the binary is, what a correct change respects, which constraints are search-checkable, and where the agent must stop. This differs from `docs-drift-review.md`, which checks that `AGENTS.md` constraints still match the code; from `zig-src-review.md` and `scripts-review.md`, which enforce those constraints in `src/` and `scripts/`; and from the six game-server guides, which skip this tree. Do not review the prompts in this directory (they are this file's siblings, not its subject).
+Your goal is to evaluate whether `AGENTS.md` works as a rubric an agent can apply: whether it names what the binary is, what a correct change respects, which constraints are search-checkable, and where the agent must stop. This differs from `docs-drift-review.md`, which checks that `AGENTS.md` constraints still match the code; from `zig-src-review.md` and `scripts-review.md`, which enforce those constraints in `src/` and `scripts/`; and from the six `src/` quality guides, which review code rather than rules. Do not review the prompts in this directory (they are this file's siblings, not its subject).
 
 ## Execution contract
 

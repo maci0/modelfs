@@ -6,40 +6,42 @@ what passes locally is what passes on push.
 
 ## Setup, once per clone
 
-Requirements: Linux (x86_64 or aarch64), **Zig 0.16.0 or newer** from
-https://ziglang.org/download/ (`minimum_zig_version` in
-[build.zig.zon](build.zig.zon) is the floor and the version CI installs;
-setup-zig reads that field so a bump updates every job), libfuse3 headers
-(`libfuse3-dev` / `fuse3-devel`), shellcheck (`shellcheck` / `ShellCheck`
-from the package manager), and **uv** (https://docs.astral.sh/uv/).
-Python tooling is pinned and type-checked against 3.12
-([.python-version](.python-version); CI reads that file into setup-uv, so
-a bump updates the check job). uv itself is `[tool.uv] required-version`
-in [pyproject.toml](pyproject.toml) (the field setup-uv installs from).
-The 9-node cluster suite also needs the FUSE helper (`fuse3` / `fuse`,
-providing `/dev/fuse` and `fusermount3`); the 4-VM cluster suite needs
-libvirt + KVM + sudo (it boots an NFS server VM and three client VMs, so
-it exercises a real NFS origin and real network piece exchange -- see
-run_vm_cluster_e2e.sh). Install the lock with uv:
+Every version below is pinned in a file CI also reads, so a bump updates
+both at once:
+
+| Tool | Floor | Pinned in |
+|---|---|---|
+| Zig | 0.16.0 | `minimum_zig_version` in [build.zig.zon](build.zig.zon) (setup-zig reads it) |
+| Python | 3.12 | [.python-version](.python-version) (setup-uv reads it) |
+| uv | see manifest | `[tool.uv] required-version` in [pyproject.toml](pyproject.toml) |
+| ruff, mypy | exact | [requirements-dev.lock.txt](requirements-dev.lock.txt) |
+
+Also needed from the package manager: libfuse3 headers (`libfuse3-dev` /
+`fuse3-devel`) and shellcheck. Then:
 
 ```bash
 uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
 ```
 
-`.python-version` selects 3.12; if uv cannot find an interpreter, run
-`uv python install 3.12` first.
+If uv cannot find an interpreter, run `uv python install 3.12` first.
+`scripts/check.sh` puts `.venv/bin` on PATH itself, so you never activate it,
+but it refuses anything other than that lock's `python3`, `ruff`, and `mypy`:
+an empty `uv venv` or the OS copies disagree with CI and fail either here or
+only after push.
 
-`scripts/check.sh` requires `.venv/bin/{python3,ruff,mypy}` (the lock
-install, not an empty `uv venv`) and puts that directory on PATH, so you
-never need to activate it. The interpreter must match `.python-version`
-(the same series CI installs). If `zig build` stops with "libfuse3 headers
-not found", install the package it names (or point `-Dfuse-include=<dir>`
-at a non-default location); on Debian/Ubuntu,
-`./scripts/install_libfuse3_dev.sh` runs that apt install exactly as CI
-does (it needs passwordless `sudo -n` and `apt-get`).
-`./scripts/check.sh --help` lists the contributor commands; each listed
-script answers `--help` instead of starting work. `zig build --help`
-lists the `check`/`ci`/`fmt`/`test` steps.
+If `zig build` stops with "libfuse3 headers not found", install the package it
+names, or point `-Dfuse-include=<dir>` at a non-default location. On
+Debian/Ubuntu `./scripts/install_libfuse3_dev.sh` runs that apt install exactly
+as CI does (needs passwordless `sudo -n`).
+
+The end-to-end suites want more: `/dev/fuse` and `fusermount3` (`fuse3` /
+`fuse`) for the FUSE ones, and libvirt + KVM + sudo for the 4-VM suite, which
+boots an NFS server and three clients to exercise a real origin and real
+network piece exchange.
+
+`./scripts/check.sh --help` lists every contributor command and `zig build --help`
+the `check`/`ci`/`fmt`/`test` steps; each script answers `--help` instead of
+starting work.
 
 ## The one command that matters
 
@@ -78,47 +80,76 @@ DT_RPATH/DT_RUNPATH.
 
 ## End-to-end suites
 
+Not in the gate: each needs hardware or a daemon CI does not have. Every one
+answers `--help` without starting work.
+
 ```bash
 ./scripts/run_e2e_tests.sh             # CLI and peer protocol; no FUSE mount needed
 ./scripts/run_cluster_e2e_9nodes.sh    # mounts 9 FUSE filesystems: needs /dev/fuse and fusermount3 (fuse3 / fuse)
+./scripts/test_hot_reload.sh           # `modelfs update` on a live mount: same FUSE requirement
 ./scripts/run_vm_cluster_e2e.sh        # 4 VMs (NFS server + 3 clients) on libvirt/KVM: needs sudo, /dev/kvm, cloud-image-utils
 ./scripts/test_fault_tolerance.sh      # peer loss and lease expiry; some checks skip loudly without a live peer
-./scripts/test_dr_restore_drill.sh     # restore drill against stub zfs; also run by check.sh
+```
+
+## Build and release checks
+
+```bash
+./scripts/cross_aarch64.sh             # aarch64 ReleaseFast against the vendored libfuse3
+./scripts/repro_check.sh               # two ReleaseFast builds from different paths, byte-compared
+./scripts/install_libfuse3_dev.sh      # the apt install CI does (needs passwordless sudo -n)
+python3 scripts/run_benchmarks_and_plots.py   # live benchmarks into .scratch/benchmarks/
+```
+
+The benchmark script measures the machine it runs on and writes to gitignored
+`.scratch/benchmarks/`; `--update-docs` is what regenerates
+[docs/benchmarks.md](docs/benchmarks.md) and its figures, and should only be run
+on representative hardware.
+
+## NAS backup and restore scripts
+
+These run on the NAS or the replica host, not in a clone. [docs/recovery.md](docs/recovery.md)
+is the runbook they belong to.
+
+```bash
+./scripts/install_nas_backup.sh        # copy snapshot/replica/drill units (dry-run; --install writes)
+./scripts/dr_restore_drill.sh          # monthly restore drill
+./scripts/dr_restore_drill.sh --age-only  # fail if newest snapshot is older than 25 h
 ./scripts/check_drill_log.sh           # fail if the monthly drill log is missing or stale
 ./scripts/check_offsite.sh             # fail if the site-loss copy is missing or older than 8 days
 ./scripts/dr_pool_restore.sh           # pool-loss recv (dry-run; --execute pulls from the replica)
-./scripts/dr_restore_drill.sh --age-only  # fail if newest snapshot is older than 25 h (NAS)
 ./scripts/hold_monthlies.sh            # hold monthly snapshots on the replica (syncoid ExecStartPost)
-./scripts/install_nas_backup.sh        # copy NAS snapshot/replica/drill units (dry-run; --install writes)
+./scripts/test_dr_restore_drill.sh     # all of the above against a stub zfs; also run by check.sh
 ```
 
 ## PR expectations
 
-The blocking requirement is green CI: `./scripts/check.sh`, the
-`cross-aarch64` compile job, and the `reproducibility` job
-(`./scripts/ci.sh` runs all three). There is no sign-off gate and no
-requirement that a PR add a changelog entry, but `scripts/check.sh`
-requires CHANGELOG.md's `##` headings to be `[Unreleased]` first, then dated
-semver versions in strictly descending order, one of them matching
-build.zig.zon, plus a `[name]:` footer link for each heading and a
-current-tag mention in README.md, SECURITY.md, and docs/THREAT_MODEL.md. Behavior changes belong in
-[CHANGELOG.md](CHANGELOG.md) as a dated
-`###` section under `[Unreleased]` (`## [Unreleased]` and `## [x.y.z] - date`
-are the only `##` headings; a sibling `## [Name] - date` reads as a
-release, so history that shipped in a version nests as `###` under it;
-`scripts/check.sh` pins that against `.version` in build.zig.zon), and
-changes to
-[requirements-dev.txt](requirements-dev.txt) must be reflected in the
-hash-pinned lock (regeneration command in the lock's header) and in
-[sbom.cdx.json](sbom.cdx.json) (`python3 scripts/sbom.py --write`). A
-new lock package also needs its SPDX id in `scripts/sbom.py` (`_SPDX`,
-from the wheel `License-Expression`). GitHub Actions in
-`.github/workflows` must be pinned to a 40- or 64-character commit SHA
-and listed in `_SPDX` (LICENSE at that commit); the inventory records
-the digest as a hash and refuses a moving tag. Zig's
-`minimum_zig_version` is inventoried the same way. A refresh of the
-vendored arm64 libfuse3 `.deb`s must regenerate
-`.deps/fuse3-arm64/SHA256SUMS` and the SBOM the same way.
+The only blocking requirement is green CI: `./scripts/check.sh`, the
+`cross-aarch64` compile job, and the `reproducibility` job, all three of which
+`./scripts/ci.sh` runs locally. There is no sign-off gate.
+
+**Behavior changes belong in [CHANGELOG.md](CHANGELOG.md)**, as a dated `###`
+section under `[Unreleased]`. Adding one is not itself gated, but the file's
+shape is: `## [Unreleased]` first, then dated semver versions in strictly
+descending order with one matching `build.zig.zon`, each with a `[name]:`
+footer link, and `v<version>` named in README.md, SECURITY.md, and
+docs/THREAT_MODEL.md. `##` is reserved for those two forms, so history that
+shipped in a version nests as `###` under it: a sibling `## [Name] - date`
+reads as a release.
+
+**Dependency changes carry inventory work.** [sbom.cdx.json](sbom.cdx.json) is
+the CycloneDX record and `python3 scripts/sbom.py --check` holds the tree to it:
+
+* A [requirements-dev.txt](requirements-dev.txt) edit must be reflected in the
+  hash-pinned lock (regeneration command is in the lock's header) and in the
+  SBOM (`python3 scripts/sbom.py --write`). A new package also needs its SPDX
+  id in `_SPDX` in `scripts/sbom.py`, taken from the wheel's
+  `License-Expression`.
+* GitHub Actions in `.github/workflows` must be pinned to a 40- or 64-character
+  commit SHA and listed in `_SPDX` with the LICENSE at that commit. The
+  inventory records the digest as a hash and refuses a moving tag.
+* Zig's `minimum_zig_version` and a refresh of the vendored arm64 libfuse3
+  `.deb`s (which also regenerates `.deps/fuse3-arm64/SHA256SUMS`) go through
+  the same `--write`.
 
 ## Cutting a release
 

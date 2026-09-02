@@ -32,7 +32,13 @@ Verifiably safe to ignore in any backup plan: caches (next read re-hydrates; cul
 | NAS host dead | **total** | any ZFS box becomes the NAS from the replica |
 | site loss (fire, theft, ransomware) | **total** | offsite copy |
 
-One acknowledged-but-not-durable window exists that no snapshot closes: the NAS export is `async` ([operations.md](operations.md)), so the server replies to NFS writes before stable storage, and a NAS crash can lose the last few seconds of writes clients already saw succeed. The hourly snapshot protects what was persisted; it cannot recover bytes that never reached stable storage. A synced export would close the window at ingest-throughput cost; that trade is kept as-is on purpose (operations.md).
+One acknowledged-but-not-durable window exists that no snapshot closes. The NAS export is
+`async` ([operations.md](operations.md)), so the server replies to NFS writes before stable
+storage, and a NAS crash can lose the last few seconds of writes clients already saw succeed.
+
+The hourly snapshot protects what was persisted; it cannot recover bytes that never reached
+stable storage. A synced export would close the window at ingest-throughput cost, and that trade
+is kept as-is on purpose.
 
 Realistic worst case is the third row of the first column, not hardware: one wrong `rm -rf` through `/models` deletes at disk speed and POSIX has no trash can. Snapshots are the soft-delete window.
 
@@ -55,9 +61,28 @@ systemctl enable --now sanoid.timer sanoid-prune.timer
 systemctl enable --now modelfs-drill.timer modelfs-drill-log.timer modelfs-snap-age.timer
 ```
 
-`scripts/nas/sanoid.conf` is the autosnap + autoprune policy (36 hourly, 30 daily, 3 monthly, `recursive = yes`). Weights are near-immutable and lz4-compressed, so snapshots cost almost nothing; tune counts to spare capacity, then re-copy the file. Recursive is a no-op while `tank/models` has only directories underneath ([operations.md](operations.md)); it is there so a later `zfs create tank/models/gguf` (or similar) is snapshotted without rewriting the backup job. The replica pull (`syncoid --recursive`) and `hold_monthlies.sh -r` follow the same growth; the restore drill age-checks each child so a dataset the job never copied cannot look green.
+### Layer 1: local snapshots
 
-Replica onto a second machine or external disk (covers pool loss). The unit is a **pull on the replica host**, not a push from the NAS: NAS root must not hold a credential that can `zfs destroy` the copy that exists to survive NAS root. Override `MF_SYNCOID_SRC` (default `nas:tank/models`) with a drop-in so a later `install_nas_backup.sh --install` cannot restore the placeholder. `systemctl edit` writes `/etc/systemd/system/<unit>.d/override.conf`; `systemctl edit --full` replaces the unit file the installer copies.
+`scripts/nas/sanoid.conf` is the autosnap and autoprune policy: 36 hourly, 30 daily, 3 monthly,
+`recursive = yes`. Weights are near-immutable and lz4-compressed, so snapshots cost almost
+nothing; tune the counts to spare capacity, then re-copy the file.
+
+Recursive is a no-op while `tank/models` has only directories underneath
+([operations.md](operations.md)). It is there so a later `zfs create tank/models/gguf` is
+snapshotted without rewriting the backup job. The replica pull (`syncoid --recursive`) and
+`hold_monthlies.sh -r` follow the same growth, and the restore drill age-checks each child, so a
+dataset the job never copied cannot look green.
+
+### Layer 2: the replica (covers pool loss)
+
+Onto a second machine or an external disk. The unit is a **pull on the replica host**, not a
+push from the NAS: NAS root must not hold a credential that can `zfs destroy` the copy that
+exists to survive NAS root.
+
+Override `MF_SYNCOID_SRC` (default `nas:tank/models`) with a drop-in, so a later
+`install_nas_backup.sh --install` cannot restore the placeholder. `systemctl edit` writes
+`/etc/systemd/system/<unit>.d/override.conf`; `systemctl edit --full` would replace the unit
+file the installer copies.
 
 ```bash
 systemctl edit syncoid-models.service
@@ -72,13 +97,75 @@ systemctl edit modelfs-snap-age.service   # same Environment=
 systemctl enable --now modelfs-drill.timer modelfs-snap-age.timer
 ```
 
-The replica unit passes `--recursive`, matching `sanoid.conf`'s `recursive = yes`: a later `zfs create tank/models/gguf` is snapshotted on the NAS and must also land on the replica, or pool-loss restore silently drops the new dataset. `ExecStartPost` in that unit runs [`scripts/hold_monthlies.sh`](../scripts/hold_monthlies.sh) (`modelfs-hold-monthlies`) to `zfs hold` every `*_monthly` snapshot of the dataset **and its descendants** (`modelfs-dr`) so a recursive destroy cannot take them without an explicit `zfs release`. Already-held is success (yesterday's pull tagged it). Any other hold failure fails the unit: a green pull with no hold is not a replica that survives a fat-finger `zfs destroy -r`. Zero snapshots at all also fails (a replica of nothing cannot be restored); zero monthlies among other snapshots is success until the first monthly lands. Root on the replica host can still release-and-destroy; a second person or a key that cannot `zfs release` is the remaining control, and is not in this repo. `TimeoutStartSec=infinity` is set on the syncoid and drill services so a host whose systemd still times out Type=oneshot at 90 s cannot kill a multi-hour recv or a `diff -rq` of the live tree. Syncoid's SSH uses `BatchMode=yes` and `ConnectTimeout=30` so a missing host key or a blackholed NAS fails the unit (and fires `OnFailure=`) instead of hanging until infinity. The ZFS units (`syncoid-models`, the drill, snap-age, offsite-age) `Requires=zfs-import.target` so a failed pool import does not still start a oneshot that can only fail. `notify-admin@.service` and the read-only age/log alarms (`modelfs-snap-age.service`, `modelfs-drill-log.service`, `modelfs-offsite-age.service`) are sandboxed (`ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`); keep `/dev` visible (`/dev/log` for the notifier, `/dev/zfs` for the age checks). Syncoid does not set `ProtectHome=yes`: its SSH key lives in `/root/.ssh`.
+The unit passes `--recursive`, matching `sanoid.conf`. A later `zfs create tank/models/gguf` is
+snapshotted on the NAS and must also land on the replica, or pool-loss restore silently drops
+the new dataset.
 
-Offsite: rotate a disk out weekly, or `syncoid --recursive` to a hosted ZFS box (same flag as the local replica: child datasets must follow). The dataset is private; encrypt the transport or the target. Verify the copy with [`scripts/check_offsite.sh`](../scripts/check_offsite.sh) (`modelfs-check-offsite`) when the disk is attached, or enable `modelfs-offsite-age.timer` on a hosted box that always holds the copy (`systemctl edit modelfs-offsite-age.service` to set `MF_OFFSITE_DATASET`; there is no live-NAS default, because checking `tank/models` on the NAS would bless production snapshots as the offsite copy). Newest snapshot older than `MF_OFFSITE_MAX_AGE` (default 8 days, weekly plus slack) is the alarm. A stopped rotation is no longer silent until the next site-loss review.
+**Holds.** `ExecStartPost` runs [`scripts/hold_monthlies.sh`](../scripts/hold_monthlies.sh)
+(`modelfs-hold-monthlies`) to `zfs hold` every `*_monthly` snapshot of the dataset **and its
+descendants** under the tag `modelfs-dr`, so a recursive destroy cannot take them without an
+explicit `zfs release`. Already-held is success, since yesterday's pull tagged it. Any other
+hold failure fails the unit: a green pull with no hold is not a replica that survives a
+fat-finger `zfs destroy -r`. Zero snapshots at all also fails, because a replica of nothing
+cannot be restored; zero monthlies among other snapshots is success until the first monthly
+lands. Root on the replica host can still release and destroy. A second person, or a key that
+cannot `zfs release`, is the remaining control, and is not in this repo.
 
-Failure visibility: a green timer only proves it fired. `OnFailure=notify-admin@%n.service` sits on the **services** (`sanoid.service`, `sanoid-prune.service`, `syncoid-models.service`, `modelfs-drill.service`, `modelfs-drill-log.service`, `modelfs-snap-age.service`, `modelfs-offsite-age.service`), not the timers. A drop-in on `sanoid.timer` would stay green while `sanoid.service` failed to snapshot. Disabling `sanoid.timer` never fails `sanoid.service` at all, so `modelfs-snap-age.timer` (every hour of uptime, not `OnCalendar=hourly`) runs `modelfs-restore-drill --age-only`: newest snapshot older than `MF_DRILL_MAX_SNAP_AGE` (default 25 h) is the alarm. The age watchdogs (`modelfs-snap-age.timer`, `modelfs-drill-log.timer`, `modelfs-offsite-age.timer`) use `OnBootSec`/`OnUnitActiveSec` so a DST spring-forward cannot skip a local hour and a fall-back doubled hour cannot leave a 2 h hole; `Persistent=` is OnCalendar-only, so those units fire again after reboot via `OnBootSec`. The replica pull and monthly clone stay calendar events, pinned to UTC (`OnCalendar=daily UTC`, `OnCalendar=monthly UTC`) so a host TZ cannot move them. `notify-admin@.service` logs to syslog (`modelfs-backup`); replace ExecStart with the site mailer or webhook when one exists.
+**Unit hardening.** `TimeoutStartSec=infinity` on the syncoid and drill services, so a host
+whose systemd still times out `Type=oneshot` at 90 s cannot kill a multi-hour recv or a
+`diff -rq` of the live tree. Syncoid's SSH uses `BatchMode=yes` and `ConnectTimeout=30`, so a
+missing host key or a blackholed NAS fails the unit (and fires `OnFailure=`) instead of hanging
+until infinity. The ZFS units (`syncoid-models`, drill, snap-age, offsite-age) all
+`Requires=zfs-import.target`, so a failed pool import does not start a oneshot that can only
+fail. `notify-admin@.service` and the read-only age and log alarms are sandboxed
+(`ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`) but keep
+`/dev` visible: `/dev/log` for the notifier, `/dev/zfs` for the age checks. Syncoid does not set
+`ProtectHome=yes`, because its SSH key lives in `/root/.ssh`.
 
-Treat these as alarms, not log noise: no new snapshot inside 25 h (`modelfs-snap-age.timer`; the monthly clone is the restore proof, not the schedule watchdog), replica newest snapshot older than 36 h (daily pull plus slack; `MF_DRILL_MAX_REPLICA_AGE`, set `MF_DRILL_REPLICA` on the replica host), `modelfs-check-drill-log` failing (log missing, empty, or older than 35 days), offsite newest snapshot older than 8 days (`modelfs-check-offsite`; weekly rotation plus slack).
+### Layer 3: offsite (covers site loss)
+
+Rotate a disk out weekly, or `syncoid --recursive` to a hosted ZFS box. Same `--recursive` as
+the local replica: child datasets must follow. The dataset is private, so encrypt the transport
+or the target.
+
+Verify the copy with [`scripts/check_offsite.sh`](../scripts/check_offsite.sh)
+(`modelfs-check-offsite`) when the disk is attached, or enable `modelfs-offsite-age.timer` on a
+hosted box that always holds the copy, setting `MF_OFFSITE_DATASET` through
+`systemctl edit modelfs-offsite-age.service`. There is no live-NAS default on purpose: checking
+`tank/models` on the NAS would bless production snapshots as the offsite copy. A newest snapshot
+older than `MF_OFFSITE_MAX_AGE` (default 8 days, weekly plus slack) is the alarm, so a stopped
+rotation is no longer silent until the next site-loss review.
+
+### Failure visibility
+
+A green timer only proves it fired. `OnFailure=notify-admin@%n.service` therefore sits on the
+**services** (`sanoid.service`, `sanoid-prune.service`, `syncoid-models.service`,
+`modelfs-drill.service`, `modelfs-drill-log.service`, `modelfs-snap-age.service`,
+`modelfs-offsite-age.service`), not the timers: a drop-in on `sanoid.timer` would stay green
+while `sanoid.service` failed to snapshot.
+
+Disabling `sanoid.timer` never fails `sanoid.service` at all. That is what
+`modelfs-snap-age.timer` covers, running `modelfs-restore-drill --age-only` every hour of
+uptime rather than `OnCalendar=hourly`.
+
+The three age watchdogs (`modelfs-snap-age.timer`, `modelfs-drill-log.timer`,
+`modelfs-offsite-age.timer`) use `OnBootSec`/`OnUnitActiveSec`, so a DST spring-forward cannot
+skip a local hour and a fall-back doubled hour cannot leave a 2 h hole; `Persistent=` is
+OnCalendar-only, so those units fire again after reboot through `OnBootSec`. The replica pull
+and monthly clone stay calendar events pinned to UTC (`OnCalendar=daily UTC`,
+`OnCalendar=monthly UTC`), so a host timezone cannot move them.
+
+`notify-admin@.service` logs to syslog under `modelfs-backup`. Replace its `ExecStart` with the
+site mailer or webhook when one exists.
+
+These four are alarms, not log noise:
+
+| Alarm | Threshold | Unit |
+|---|---|---|
+| No new snapshot on the NAS | 25 h (`MF_DRILL_MAX_SNAP_AGE`) | `modelfs-snap-age.timer`. The monthly clone is the restore proof, not the schedule watchdog |
+| Replica newest snapshot stale | 36 h, a daily pull plus slack (`MF_DRILL_MAX_REPLICA_AGE`) | the drill, with `MF_DRILL_REPLICA` set on the replica host |
+| Drill log missing, empty, or stale | 35 days | `modelfs-check-drill-log` |
+| Offsite newest snapshot stale | 8 days, weekly rotation plus slack | `modelfs-check-offsite` |
 
 Before risky bulk work (`rm -rf` of an old model, big re-download with overwrite, moving datasets), take a named snapshot; it is the pre-run safety net POSIX does not give you:
 
@@ -92,7 +179,14 @@ In order of likelihood.
 
 ### A. A spark or its NVMe died
 
-Nothing to restore. Rebuild per [architecture.md](architecture.md) (Run), remount the origin per [operations.md](operations.md), start `modelfs`. Cache warms on demand. Leases republish themselves; `--seed` bootstraps `.cluster` if it is empty. Re-apply any pins: the markers lived under `/var/cache/modelfs/pin/`, so without them the cull treats every previously pinned file as an ordinary LRU candidate. Before a planned cache wipe, `find /var/cache/modelfs/pin -type f` is the re-pin list; after an unplanned NVMe loss that list is gone with the disk.
+Nothing to restore. Rebuild the node per the [README](../README.md) quickstart, remount the
+origin per [operations.md](operations.md), and start `modelfs`. The cache warms on demand and
+leases republish themselves; `--seed` bootstraps `.cluster` if it is empty.
+
+Re-apply any pins. The markers lived under `/var/cache/modelfs/pin/`, so without them the cull
+treats every previously pinned file as an ordinary LRU candidate. Before a *planned* cache wipe,
+`find /var/cache/modelfs/pin -type f` is the re-pin list; after an unplanned NVMe loss that list
+is gone with the disk.
 
 ### B. Files deleted or corrupted (point in time)
 
@@ -113,7 +207,21 @@ RPO equals the autosnap interval (1 h in the config above). After any copy-back 
 
 Order matters. The trap: node caches may hold pieces **newer** than the restored snapshot, and the stale-piece rule (cache keeps bytes until cull or size change, [architecture.md](architecture.md)) would serve post-rollback data over restored data.
 
-Section 3's replica is a syncoid pull on the replica host, not a stream file. Replay from that host (or from a locally imported replica dataset). `latest.zfsstream` is not an artifact this repo produces. [`scripts/dr_pool_restore.sh`](../scripts/dr_pool_restore.sh) (`modelfs-pool-restore`) is the recv, property-set, and monthly hold: dry-run by default, `--execute` to pull. `--from` is a `--recursive` syncoid with `BatchMode=yes` and `ConnectTimeout=30` (same fail-closed SSH as the daily pull). `--local-from` is `zfs send -R` (already recursive). Holds do not travel with the stream, so after a successful recv the script holds monthlies on DEST the same way the replica `ExecStartPost` does. It refuses a mounted DEST unless `--force`, so it cannot `--force-delete` the live export by accident. It does not create the pool (vdev layout is site-specific) and does not wipe node caches (those are other hosts).
+Section 3's replica is a syncoid pull on the replica host, not a stream file, so replay from
+that host or from a locally imported replica dataset. `latest.zfsstream` is not an artifact this
+repo produces.
+
+[`scripts/dr_pool_restore.sh`](../scripts/dr_pool_restore.sh) (`modelfs-pool-restore`) does the
+recv, the property set, and the monthly hold. It is dry-run by default; `--execute` pulls.
+
+* `--from` is a `--recursive` syncoid with `BatchMode=yes` and `ConnectTimeout=30`, the same
+  fail-closed SSH as the daily pull. `--local-from` is `zfs send -R`, already recursive.
+* Holds do not travel with the stream, so after a successful recv the script holds monthlies on
+  DEST the same way the replica's `ExecStartPost` does.
+* It refuses a mounted DEST unless `--force`, so it cannot `--force-delete` the live export by
+  accident.
+* It does **not** create the pool, because vdev layout is site-specific, and does not wipe node
+  caches, which live on other hosts.
 
 ```bash
 # 1. Recreate the pool (vdevs: see open questions). syncoid creates
@@ -170,11 +278,72 @@ A backup never restored is a hypothesis. Monthly, on the NAS:
 ./scripts/dr_restore_drill.sh tank/models
 ```
 
-The script ([scripts/dr_restore_drill.sh](../scripts/dr_restore_drill.sh)) picks the newest snapshot by creation time (not name order, where hourly/daily/monthly suffixes would decide), clones it onto a mountpoint that is not the live export (sibling `modelfs-drill`, or `MF_DRILL_CLONE_MP`; a collision with the live tree fails the drill, because that path would checksum production against itself), diffs the restored tree against the live dataset (`MF_DRILL_LIVE` overrides that path; default is the dataset's mountpoint), and checksums one size-stable file on both sides before appending the log line that proves the drill ran. `.cluster` leases and the `.zfs` snapdir are skipped in the file count, the diff, and the sample: a snapshot of only heartbeats is "zero files" and fails. Drift inside the RPO window is counted, never failed; a size-stable file that hashes differently fails the drill, and so does an empty snapshot or a missing snapshot schedule: the "no snapshots" exit is the sanoid.timer alarm. The drill also fails when the newest snapshot is older than `MF_DRILL_MAX_SNAP_AGE` (default 25 h): snapshots that exist but stopped refreshing mean sanoid died after the last green drill, and restoring them would miss the RPO table claims. That age rides the log line as `snap_age_s`, so the RPO column above stays a measured number rather than an assumption. Child datasets under `tank/models` (none today; a later `zfs create`) are age-checked the same way: a child with no snapshot, or one past the 25 h bound, means sanoid recursive stopped covering the new dataset. The parent clone is still the restore proof for today's directory layout; children are the growth alarm. The same age check is `--age-only` (no clone, no log line; a freshness check is not a restore) and is what `modelfs-snap-age.timer` runs every hour of uptime, so a disabled `sanoid.timer` pages within 25 h instead of waiting for the next monthly clone. Exit status is the verdict; `MF_DRILL_KEEP=1` leaves the clone mounted for inspection and `MF_DRILL_LOG` relocates the artifact log from `/var/log/modelfs-drill.log`.
+### What the drill does
 
-The pool-loss copy is not visible to a local `zfs list` when syncoid pulled it to another host. Run the same script on the replica host (or import the replica and set `MF_DRILL_REPLICA`), otherwise the log line records `replica=unchecked`. When `MF_DRILL_REPLICA` is set, a missing dataset, an empty snapshot list, or a replica older than `MF_DRILL_MAX_REPLICA_AGE` (default 36 h, a daily pull plus slack) fails the drill the same way a dead sanoid.timer does. The primary snapshot age bound stays `MF_DRILL_MAX_SNAP_AGE` (default 25 h) so an hourly autosnap that died overnight still fails on the NAS.
+[`scripts/dr_restore_drill.sh`](../scripts/dr_restore_drill.sh) picks the newest snapshot by
+**creation time**, not name order, where hourly/daily/monthly suffixes would decide. It then:
 
-`clone_s` is snapshot-clone time for procedure B (CoW, seconds), recorded from `/proc/uptime` so an NTP step during the clone cannot log a negative number. It is not the pool-loss RTO; that is the timed `syncoid`/`zfs send` in procedure C. The log line is the artifact proving the drill ran. Its stamp is UTC (`YYYY-MM-DDTHH:MM:SSZ`), so aging it does not depend on the NAS timezone or a DST fall-back. A snapshot whose ZFS creation is in the future of the host clock fails the drill (the RPO comparison cannot be trusted). `scripts/check_drill_log.sh` (and `modelfs-drill-log.timer`, every 24 h of uptime) fails when that newest stamp is missing, empty, unparseable, in the future, or older than 35 days (`MF_DRILL_LOG_MAX_AGE`); that is the alarm, not a grep someone might remember to run. `scripts/test_dr_restore_drill.sh` (also run by `scripts/check.sh`) drives the drill, `--age-only`, `hold_monthlies.sh`, the log checker, `check_offsite.sh`, and `dr_pool_restore.sh` through a stub `zfs` so a clone-onto-live, empty-snapshot, uncovered child dataset, stale-log, swallowed-hold, empty-replica, stale-offsite, or live-dataset recv false pass cannot ship. `hold_monthlies.sh` fails when the replica has no snapshots at all (a green pull of nothing cannot survive `zfs destroy -r`); zero monthlies among other snapshots is still success (the first month has no `*_monthly` yet).
+1. Clones it onto a mountpoint that is not the live export (sibling `modelfs-drill`, or
+   `MF_DRILL_CLONE_MP`). A collision with the live tree fails the drill, because that path would
+   checksum production against itself.
+2. Diffs the restored tree against the live dataset (`MF_DRILL_LIVE` overrides that path;
+   default is the dataset's mountpoint).
+3. Checksums one size-stable file on both sides.
+4. Appends the log line that proves the drill ran.
+
+`.cluster` leases and the `.zfs` snapdir are skipped in the file count, the diff, and the
+sample, so a snapshot of only heartbeats counts as zero files and fails.
+
+Exit status is the verdict. `MF_DRILL_KEEP=1` leaves the clone mounted for inspection, and
+`MF_DRILL_LOG` relocates the artifact log from `/var/log/modelfs-drill.log`.
+
+### What fails it
+
+* A size-stable file that hashes differently. Drift inside the RPO window is counted, never
+  failed.
+* An empty snapshot, or no snapshots at all: that exit is the `sanoid.timer` alarm.
+* A newest snapshot older than `MF_DRILL_MAX_SNAP_AGE` (default 25 h). Snapshots that exist but
+  stopped refreshing mean sanoid died after the last green drill, and restoring them would miss
+  the RPO table's claims. That age rides the log line as `snap_age_s`, so the RPO column stays a
+  measured number rather than an assumption.
+* A child dataset under `tank/models` (none today, but a later `zfs create`) with no snapshot or
+  one past the same 25 h bound: sanoid recursive stopped covering it. The parent clone is the
+  restore proof for today's directory layout; children are the growth alarm.
+* A snapshot whose ZFS creation time is in the future of the host clock, since the RPO
+  comparison cannot then be trusted.
+
+`--age-only` runs just the age check: no clone, no log line, because a freshness check is not a
+restore. That is what `modelfs-snap-age.timer` runs every hour of uptime, so a disabled
+`sanoid.timer` pages within 25 h instead of waiting for the next monthly clone.
+
+### Checking the replica too
+
+The pool-loss copy is invisible to a local `zfs list` when syncoid pulled it to another host.
+Run the same script on the replica host, or import the replica and set `MF_DRILL_REPLICA`;
+otherwise the log line records `replica=unchecked`.
+
+With `MF_DRILL_REPLICA` set, a missing dataset, an empty snapshot list, or a replica older than
+`MF_DRILL_MAX_REPLICA_AGE` (default 36 h, a daily pull plus slack) fails the drill the same way
+a dead `sanoid.timer` does. The primary bound stays `MF_DRILL_MAX_SNAP_AGE` (25 h), so an hourly
+autosnap that died overnight still fails on the NAS.
+
+### The log line, and what checks it
+
+`clone_s` is the snapshot-clone time for procedure B: CoW, so seconds. It is recorded from
+`/proc/uptime` so an NTP step during the clone cannot log a negative number, and it is **not**
+the pool-loss RTO, which is the timed `syncoid`/`zfs send` in procedure C.
+
+The stamp is UTC (`YYYY-MM-DDTHH:MM:SSZ`), so aging it does not depend on the NAS timezone or a
+DST fall-back. [`scripts/check_drill_log.sh`](../scripts/check_drill_log.sh), and
+`modelfs-drill-log.timer` every 24 h of uptime, fails when that newest stamp is missing, empty,
+unparseable, in the future, or older than 35 days (`MF_DRILL_LOG_MAX_AGE`). That is the alarm,
+rather than a grep someone might remember to run.
+
+[`scripts/test_dr_restore_drill.sh`](../scripts/test_dr_restore_drill.sh), also run by
+`scripts/check.sh`, drives the drill, `--age-only`, `hold_monthlies.sh`, the log checker,
+`check_offsite.sh`, and `dr_pool_restore.sh` through a stub `zfs`, so a clone-onto-live,
+empty-snapshot, uncovered-child-dataset, stale-log, swallowed-hold, empty-replica,
+stale-offsite, or live-dataset-recv false pass cannot ship.
 
 ## 7. Incident access
 
