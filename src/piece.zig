@@ -160,6 +160,30 @@ pub const Bitfield = struct {
         return self.bytes[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0;
     }
 
+    /// True when every bit in [start, end) is set. An empty span is vacuously
+    /// filled; a span that runs past nbits is not (get() of those indices is
+    /// false). Word-at-a-time so a FUSE read covering many small pieces does
+    /// not walk each bit: rangeFilled used this per covered index.
+    pub fn allSet(self: Bitfield, start: u32, end: u32) bool {
+        if (start >= end) return true;
+        if (end > self.nbits) return false;
+        var i: u32 = start;
+        while (i < end and (i & 7) != 0) : (i += 1) {
+            if (!self.get(i)) return false;
+        }
+        while (end - i >= 64) : (i += 64) {
+            const w = std.mem.readInt(u64, self.bytes[i / 8 ..][0..8], .little);
+            if (w != std.math.maxInt(u64)) return false;
+        }
+        while (end - i >= 8) : (i += 8) {
+            if (self.bytes[i / 8] != 0xff) return false;
+        }
+        while (i < end) : (i += 1) {
+            if (!self.get(i)) return false;
+        }
+        return true;
+    }
+
     pub fn set(self: *Bitfield, i: u32) void {
         if (i >= self.nbits) return;
         self.bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
@@ -610,6 +634,31 @@ test "filled masks pad bits inside a full trailing word" {
     bf2.set(9);
     bf2.bytes[1] |= 0b11110000;
     try std.testing.expectEqual(@as(u32, 1), bf2.filled());
+}
+
+test "allSet walks words and rejects a span past nbits" {
+    const gpa = std.testing.allocator;
+    var bf = try Bitfield.init(gpa, 70);
+    defer bf.deinit(gpa);
+    try std.testing.expect(bf.allSet(0, 0));
+    try std.testing.expect(bf.allSet(3, 3));
+    try std.testing.expect(!bf.allSet(0, 1));
+    var i: u32 = 0;
+    while (i < 70) : (i += 1) bf.set(i);
+    try std.testing.expect(bf.allSet(0, 70));
+    try std.testing.expect(bf.allSet(0, 64));
+    try std.testing.expect(bf.allSet(3, 67));
+    try std.testing.expect(bf.allSet(64, 70));
+    bf.clear(63);
+    try std.testing.expect(!bf.allSet(0, 64));
+    try std.testing.expect(bf.allSet(64, 70));
+    try std.testing.expect(!bf.allSet(0, 71));
+    try std.testing.expect(!bf.allSet(70, 71));
+    // A hole in the middle of a full word.
+    bf.set(63);
+    bf.clear(10);
+    try std.testing.expect(!bf.allSet(0, 16));
+    try std.testing.expect(bf.allSet(11, 16));
 }
 
 test "lastSet scans words and tolerates pad bits" {

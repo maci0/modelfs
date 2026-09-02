@@ -1457,6 +1457,11 @@ pub const Store = struct {
         // Manifest entries fill gaps only: a local origin fill or
         // write-through is the trust root for that piece, and a later
         // load (or a stale same-size manifest) must not replace it.
+        // They must not mark the entry dirty (they already exist on origin).
+        // Reserve once: a 70 GiB file is thousands of puts, and each
+        // grow would realloc the map under file.mu.
+        const extra: u32 = @intCast(@min(mf.entries.len, std.math.maxInt(u32)));
+        file.hashes.ensureTotalCapacity(file.hashes.count() +| extra) catch {};
         for (mf.entries) |e| {
             if (file.hashes.contains(e.idx)) continue;
             file.hashes.put(e.idx, e.hash) catch |err| {
@@ -1614,11 +1619,7 @@ pub const Store = struct {
     pub fn rangeFilled(file: *Cached, file_size: u64, span: piece.Span, piece_size: u32) bool {
         if (!piece.rangeTracked(span, file_size, piece_size)) return false;
         const cov = piece.cover(span, file_size, piece_size);
-        var i = cov.start;
-        while (i < cov.end) : (i += 1) {
-            if (!file.bits.get(i)) return false;
-        }
-        return true;
+        return file.bits.allSet(cov.start, cov.end);
     }
 
     /// Writes one piece at its offset. Internal step of completeFill; the
@@ -1958,17 +1959,9 @@ pub const Store = struct {
             // digests, the boundary-hash removal, and the sidecar save below
             // describe the bytes actually in the cache fd.
             if (cov.start < cov.end) {
-                var already = true;
-                var i = cov.start;
-                while (i < cov.end) : (i += 1) {
-                    if (!file.bits.get(i)) {
-                        already = false;
-                        break;
-                    }
-                }
-                if (already) {
+                if (file.bits.allSet(cov.start, cov.end)) {
                     var changed = false;
-                    i = cov.start;
+                    var i = cov.start;
                     while (i < cov.end) : (i += 1) {
                         const in_data = piece.offset(i, self.piece_size) - off;
                         var h: [piece.digest_len]u8 = undefined;
@@ -2162,17 +2155,56 @@ pub const Store = struct {
         return fd;
     }
 
+    /// In-memory LRU sample size. cullOne only punches one piece per round,
+    /// so collecting every idle file allocated and sorted O(files) and pinned
+    /// them all until the punch finished. 32 oldest is large enough that a
+    /// handful of pinned or empty entries cannot hide a punchable victim,
+    /// and small enough that the pins and the insertion walk stay bounded.
+    const idle_sample_cap: usize = 32;
+
+    const IdleCand = struct { f: *Cached, at: i64 };
+
+    fn idleOlder(at: i64, rel: []const u8, b: IdleCand) bool {
+        if (at != b.at) return at < b.at;
+        return std.mem.order(u8, rel, b.f.rel) == .lt;
+    }
+
+    /// Inserts one idle live entry into the oldest-first sample, replacing
+    /// the youngest when full. True when `f` occupies a slot (its pin stays);
+    /// false when it lost to the current sample (caller drops the pin).
+    fn considerIdle(cands: *[idle_sample_cap]IdleCand, count: *usize, f: *Cached, at: i64) bool {
+        const slot = if (count.* < idle_sample_cap) blk: {
+            const s = count.*;
+            count.* += 1;
+            break :blk s;
+        } else blk: {
+            if (!idleOlder(at, f.rel, cands[idle_sample_cap - 1])) return false;
+            const evicted = cands[idle_sample_cap - 1].f;
+            _ = evicted.refs.fetchSub(1, .monotonic);
+            break :blk idle_sample_cap - 1;
+        };
+        cands[slot] = .{ .f = f, .at = at };
+        var i = slot;
+        while (i > 0 and idleOlder(cands[i].at, cands[i].f.rel, cands[i - 1])) {
+            std.mem.swap(IdleCand, &cands[i], &cands[i - 1]);
+            i -= 1;
+        }
+        return true;
+    }
+
     /// Punch one LRU unpinned piece. Returns false if nothing to cull.
     /// `now_sec` is the caller's monotonic instant (see punchPiece).
     pub fn cullOne(self: *Store, now_sec: i64) bool {
         // Idle time is elapsed time: monotonic clock, immune to NTP steps.
-        const Cand = struct { f: *Cached, at: i64 };
-        var cands: std.ArrayList(Cand) = .empty;
-        defer cands.deinit(self.gpa);
+        var cands: [idle_sample_cap]IdleCand = undefined;
+        var n: usize = 0;
         // Phase 1 under store.mu is memory-only: an atomic last_access load
-        // plus a reference pin per idle entry. Stat'ing pin files and probing
-        // bits here used to hold this global lock -- which every get() and
-        // lookupRef() takes -- behind O(files) disk I/O on every cull round.
+        // plus a reference pin per sampled idle entry. Stat'ing pin files
+        // and probing bits here used to hold this global lock -- which every
+        // get() and lookupRef() takes -- behind O(files) disk I/O on every
+        // cull round. The sample is bounded: a node caching thousands of
+        // idle models must not allocate and pin the whole map to punch one
+        // piece.
         self.mu.lockUncancelable(self.io);
         var it = self.files.iterator();
         while (it.next()) |e| {
@@ -2180,13 +2212,11 @@ pub const Store = struct {
             const at = f.last_access.load(.monotonic);
             if (now_sec -| at < recency_secs) continue;
             _ = f.refs.fetchAdd(1, .monotonic);
-            cands.append(self.gpa, .{ .f = f, .at = at }) catch {
+            if (!considerIdle(&cands, &n, f, at))
                 _ = f.refs.fetchSub(1, .monotonic);
-                continue;
-            };
         }
         self.mu.unlock(self.io);
-        defer for (cands.items) |cd| self.releaseFile(cd.f);
+        defer for (cands[0..n]) |cd| self.releaseFile(cd.f);
 
         // Phase 2 runs outside every lock, LRU first: punchPiece revalidates
         // recency, pin, mid-fill, and bit state under content_mu then
@@ -2194,13 +2224,7 @@ pub const Store = struct {
         // candidate. Equal-recency ties break by rel bytes: map iteration
         // order must not decide which of several equally idle files is
         // culled first.
-        std.mem.sort(Cand, cands.items, {}, struct {
-            fn lessThan(_: void, a: Cand, b: Cand) bool {
-                if (a.at != b.at) return a.at < b.at;
-                return std.mem.order(u8, a.f.rel, b.f.rel) == .lt;
-            }
-        }.lessThan);
-        for (cands.items) |cd| {
+        for (cands[0..n]) |cd| {
             if (self.pinExists(cd.f.rel)) continue;
             const idx = blk: {
                 cd.f.mu.lockUncancelable(self.io);
@@ -4990,6 +5014,58 @@ test "readServed takes origin for the tail past the u32 piece-index clamp" {
     const n = st.readServed(f, rb[0..pattern.len], tail_off, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
     try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
+}
+
+test "considerIdle keeps a bounded oldest-first sample" {
+    const gpa = std.testing.allocator;
+    var dummy_bits = try piece.Bitfield.init(gpa, 1);
+    defer dummy_bits.deinit(gpa);
+    var filling = std.AutoHashMap(u32, u64).init(gpa);
+    defer filling.deinit();
+    var hashes = std.AutoHashMap(u32, [piece.digest_len]u8).init(gpa);
+    defer hashes.deinit();
+    var rels: [Store.idle_sample_cap + 1][8]u8 = undefined;
+    var files: [Store.idle_sample_cap + 1]Store.Cached = undefined;
+    var i: usize = 0;
+    while (i < files.len) : (i += 1) {
+        const name = try std.fmt.bufPrint(&rels[i], "f{d:0>2}", .{i});
+        files[i] = .{
+            .rel = name,
+            .size = 1,
+            .bits = dummy_bits,
+            .filling = filling,
+            .hashes = hashes,
+        };
+        files[i].refs.store(1, .monotonic);
+    }
+    var cands: [Store.idle_sample_cap]Store.IdleCand = undefined;
+    var count: usize = 0;
+    // Scrambled arrival: at = 100+i so f00 is oldest. The extra file is
+    // younger than the sample and must not occupy a slot.
+    i = files.len;
+    while (i > 0) {
+        i -= 1;
+        const f = &files[i];
+        const at: i64 = @intCast(100 + i);
+        _ = f.refs.fetchAdd(1, .monotonic);
+        if (!Store.considerIdle(&cands, &count, f, at))
+            _ = f.refs.fetchSub(1, .monotonic);
+    }
+    try std.testing.expectEqual(Store.idle_sample_cap, count);
+    try std.testing.expectEqualStrings("f00", cands[0].f.rel);
+    try std.testing.expectEqual(@as(i64, 100), cands[0].at);
+    try std.testing.expectEqualStrings("f31", cands[count - 1].f.rel);
+    // The extra file (f32) lost the sample: refs back to the birth pin.
+    try std.testing.expectEqual(@as(u32, 1), files[Store.idle_sample_cap].refs.load(.monotonic));
+    // Occupants keep the extra pin.
+    try std.testing.expectEqual(@as(u32, 2), files[0].refs.load(.monotonic));
+    // An even older candidate replaces the youngest and bubbles to the front.
+    files[Store.idle_sample_cap].rel = try std.fmt.bufPrint(&rels[Store.idle_sample_cap], "f-old", .{});
+    _ = files[Store.idle_sample_cap].refs.fetchAdd(1, .monotonic);
+    try std.testing.expect(Store.considerIdle(&cands, &count, &files[Store.idle_sample_cap], 50));
+    try std.testing.expectEqualStrings("f-old", cands[0].f.rel);
+    try std.testing.expectEqual(@as(i64, 50), cands[0].at);
+    try std.testing.expectEqual(@as(u32, 1), files[Store.idle_sample_cap - 1].refs.load(.monotonic));
 }
 
 test "considerVictim keeps a bounded oldest-first sample" {

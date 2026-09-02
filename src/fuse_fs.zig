@@ -750,17 +750,16 @@ fn serveHydrated(
     return rc;
 }
 
-export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
-    _ = fi;
-    if (buf == null) return -sys.c.EFAULT;
-    const st = statePtr();
-    // Latency covers the whole handler: warm reads too, so the tick line's
-    // average tracks real reader-perceived latency, not just miss stalls.
-    const rd_t0 = sys.monoNs(st.io);
-    defer _ = st.store.stats.read_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - rd_t0, 0)), .monotonic);
-    var rel: []const u8 = "";
-    const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
-    if (rerr != 0) return rerr;
+/// Live cache entry for a FUSE read, or an errno. A referenced entry is
+/// returned without restatting origin: open and getattr already sampled it,
+/// and a getattr RTT on every 128 KiB read would make the warm NVMe path
+/// pay NFS. Size changes through the mount update the entry in place
+/// (`cacheFill`, `mf_truncate`); an external origin rewrite is visible on
+/// the next open, matching NFS close-to-open. A cold path (no live entry)
+/// still stats origin so the first read of an unopened file, and every
+/// read after reapIdle dropped the entry, keep their previous errno.
+fn fileForRead(st: *State, rel: []const u8) union(enum) { err: c_int, file: *store_mod.Store.Cached } {
+    if (st.store.lookupRef(rel)) |file| return .{ .file = file };
     // Report the real origin failure (EIO on NFS, ENOENT, ...): collapsing it
     // into EISDIR would send readers hunting for a directory that is not there.
     var ost: sys.c.struct_stat = undefined;
@@ -773,18 +772,37 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         // runs; without this count reads_err stays flat while clients see
         // an EIO storm.
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
-        return rc_stat;
+        return .{ .err = rc_stat };
     }
-    if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return -sys.c.EISDIR;
+    if ((ost.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return .{ .err = -sys.c.EISDIR };
     const origin_size = sys.sizeFromStat(ost.st_size) orelse {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         std.log.warn("origin size unusable for {s}; failing read", .{rel});
-        return -sys.c.EIO;
+        return .{ .err = -sys.c.EIO };
     };
     const file = st.store.getIdentified(rel, origin_size, store_mod.OriginId.fromStat(ost), sys.monoSec(st.io)) catch |err| {
         _ = st.store.stats.reads_err.fetchAdd(1, .monotonic);
         std.log.warn("cache entry open failed for {s} ({t}); failing read", .{ rel, err });
-        return -sys.c.ENOMEM;
+        return .{ .err = -sys.c.ENOMEM };
+    };
+    return .{ .file = file };
+}
+
+export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+    _ = fi;
+    if (buf == null) return -sys.c.EFAULT;
+    const st = statePtr();
+    // Latency covers the whole handler: warm reads too, so the tick line's
+    // average tracks real reader-perceived latency, not just miss stalls.
+    const rd_t0 = sys.monoNs(st.io);
+    defer _ = st.store.stats.read_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - rd_t0, 0)), .monotonic);
+    var rel: []const u8 = "";
+    const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
+    if (rerr != 0) return rerr;
+    const opened = fileForRead(st, rel);
+    const file = switch (opened) {
+        .err => |e| return e,
+        .file => |f| f,
     };
     defer st.store.releaseFile(file);
     const want = @min(size, @as(usize, std.math.maxInt(c_int)));
@@ -1855,4 +1873,43 @@ test "serveHydrated falls back to origin when the cache cannot land a fill" {
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
     try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
     try std.testing.expect(!st.store.hasPiece(file, 0, sys.monoSec(st.io)));
+}
+
+test "fileForRead uses a live entry without restatting origin" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-file-for-read");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-file-for-read");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.store.deinit();
+    defer st.catalog.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+
+    const pattern = "0123456789abcdef";
+    var tb: [192]u8 = undefined;
+    var zb: [192]u8 = undefined;
+    const origin_z = try sys.toZ(&zb, try std.fmt.bufPrint(&tb, "{s}/warm.bin", .{origin_d}));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, pattern));
+
+    const file = try st.store.get("warm.bin", pattern.len, sys.monoSec(st.io));
+    st.store.releaseFile(file);
+
+    // Origin gone: a restat would fail ENOENT. A live entry must still
+    // answer so a warm sequential read does not pay NFS getattr, and so
+    // origin-down does not black-hole a fully cached file.
+    try std.testing.expectEqual(@as(i32, 0), sys.unlink(origin_z));
+    const live = fileForRead(&st, "warm.bin");
+    try std.testing.expect(std.meta.activeTag(live) == .file);
+    const got = live.file;
+    defer st.store.releaseFile(got);
+    try std.testing.expectEqual(pattern.len, got.size);
+
+    const cold = fileForRead(&st, "gone.bin");
+    try std.testing.expect(std.meta.activeTag(cold) == .err);
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), cold.err);
 }

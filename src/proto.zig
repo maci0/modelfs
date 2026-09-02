@@ -199,6 +199,32 @@ pub fn bearerOk(got: []const u8, want: []const u8) bool {
 /// only one of the two gates. Incomplete UTF-8 encodings are display
 /// noise, not controls.
 pub fn containsControl(s: []const u8) bool {
+    // Skip leading printable-ASCII 8-byte chunks (the common FUSE path:
+    // `gguf/model.gguf`) so relOk does not call utf8FormatControlAt per
+    // byte. The first word with a C0, DEL, or high bit falls through to
+    // the byte loop; skipped words are all < 0x80, so no UTF-8 sequence
+    // starts in them and a multi-byte control cannot straddle the cut.
+    var i: usize = 0;
+    while (i + 8 <= s.len) : (i += 8) {
+        const w = std.mem.readInt(u64, s[i..][0..8], .little);
+        if (asciiWordHasControlOrNonAscii(w)) return containsControlBytes(s[i..]);
+    }
+    return containsControlBytes(s[i..]);
+}
+
+/// Any byte in `w` is C0 (< 0x20), DEL (0x7f), or non-ASCII (>= 0x80).
+fn asciiWordHasControlOrNonAscii(w: u64) bool {
+    const hi: u64 = 0x8080_8080_8080_8080;
+    const sp: u64 = 0x2020_2020_2020_2020;
+    const one: u64 = 0x0101_0101_0101_0101;
+    const del: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    if (w & hi != 0) return true;
+    if ((w -% sp) & ~w & hi != 0) return true;
+    const x = w ^ del;
+    return (x -% one) & ~x & hi != 0;
+}
+
+fn containsControlBytes(s: []const u8) bool {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
         const ch = s[i];
@@ -377,6 +403,11 @@ test "containsControl covers C0 C1 line separators and format controls" {
     try std.testing.expect(!containsControl("a\u{fffc}b"));
     try std.testing.expect(containsControl("a\nb"));
     try std.testing.expect(containsControl("a\x7fb"));
+    // Word skip must still see a control after a printable-ASCII prefix
+    // longer than 8 bytes, and must not flag a long clean path.
+    try std.testing.expect(!containsControl("gguf/llama-70b-instruct-q4_k_m.gguf"));
+    try std.testing.expect(containsControl("gguf/llama-70b-instruct\nq4.gguf"));
+    try std.testing.expect(containsControl("gguf/llama-70b-instruct\x7fq4.gguf"));
     try std.testing.expect(containsControl("a\xc2\x9bb"));
     try std.testing.expect(containsControl("a\u{2028}b"));
     try std.testing.expect(containsControl("a\u{2029}b"));
