@@ -269,7 +269,13 @@ The trusted digests come from two places:
   monotonic instant instead of disabling peer fills for the entry's
   lifetime, and a manifest whose grid, size, or origin identity (mtime/ino
   trailer) disagrees with the reader's is ignored (origin fills, no peer
-  verification). A file with no manifest anywhere has no trust
+  verification). A load that races a wipe (`writes` bumped by a size
+  change, same-size rewrite, or distrust while the origin read is off
+  `file.mu`) is dropped rather than merged, and a manifest whose mtime
+  predates `Cached.origin_id` is retried the same way
+  (`Store.tryLoadManifest`): the blob still names the previous object's
+  digests at the same `file_size`, and admitting them would let a peer
+  fill resurrect pre-rewrite bytes. A file with no manifest anywhere has no trust
   reference, so its fills stay origin-only -- the cost of never serving
   unverified bytes (THREAT_MODEL.md, former gap R2).
 
