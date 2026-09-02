@@ -118,6 +118,15 @@ pub const Stats = struct {
     /// (dead peer, auth mismatch, malformed reply). A fleet silently
     /// degraded to NFS-only shows here while reads keep succeeding.
     probe_err: std.atomic.Value(u64) = .init(0),
+    /// Discovery-tick lease publish write/rename failures. An idle node
+    /// with a dead origin never touches getattr/read, so without this the
+    /// outage is only origin_down in status.json and the tick line stays
+    /// silent. One increment per failed publish, not per FUSE op.
+    lease_err: std.atomic.Value(u64) = .init(0),
+    /// getattr/open/readdir origin-infrastructure failures (EIO/ESTALE/
+    /// ETIMEDOUT). md_us is time, not outcomes: an NFS outage during `ls`
+    /// would otherwise look like a slow-but-healthy metadata interval.
+    meta_err: std.atomic.Value(u64) = .init(0),
     pieces_culled: std.atomic.Value(u64) = .init(0),
     /// Peer HTTP server: accepted /have 200, /data 206, and /stage 200
     /// replies, rejected bearer tokens, and 5xx replies served. http_ok is
@@ -140,11 +149,12 @@ pub const Stats = struct {
     /// Unsupported HTTP methods (non-GET). Deduplicated at warn level; every
     /// occurrence still counts here so a probing campaign is not silent.
     http_405: std.atomic.Value(u64) = .init(0),
-    /// Cumulative wall time inside /ping, /have, /data, and /stage handlers.
+    /// Cumulative wall time inside /have, /data, and /stage handlers.
     /// http_us on the tick line is the serving-side twin of rd_us: without it
     /// a node whose peer replies are slow looks healthy (http_ok climbing,
-    /// inflight low between requests). 401, 405, and malformed heads stay
-    /// untimed. /ping is timed here but not counted in http_ok.
+    /// inflight low between requests). 401, 405, malformed heads, and /ping
+    /// stay untimed: /ping is liveness, and timing it would make a health
+    /// check fire an otherwise-idle tick line of zeros.
     http_nanos: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks
@@ -179,6 +189,8 @@ pub const Stats = struct {
         fill_err_verify: u64 = 0,
         serve_verify_fail: u64 = 0,
         probe_err: u64 = 0,
+        lease_err: u64 = 0,
+        meta_err: u64 = 0,
         pieces_culled: u64 = 0,
         http_ok: u64 = 0,
         http_unauthorized: u64 = 0,
@@ -315,12 +327,15 @@ pub const Store = struct {
     /// Edge-triggered origin I/O outage flag. FUSE getattr/open/read/write
     /// and originPread/originPwrite share this so an NFS outage logs once
     /// (path + errno) instead of once per syscall, and recovery logs once
-    /// too, the same shape as cullLoop's statvfs suspension. status.json
-    /// publishes it as origin_down (0/1) so `modelfs status` answers whether
-    /// NFS is currently failing. Peer HTTP keeps its per-request origin-stat
-    /// warns: that path is already bounded by the inflight cap. Origin
-    /// pread/pwrite still raise this flag, so a fill or peer /data hydration
-    /// that hits EIO after a successful stat is not silent in status.json.
+    /// too, the same shape as cullLoop's statvfs suspension. Discovery-tick
+    /// lease publish/refresh feed it as well (`tickCluster`), so an idle
+    /// node with a dead origin is visible without waiting for a FUSE op.
+    /// status.json publishes it as origin_down (0/1) so `modelfs status`
+    /// answers whether NFS is currently failing. Peer HTTP keeps its
+    /// per-request origin-stat warns: that path is already bounded by the
+    /// inflight cap. Origin pread/pwrite still raise this flag, so a fill
+    /// or peer /data hydration that hits EIO after a successful stat is not
+    /// silent in status.json.
     origin_io_down: std.atomic.Value(bool) = .init(false),
     mu: std.Io.Mutex = .init,
     files: std.StringHashMap(*Cached),

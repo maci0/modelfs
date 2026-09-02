@@ -1212,8 +1212,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     // against the same sample instead of two reads drifting across startup,
     // which could persist a lease a same-tick refresh would call expired.
     const cluster_now = sys.nowSec(init.io);
-    st.catalog.publish(cluster_now);
-    st.catalog.refresh(cluster_now);
+    fuse_fs.tickCluster(st, cluster_now);
     st.server.bindAll(addrs.items) catch |err| {
         std.log.err("bind peer http: {t}", .{err});
         teardownMount(st);
@@ -1487,11 +1486,18 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             return 1;
         },
         .missing_dir => {
-            // The origin itself was verified reachable above, so a missing or
-            // unreadable .cluster dir here is a fresh/empty cluster, not an
-            // error: same exit-0 empty output as below, with the reason on
-            // stdout next to where the listing would have been.
+            // The origin itself was verified reachable above, so a missing
+            // .cluster dir here is a fresh/empty cluster, not an error: same
+            // exit-0 empty output as below, with the reason on stdout next
+            // to where the listing would have been.
             return if (printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir })) 0 else 1;
+        },
+        .io_err => |e| {
+            // EIO/ENOTDIR/EACCES: the origin is there but .cluster cannot
+            // be listed. Printing the empty-cluster line would look like a
+            // healthy fleet of zero, which is the wrong incident start.
+            _ = printOut(io, gpa, "cannot read cluster leases at {s}/{s} (errno {d})\n", .{ origin, discover.cluster_dir, e });
+            return 1;
         },
     }
 
@@ -2375,6 +2381,20 @@ test "cmdPeers separates unreachable origins from empty clusters" {
     const file_origin = try std.fmt.bufPrint(&fb, "{s}/regular", .{origin_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&wb, file_origin), "x"));
     try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = file_origin }));
+
+    // A regular file at origin/.cluster is unreadable, not an empty
+    // cluster: listing must fail instead of printing "no cluster leases".
+    var zb2: [256]u8 = undefined;
+    var fb2: [192]u8 = undefined;
+    const cluster_fp = try std.fmt.bufPrint(&fb2, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb2, cluster_fp), "not-a-dir"));
+    var out2: std.ArrayList(u8) = .empty;
+    defer out2.deinit(gpa);
+    captured_stdout = &out2;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
+    try std.testing.expect(std.mem.indexOf(u8, out2.items, "cannot read cluster leases") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out2.items, "no cluster leases") == null);
 }
 
 test "verify and dupes refuse a file origin instead of scanning empty" {

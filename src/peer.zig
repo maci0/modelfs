@@ -437,10 +437,9 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
     if (std.mem.eql(u8, path, "/ping")) {
         // Liveness probe: what health checks, load balancers, and monitoring
         // poll to know the process is alive and answering on its listen port.
-        // Untamed would be invisible to the error rate: http_ok only counts
-        // data-plane replies, but a fleet that can only ping is still degraded.
-        const t0 = sys.monoNs(self.io);
-        defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
+        // Untimed on purpose: http_ok counts data-plane replies, and folding
+        // ping wall time into http_nanos would make a health-check poll fire
+        // an otherwise-idle tick line of zeros (http_us 0, httpok 0).
         reply(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         return;
     }
@@ -3017,8 +3016,10 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 200 OK\r\n"));
         try std.testing.expect(std.mem.indexOf(u8, res.items, "Content-Type: text/plain\r\n") != null);
         try std.testing.expect(std.mem.endsWith(u8, res.items, "\r\n\r\nok"));
-        // /ping is liveness, not a piece transfer: it must not inflate http_ok.
+        // /ping is liveness, not a piece transfer: it must not inflate http_ok
+        // or http_nanos (a health-check poll must not fire an idle tick).
         try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_nanos.load(.monotonic));
     }
     // A non-GET method is refused even with valid auth, and the refusal
     // names what the resource accepts (RFC 9110 §15.5.5).

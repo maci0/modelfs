@@ -204,8 +204,9 @@ pub fn validId(s: []const u8) bool {
 
 /// Outcome of opening origin/.cluster for a lease walk. Callers interpret
 /// missing_dir themselves: Catalog.refresh keeps the previous peer list;
-/// `modelfs peers` lists as empty.
-const LeaseWalk = enum { ok, path_too_long, missing_dir };
+/// `modelfs peers` lists as empty. io_err is a real open failure (EIO,
+/// ENOTDIR, EACCES): not an empty cluster, and not a path-too-long skip.
+const LeaseWalk = union(enum) { ok, path_too_long, missing_dir, io_err: i32 };
 
 /// Cap on a lease document read from origin/.cluster. formatLease writes
 /// into 2048 bytes; this is twice that so a slightly larger co-tenant
@@ -226,9 +227,11 @@ pub fn walkLeases(gpa: std.mem.Allocator, origin: []const u8, visitor: anytype) 
     // the target. ENOENT stays the missing-dir reading.
     const dir = sys.opendirNoFollow(dirz) orelse {
         const e = sys.errno();
-        if (e != c.ENOENT)
-            std.log.warn("lease walk skipped for {s} (errno {d})", .{ cluster_dir, e });
-        return .missing_dir;
+        if (e == c.ENOENT) return .missing_dir;
+        // Caller names the failure: Catalog.refresh edge-triggers so a
+        // dead origin cannot warn every tick, and `modelfs peers` exits 1
+        // instead of printing an empty cluster.
+        return .{ .io_err = e };
     };
     defer sys.closedir(dir);
 
@@ -307,6 +310,17 @@ pub const Catalog = struct {
     /// (broken cache backend, flaky transfer) would otherwise flood the
     /// journal with one warn per piece. Bounded like probe_down.
     fetch_down: std.ArrayList(AddrDown) = .empty,
+
+    /// Last publish write/rename errno (0 on success or a config skip).
+    /// discLoop feeds this into Store.noteOriginIo so an idle node with a
+    /// dead origin raises origin_down without waiting for a FUSE getattr.
+    publish_rc: i32 = 0,
+    /// Last refresh walk errno (0 on success, missing dir, or path-too-long).
+    refresh_rc: i32 = 0,
+    /// Edge-trigger for publish write/rename and refresh walk failures:
+    /// a dead origin must not warn every 10 s tick.
+    publish_failing: bool = false,
+    refresh_failing: bool = false,
 
     /// /have answers from recent probes, keyed by (rel, ip, port).
     /// fillFromPeers runs once per piece; without this cache a sequential
@@ -796,6 +810,27 @@ pub const Catalog = struct {
     /// missed republish does not expire this node out of every peer's list.
     const lease_ttl_secs: i64 = 30;
 
+    /// Combined origin errno of the last publish+refresh pair: publish
+    /// write/rename first, else the refresh walk. 0 means both succeeded
+    /// or skipped for a config reason (path too long, missing dir).
+    pub fn originErrno(self: *const Catalog) i32 {
+        if (self.publish_rc != 0) return self.publish_rc;
+        return self.refresh_rc;
+    }
+
+    fn notePublishFail(self: *Catalog, zpath: [*:0]const u8, rc: i32) void {
+        self.publish_rc = rc;
+        if (!self.publish_failing)
+            std.log.warn("lease publish failed at {s} (errno {d})", .{ zpath, -rc });
+        self.publish_failing = true;
+    }
+
+    fn notePublishOk(self: *Catalog) void {
+        self.publish_rc = 0;
+        if (self.publish_failing) std.log.info("lease publish recovered", .{});
+        self.publish_failing = false;
+    }
+
     /// Publishes this node's lease with `until = now_sec + lease_ttl_secs`.
     /// The caller's wall-clock instant (epoch seconds: leases are compared
     /// across machines) keeps the document a pure function of state plus
@@ -804,32 +839,39 @@ pub const Catalog = struct {
     pub fn publish(self: *Catalog, now_sec: i64) void {
         // A node whose lease never lands disappears from the cluster for
         // every other peer; every skip below must reach the operator's log.
+        // Config skips (path too long) are not origin I/O: they leave
+        // publish_rc at 0 so they cannot raise origin_down.
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
         const dir = self.clusterDir(&dbuf) catch {
             std.log.warn("lease publish skipped: origin path too long ({s})", .{self.origin});
+            self.publish_rc = 0;
             return;
         };
         var fbuf: [sys.c.PATH_MAX]u8 = undefined;
         const path = sys.joinZ(&fbuf, std.mem.span(dir), self.self_id) catch {
             std.log.warn("lease publish skipped: id \"{s}\" does not fit the lease path", .{self.self_id});
+            self.publish_rc = 0;
             return;
         };
         // <id>.json, staged through <id>.json.tmp + rename
         var with: [sys.c.PATH_MAX]u8 = undefined;
         const zpath = sys.appendExt(&with, path, ".json") catch {
             std.log.warn("lease publish skipped: id \"{s}\" does not fit the lease path", .{self.self_id});
+            self.publish_rc = 0;
             return;
         };
         var json_buf: [2048]u8 = undefined;
         const until = now_sec +| lease_ttl_secs;
         const json = proto.formatLease(&json_buf, self.self_id, until, self.addrs) catch {
             std.log.warn("lease publish skipped: {d} addresses do not fit the lease document", .{self.addrs.len});
+            self.publish_rc = 0;
             return;
         };
 
         var tmp: [sys.c.PATH_MAX]u8 = undefined;
         const ztmp = sys.appendExt(&tmp, zpath, ".tmp") catch {
             std.log.warn("lease publish skipped: id \"{s}\" does not fit the lease path", .{self.self_id});
+            self.publish_rc = 0;
             return;
         };
         // O_NOFOLLOW: the .cluster dir is shared NFS storage, and a symlink
@@ -850,14 +892,16 @@ pub const Catalog = struct {
             // A retry every tick would refresh mtime, so sweepLeases would
             // never age it out.
             _ = sys.unlink(ztmp);
-            std.log.warn("lease publish failed at {s} (errno {d})", .{ zpath, -w });
+            self.notePublishFail(zpath, w);
             return;
         }
         const re = sys.rename(ztmp, zpath);
         if (re != 0) {
             _ = sys.unlink(ztmp);
-            std.log.warn("lease publish rename failed at {s} (errno {d})", .{ zpath, -re });
+            self.notePublishFail(zpath, re);
+            return;
         }
+        self.notePublishOk();
     }
 
     /// Rebuilds the peer list from origin/.cluster, dropping leases expired
@@ -891,21 +935,40 @@ pub const Catalog = struct {
             .paths = &new_paths,
         };
         switch (walkLeases(self.gpa, self.origin, &acc)) {
-            .ok => {},
+            .ok => {
+                self.refresh_rc = 0;
+                if (self.refresh_failing) std.log.info("cluster leases recovered at {s}/{s}", .{ self.origin, cluster_dir });
+                self.refresh_failing = false;
+            },
             .path_too_long => {
                 new_paths.deinit(self.gpa);
                 new_arena.deinit();
-                // Same degrade as missing_dir: keep the last known membership,
-                // but name why it went stale. Silent here used to look like
-                // a frozen peer list with no journal line.
-                std.log.warn("cluster lease path too long at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
+                // Config, not origin I/O: keep the last known membership
+                // and leave refresh_rc at 0 so this cannot raise origin_down.
+                self.refresh_rc = 0;
+                if (!self.refresh_failing)
+                    std.log.warn("cluster lease path too long at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
+                self.refresh_failing = true;
                 return;
             },
             .missing_dir => {
                 new_paths.deinit(self.gpa);
                 new_arena.deinit();
-                // Degrade to the previous peer list, but say why it went stale.
-                std.log.warn("cluster leases unreadable at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
+                // ENOENT: empty/fresh cluster, or .cluster was removed.
+                // Not an infrastructure outage; keep the previous list.
+                self.refresh_rc = 0;
+                if (!self.refresh_failing)
+                    std.log.warn("cluster leases unreadable at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
+                self.refresh_failing = true;
+                return;
+            },
+            .io_err => |e| {
+                new_paths.deinit(self.gpa);
+                new_arena.deinit();
+                self.refresh_rc = -e;
+                if (!self.refresh_failing)
+                    std.log.warn("cluster leases unreadable at {s}/{s} (errno {d}); keeping previous peer list", .{ self.origin, cluster_dir, e });
+                self.refresh_failing = true;
                 return;
             },
         }
@@ -2132,7 +2195,12 @@ test "publish unlinks the staging file when rename fails" {
     const addrs = [_]proto.LeaseAddr{.{ .ip = "10.0.0.1", .port = 18080, .mbps = 0 }};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
     defer cat.deinit();
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
     cat.publish(sys.nowSec(std.testing.io));
+    try std.testing.expect(cat.publish_rc != 0);
+    try std.testing.expect(cat.originErrno() != 0);
 
     var zbuf: [192]u8 = undefined;
     var stbuf: c.struct_stat = undefined;
@@ -2156,6 +2224,25 @@ test "walkLeases visits parsed leases and skips hidden corrupt and missing" {
         };
         var empty: Empty = .{};
         try std.testing.expectEqual(LeaseWalk.missing_dir, walkLeases(gpa, origin_d, &empty));
+    }
+
+    // A regular file at .cluster is not an empty cluster: opendir fails
+    // ENOTDIR, which must surface as io_err so `modelfs peers` exits 1.
+    {
+        var fb: [192]u8 = undefined;
+        var zb: [192]u8 = undefined;
+        const cluster_fp = try std.fmt.bufPrint(&fb, "{s}/.cluster", .{origin_d});
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, cluster_fp), "not-a-dir"));
+        const Empty = struct {
+            pub fn visit(_: *@This(), _: []const u8, _: std.json.Parsed(proto.Lease)) void {
+                unreachable;
+            }
+        };
+        var empty: Empty = .{};
+        const walked = walkLeases(gpa, origin_d, &empty);
+        try std.testing.expect(walked == .io_err);
+        try std.testing.expectEqual(@as(i32, c.ENOTDIR), walked.io_err);
+        try std.testing.expectEqual(@as(i32, 0), sys.unlink(try sys.toZ(&zb, cluster_fp)));
     }
 
     var cbuf: [160]u8 = undefined;

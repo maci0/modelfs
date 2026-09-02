@@ -29,6 +29,13 @@ and default-behavior changes: the next tag is a minor, not a patch
 - **Origin I/O failures return the libc errno** (FUSE replies and `noteOriginIo` used to report EPERM because the wrappers passed through libc's `-1`).
 - **A FIFO at a model path fails ESPIPE on read and ENXIO on write** (used to hang the FUSE worker until a counterpart appeared).
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused**, matching the rest of Default_Ignorable.
+- **`modelfs peers` exits 1 when `origin/.cluster` is unreadable** (EIO, ENOTDIR, EACCES). A missing `.cluster` is still an empty cluster (exit 0). An origin I/O failure used to print `no cluster leases` and exit 0.
+
+### Idle origin outages and metadata failures reach the tick line - 2026-09-02
+- **Lease publish and unreadable `.cluster` walks raise `origin_down`.** Discovery already wrote the origin every 10 s, but a node with no FUSE traffic left `origin_down` at 0 until the first getattr. `tickCluster` feeds the publish/refresh errno into `Store.noteOriginIo`. Write/rename and walk failures are edge-triggered (one warn, then `lease publish recovered` / `cluster leases recovered`) so a dead NFS cannot warn every tick.
+- **`lease_err` and `meta_err` ride status.json and the tick line.** `lease_err` counts failed lease publishes (the idle-node origin-down heartbeat). `meta_err` counts getattr/open/readdir EIO/ESTALE/ETIMEDOUT so an `ls` storm during an outage does not look like a slow-but-healthy `md_us` interval.
+- **`/ping` is no longer timed in `http_nanos`.** It stays uncounted in `http_ok`. Timing it made a health-check poll fire an otherwise-idle tick line of zeros (`http_us` 0 over a zero denominator).
+- **Three `expectedHash` tests pass the `now_ms` argument.** They still used the two-arg form, so `zig build test` failed to compile.
 
 ### /stage backoff TTL starts at the failure, not the attempt - 2026-09-02
 - **A failed `/stage` is marked down from the instant it returns.** `fetchFromCands` used to stamp `Catalog.noteStageDown` with the clock sample taken before `fetchPieceStaged`. That function's dial/head budget is 15 s + 10 s against a 2 s TTL, so a blackholed `/stage` left `expires_ms` in the past and every later piece of the same file retried the extra round trip. Fast 501s still get the same 2 s window.

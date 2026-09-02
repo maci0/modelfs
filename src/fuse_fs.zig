@@ -452,7 +452,10 @@ export fn mf_getattr(path: [*c]const u8, stbuf: ?*fuse.struct_stat, fi: ?*fuse.f
     if (rerr != 0) return rerr;
     var ost: sys.c.struct_stat = undefined;
     const rc = st.store.statOrigin(rel, &ost);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        countMetaErr(st, rc);
+        return rc;
+    }
     // Same translated C type; a whole-struct assign keeps every stat field.
     if (stbuf) |out| out.* = ost;
     return 0;
@@ -479,7 +482,10 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     // Return the captured errno, like getattr/read do: re-reading errno here
     // would report whatever ran between the failed stat and this return.
     const rc = st.store.statOrigin(rel, &ost);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        countMetaErr(st, rc);
+        return rc;
+    }
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
         const size = sys.sizeFromStat(ost.st_size) orelse {
@@ -1114,7 +1120,11 @@ export fn mf_readdir(path: [*c]const u8, buf: ?*anyopaque, filler: fuse.fuse_fil
     // lstat-then-opendir: a racer swapping the name to a link in that window
     // would otherwise list the target. ELOOP on links, ENOTDIR on a file,
     // matching the previous lstat gates.
-    const dir = sys.opendirNoFollow(op) orelse return sys.negErrno();
+    const dir = sys.opendirNoFollow(op) orelse {
+        const rc = sys.negErrno();
+        countMetaErr(st, rc);
+        return rc;
+    };
     defer sys.closedir(dir);
     const fill = filler orelse return -sys.c.EIO;
     var names = OriginDirNames{ .dir = dir, .hide_cluster = rel.len == 0 };
@@ -1231,6 +1241,25 @@ export fn mf_destroy(ud: ?*anyopaque) callconv(.c) void {
     st.server.stop();
 }
 
+/// One discovery-tick origin sample: publish then refresh, then feed the
+/// combined errno into origin_down / lease_err. An idle node never getattr's,
+/// so without this the origin health gauge stays 0 until the first client
+/// I/O even though the tick already wrote the origin. Mount startup uses
+/// the same helper so a dead NFS is visible in status.json before the
+/// first FUSE op.
+pub fn tickCluster(st: *State, now: i64) void {
+    st.catalog.publish(now);
+    if (st.catalog.publish_rc != 0)
+        _ = st.store.stats.lease_err.fetchAdd(1, .monotonic);
+    st.catalog.refresh(now);
+    st.store.noteOriginIo(discover.cluster_dir, st.catalog.originErrno(), "lease");
+}
+
+fn countMetaErr(st: *State, rc: i32) void {
+    if (rc < 0 and store_mod.Store.originIoOutage(-rc))
+        _ = st.store.stats.meta_err.fetchAdd(1, .monotonic);
+}
+
 /// Sleeps up to ms in 100ms slices, bailing out early once the daemon stops:
 /// a plain sleepMs would keep shutdown waiting out the full tick.
 fn napMs(st: *State, ms: u32) void {
@@ -1300,8 +1329,7 @@ fn discLoop(st: *State) void {
         // mtime on the origin (NAS clock) and uses `now` only when that
         // file is missing.
         const now = sys.nowSec(st.io);
-        st.catalog.publish(now);
-        st.catalog.refresh(now);
+        tickCluster(st, now);
         st.catalog.sweepLeases(now);
         // Membership is a gauge, not a counter, so it never moves the tick
         // line. An idle node that loses every peer would otherwise stay
@@ -1354,13 +1382,16 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     // and a tick fires on any counter moving. Without this field a
     // metadata-only interval logs a line of zeros.
     const md_us = @divTrunc(d.getattr_nanos + d.open_nanos + d.statfs_nanos, std.time.ns_per_us);
-    std.log.info(
-        // Field names mirror Stats.Snap's (what status.json publishes), so
-        // the journal line and the machine artifact share one vocabulary and
-        // no key collides ("err" used to name both read and write failures).
+    // Format into a buffer then log one string: std.log.info is capped at
+    // 32 format args, and the tick already named more Snap fields than that.
+    var line_buf: [1536]u8 = undefined;
+    var w = std.Io.Writer.fixed(&line_buf);
+    // Field names mirror Stats.Snap's (what status.json publishes), so
+    // the journal line and the machine artifact share one vocabulary and
+    // no key collides ("err" used to name both read and write failures).
+    w.print(
         "tick: reads_ok={d} reads_err={d} reads_warm={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d} wr_us={d}" ++
-            " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache/verify={d}/{d}/{d}/{d}" ++
-            " probe_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http405={d} http_us={d} md_us={d}",
+            " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache/verify={d}/{d}/{d}/{d}",
         .{
             d.reads_ok,
             d.reads_err,
@@ -1379,7 +1410,13 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.fill_err_origin,
             d.fill_err_cache,
             d.fill_err_verify,
+        },
+    ) catch return;
+    w.print(
+        " probe_err={d} lease_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http405={d} http_us={d} md_us={d} meta_err={d}",
+        .{
             d.probe_err,
+            d.lease_err,
             @divTrunc(d.bytes_from_peer, mib),
             @divTrunc(d.bytes_from_origin, mib),
             @divTrunc(d.bytes_to_peer, mib),
@@ -1393,8 +1430,10 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.http_405,
             http_us,
             md_us,
+            d.meta_err,
         },
-    );
+    ) catch return;
+    std.log.info("{s}", .{w.buffered()});
 }
 
 fn writeStatus(st: *State) void {
@@ -1601,6 +1640,8 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expect(doc.value.cache_free_pct >= 0);
     try std.testing.expectEqual(@as(i32, 0), doc.value.origin_down);
     try std.testing.expectEqual(@as(u64, 0), doc.value.stats.http_nanos);
+    try std.testing.expectEqual(@as(u64, 0), doc.value.stats.lease_err);
+    try std.testing.expectEqual(@as(u64, 0), doc.value.stats.meta_err);
     // now_s is a current epoch second (operators/monitors); mono_s is the
     // same-machine monotonic instant the wedge gate compares against. Zero
     // or a swapped pair would make `status` misread a live node.
@@ -1734,6 +1775,54 @@ test "logStatsTick summarizes deltas and stays silent when idle" {
     logStatsTick(&st, &prev);
     try std.testing.expectEqual(@as(u64, 2000), prev.getattr_nanos);
     try std.testing.expectEqual(@as(u64, 2), prev.http_405);
+
+    // lease_err and meta_err are Snap fields too: an idle origin outage or
+    // a getattr EIO storm must advance prev or the next real increment is
+    // swallowed as 0.
+    _ = st.store.stats.lease_err.fetchAdd(1, .monotonic);
+    _ = st.store.stats.meta_err.fetchAdd(4, .monotonic);
+    logStatsTick(&st, &prev);
+    try std.testing.expectEqual(@as(u64, 1), prev.lease_err);
+    try std.testing.expectEqual(@as(u64, 4), prev.meta_err);
+}
+
+test "tickCluster counts lease_err on publish failure and meta_err on origin outage" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-tick-cluster");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-tick-cluster");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+    var lbuf: [192]u8 = undefined;
+    const lease_fp = try std.fmt.bufPrint(&lbuf, "{s}/me.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(lease_fp, 0o755));
+
+    const addrs = [_]proto.LeaseAddr{.{ .ip = "10.0.0.1", .port = 18080, .mbps = 0 }};
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 4096, .{}, "me", &addrs, &.{}, &.{}, "", true);
+    defer st.deinit();
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    tickCluster(&st, sys.nowSec(st.io));
+    try std.testing.expectEqual(@as(u64, 1), st.store.stats.lease_err.load(.monotonic));
+    try std.testing.expect(st.catalog.originErrno() != 0);
+    // EISDIR is path-level, not NFS down.
+    try std.testing.expect(!st.store.origin_io_down.load(.monotonic));
+
+    countMetaErr(&st, -sys.c.ENOENT);
+    try std.testing.expectEqual(@as(u64, 0), st.store.stats.meta_err.load(.monotonic));
+    countMetaErr(&st, -sys.c.EIO);
+    try std.testing.expectEqual(@as(u64, 1), st.store.stats.meta_err.load(.monotonic));
+    countMetaErr(&st, -sys.c.ESTALE);
+    try std.testing.expectEqual(@as(u64, 2), st.store.stats.meta_err.load(.monotonic));
 }
 
 test "hydratePiece fails closed when write generation keeps discarding fills" {
