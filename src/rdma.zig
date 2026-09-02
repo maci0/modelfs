@@ -17,6 +17,7 @@
 //! `ibv_reg_mr`, the RDMA Read, fabric tuning) is design.md section 15.
 const std = @import("std");
 const piece = @import("piece.zig");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 
 /// Serialized size of one stage window (the /stage 200 body).
 /// len u64 + rkey u32 + addr u64 + digest 32.
@@ -233,14 +234,56 @@ test "window encode decode round trip" {
     try std.testing.expectError(error.NoSpaceLeft, encodeWindow(w, buf[0..8]));
 }
 
+fn windowBody(comptime w: Window) [window_len]u8 {
+    var buf: [window_len]u8 = undefined;
+    _ = encodeWindow(w, &buf) catch unreachable;
+    return buf;
+}
+
+const seed_window_ok = fuzzcorpus.entry(&windowBody(.{
+    .len = 16777216,
+    .rkey = 7,
+    .addr = 0x1234,
+    .digest = [_]u8{0xCD} ** piece.digest_len,
+}));
+const seed_window_zeroed = fuzzcorpus.entry(&windowBody(.{
+    .len = 0,
+    .rkey = 0,
+    .addr = 0,
+    .digest = [_]u8{0} ** piece.digest_len,
+}));
+const seed_window_max = fuzzcorpus.entry(&windowBody(.{
+    .len = std.math.maxInt(u64),
+    .rkey = std.math.maxInt(u32),
+    .addr = std.math.maxInt(u64),
+    .digest = [_]u8{0xFF} ** piece.digest_len,
+}));
+const seed_window_empty = fuzzcorpus.entry("");
+const seed_window_short = fuzzcorpus.entry("\x00" ** 10);
+const seed_window_long = fuzzcorpus.entry("\x00" ** (window_len + 8));
+
+const fuzz_window_corpus = [_][]const u8{
+    &seed_window_ok,
+    &seed_window_zeroed,
+    &seed_window_max,
+    &seed_window_empty,
+    &seed_window_short,
+    &seed_window_long,
+};
+
 /// The window body arrives from a peer over the control channel: the
 /// harness asserts the codec oracle -- a decoded window must be exactly
 /// window_len bytes, and a clean round trip reproduces the fields -- not
-/// just crash-freedom.
+/// just crash-freedom. Seeds go through fuzzcorpus.entry so Smith.slice
+/// feeds the codec bytes rather than treating the first four (the len
+/// field) as a length prefix, which would skip every well-formed window.
 fn fuzzWindowDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var blob_buf: [64]u8 = undefined;
     const blob = blob_buf[0..smith.slice(&blob_buf)];
-    const w = decodeWindow(blob) orelse return;
+    const w = decodeWindow(blob) orelse {
+        try std.testing.expect(blob.len != window_len);
+        return;
+    };
     try std.testing.expectEqual(blob.len, window_len);
     // The fields are opaque to the parser, but a round trip must reproduce
     // them exactly (len/rkey/addr are what the backend reads against).
@@ -250,15 +293,7 @@ fn fuzzWindowDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
 }
 
 test "fuzz window decode honors the codec oracle" {
-    var seed: [window_len]u8 = undefined;
-    const w = Window{
-        .len = 16777216,
-        .rkey = 7,
-        .addr = 0x1234,
-        .digest = [_]u8{0xCD} ** piece.digest_len,
-    };
-    _ = try encodeWindow(w, &seed);
-    try std.testing.fuzz({}, fuzzWindowDecodeOne, .{ .corpus = &.{&seed} });
+    try std.testing.fuzz({}, fuzzWindowDecodeOne, .{ .corpus = &fuzz_window_corpus });
 }
 
 test "fake backend stages and reads one window" {

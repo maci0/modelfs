@@ -938,29 +938,61 @@ fn manifestSeed(ps: u32, fs: u64, entries: []const ManifestEntry) [manifestLen(e
     return b;
 }
 
-const seed_manifest_clean = manifestSeed(1, 8, &.{
+const seed_manifest_clean = fuzzcorpus.entry(&manifestSeed(1, 8, &.{
     .{ .idx = 0, .hash = [_]u8{0x11} ** digest_len },
     .{ .idx = 2, .hash = [_]u8{0x22} ** digest_len },
-});
-const seed_manifest_empty = manifestSeed(1, 8, &.{});
-const seed_manifest_corrupt_magic = blk: {
+}));
+const seed_manifest_empty = fuzzcorpus.entry(&manifestSeed(1, 8, &.{}));
+const seed_manifest_corrupt_magic = fuzzcorpus.entry(&blk: {
     var b = manifestSeed(1, 8, &.{.{ .idx = 0, .hash = [_]u8{0x11} ** digest_len }});
     b[0] = 'X';
     break :blk b;
-};
-const seed_manifest_truncated: [20]u8 = blk: {
+});
+const seed_manifest_truncated = fuzzcorpus.entry(&blk: {
     var b = manifestSeed(1, 8, &.{
         .{ .idx = 0, .hash = [_]u8{0x11} ** digest_len },
         .{ .idx = 1, .hash = [_]u8{0x22} ** digest_len },
     });
     break :blk b[0..20].*;
+});
+const seed_manifest_zero_ps = fuzzcorpus.entry(&blk: {
+    var b = manifestSeed(1, 8, &.{.{ .idx = 0, .hash = [_]u8{0x11} ** digest_len }});
+    std.mem.writeInt(u32, b[4..8], 0, .little);
+    break :blk b;
+});
+const seed_manifest_dup_idx = fuzzcorpus.entry(&manifestSeed(1, 8, &.{
+    .{ .idx = 1, .hash = [_]u8{0x11} ** digest_len },
+    .{ .idx = 1, .hash = [_]u8{0x22} ** digest_len },
+}));
+const seed_manifest_desc_idx = fuzzcorpus.entry(&manifestSeed(1, 8, &.{
+    .{ .idx = 2, .hash = [_]u8{0x11} ** digest_len },
+    .{ .idx = 0, .hash = [_]u8{0x22} ** digest_len },
+}));
+const seed_manifest_oob_idx = fuzzcorpus.entry(&manifestSeed(1, 8, &.{
+    .{ .idx = 8, .hash = [_]u8{0x11} ** digest_len },
+}));
+const seed_manifest_absent = fuzzcorpus.entry("");
+
+const fuzz_manifest_corpus = [_][]const u8{
+    &seed_manifest_clean,
+    &seed_manifest_empty,
+    &seed_manifest_corrupt_magic,
+    &seed_manifest_truncated,
+    &seed_manifest_zero_ps,
+    &seed_manifest_dup_idx,
+    &seed_manifest_desc_idx,
+    &seed_manifest_oob_idx,
+    &seed_manifest_absent,
 };
 
 /// Manifests ride on shared storage like sidecars, and a corrupt or hostile
 /// one must never yield a trust reference: the harness asserts the codec's
 /// full oracle -- null for a non-manifest, BadManifest for structural
 /// corruption, and, for a clean decode, strictly ascending in-grid indices
-/// with an exact-length body -- not just crash-freedom.
+/// with an exact-length body that re-encodes identically -- not just
+/// crash-freedom. Seeds go through fuzzcorpus.entry so Smith.slice feeds
+/// the codec bytes rather than treating the MFSM magic as a length prefix,
+/// which would skip every well-formed manifest.
 fn fuzzManifestDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const gpa = std.testing.allocator;
     var blob_buf: [160]u8 = undefined;
@@ -979,13 +1011,14 @@ fn fuzzManifestDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expect(e.idx < max_idx);
         prev = e.idx;
     }
+
+    // Persistence pair: a decoded blob must re-encode to the same bytes
+    // the origin reader just trusted.
+    var out_buf: [160]u8 = undefined;
+    const enc = try manifestEncode(m.?.piece_size, m.?.file_size, m.?.entries, out_buf[0..blob.len]);
+    try std.testing.expectEqualSlices(u8, blob, enc);
 }
 
 test "fuzz manifest decode honors the codec oracle" {
-    try std.testing.fuzz({}, fuzzManifestDecodeOne, .{ .corpus = &.{
-        &seed_manifest_clean,
-        &seed_manifest_corrupt_magic,
-        &seed_manifest_truncated,
-        &seed_manifest_empty,
-    } });
+    try std.testing.fuzz({}, fuzzManifestDecodeOne, .{ .corpus = &fuzz_manifest_corpus });
 }

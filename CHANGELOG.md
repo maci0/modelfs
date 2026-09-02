@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### /stage window and origin manifest fuzz seeds reach the decode path - 2026-09-02
+- **The `/stage` window and piece-hash manifest fuzz corpora now use `fuzzcorpus.entry` framing.** `Smith.slice` reads a u32 length prefix; the raw codec bytes were consumed as that prefix, so a well-formed window or `MFSM` blob never decoded during corpus replay. Truncated, empty, over-long, and structurally corrupt seeds now sit next to a clean one; a decoded manifest re-encodes to the same blob.
+
 ### Ship ELF pins PIC, no RPATH, and a frozen build-id; VM e2e matches ReleaseFast - 2026-09-02
 - **The shipped image now pins PIC, refuses DT_RPATH/DT_RUNPATH, and freezes `--build-id=none`.** `exe.pie` already produced an ET_DYN, but PIC was left to the compiler default, `-Dfuse-lib` could have become a runtime search path (baking the build-host extract dir into the spark binary), and a CLI `--build-id=uuid` would have made two builds of the same tree disagree. `checkHardenedElf` now fails those dynamic tags the same way it already fails a non-PIE or lazy-binding link. `scripts/check.sh` and `scripts/cross_aarch64.sh` pin `LC_ALL=C`/`TZ=UTC`; `require_zig` enforces `minimum_zig_version` so an old toolchain dies at the script preflight instead of as a compile error.
 - **The 4-VM cluster e2e builds the ReleaseFast image from tracked sources.** It used to `tar` the whole worktree (so a host `.zig-cache` could ride into the guest) and `zig build` Debug, while claiming to match the spark deploy. It now packs `git ls-files` like `repro_check.sh`, fetches the tarball named by `build.zig.zon`'s `minimum_zig_version`, and compiles `-Doptimize=ReleaseFast`.
