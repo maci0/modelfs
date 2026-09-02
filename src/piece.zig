@@ -1,6 +1,7 @@
 //! Piece arithmetic (count/offset/cover/trackedEnd) and the persisted cache bitfield
-//! codec, including pad-bit defenses against corrupt sidecars and the sidecar
-//! header piece-size reader (`sidecarPieceSize`).
+//! codec, including pad-bit defenses against corrupt sidecars, the sidecar
+//! header piece-size reader (`sidecarPieceSize`), and piece-hash manifest
+//! overlap (`manifestOverlap` / `manifestOverlapPrepared`) used by `modelfs dupes`.
 const std = @import("std");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 
@@ -462,6 +463,152 @@ pub fn manifestName(rel: []const u8, out: *[2 * digest_len]u8) []const u8 {
     const hexed = digestHex(h);
     @memcpy(out, &hexed);
     return out[0..hexed.len];
+}
+
+/// Shared-content summary between two manifests.
+pub const Overlap = struct {
+    /// Piece indexes both files hash identically (same idx, same digest):
+    /// what a same-size re-export would share under the fixed grid.
+    aligned: u64 = 0,
+    /// Distinct digests present in both files, whatever the index: content
+    /// shared somewhere in the file.
+    shared: u64 = 0,
+    /// True when the files have the same size and every piece matches:
+    /// an outright duplicate (same bytes, possibly different path).
+    identical: bool = false,
+};
+
+/// Digest ordering for the shared-content merge.
+fn digestLess(_: void, x: ManifestEntry, y: ManifestEntry) bool {
+    return std.mem.order(u8, &x.hash, &y.hash) == .lt;
+}
+
+/// Owned digest-sorted copy of `entries`. A pair scan sorts each manifest
+/// once and reuses the copy across every pair, instead of duplicating and
+/// sorting both entry arrays per pair (2K² allocs and sorts for K manifests).
+pub fn digestSorted(gpa: std.mem.Allocator, entries: []const ManifestEntry) ![]ManifestEntry {
+    const copy = try gpa.dupe(ManifestEntry, entries);
+    std.mem.sort(ManifestEntry, copy, {}, digestLess);
+    return copy;
+}
+
+/// Compares two manifests' entries (both sorted by idx, as decode
+/// guarantees). Aligned counts same-index same-digest pairs; shared counts
+/// distinct digests in both (a merge over the caller's digest-sorted copies
+/// `a_dig`/`b_dig`, built once per manifest); identical is same file size
+/// plus every piece matching.
+pub fn manifestOverlapPrepared(
+    a: Manifest,
+    b: Manifest,
+    a_dig: []const ManifestEntry,
+    b_dig: []const ManifestEntry,
+) Overlap {
+    var ov = Overlap{};
+    // Aligned pass: both entry lists are ascending by idx.
+    {
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < a.entries.len and j < b.entries.len) {
+            if (a.entries[i].idx == b.entries[j].idx) {
+                if (std.mem.eql(u8, &a.entries[i].hash, &b.entries[j].hash)) ov.aligned += 1;
+                i += 1;
+                j += 1;
+            } else if (a.entries[i].idx < b.entries[j].idx) {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+    }
+    ov.identical = a.file_size == b.file_size and
+        a.entries.len == b.entries.len and
+        ov.aligned == a.entries.len;
+    // Shared pass: merge-intersect the digest-sorted copies.
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a_dig.len and j < b_dig.len) {
+        switch (std.mem.order(u8, &a_dig[i].hash, &b_dig[j].hash)) {
+            .lt => i += 1,
+            .gt => j += 1,
+            .eq => {
+                // One increment per distinct digest: a file that repeats
+                // the same piece hash (padding, duplicated tensors) must
+                // not inflate "shared digest(s)" once per occurrence.
+                ov.shared += 1;
+                const h = a_dig[i].hash;
+                i += 1;
+                j += 1;
+                while (i < a_dig.len and std.mem.eql(u8, &a_dig[i].hash, &h)) i += 1;
+                while (j < b_dig.len and std.mem.eql(u8, &b_dig[j].hash, &h)) j += 1;
+            },
+        }
+    }
+    return ov;
+}
+
+/// Single-pair convenience wrapper (tests): builds the digest-sorted copies
+/// itself. Pair scans should build them once per manifest and call
+/// `manifestOverlapPrepared` instead.
+pub fn manifestOverlap(gpa: std.mem.Allocator, a: Manifest, b: Manifest) !Overlap {
+    const ca = try digestSorted(gpa, a.entries);
+    defer gpa.free(ca);
+    const cb = try digestSorted(gpa, b.entries);
+    defer gpa.free(cb);
+    return manifestOverlapPrepared(a, b, ca, cb);
+}
+
+test "manifestOverlap counts aligned, shared, and identical content" {
+    const h0 = [_]u8{0x11} ** digest_len;
+    const h1 = [_]u8{0x22} ** digest_len;
+    const h2 = [_]u8{0x33} ** digest_len;
+    var a_entries = [_]ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h1 },
+    };
+    var b_entries = [_]ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h2 },
+    };
+    var c_entries = [_]ManifestEntry{
+        .{ .idx = 1, .hash = h0 },
+        .{ .idx = 2, .hash = h1 },
+    };
+    const A = Manifest{ .piece_size = 16, .file_size = 32, .entries = &a_entries };
+    // Same bytes at index 0, different at index 1: aligned 1, shared 1.
+    const B = Manifest{ .piece_size = 16, .file_size = 32, .entries = &b_entries };
+    const ab = try manifestOverlap(std.testing.allocator, A, B);
+    try std.testing.expectEqual(@as(u64, 1), ab.aligned);
+    try std.testing.expectEqual(@as(u64, 1), ab.shared);
+    try std.testing.expect(!ab.identical);
+    // The same content at a shifted index: shared but not aligned (only
+    // CDC could recover this -- the telemetry Level 3 waits on).
+    const C = Manifest{ .piece_size = 16, .file_size = 48, .entries = &c_entries };
+    const ac = try manifestOverlap(std.testing.allocator, A, C);
+    try std.testing.expectEqual(@as(u64, 0), ac.aligned);
+    try std.testing.expectEqual(@as(u64, 2), ac.shared);
+    try std.testing.expect(!ac.identical);
+    // Byte-identical manifests: every piece matches.
+    const ad = try manifestOverlap(std.testing.allocator, A, A);
+    try std.testing.expectEqual(@as(u64, 2), ad.aligned);
+    try std.testing.expectEqual(@as(u64, 2), ad.shared);
+    try std.testing.expect(ad.identical);
+    // Repeated digest in both files is one distinct shared digest, not
+    // one per occurrence (the report names "shared digest(s)").
+    var d_entries = [_]ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h0 },
+    };
+    var e_entries = [_]ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h0 },
+        .{ .idx = 2, .hash = h1 },
+    };
+    const D = Manifest{ .piece_size = 16, .file_size = 32, .entries = &d_entries };
+    const E = Manifest{ .piece_size = 16, .file_size = 48, .entries = &e_entries };
+    const de = try manifestOverlap(std.testing.allocator, D, E);
+    try std.testing.expectEqual(@as(u64, 2), de.aligned);
+    try std.testing.expectEqual(@as(u64, 1), de.shared);
+    try std.testing.expect(!de.identical);
 }
 
 test "sidecarPieceSize reads the header and refuses a zero or foreign blob" {

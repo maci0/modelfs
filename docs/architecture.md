@@ -107,7 +107,7 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 |---|---|
 | `c.h`, `c.zig` | Sole door to libfuse3 and libc |
 | `sys.zig` | Syscall wrappers: EINTR retry, CLOEXEC, nofollow/owner-only writes; IPv4 `bind`/`accept`/`connect`/`listen`/`getsockname` and socket options through `std.c` |
-| `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`) and the persisted bitfield codec |
+| `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`), the persisted bitfield codec, and piece-hash manifest overlap (`manifestOverlap` / `manifestOverlapPrepared`) |
 | `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`) |
 | `cull.zig` | Free-space watermark policy |
 | `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
@@ -121,7 +121,7 @@ Daemon code lives in a flat `src/*.zig`. Dependencies point downward; there are 
 
 `main` → `fuse_fs` → `peer` → (`store`, `discover`, `rdma`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
 
-CLI commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`) import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`, `manifestsDirPath`) rather than reconstructing those joins. Pin, verify, and dupes pass the process `std.Io` into Store so recency and retry instants stay on the injected clock.
+CLI commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`) import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`, `manifestsDirPath`) rather than reconstructing those joins. Pin, verify, and dupes pass the process `std.Io` into Store so recency and retry instants stay on the injected clock. `dupes` compares manifests through `piece.manifestOverlapPrepared`.
 
 ---
 

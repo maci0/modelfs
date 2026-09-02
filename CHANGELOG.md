@@ -19,6 +19,13 @@ until the next tag.
 ### Idle reap aborts on allocation failure - 2026-09-02
 - **A failed candidate append skips the reap instead of keeping a hash-map prefix.** `reapIdle` already sorted collected entries so a crash mid-unlink left a deterministic remainder, but an OOM while pinning still kept whichever idle files HashMap iteration had visited first. The next tick retries the full set.
 
+### Manifest overlap lives with the piece-hash codec - 2026-09-02
+- **`modelfs dupes` compares manifests through `piece.manifestOverlapPrepared`.**
+  Aligned/shared/identical overlap used to live in the CLI next to
+  `cmdDupes`; the codec that owns `Manifest` now owns the comparison, so
+  a second consumer does not reimplement the merge. `manifestOverlap`
+  returns an error on allocation failure instead of reporting empty overlap.
+
 ### FUSE unlink retry of a gone file is success - 2026-09-02
 - **`Store.unlinkOrigin` treats ENOENT as success.** `mkdir` of an existing
   directory and `rmdir` of a gone directory already converged so a FUSE
