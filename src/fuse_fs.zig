@@ -877,18 +877,21 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     const want = @min(size, @as(usize, std.math.maxInt(c_int)));
     if (off < 0) return -sys.c.EINVAL;
     const uoff: u64 = @intCast(off);
+    // Hold xfer from the bit sample through the cache pread: recency
+    // stamping alone cannot cover a straddling read whose next piece
+    // hydrates past recency_secs, or a FUSE worker descheduled between
+    // rangeFilled and readCache. punchPiece and copyIntoCache both refuse
+    // the cache fd while this is nonzero.
+    st.store.beginXfer(file);
+    defer st.store.endXfer(file);
     // One size sample under file.mu: truncate/reconcileSize shrink it
     // concurrently, and reading it twice unlocked can pass the bounds check
     // on the old value then underflow the subtraction on the new one.
     file.mu.lockUncancelable(st.io);
     const fsize = file.size;
-    // A warm read touches no other state until readCache stamps at the end:
-    // without a stamp here, a cull punch (idle past the window, all gates
-    // green) could land between ensureRange's bit checks and the read and
-    // serve hole zeros behind bits this call already trusted. Checking the
-    // covered bits in this same window lets a fully-cached range skip
-    // ensureRange's per-piece lock (hasPiece stamps and re-checks what we
-    // already know).
+    // Checking the covered bits in this same window lets a fully-cached
+    // range skip ensureRange's per-piece lock (hasPiece stamps and
+    // re-checks what we already know). last_access still feeds LRU.
     file.last_access.store(sys.monoSec(st.io), .monotonic);
     if (uoff >= fsize) {
         file.mu.unlock(st.io);

@@ -644,8 +644,10 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, idx: u32) void
     defer self.store.releaseFile(file);
     // Same whole-transfer guard as serveData: hydration and the staging
     // read must not race a punch, and a hole read here would stage zeros.
-    _ = file.xfer.fetchAdd(1, .monotonic);
-    defer _ = file.xfer.fetchSub(1, .monotonic);
+    // beginXfer takes content_mu so a concurrent copyIntoCache cannot
+    // pwrite under this transfer.
+    self.store.beginXfer(file);
+    defer self.store.endXfer(file);
     const ps = self.store.piece_size;
     const ln = piece.len(size, idx, ps);
     if (ln == 0) {
@@ -1011,9 +1013,10 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     // punchPiece off for its duration. Per-chunk recency stamping alone
     // cannot do this -- one stalled sendfile blocks up to the 30s socket
     // timeout, far past the 10s cull window, and a punch mid-send ships
-    // hole zeros that the fetching peer then marks filled.
-    _ = file.xfer.fetchAdd(1, .monotonic);
-    defer _ = file.xfer.fetchSub(1, .monotonic);
+    // hole zeros that the fetching peer then marks filled. beginXfer takes
+    // content_mu so copyIntoCache cannot pwrite under the sendfile.
+    self.store.beginXfer(file);
+    defer self.store.endXfer(file);
     const want = rg_end -| rg.start +| 1;
 
     if (!hydrateRange(self, fd, file, .{ .off = rg.start, .len = want }, size)) return;

@@ -24,6 +24,10 @@ until the next tag.
 ### NAS backup timers keep cadence across DST - 2026-09-02
 - **Watchdog timers tick elapsed time, and the replica/drill calendars are UTC.** `OnCalendar=hourly` in `America/Los_Angeles` (and `Europe/Berlin`) skips 02:00 on spring-forward and fires once across the fall-back doubled hour, so `modelfs-snap-age.timer` could sit idle for 2 h that night. Age checks (`modelfs-snap-age.timer`, `modelfs-drill-log.timer`, `modelfs-offsite-age.timer`) now use `OnBootSec`/`OnUnitActiveSec`; `Persistent=` is OnCalendar-only, so those units cover a reboot via `OnBootSec`. `syncoid-models.timer` is `daily UTC` and `modelfs-drill.timer` is `monthly UTC`, so a host TZ cannot move the pull or the monthly clone.
 
+### Cache writes wait out in-flight cache-fd transfers - 2026-09-02
+- **A FUSE write-through no longer pwrites the cache fd under a peer sendfile or FUSE read of the same file.** `copyIntoCache` skipped that `Cached.xfer` check, so a local write during `/data` mixed new bytes into the in-flight copy and the fetching peer marked the mix filled. A retry of bytes already in the cache is still a no-op; any other overlapping range is unmarked so readers refill from origin.
+- **A FUSE read holds `xfer` from the bit sample through the cache pread.** Recency stamping alone could not cover a 128 KiB read that straddles a piece boundary while the next piece hydrates past the 10s cull window: `punchPiece` holed the first piece and the pread served zeros as cached data. Peer `/data` and `/stage` take the same claim under the content lock so a write-through cannot start between the load and the copy.
+
 ### Peer goodput samples ignore sub-resolution clock ticks - 2026-09-02
 - **A piece fetch whose elapsed time is 1 ns no longer records ~10 PB/s.** `rangeBps` already returned 0 for a same-ns tick (which pulled the EWMA toward a dead path). A 1 ns tick on a 16 MiB piece is finite (~1.7e16 B/s) and pulled the EWMA the other way, so `pickBest` stuck on that path until tens of real samples decayed it. Samples above 1 TB/s now keep the prior, like a non-positive interval.
 

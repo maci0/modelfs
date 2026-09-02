@@ -375,7 +375,10 @@ pub const Store = struct {
         /// write-through bytes and then mark them filled. punchPiece or
         /// ftruncate taking only file.mu could hole a piece between
         /// copyIntoCache's pwrite and mark, then the mark would publish hole
-        /// zeros as cached data. Lock order is content_mu then file.mu.
+        /// zeros as cached data. beginXfer increments xfer under this lock
+        /// so copyIntoCache cannot sample xfer==0 and then pwrite under a
+        /// sendfile that started between the load and the copy. Lock order
+        /// is content_mu then file.mu.
         content_mu: std.Io.Mutex = .init,
         /// Count of local origin mutations observed on this entry (write-through,
         /// distrust, truncate wipe). Nonzero means peer bytes for this path
@@ -397,12 +400,15 @@ pub const Store = struct {
         freed: std.atomic.Value(bool) = .init(false),
         /// Peer transfers currently streaming through this entry (the whole
         /// /data span: hydration plus send) and cache reads in flight (the
-        /// FUSE warm-read path, readCache). punchPiece refuses to hole a
-        /// piece while this is nonzero: bytes in flight are read straight
-        /// from the pages a punch would cut, and the fetching peer (or the
-        /// warm reader) would get hole zeros. Recency stamping alone
-        /// cannot provide this -- a single stalled sendfile chunk or pread
-        /// can block far longer than recency_secs.
+        /// FUSE read path from the bit sample through pread, plus readCache).
+        /// punchPiece refuses to hole a piece while this is nonzero: bytes
+        /// in flight are read straight from the pages a punch would cut, and
+        /// the fetching peer (or the FUSE reader) would get hole zeros.
+        /// copyIntoCache refuses to pwrite while this is nonzero for the
+        /// same reason: a write-through under sendfile mixes new bytes into
+        /// the in-flight copy. Recency stamping alone cannot provide this
+        /// -- a single stalled sendfile chunk, a slow hydrate of the next
+        /// piece in a straddling read, or a pread can outlast recency_secs.
         xfer: std.atomic.Value(u32) = .init(0),
         /// Trusted per-piece content digests (blake3 of the piece bytes),
         /// keyed by piece index. Sources: the origin piece-hash manifest
@@ -1739,6 +1745,22 @@ pub const Store = struct {
         return 0;
     }
 
+    /// Claim an in-flight cache-fd transfer. Pair with endXfer. The increment
+    /// sits under content_mu so copyIntoCache cannot sample xfer==0 and then
+    /// pwrite under a sendfile or FUSE read that started between the load
+    /// and the copy. readCache still increments xfer without this lock: it
+    /// must be able to land while punchPiece holds content_mu so the
+    /// post-saveBits recheck can abort the hole.
+    pub fn beginXfer(self: *Store, file: *Cached) void {
+        file.content_mu.lockUncancelable(self.io);
+        _ = file.xfer.fetchAdd(1, .monotonic);
+        file.content_mu.unlock(self.io);
+    }
+
+    pub fn endXfer(_: *Store, file: *Cached) void {
+        _ = file.xfer.fetchSub(1, .monotonic);
+    }
+
     pub fn readCache(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64) isize {
         // Same in-flight protection serveData gives peer sends: punchPiece
         // must not hole a piece while bytes are being read from the cache fd
@@ -2025,21 +2047,29 @@ pub const Store = struct {
     /// writer had already committed, leaving filled bits naming holes it cut.
     /// pwrite extends the fd to its own end by itself, so growth needs no
     /// truncate; a fresh openCache sizes the descriptor under file.mu.
+    /// A peer sendfile or FUSE read holds xfer across the cache fd; pwrite
+    /// under that transfer mixes new bytes into the in-flight copy. Skip
+    /// the pwrite then: a retry of bytes already in the cache (matching
+    /// hashes) is a no-op, and any other overlapping range is unmarked so
+    /// readers refill from origin.
     pub fn copyIntoCache(self: *Store, file: *Cached, off: u64, data: []const u8) bool {
         file.content_mu.lockUncancelable(self.io);
         defer file.content_mu.unlock(self.io);
 
-        const cfd = self.openCache(file);
+        const busy = file.xfer.load(.monotonic) != 0;
         var copied = false;
-        if (cfd < 0) {
-            std.log.warn("cache fill skipped for {s} (errno {d}); reads fall back to origin", .{ file.rel, -cfd });
-        } else {
-            const w = sys.pwriteAll(cfd, data, off);
-            if (w != @as(isize, @intCast(data.len))) {
-                std.log.warn("cache fill failed for {s} (errno {d}); reads fall back to origin", .{ file.rel, -w });
+        if (!busy) {
+            const cfd = self.openCache(file);
+            if (cfd < 0) {
+                std.log.warn("cache fill skipped for {s} (errno {d}); reads fall back to origin", .{ file.rel, -cfd });
             } else {
-                sys.fadviseDontneed(cfd, off, data.len);
-                copied = true;
+                const w = sys.pwriteAll(cfd, data, off);
+                if (w != @as(isize, @intCast(data.len))) {
+                    std.log.warn("cache fill failed for {s} (errno {d}); reads fall back to origin", .{ file.rel, -w });
+                } else {
+                    sys.fadviseDontneed(cfd, off, data.len);
+                    copied = true;
+                }
             }
         }
         // Marking, the write generation, and the sidecar save share file.mu:
@@ -2053,41 +2083,40 @@ pub const Store = struct {
         // write-through unlinked these artifacts; marking plus saving would
         // resurrect a sidecar claiming filled pieces over missing bytes.
         if (file.dead.load(.acquire)) return false;
-        if (copied) {
-            const cov = piece.fullCover(.{ .off = off, .len = data.len }, self.piece_size);
-            // Already applied: every fully-covered piece is marked. A FUSE
-            // retry after a lost reply re-pwrites the same bytes; bumping
-            // writes again would drop in-flight fills of other pieces, and
-            // rewriting the sidecar is a mutation a punch round could observe.
-            // Partial writes (empty fullCover) still bump: they must invalidate
-            // an in-flight fill of the overlapping piece so it cannot overwrite
-            // the patch with stale whole-piece bytes. But "all marked" cannot
-            // tell a retry from a same-size rewrite: re-hash the in-hand
-            // buffer against the recorded digests. Unchanged keeps the fast
-            // path; changed falls through so the writes bump, the fresh
-            // digests, the boundary-hash removal, and the sidecar save below
-            // describe the bytes actually in the cache fd.
-            if (cov.start < cov.end) {
-                if (file.bits.allSet(cov.start, cov.end)) {
-                    var changed = false;
-                    var i = cov.start;
-                    while (i < cov.end) : (i += 1) {
-                        const in_data = piece.offset(i, self.piece_size) - off;
-                        var h: [piece.digest_len]u8 = undefined;
-                        piece.digest(data[@intCast(in_data)..][0..self.piece_size], &h);
-                        if (file.hashes.get(i)) |old| {
-                            if (!std.mem.eql(u8, &h, &old)) {
-                                changed = true;
-                                break;
-                            }
-                        } else {
+        const cov = piece.fullCover(.{ .off = off, .len = data.len }, self.piece_size);
+        // Already applied: every fully-covered piece is marked. A FUSE
+        // retry after a lost reply re-pwrites the same bytes; bumping
+        // writes again would drop in-flight fills of other pieces, and
+        // rewriting the sidecar is a mutation a punch round could observe.
+        // Partial writes (empty fullCover) still bump: they must invalidate
+        // an in-flight fill of the overlapping piece so it cannot overwrite
+        // the patch with stale whole-piece bytes. But "all marked" cannot
+        // tell a retry from a same-size rewrite: re-hash the in-hand
+        // buffer against the recorded digests. Unchanged keeps the fast
+        // path (including when xfer blocked the pwrite: the cache already
+        // holds these bytes); changed falls through so the writes bump.
+        if (cov.start < cov.end) {
+            if (file.bits.allSet(cov.start, cov.end)) {
+                var changed = false;
+                var i = cov.start;
+                while (i < cov.end) : (i += 1) {
+                    const in_data = piece.offset(i, self.piece_size) - off;
+                    var h: [piece.digest_len]u8 = undefined;
+                    piece.digest(data[@intCast(in_data)..][0..self.piece_size], &h);
+                    if (file.hashes.get(i)) |old| {
+                        if (!std.mem.eql(u8, &h, &old)) {
                             changed = true;
                             break;
                         }
+                    } else {
+                        changed = true;
+                        break;
                     }
-                    if (!changed) return true;
                 }
+                if (!changed) return true;
             }
+        }
+        if (copied) {
             file.writes += 1;
             // Trusted hashes for the fully-covered pieces: the write buffer
             // holds exactly their bytes (fullCover), so each digest is the
@@ -2118,9 +2147,9 @@ pub const Store = struct {
             // marked piece skips hydration and would serve the pre-write
             // cache copy -- and /have would advertise it to the fleet.
             file.writes += 1;
-            const cov = piece.cover(.{ .off = off, .len = data.len }, file.size, self.piece_size);
-            var i = cov.start;
-            while (i < cov.end) : (i += 1) {
+            const overlap = piece.cover(.{ .off = off, .len = data.len }, file.size, self.piece_size);
+            var i = overlap.start;
+            while (i < overlap.end) : (i += 1) {
                 file.bits.clear(i);
                 // The covered pieces' digests described pre-write bytes; the
                 // refill that follows records fresh ones.
@@ -4230,6 +4259,58 @@ test "readCache holds xfer for the read and restores it" {
     const idle = sys.monoSec(std.testing.io) + 3600;
     try std.testing.expect(st.punchPiece(f, 0, idle));
     try std.testing.expect(!st.hasPiece(f, 0, idle));
+}
+
+test "copyIntoCache does not pwrite under an in-flight transfer" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-wt-xfer");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-wt-xfer");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var first: [16]u8 = undefined;
+    @memset(&first, 0xAA);
+    var next: [16]u8 = undefined;
+    @memset(&next, 0xBB);
+
+    const f = try st.get("xferwt.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expect(st.copyIntoCache(f, 0, &first));
+    try std.testing.expect(st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+
+    // Peer sendfile / FUSE read holds xfer across the cache fd. A
+    // write-through of different bytes must not pwrite under that copy:
+    // the in-flight reader would mark a mix of 0xAA and 0xBB filled.
+    st.beginXfer(f);
+    try std.testing.expect(!st.copyIntoCache(f, 0, &next));
+    try std.testing.expect(st.wroteLocally(f));
+    try std.testing.expect(!st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
+    var rd: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqualSlices(u8, &first, &rd);
+    st.endXfer(f);
+
+    // A retry of the bytes already in the cache is a no-op even while
+    // xfer is held: re-pwrite is skipped, marks stay, writes does not bump.
+    const f2 = try st.get("retry.bin", 16, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f2);
+    try std.testing.expect(st.copyIntoCache(f2, 0, &first));
+    f2.mu.lockUncancelable(std.testing.io);
+    const w0 = f2.writes;
+    f2.mu.unlock(std.testing.io);
+    st.beginXfer(f2);
+    try std.testing.expect(st.copyIntoCache(f2, 0, &first));
+    try std.testing.expect(st.hasPiece(f2, 0, sys.monoSec(std.testing.io)));
+    f2.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(w0, f2.writes);
+    f2.mu.unlock(std.testing.io);
+    st.endXfer(f2);
 }
 
 test "fill completion and piece probes refresh the cull recency window" {
