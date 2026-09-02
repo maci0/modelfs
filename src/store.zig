@@ -1850,6 +1850,28 @@ pub const Store = struct {
         return n;
     }
 
+    /// fsync/fdatasync the origin name. FUSE's default ENOSYS for an
+    /// unwired `fsync` is converted to success by the kernel (`no_fsync`),
+    /// so an ingest that called fsync would report durability without an
+    /// NFS COMMIT. Open is O_RDONLY: COMMIT is per-inode, and a reader
+    /// must be able to fsync a file it cannot write. O_NOFOLLOW / O_NONBLOCK
+    /// match originPread (planted symlink, FIFO).
+    pub fn originFsync(self: *Store, rel: []const u8, data_only: bool) i32 {
+        var path: [sys.c.PATH_MAX]u8 = undefined;
+        const p = self.originPath(&path, rel) catch return -c.ENAMETOOLONG;
+        const what: []const u8 = if (data_only) "fdatasync" else "fsync";
+        const fd = sys.open(p, c.O_RDONLY | c.O_NOFOLLOW | c.O_NONBLOCK, 0);
+        if (fd < 0) {
+            const rc = sys.negErrno();
+            self.noteOriginIo(rel, rc, what);
+            return rc;
+        }
+        const sc = if (data_only) sys.fdatasync(fd) else sys.fsync(fd);
+        sys.close(fd);
+        self.noteOriginIo(rel, sc, what);
+        return sc;
+    }
+
     /// Filesystem stats for the origin name. A planted final symlink would
     /// otherwise make statvfs(2) report the target's filesystem (df of a
     /// link to `/` leaks the host root's size/free through the mount).
@@ -6062,9 +6084,10 @@ test "origin access refuses a symlink planted at the model path" {
 
     // O_NOFOLLOW contract on the origin tier: the origin is shared storage a
     // co-tenant can plant names in, so a symlink at a model path must never
-    // turn the daemon's stat/pread/pwrite/statvfs into reads or writes of the
-    // link's client-local target. statOrigin reports S_IFLNK (every caller's
-    // S_IFREG gate then rejects fail-closed), and data/statvfs answer ELOOP.
+    // turn the daemon's stat/pread/pwrite/fsync/statvfs into reads or writes
+    // of the link's client-local target. statOrigin reports S_IFLNK (every
+    // caller's S_IFREG gate then rejects fail-closed), and data/statvfs/fsync
+    // answer ELOOP.
     var tb: [192]u8 = undefined;
     const target = try std.fmt.bufPrint(&tb, "{s}/secret.txt", .{origin_d});
     var zb: [192]u8 = undefined;
@@ -6082,6 +6105,8 @@ test "origin access refuses a symlink planted at the model path" {
     var rbuf: [8]u8 = undefined;
     try std.testing.expectEqual(-c.ELOOP, st.originPread("planted.gguf", &rbuf, 0));
     try std.testing.expectEqual(-c.ELOOP, st.originPwrite("planted.gguf", &rbuf, 0));
+    try std.testing.expectEqual(-c.ELOOP, st.originFsync("planted.gguf", false));
+    try std.testing.expectEqual(-c.ELOOP, st.originFsync("planted.gguf", true));
     var vs: c.struct_statvfs = undefined;
     try std.testing.expectEqual(-c.ELOOP, st.originStatvfs("planted.gguf", &vs));
     // The planted target keeps its bytes: nothing read or wrote through.
@@ -6122,6 +6147,32 @@ test "origin access refuses a FIFO planted at the model path" {
     var rbuf: [8]u8 = undefined;
     try std.testing.expectEqual(-c.ESPIPE, st.originPread("fifo.gguf", &rbuf, 0));
     try std.testing.expectEqual(-c.ENXIO, st.originPwrite("fifo.gguf", rbuf[0..5], 0));
+    // O_RDONLY|O_NONBLOCK of a FIFO returns immediately; fsync on a pipe
+    // is EINVAL, not a hang.
+    try std.testing.expectEqual(-c.EINVAL, st.originFsync("fifo.gguf", false));
+}
+
+test "originFsync of a regular file succeeds and missing is ENOENT" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-fsync");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-fsync");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    try std.testing.expectEqual(-c.ENOENT, st.originFsync("gone.bin", false));
+
+    var tb: [192]u8 = undefined;
+    var zb: [192]u8 = undefined;
+    const real_z = try sys.toZ(&zb, try std.fmt.bufPrint(&tb, "{s}/real.bin", .{origin_d}));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(real_z, "model"));
+    try std.testing.expectEqual(@as(i32, 0), st.originFsync("real.bin", false));
+    try std.testing.expectEqual(@as(i32, 0), st.originFsync("real.bin", true));
 }
 
 test "late finisher on a forgotten entry does not resurrect the sidecar" {

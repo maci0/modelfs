@@ -222,6 +222,27 @@ pub fn close(fd: c_int) void {
     if (fd >= 0) _ = c.close(fd);
 }
 
+/// libc fsync with EINTR retry. A raw `linux.fsync` return is a usize with
+/// -errno in the high bits, which does not fit i32 (the retry would panic
+/// in safe builds and skip in ReleaseFast).
+pub fn fsync(fd: c_int) i32 {
+    return syncFd(fd, false);
+}
+
+/// libc fdatasync with the same EINTR / -errno contract as `fsync`.
+pub fn fdatasync(fd: c_int) i32 {
+    return syncFd(fd, true);
+}
+
+fn syncFd(fd: c_int, data_only: bool) i32 {
+    while (true) {
+        const rc = if (data_only) c.fdatasync(fd) else c.fsync(fd);
+        if (rc == 0) return 0;
+        const e = errno();
+        if (e != c.EINTR) return if (e == 0) -1 else -e;
+    }
+}
+
 /// Close a write fd and return whether deallocation succeeded. NFS reports
 /// delayed write errors here; ignoring them would turn a failed ingest into
 /// a successful FUSE write over missing bytes. Linux still closes the
@@ -507,17 +528,10 @@ fn writeFileFull(path: [*:0]const u8, data: []const u8, extra_flags: c_int, dura
         return @intCast(n);
     }
     if (durable) {
-        while (true) {
-            // libc fsync: a raw linux.fsync return is a usize with -errno
-            // in the high bits, which does not fit i32 and so cannot be
-            // compared to EINTR (the retry would panic in safe builds and
-            // skip in ReleaseFast).
-            if (c.fsync(fd) == 0) break;
-            const e = errno();
-            if (e != c.EINTR) {
-                _ = closeWrite(fd);
-                return -e;
-            }
+        const sc = fsync(fd);
+        if (sc != 0) {
+            _ = closeWrite(fd);
+            return sc;
         }
     }
     return closeWrite(fd);
@@ -821,6 +835,23 @@ test "preadAll pwriteAll writeAll surface the libc errno" {
     try std.testing.expectEqual(@as(isize, -c.EBADF), preadAll(0x4000_0000, &buf, 0));
     try std.testing.expectEqual(@as(isize, -c.EBADF), pwriteAll(0x4000_0000, &buf, 0));
     try std.testing.expectEqual(@as(isize, -c.EBADF), writeAll(0x4000_0000, &buf));
+}
+
+test "fsync and fdatasync report a bad fd and succeed after a write" {
+    try std.testing.expectEqual(@as(i32, -c.EBADF), fsync(0x4000_0000));
+    try std.testing.expectEqual(@as(i32, -c.EBADF), fdatasync(0x4000_0000));
+
+    var path_buf: [128]u8 = undefined;
+    var z_buf: [128]u8 = undefined;
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/fs-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const z = try toZ(&z_buf, p);
+    const fd = open(z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, 0o644);
+    try std.testing.expect(fd >= 0);
+    defer _ = c.unlink(z);
+    try std.testing.expect(writeAll(fd, "ok") >= 0);
+    try std.testing.expectEqual(@as(i32, 0), fsync(fd));
+    try std.testing.expectEqual(@as(i32, 0), fdatasync(fd));
+    try std.testing.expectEqual(@as(i32, 0), closeWrite(fd));
 }
 
 test "closeWrite reports a bad fd and succeeds after a write" {

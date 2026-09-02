@@ -30,6 +30,15 @@ until the next tag.
 - **`modelfs peers` prints an unreadable `.cluster` on stderr.** The listing is stdout; mixing the error into it made `modelfs peers | grep live` see a diagnostic as a row. Exit 1 is unchanged. A missing `.cluster` is still an empty cluster on stdout (exit 0).
 - **`modelfs dupes --all` exits 1 when `origin/.cluster/manifests` is unreadable** (EIO, ENOTDIR, EACCES). A missing dir is still an empty scan (exit 0). Any opendir failure used to print `no manifests to compare` and exit 0. `modelfs help` names the 0/1/2 exit split.
 
+### FUSE fsync reaches the origin - 2026-09-02
+- **`fsync`/`fdatasync` through the mount now COMMITs the origin file.** An
+  unwired FUSE `fsync` returns ENOSYS, which the kernel treats as success
+  and then skips every later fsync (`no_fsync`). Ingest that called
+  `fsync` (or `cp --fsync`) then reported durability without an NFS
+  COMMIT. `Store.originFsync` opens the origin name (`O_NOFOLLOW` /
+  `O_NONBLOCK`) and `fsync`s or `fdatasync`s it. A planted symlink is
+  still `ELOOP`; a FIFO is `EINVAL` rather than a hung worker.
+
 ### FUSE unlink retry of a gone file is success - 2026-09-02
 - **`Store.unlinkOrigin` treats ENOENT as success.** `mkdir` of an existing
   directory and `rmdir` of a gone directory already converged so a FUSE
@@ -89,6 +98,7 @@ and default-behavior changes: the next tag is a minor, not a patch
 - **Discovery skips lease JSON whose `id` fails `validId`.** A planted `"id":"spark1\u200b"` is no longer a peer. `modelfs peers` still lists the document.
 - **`modelfs peers` exits 1 when `origin/.cluster` is unreadable** (EIO, ENOTDIR, EACCES), with the reason on stderr. A missing `.cluster` is still an empty cluster on stdout (exit 0). An origin I/O failure used to print `no cluster leases` on stdout and exit 0.
 - **`modelfs dupes --all` exits 1 when `origin/.cluster/manifests` is unreadable** (EIO, ENOTDIR, EACCES). A missing dir is still an empty scan (exit 0). Any opendir failure used to print `no manifests to compare` and exit 0.
+- **FUSE `fsync`/`fdatasync` COMMITs the origin file.** The kernel used to convert the unwired ENOSYS into success and skip later fsyncs. An origin fsync failure is now visible to the caller.
 
 ### Idle origin outages and metadata failures reach the tick line - 2026-09-02
 - **Lease publish and unreadable `.cluster` walks raise `origin_down`.** Discovery already wrote the origin every 10 s, but a node with no FUSE traffic left `origin_down` at 0 until the first getattr. `tickCluster` feeds the publish/refresh errno into `Store.noteOriginIo`. Write/rename and walk failures are edge-triggered (one warn, then `lease publish recovered` / `cluster leases recovered`) so a dead NFS cannot warn every tick.

@@ -1002,6 +1002,18 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     return @intCast(n);
 }
 
+export fn mf_fsync(path: [*c]const u8, datasync: c_int, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+    _ = fi;
+    const st = statePtr();
+    var rel: []const u8 = "";
+    // Lookup-shaped denial: open/write on /.cluster already fail ENOENT,
+    // so fsync must not leak that the control dir exists, and must not
+    // COMMIT lease files a FUSE client cannot see.
+    const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
+    if (rerr != 0) return rerr;
+    return st.store.originFsync(rel, datasync != 0);
+}
+
 export fn mf_release(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
@@ -1583,6 +1595,7 @@ pub fn ops() fuse.fuse_operations {
     o.read = mf_read;
     o.write = mf_write;
     o.release = mf_release;
+    o.fsync = mf_fsync;
     o.truncate = mf_truncate;
     o.unlink = mf_unlink;
     o.mkdir = mf_mkdir;
@@ -1627,6 +1640,7 @@ test "fuse operations wire every supported handler" {
     try std.testing.expectEqual(&mf_read, o.read);
     try std.testing.expectEqual(&mf_write, o.write);
     try std.testing.expectEqual(&mf_release, o.release);
+    try std.testing.expectEqual(&mf_fsync, o.fsync);
     try std.testing.expectEqual(&mf_truncate, o.truncate);
     try std.testing.expectEqual(&mf_unlink, o.unlink);
     try std.testing.expectEqual(&mf_mkdir, o.mkdir);
