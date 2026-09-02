@@ -29,6 +29,15 @@
   second authenticated 405 was added, so `zig build test` failed on that
   case. It now expects 2, matching the POST and CR/LF method refusals.
 
+### The Python gate pins ruff and mypy to the lockfile versions - 2026-09-02
+- **ruff and mypy are exact pins.** `requirements-dev.txt` named a range
+  (`mypy>=2.1,<3`, `ruff>=0.16,<0.17`) while the lock held 2.3.1 / 0.16.4, so
+  `uv pip compile` could float a newer 0.16 without a bounds-file change, and
+  ruff's `required-version` accepted any 0.16.x. Both files now pin the lock
+  versions; `scripts/sbom.py` refuses a range or a bounds/lock mismatch;
+  `scripts/check.sh` fails if the venv's ruff, mypy, or Python disagree with
+  those pins and `.python-version`.
+
 ### Mongolian FVS4 and shorthand format controls no longer pass the path and echo gates - 2026-09-02
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused.** `relOk` and `discover.printable` already refused Default_Ignorable including U+180B..U+180E, but a planted path `gguf/model\u180F.bin` or lease id `spark1\u1BCA0` still echoed as the unadorned name. Those sequences are refused now; incomplete encodings and visible neighbours in the same UTF-8 blocks (U+1810, U+1BC9F) stay legal display text.
 

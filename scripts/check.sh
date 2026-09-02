@@ -62,11 +62,43 @@ fi
 # Name every missing tool at once instead of dying mid-gate on a bare
 # "command not found"; CONTRIBUTING.md documents where each comes from.
 missing=""
-for tool in zig shellcheck ruff mypy sha256sum; do
+for tool in zig shellcheck ruff mypy python3 sha256sum; do
     command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
 done
 if [[ -n "${missing}" ]]; then
     fail "required tools not found on PATH:${missing} -- see CONTRIBUTING.md (setup section)"
+fi
+
+# The venv on PATH must be the lockfile's ruff/mypy and the interpreter
+# .python-version names. ruff's required-version also refuses a mismatch,
+# but mypy has no equivalent, and a 3.13 venv would type-check a different
+# stdlib than CI.
+lock_pin() {
+    local name="$1" ver
+    ver="$(sed -n "s/^${name}==\\([^[:space:]\\\\;]*\\).*/\\1/p" "${ROOT_DIR}/requirements-dev.lock.txt")"
+    if [[ -z "${ver}" || "${ver}" == *$'\n'* ]]; then
+        fail "cannot read a single ${name}== pin from requirements-dev.lock.txt"
+    fi
+    printf '%s' "${ver}"
+}
+ruff_want="$(lock_pin ruff)"
+ruff_have="$(ruff --version)"
+if [[ "${ruff_have}" != "ruff ${ruff_want}" ]]; then
+    fail "ruff is ${ruff_have}, lock pins ${ruff_want}; reinstall .venv from requirements-dev.lock.txt"
+fi
+mypy_want="$(lock_pin mypy)"
+mypy_have="$(mypy --version)"
+case "${mypy_have}" in
+    "mypy ${mypy_want}" | "mypy ${mypy_want} "*) ;;
+    *)
+        fail "mypy is ${mypy_have}, lock pins ${mypy_want}; reinstall .venv from requirements-dev.lock.txt"
+        ;;
+esac
+py_want="$(tr -d '[:space:]' < "${ROOT_DIR}/.python-version")"
+[[ -n "${py_want}" ]] || fail "empty .python-version"
+py_have="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+if [[ "${py_have}" != "${py_want}" ]]; then
+    fail "python ${py_have} != .python-version ${py_want}"
 fi
 
 # zig fmt does not consult build.zig.zon; catch an old toolchain here

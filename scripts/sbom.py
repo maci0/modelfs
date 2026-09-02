@@ -28,6 +28,7 @@ _HEX64 = re.compile(r"[0-9a-f]{64}")
 # matches `.minimum_zig_version` (it ends in `.version`).
 _ZON_STRING = re.compile(r'^\s*\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]+)"', re.MULTILINE)
 _BOUND = re.compile(r"^([A-Za-z0-9_.-]+)\s*(?:===|==|!=|<=|>=|~=|<|>)")
+_EXACT = re.compile(r"^([A-Za-z0-9_.-]+)==([^\\\s,;]+)$")
 _PEP503_PUNCT = re.compile(r"[-_.]+")
 _ACTION = re.compile(
     r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)"
@@ -138,6 +139,30 @@ def require_bounds_locked(bounds: list[str], packages: list[LockedPackage]) -> N
     for name in bounds:
         if _pep503(name) not in locked:
             sys.exit(f"{name} is in {_BOUNDS_REL} but missing from the lock")
+
+
+def require_exact_pins(text: str, packages: list[LockedPackage]) -> None:
+    """Bounds file must be name==version and match the lock, not a range."""
+    if not packages:
+        sys.exit(f"{_LOCK_REL} lists no packages")
+    locked = {_pep503(pkg.name): pkg.version for pkg in packages}
+    saw = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        saw = True
+        exact = _EXACT.match(line)
+        if exact is None:
+            sys.exit(f"{_BOUNDS_REL} must pin exactly (name==version), not {line!r}")
+        name, ver = exact.group(1), exact.group(2)
+        got = locked.get(_pep503(name))
+        if got is None:
+            sys.exit(f"{name} is in {_BOUNDS_REL} but missing from the lock")
+        if got != ver:
+            sys.exit(f"{name}=={ver} in {_BOUNDS_REL} does not match lock {got}")
+    if not saw:
+        sys.exit(f"{_BOUNDS_REL} lists no packages")
 
 
 def parse_sha256sums(text: str) -> list[tuple[str, str]]:
@@ -264,10 +289,9 @@ def build_bom(root: Path) -> dict[str, object]:
     version = zon_string(zon_text, "version")
     min_zig = zon_string(zon_text, "minimum_zig_version")
     packages = parse_lock((root / _LOCK_REL).read_text(encoding="utf-8"))
-    require_bounds_locked(
-        parse_bounds((root / _BOUNDS_REL).read_text(encoding="utf-8")),
-        packages,
-    )
+    bounds_text = (root / _BOUNDS_REL).read_text(encoding="utf-8")
+    require_bounds_locked(parse_bounds(bounds_text), packages)
+    require_exact_pins(bounds_text, packages)
     deb_dir = root / ".deps" / "fuse3-arm64"
     debs = parse_sha256sums((deb_dir / "SHA256SUMS").read_text(encoding="utf-8"))
     actions = load_actions(root)
@@ -392,6 +416,17 @@ def _self_test_bounds() -> None:
     _must_exit(lambda: require_bounds_locked(["mypy", "ruff"], [pkg]), "missing from the lock")
     _must_exit(lambda: require_bounds_locked(["mypy"], []), "lists no packages")
     require_bounds_locked(["Mypy"], [pkg])
+    require_exact_pins("mypy==2.3.1\n", [pkg])
+    _must_exit(lambda: require_exact_pins("mypy>=2.1,<3\n", [pkg]), "must pin exactly")
+    _must_exit(lambda: require_exact_pins("mypy==2.0.0\n", [pkg]), "does not match lock")
+    _must_exit(
+        lambda: require_exact_pins(
+            "mypy==2.3.1\n",
+            [LockedPackage(name="ruff", version="1", hashes=["a"])],
+        ),
+        "missing from the lock",
+    )
+    _must_exit(lambda: require_exact_pins("# none\n", [pkg]), "lists no packages")
 
 
 def _self_test_zon() -> None:

@@ -5,9 +5,8 @@
 # which are not pip-installable and are intentionally not listed here.
 # Install: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
 #
-# Pins: lower bound = oldest validated version, capped before the next
-# breaking release so lint/config changes cannot drift in unnoticed.
-# requirements-dev.lock.txt resolves this file to exact, sha256-pinned
-# versions; regenerate it (command in its header) after changing bounds.
-mypy>=2.1,<3
-ruff>=0.16,<0.17
+# Exact pins matching requirements-dev.lock.txt. A range here would let
+# `uv pip compile` float a newer ruff/mypy without a bounds-file diff.
+# Bump a pin, then regenerate the lock (command in its header).
+mypy==2.3.1
+ruff==0.16.4

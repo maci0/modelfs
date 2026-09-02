@@ -12,10 +12,10 @@ line-length = 100
 # Matches .python-version and the CI interpreter: the only runtimes these
 # scripts are ever installed and run under.
 target-version = "py312"
-# Same bounds as requirements-dev.txt: a bare ruff outside the pinned venv
-# with different semantics must refuse to run instead of silently
-# disagreeing with the CI gate.
-required-version = ">=0.16,<0.17"
+# Same pin as requirements-dev.txt / the lock: a bare ruff outside the
+# pinned venv with different semantics must refuse to run instead of
+# silently disagreeing with the CI gate.
+required-version = "==0.16.4"
 
 [tool.ruff.lint]
 # Every group, including preview: a new prefix that lands in the pinned
