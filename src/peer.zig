@@ -191,16 +191,18 @@ const auth_warn_min_gap_ms: i64 = 1000;
 /// per auth_warn_min_gap_ms, claimed with a CAS so concurrent handlers
 /// cannot pile up lines in the same window. The rejection itself is always
 /// counted; only the line is throttled.
-fn claimAuthWarn(self: *Server, now_ms: i64) bool {
-    const prev = self.last_auth_warn_ms.load(.monotonic);
+fn claimWarn(slot: *std.atomic.Value(i64), now_ms: i64) bool {
+    const prev = slot.load(.monotonic);
     return now_ms -| prev >= auth_warn_min_gap_ms and
-        self.last_auth_warn_ms.cmpxchgStrong(prev, now_ms, .monotonic, .monotonic) == null;
+        slot.cmpxchgStrong(prev, now_ms, .monotonic, .monotonic) == null;
+}
+
+fn claimAuthWarn(self: *Server, now_ms: i64) bool {
+    return claimWarn(&self.last_auth_warn_ms, now_ms);
 }
 
 fn claimMethodWarn(self: *Server, now_ms: i64) bool {
-    const prev = self.last_method_warn_ms.load(.monotonic);
-    return now_ms -| prev >= auth_warn_min_gap_ms and
-        self.last_method_warn_ms.cmpxchgStrong(prev, now_ms, .monotonic, .monotonic) == null;
+    return claimWarn(&self.last_method_warn_ms, now_ms);
 }
 
 test "claimAuthWarn allows one line per gap window" {
@@ -662,7 +664,7 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, idx: u32) void
         replyStatus(self, fd, "501 Not Implemented");
         return;
     }
-    if (!hydrateRange(self, fd, file, start, ln, size)) return;
+    if (!hydrateRange(self, fd, file, .{ .off = start, .len = ln }, size)) return;
     const expect = self.store.expectedHash(file, idx, sys.monoMs(self.io));
     const buf = self.gpa.alloc(u8, ln) catch {
         std.log.warn("stage buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, idx });
@@ -731,8 +733,8 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, idx: u32) void
 /// alloc/free pair per 16 MiB piece, allocated only when a covered piece
 /// actually lacks its bit: fully-cached ranges skip the allocation.
 /// Sends the error reply itself; false means streaming cannot proceed.
-fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, size: u64) bool {
-    const cov = piece.cover(.{ .off = start, .len = want }, size, self.store.piece_size);
+fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
+    const cov = piece.cover(span, file_size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
     const piece_size = self.store.piece_size;
     var pbuf: ?[]u8 = null;
@@ -845,13 +847,15 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
 /// bodyDeadlineFor): SO_SNDTIMEO resets on every drained byte, so the
 /// per-chunk clamp to its remainder is what keeps a dribbling receiver from
 /// holding an inflight slot forever.
-fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, file_size: u64, deadline_ms: i64) void {
+fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64, deadline_ms: i64) void {
     // Sendfile copies the cache fd, including sparse holes. A range the
     // bitfield cannot name would ship those zeros as a 206 body and the
     // fetching peer would mark them filled. file_size is the origin sample
     // this 206 advertised: reading file.size unlocked races a concurrent
     // truncate and can treat an untracked tail as cacheable.
-    const cache_ok = piece.rangeTracked(.{ .off = start, .len = want }, file_size, self.store.piece_size);
+    const start = span.off;
+    const want = span.len;
+    const cache_ok = piece.rangeTracked(span, file_size, self.store.piece_size);
     const cfd = if (cache_ok) self.store.openCache(file) else @as(c_int, -1);
     if (cfd >= 0) {
         var done: u64 = 0;
@@ -937,8 +941,8 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
 /// entries that predate hashing, or files with no manifest and no origin
 /// fill this session) stream as before: their provenance cannot be proven,
 /// and refusing them would turn every pre-upgrade cache into a full refill.
-fn verifyRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, start: u64, want: u64, size: u64) bool {
-    const cov = piece.cover(.{ .off = start, .len = want }, size, self.store.piece_size);
+fn verifyRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
+    const cov = piece.cover(span, file_size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
     const piece_size = self.store.piece_size;
     var pbuf: ?[]u8 = null;
@@ -952,7 +956,7 @@ fn verifyRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
         // serving node must not hold file locks across it, and this loop
         // holds none.
         const expect = self.store.expectedHash(file, pi, now_ms) orelse continue;
-        const ln = piece.len(size, pi, piece_size);
+        const ln = piece.len(file_size, pi, piece_size);
         if (ln == 0) continue;
         if (pbuf == null)
             pbuf = self.gpa.alloc(u8, piece_size) catch {
@@ -1013,11 +1017,11 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     defer _ = file.xfer.fetchSub(1, .monotonic);
     const want = rg_end -| rg.start +| 1;
 
-    if (!hydrateRange(self, fd, file, rg.start, want, size)) return;
+    if (!hydrateRange(self, fd, file, .{ .off = rg.start, .len = want }, size)) return;
     // At-rest verification before the 206 goes on the wire: hydrated pieces
     // were verified at admit, and cached pieces must still match their
     // trusted digest or they are not served (verifyRange replies 500).
-    if (!verifyRange(self, fd, file, rg.start, want, size)) return;
+    if (!verifyRange(self, fd, file, .{ .off = rg.start, .len = want }, size)) return;
 
     var hdr: [220]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {d}-{d}/{d}\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
@@ -1039,7 +1043,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
     _ = self.store.stats.bytes_to_peer.fetchAdd(want, .monotonic);
 
-    streamRange(self, fd, file, rg.start, want, size, bodyDeadlineFor(self.io, want));
+    streamRange(self, fd, file, .{ .off = rg.start, .len = want }, size, bodyDeadlineFor(self.io, want));
 }
 
 fn reply(fd: std.posix.fd_t, s: []const u8) void {
@@ -2211,7 +2215,7 @@ test "streamRange honors the response body budget in both directions" {
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
         const t0 = sys.monoMs(std.testing.io);
-        streamRange(&srv.server, pair[1], f, 0, pattern.len, pattern.len, t0 - 1);
+        streamRange(&srv.server, pair[1], f, .{ .off = 0, .len = pattern.len }, pattern.len, t0 - 1);
         try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
         var probe: [1]u8 = undefined;
         try std.testing.expect(c.recv(pair[0], &probe, probe.len, c.MSG_PEEK | c.MSG_DONTWAIT) < 0);
@@ -2221,7 +2225,7 @@ test "streamRange honors the response body budget in both directions" {
         const pair = try responsePair("");
         defer sys.close(pair[0]);
         defer sys.close(pair[1]);
-        streamRange(&srv.server, pair[1], f, 0, pattern.len, pattern.len, sys.monoMs(std.testing.io) + 60_000);
+        streamRange(&srv.server, pair[1], f, .{ .off = 0, .len = pattern.len }, pattern.len, sys.monoMs(std.testing.io) + 60_000);
         var got: [pattern.len]u8 = undefined;
         const n = sys.readOnce(pair[0], &got) catch 0;
         try std.testing.expectEqual(@as(usize, got.len), n);

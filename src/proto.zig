@@ -3,6 +3,7 @@
 //! the HTTP server and client.
 const std = @import("std");
 const fuzzcorpus = @import("fuzzcorpus.zig");
+const piece = @import("piece.zig");
 
 const unreserved_lut: [256]bool = blk: {
     var tbl = [_]bool{false} ** 256;
@@ -327,7 +328,7 @@ pub const HaveBits = struct {
     /// different byte ranges than ours.
     pub fn hasPiece(self: HaveBits, idx: u32, local_piece_size: u32) bool {
         if (self.piece_size != 0 and self.piece_size != local_piece_size) return false;
-        return idx / 8 < self.bits.len and (self.bits[idx / 8] & (@as(u8, 1) << @intCast(idx % 8))) != 0;
+        return piece.bitIsSet(self.bits, idx);
     }
 };
 

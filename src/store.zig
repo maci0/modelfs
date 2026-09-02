@@ -1705,7 +1705,7 @@ pub const Store = struct {
     /// name (piece index past u32, after count() clamps) is never filled:
     /// cover() of that tail is empty, which would otherwise look like a hit
     /// and serve hole zeros.
-    pub fn rangeFilled(file: *Cached, file_size: u64, span: piece.Span, piece_size: u32) bool {
+    pub fn rangeFilled(file: *Cached, span: piece.Span, file_size: u64, piece_size: u32) bool {
         if (!piece.rangeTracked(span, file_size, piece_size)) return false;
         const cov = piece.cover(span, file_size, piece_size);
         return file.bits.allSet(cov.start, cov.end);
@@ -1873,7 +1873,7 @@ pub const Store = struct {
     /// non-directory at that name (file, symlink) stays EEXIST, the
     /// origin's own POSIX answer. Empty rel is the origin root: mkdir of
     /// an existing directory still converges.
-    pub fn mkdirOrigin(self: Store, rel: []const u8, mode: c.mode_t) i32 {
+    pub fn mkdirOrigin(self: *const Store, rel: []const u8, mode: c.mode_t) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const op = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
         const rc = sys.mkdir(op, mode);
@@ -1890,7 +1890,7 @@ pub const Store = struct {
     /// that name stays ENOTDIR and a non-empty directory stays ENOTEMPTY,
     /// the origin's own POSIX answers. Empty rel is the origin root and
     /// is EBUSY: rmdir of FUSE "/" must not delete the export.
-    pub fn rmdirOrigin(self: Store, rel: []const u8) i32 {
+    pub fn rmdirOrigin(self: *const Store, rel: []const u8) i32 {
         if (rel.len == 0) return -c.EBUSY;
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const op = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
@@ -2713,16 +2713,16 @@ test "rangeFilled is true only when every covered piece is marked" {
     };
     defer file.hashes.deinit();
     const ps: u32 = 16;
-    try std.testing.expect(Store.rangeFilled(&file, 64, .{ .off = 0, .len = 16 }, ps));
-    try std.testing.expect(Store.rangeFilled(&file, 64, .{ .off = 0, .len = 32 }, ps));
-    try std.testing.expect(!Store.rangeFilled(&file, 64, .{ .off = 0, .len = 33 }, ps));
-    try std.testing.expect(!Store.rangeFilled(&file, 64, .{ .off = 32, .len = 16 }, ps));
-    try std.testing.expect(Store.rangeFilled(&file, 64, .{ .off = 100, .len = 8 }, ps));
+    try std.testing.expect(Store.rangeFilled(&file, .{ .off = 0, .len = 16 }, 64, ps));
+    try std.testing.expect(Store.rangeFilled(&file, .{ .off = 0, .len = 32 }, 64, ps));
+    try std.testing.expect(!Store.rangeFilled(&file, .{ .off = 0, .len = 33 }, 64, ps));
+    try std.testing.expect(!Store.rangeFilled(&file, .{ .off = 32, .len = 16 }, 64, ps));
+    try std.testing.expect(Store.rangeFilled(&file, .{ .off = 100, .len = 8 }, 64, ps));
     // Piece-size 1 past 4 GiB: cover() of the tail is empty (indexAt
     // clamps), which used to look filled.
     const tail_off: u64 = std.math.maxInt(u32);
-    try std.testing.expect(!Store.rangeFilled(&file, tail_off + 100, .{ .off = tail_off, .len = 8 }, 1));
-    try std.testing.expect(!Store.rangeFilled(&file, tail_off + 100, .{ .off = tail_off - 10, .len = 20 }, 1));
+    try std.testing.expect(!Store.rangeFilled(&file, .{ .off = tail_off, .len = 8 }, tail_off + 100, 1));
+    try std.testing.expect(!Store.rangeFilled(&file, .{ .off = tail_off - 10, .len = 20 }, tail_off + 100, 1));
 }
 
 test "cacheFill grows entry preserving earlier piece marks" {

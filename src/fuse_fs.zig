@@ -695,11 +695,12 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
     return 0;
 }
 
-/// fsize must be a size sample taken under file.mu by the caller (the same
-/// sample that bounded n): cover() then agrees with the bounds check instead
-/// of racing a concurrent truncate on an unlocked file.size read.
-fn ensureRange(st: *State, file: *store_mod.Store.Cached, fsize: u64, off: u64, n: u64) i32 {
-    const cov = piece.cover(.{ .off = off, .len = n }, fsize, st.store.piece_size);
+/// `file_size` must be a size sample taken under file.mu by the caller (the
+/// same sample that bounded `span`): cover() then agrees with the bounds
+/// check instead of racing a concurrent truncate on an unlocked file.size
+/// read.
+fn ensureRange(st: *State, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) i32 {
+    const cov = piece.cover(span, file_size, st.store.piece_size);
     if (cov.start >= cov.end) return 0;
     // One reusable buffer for every hydrated piece in the range, allocated
     // only when some covered piece actually lacks its bit: warm reads (every
@@ -723,11 +724,11 @@ fn ensureRange(st: *State, file: *store_mod.Store.Cached, fsize: u64, off: u64, 
     return 0;
 }
 
-/// Serve `buf` at `off` after hydrating any missing pieces. A failed fill
-/// (dead/full cache, discarded claim) must not black-hole a healthy origin:
-/// `readServed` already degrades a failed cache pread, and this is the
-/// matching miss-path policy. Returning the hydration errno without the
-/// origin read turned a cache-disk failure into a total read outage.
+/// Serve `buf` at `span.off` after hydrating any missing pieces. A failed
+/// fill (dead/full cache, discarded claim) must not black-hole a healthy
+/// origin: `readServed` already degrades a failed cache pread, and this is
+/// the matching miss-path policy. Returning the hydration errno without
+/// the origin read turned a cache-disk failure into a total read outage.
 /// Origin-down fails here too: `originPread` returns the same class of
 /// error, and the caller publishes the hydration errno so the first
 /// failure stays named.
@@ -736,13 +737,14 @@ fn serveHydrated(
     file: *store_mod.Store.Cached,
     rel: []const u8,
     buf: []u8,
-    off: u64,
-    fsize: u64,
+    span: piece.Span,
+    file_size: u64,
     ready: bool,
 ) isize {
-    const rc = if (ready) 0 else ensureRange(st, file, fsize, off, buf.len);
-    if (rc == 0) return st.store.readServed(file, buf, off, sys.monoSec(st.io));
-    const got = st.store.originPread(rel, buf, off);
+    std.debug.assert(span.len == buf.len);
+    const rc = if (ready) 0 else ensureRange(st, file, span, file_size);
+    if (rc == 0) return st.store.readServed(file, buf, span.off, sys.monoSec(st.io));
+    const got = st.store.originPread(rel, buf, span.off);
     if (got >= 0) {
         std.log.warn("hydration failed for {s} (errno {d}); serving this read from origin", .{ rel, -rc });
         return got;
@@ -826,9 +828,9 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
         return 0;
     }
     const n = @min(want, @as(usize, @intCast(fsize - uoff)));
-    const ready = store_mod.Store.rangeFilled(file, fsize, .{ .off = uoff, .len = @as(u64, n) }, st.store.piece_size);
+    const ready = store_mod.Store.rangeFilled(file, .{ .off = uoff, .len = @as(u64, n) }, fsize, st.store.piece_size);
     file.mu.unlock(st.io);
-    const got = serveHydrated(st, file, rel, buf[0..n], uoff, fsize, ready);
+    const got = serveHydrated(st, file, rel, buf[0..n], .{ .off = uoff, .len = n }, fsize, ready);
     if (got < 0) {
         // The failing tier kept its own fill_err_* count; the op-level
         // counter must still see the read fail, or error-rate alerts keying
@@ -1869,7 +1871,7 @@ test "serveHydrated falls back to origin when the cache cannot land a fill" {
     defer std.testing.log_level = prev_log_level;
 
     var rb: [16]u8 = undefined;
-    const n = serveHydrated(&st, file, "fb.bin", &rb, 0, pattern.len, false);
+    const n = serveHydrated(&st, file, "fb.bin", &rb, .{ .off = 0, .len = rb.len }, pattern.len, false);
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
     try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
     try std.testing.expect(!st.store.hasPiece(file, 0, sys.monoSec(st.io)));

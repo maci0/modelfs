@@ -38,17 +38,32 @@ pub fn count(file_size: u64, piece_size: u32) u32 {
     return @intCast(@min(divCeilSat(file_size, @as(u64, piece_size)), @as(u64, std.math.maxInt(u32))));
 }
 
-/// The pwrite address of piece idx. A u64 product of two u32 values cannot
+/// The pwrite address of piece `idx`. A u64 product of two u32 values cannot
 /// overflow, so no pow2 fast path is needed here (unlike indexAt's divide).
-pub fn offset(index: u32, piece_size: u32) u64 {
-    return @as(u64, index) * piece_size;
+pub fn offset(idx: u32, piece_size: u32) u64 {
+    return @as(u64, idx) * piece_size;
 }
 
-pub fn len(file_size: u64, index: u32, piece_size: u32) u32 {
-    const start = offset(index, piece_size);
+pub fn len(file_size: u64, idx: u32, piece_size: u32) u32 {
+    const start = offset(idx, piece_size);
     if (start >= file_size) return 0;
     const remain = file_size - start;
     return @intCast(@min(remain, piece_size));
+}
+
+/// Byte offset of bit `idx` in a packed little-endian bitfield. Floor
+/// division: bits 0..7 live in byte 0.
+pub fn bitByte(idx: u32) usize {
+    return @divFloor(@as(usize, idx), 8);
+}
+
+/// Whether bit `idx` is set in packed little-endian `bytes`. An index past
+/// the slice is unset. Shared by Bitfield.get and the /have wire bitmap so
+/// the two cannot disagree on the packing.
+pub fn bitIsSet(bytes: []const u8, idx: u32) bool {
+    const byte_i = bitByte(idx);
+    if (byte_i >= bytes.len) return false;
+    return bytes[byte_i] & (@as(u8, 1) << @intCast(idx % 8)) != 0;
 }
 
 fn indexAt(file_off: u64, piece_size: u32) u32 {
@@ -169,7 +184,7 @@ pub const Bitfield = struct {
 
     pub fn get(self: Bitfield, i: u32) bool {
         if (i >= self.nbits) return false;
-        return self.bytes[i / 8] & (@as(u8, 1) << @intCast(i % 8)) != 0;
+        return bitIsSet(self.bytes, i);
     }
 
     /// True when every bit in [start, end) is set. An empty span is vacuously
@@ -184,11 +199,11 @@ pub const Bitfield = struct {
             if (!self.get(i)) return false;
         }
         while (end - i >= 64) : (i += 64) {
-            const w = std.mem.readInt(u64, self.bytes[i / 8 ..][0..8], .little);
+            const w = std.mem.readInt(u64, self.bytes[bitByte(i)..][0..8], .little);
             if (w != std.math.maxInt(u64)) return false;
         }
         while (end - i >= 8) : (i += 8) {
-            if (self.bytes[i / 8] != 0xff) return false;
+            if (self.bytes[bitByte(i)] != 0xff) return false;
         }
         while (i < end) : (i += 1) {
             if (!self.get(i)) return false;
@@ -198,12 +213,12 @@ pub const Bitfield = struct {
 
     pub fn set(self: *Bitfield, i: u32) void {
         if (i >= self.nbits) return;
-        self.bytes[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+        self.bytes[bitByte(i)] |= @as(u8, 1) << @intCast(i % 8);
     }
 
     pub fn clear(self: *Bitfield, i: u32) void {
         if (i >= self.nbits) return;
-        self.bytes[i / 8] &= ~(@as(u8, 1) << @intCast(i % 8));
+        self.bytes[bitByte(i)] &= ~(@as(u8, 1) << @intCast(i % 8));
     }
 
     pub fn filled(self: Bitfield) u32 {
@@ -619,6 +634,17 @@ test "piece count and cover" {
     try std.testing.expectEqual(@as(u32, 4), indexAt(16384, 4096));
 }
 
+test "bitIsSet packs little-endian and stops at the slice" {
+    try std.testing.expectEqual(@as(usize, 0), bitByte(0));
+    try std.testing.expectEqual(@as(usize, 0), bitByte(7));
+    try std.testing.expectEqual(@as(usize, 1), bitByte(8));
+    var bits = [_]u8{ 0b0000_0001, 0b1000_0000 };
+    try std.testing.expect(bitIsSet(&bits, 0));
+    try std.testing.expect(!bitIsSet(&bits, 1));
+    try std.testing.expect(bitIsSet(&bits, 15));
+    try std.testing.expect(!bitIsSet(&bits, 16));
+}
+
 test "bitfield set get persist" {
     const gpa = std.testing.allocator;
     var bf = try Bitfield.init(gpa, 10);
@@ -940,7 +966,7 @@ fn fuzzBitfieldDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
         const copy = @min(Bitfield.bytesLen(bf.nbits), src.len);
         var i: u32 = 0;
         while (i < bf.nbits) : (i += 1) {
-            const kept = i / 8 < copy and (src[i / 8] >> @as(u3, @intCast(i % 8))) & 1 != 0;
+            const kept = bitByte(i) < copy and (src[bitByte(i)] >> @as(u3, @intCast(i % 8))) & 1 != 0;
             try std.testing.expectEqual(kept, bf.get(i));
         }
     } else {
