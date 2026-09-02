@@ -88,9 +88,10 @@ const usage =
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID (mount only, like --id) MODELFS_LOG set the same values
     \\as their flags; an explicit flag wins. MODELFS_PSK_VALUE cannot be
-    \\combined with --psk or MODELFS_PSK on mount. A PSK file or
-    \\MODELFS_PSK_VALUE is trimmed of surrounding whitespace. An empty
-    \\environment value counts as unset (defaults apply).
+    \\combined with --psk or MODELFS_PSK on mount. Every MODELFS_* value
+    \\is trimmed of surrounding whitespace. An empty or whitespace-only
+    \\value counts as unset (defaults apply), except a whitespace-only
+    \\MODELFS_PSK_VALUE which is refused as empty.
     \\
     \\Examples:
     \\  modelfs mount /models --origin /net/192.168.0.100/models
@@ -413,10 +414,16 @@ fn classifyMeta(args: []const []const u8) enum { none, help, version, bad } {
 /// it falls through to the default like an unset variable instead of
 /// replacing a usable path with "" or bricking every mount with BadId on a
 /// value that never appears anywhere. Explicit empty flags keep their
-/// meaning -- `--id ""` is still refused.
+/// meaning -- `--id ""` is still refused. Surrounding whitespace is not
+/// part of the value (EnvironmentFile trailing space, a copied path with a
+/// newline): trimmed first, and a whitespace-only remainder counts as unset
+/// the same way. MODELFS_PSK_VALUE is the exception -- a whitespace-only
+/// secret still reaches loadPsk so it can refuse EmptyPsk rather than
+/// falling through to the PSK file.
 fn envValue(environ: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
     const v = environ.get(name) orelse return null;
-    return if (v.len == 0) null else v;
+    const trimmed = std.mem.trim(u8, v, " \t\r\n");
+    return if (trimmed.len == 0) null else trimmed;
 }
 
 /// MODELFS_LOG / --log values name a std.log.Level exactly; anything else
@@ -503,14 +510,33 @@ fn pathsOverlap(a: []const u8, b: []const u8) bool {
 }
 
 /// True when the (already realpathed) path names an existing directory.
-/// Both --origin consumers gate on this right after their reachability
+/// Every --origin consumer gates on this right after their reachability
 /// check: a regular file realpaths fine, but leases can never live under
 /// it (.cluster creation fails every tick) and joined relpath reads all
 /// die ENOTDIR behind the NFS fallback, so accepting it would trade one
-/// named refusal now for a silently dead origin.
+/// named refusal now for a silently dead origin (or, for dupes --all, an
+/// empty scan that exits 0).
 fn pathIsDir(zp: [*:0]const u8) bool {
     var st: sys.c.struct_stat = undefined;
     return sys.statPath(zp, &st) == 0 and (st.st_mode & sys.c.S_IFMT) == sys.c.S_IFDIR;
+}
+
+/// Realpath of an --origin that exists as a directory. Unreachable paths
+/// and regular files fail with the same named messages mount already used,
+/// so peers/verify/dupes cannot read a typo or a file as an empty cluster
+/// or an empty duplicate scan.
+fn resolveOriginDir(gpa: std.mem.Allocator, origin: []const u8) ![]u8 {
+    const real = sys.realpathAlloc(gpa, origin) catch {
+        if (!builtin.is_test) std.log.err("origin {s} is not reachable", .{origin});
+        return error.BadPath;
+    };
+    errdefer gpa.free(real);
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    if (!if (sys.toZ(&zbuf, real)) |z| pathIsDir(z) else |_| false) {
+        if (!builtin.is_test) std.log.err("origin {s} is not a directory", .{origin});
+        return error.NotDir;
+    }
+    return real;
 }
 
 /// Refuses mount-only knobs on the other commands, as the help text promises
@@ -600,8 +626,13 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // The only inline-secret spelling: no flag carries the secret, because
     // argv is world-readable through /proc/<pid>/cmdline while the
     // environment block is readable only by the process owner and root.
-    // For scripted mounts that cannot place a PSK file.
-    if (envValue(environ, "MODELFS_PSK_VALUE")) |v| opts.psk_value = v;
+    // For scripted mounts that cannot place a PSK file. Trimmed like the
+    // file form, but a whitespace-only value stays set so loadPsk can
+    // refuse EmptyPsk instead of envValue treating it as unset and
+    // falling through to /etc/modelfs.psk.
+    if (environ.get("MODELFS_PSK_VALUE")) |raw| {
+        if (raw.len != 0) opts.psk_value = std.mem.trim(u8, raw, " \t\r\n");
+    }
     // The journal is the only configuration observability this daemon has,
     // so the ceiling is movable per environment: MODELFS_LOG=err quiets a
     // cron'd status loop, debug aids a misbehaving mount. Applied for every
@@ -768,7 +799,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             }
         } else if (std.mem.eql(u8, flag, "--seed")) {
             try rejectOutsideMount(cmd, flag);
-            const s = try takeValue(args, flag, &i, inline_val);
+            // Same surrounding-space trim --advertise applies to each
+            // comma-separated token: a quoted " 10.0.0.9" is the address,
+            // not a hostname parseHostPort would then reject.
+            const s = std.mem.trim(u8, try takeValue(args, flag, &i, inline_val), " \t");
             // Validate now with a named message instead of failing later in
             // mount setup with a bare parseInt error.
             const hp = parseHostPort(s) catch |err| {
@@ -1069,20 +1103,8 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         std.debug.print("mount needs --origin (the NFS path, e.g. /mnt/nas/models; or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
-    const origin = sys.realpathAlloc(gpa, origin_raw) catch {
-        std.log.err("origin {s} is not reachable", .{origin_raw});
-        return 1;
-    };
+    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
     defer gpa.free(origin);
-    // Reachable is not enough: a regular file realpaths fine but cannot
-    // hold .cluster leases or serve joined relpath reads. Refused before
-    // the mountpoint or cache is touched, like the dependent-path gates
-    // below.
-    var ozbuf: [sys.c.PATH_MAX]u8 = undefined;
-    if (!if (sys.toZ(&ozbuf, origin)) |z| pathIsDir(z) else |_| false) {
-        std.log.err("origin {s} is not a directory", .{origin});
-        return 1;
-    }
 
     const mount_abs = ensureDirReal(gpa, mount, "mountpoint") catch return 1;
     defer gpa.free(mount_abs);
@@ -1375,22 +1397,10 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         std.debug.print("peers needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
-    // Same reachability gate mount applies to --origin: a typo'd path must
-    // fail loudly instead of reading as an empty cluster through the
-    // missing-.cluster branch below.
-    const real = sys.realpathAlloc(gpa, origin) catch {
-        if (!builtin.is_test) std.log.err("origin {s} is not reachable", .{origin});
-        return 1;
-    };
+    // Same reachability and directory gate mount applies: a typo'd path or
+    // a regular file must fail loudly instead of listing as an empty cluster.
+    const real = resolveOriginDir(gpa, origin) catch return 1;
     defer gpa.free(real);
-    // And the same non-directory gate: a file at --origin can never hold
-    // .cluster leases, so listing it as an empty cluster would read a dead
-    // origin as healthy.
-    var rzbuf: [sys.c.PATH_MAX]u8 = undefined;
-    if (!if (sys.toZ(&rzbuf, real)) |z| pathIsDir(z) else |_| false) {
-        if (!builtin.is_test) std.log.err("origin {s} is not a directory", .{origin});
-        return 1;
-    }
 
     // Collect before printing: readdir order is filesystem-dependent (and
     // the origin is NFS), so sorting by lease file name keeps the listing a
@@ -1580,10 +1590,12 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
 /// clearing anything: without a reference there is nothing to compare
 /// against.
 fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !u8 {
-    const origin = opts.origin orelse {
+    const origin_raw = opts.origin orelse {
         std.debug.print("verify needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
+    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    defer gpa.free(origin);
     const cache = opts.cache;
     if (cache.len == 0) {
         std.debug.print("verify needs --cache (or MODELFS_CACHE)\n", .{});
@@ -2380,6 +2392,28 @@ test "cmdPeers separates unreachable origins from empty clusters" {
     try std.testing.expectEqual(@as(u8, 1), try cmdPeers(std.testing.io, gpa, .{ .origin = file_origin }));
 }
 
+test "verify and dupes refuse a file origin instead of scanning empty" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const scratch = try sys.scratchDir(&cb, "modelfs-origin-file");
+    defer sys.deleteTree(std.testing.io, scratch);
+    var zb: [256]u8 = undefined;
+    var fb: [160]u8 = undefined;
+    const file_origin = try std.fmt.bufPrint(&fb, "{s}/regular", .{scratch});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, file_origin), "x"));
+    var nb: [160]u8 = undefined;
+    const absent = try std.fmt.bufPrint(&nb, "{s}/does-not-exist", .{scratch});
+
+    // dupes --all used to opendir-fail and print "no manifests to compare"
+    // with exit 0, the same reading as a healthy empty origin.
+    try std.testing.expectEqual(@as(u8, 1), try cmdDupesAll(std.testing.io, gpa, .{ .origin = file_origin }));
+    try std.testing.expectEqual(@as(u8, 1), try cmdDupesAll(std.testing.io, gpa, .{ .origin = absent }));
+    try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, .{ .origin = file_origin }, &.{"a.bin"}));
+    try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, .{ .origin = absent }, &.{"a.bin"}));
+    try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, .{ .origin = file_origin, .cache = scratch, .piece = 16 }, "m.bin"));
+    try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, .{ .origin = absent, .cache = scratch, .piece = 16 }, "m.bin"));
+}
+
 test "cmdPeers skips an unleasable lease entry instead of failing the listing" {
     const gpa = std.testing.allocator;
     var cb: [128]u8 = undefined;
@@ -2603,10 +2637,12 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
 /// <rel>...` names specific pairs. Reads manifests only, never model
 /// bytes. A missing manifests dir is an empty scan, not an error.
 fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
-    const origin = opts.origin orelse {
+    const origin_raw = opts.origin orelse {
         std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
+    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    defer gpa.free(origin);
     var dbuf: [sys.c.PATH_MAX]u8 = undefined;
     const dirz = sys.joinZ(&dbuf, origin, store_mod.Store.manifests_dir) catch {
         if (!builtin.is_test) std.log.err("manifest dir path too long at {s}", .{origin});
@@ -2690,10 +2726,12 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 /// manifest (never ingested through modelfs, or never fully hashed) is
 /// reported as such and contributes nothing.
 fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []const u8) !u8 {
-    const origin = opts.origin orelse {
+    const origin_raw = opts.origin orelse {
         std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
+    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    defer gpa.free(origin);
     // Gate every rel before any origin I/O (same refusals as verify): a
     // bad path must not create cache dirs or read anything.
     for (paths) |path| {
@@ -3289,6 +3327,70 @@ test "empty environment variables read as unset" {
     }
 }
 
+test "parseArgs trims surrounding whitespace on environment values" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    // EnvironmentFile trailing space and a copied path with a newline must
+    // not become the path (realpath would then fail as "not reachable").
+    try environ.put("MODELFS_ORIGIN", " /env/origin \n");
+    try environ.put("MODELFS_CACHE", "\t/env/cache ");
+    try environ.put("MODELFS_PSK", " /env/psk\r\n");
+    try environ.put("MODELFS_ID", " spark-env ");
+    try environ.put("MODELFS_LOG", " debug ");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("/env/origin", parsed.opts.origin.?);
+        try std.testing.expectEqualStrings("/env/cache", parsed.opts.cache);
+        try std.testing.expectEqualStrings("/env/psk", parsed.opts.psk_file);
+        try std.testing.expectEqualStrings("spark-env", parsed.opts.id.?);
+        try std.testing.expectEqual(std.log.Level.debug, parsed.opts.log_level);
+    }
+    // Whitespace-only non-secret knobs count as unset, like an empty export.
+    try environ.put("MODELFS_ORIGIN", "  \t");
+    try environ.put("MODELFS_CACHE", " \n");
+    try environ.put("MODELFS_PSK", " ");
+    try environ.put("MODELFS_ID", " ");
+    try environ.put("MODELFS_LOG", "  ");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expect(parsed.opts.origin == null);
+        try std.testing.expectEqualStrings("/var/cache/modelfs", parsed.opts.cache);
+        try std.testing.expectEqualStrings("/etc/modelfs.psk", parsed.opts.psk_file);
+        try std.testing.expect(parsed.opts.id == null);
+        try std.testing.expectEqual(std.log.Level.info, parsed.opts.log_level);
+    }
+    // Interior spaces in an id survive the trim (validId allows them).
+    try environ.put("MODELFS_ID", " spark 1 ");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("spark 1", parsed.opts.id.?);
+    }
+    _ = environ.orderedRemove("MODELFS_PSK");
+    _ = environ.orderedRemove("MODELFS_ID");
+    // A whitespace-only inline secret is not "unset": falling through to
+    // the PSK file would start with a different credential than the
+    // operator just tried to set. loadPsk refuses it as empty.
+    try environ.put("MODELFS_PSK_VALUE", " \t\n");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("", parsed.opts.psk_value.?);
+        try std.testing.expectError(error.EmptyPsk, loadPsk(gpa, parsed.opts));
+    }
+    // Surrounding whitespace on a real secret is stripped; interior spaces
+    // stay, matching loadPsk's file-form trim.
+    try environ.put("MODELFS_PSK_VALUE", "  top secret \n");
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("top secret", parsed.opts.psk_value.?);
+    }
+}
+
 test "parseLogLevel accepts the documented names only" {
     try std.testing.expectEqual(std.log.Level.err, parseLogLevel("err").?);
     try std.testing.expectEqual(std.log.Level.warn, parseLogLevel("warn").?);
@@ -3482,6 +3584,16 @@ test "parseArgs trims whitespace in --advertise lists" {
     try std.testing.expectEqual(@as(u16, proto.default_port), parsed.opts.advertise.items[0].port);
     try std.testing.expectEqualStrings("10.0.0.2", parsed.opts.advertise.items[1].ip);
     try std.testing.expectEqual(@as(u16, 19091), parsed.opts.advertise.items[1].port);
+}
+
+test "parseArgs trims surrounding whitespace on --seed" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--seed", " 10.0.0.9:19099 " });
+    defer freeParsed(parsed, gpa);
+    try std.testing.expectEqual(@as(usize, 1), parsed.opts.seed.items.len);
+    try std.testing.expectEqualStrings("10.0.0.9:19099", parsed.opts.seed.items[0]);
 }
 
 test "parseArgs treats everything after -- as positional" {

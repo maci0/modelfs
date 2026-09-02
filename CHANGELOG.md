@@ -12,6 +12,10 @@
 ### Origin and cache joins refuse a traversal rel - 2026-09-02
 - **`Store.originPath` and the cache-subdir join refuse a rel that fails `relOk`.** Empty rel still names the origin or cache subdir root (FUSE `/`); anything else that would join `..` into those trees now fails closed at the join, matching the FUSE/peer/CLI gates.
 
+### Env whitespace trim and origin directory gate on verify/dupes - 2026-09-02
+- **Every `MODELFS_*` value is trimmed of surrounding whitespace.** An EnvironmentFile trailing space or a copied path with a newline used to become the path (`MODELFS_ORIGIN=/nas/models ` failed later as "not reachable"; `MODELFS_ID=spark1 ` published a different cluster id). Empty or whitespace-only now counts as unset, matching an empty export. `MODELFS_PSK_VALUE` is the exception: a whitespace-only inline secret is still refused as empty rather than falling through to the PSK file. `--seed` trims the same way `--advertise` already trimmed each address.
+- **`modelfs verify` and `modelfs dupes` refuse a file or unreachable `--origin`.** `dupes --all` used to treat a regular file at `--origin` as an empty scan and exit 0. Mount and peers already had the directory gate; `resolveOriginDir` is the shared check.
+
 ### Mongolian FVS4 and shorthand format controls no longer pass the path and echo gates - 2026-09-02
 - **U+180F and U+1BCA0..U+1BCA3 in paths are refused.** `relOk` and `discover.printable` already refused Default_Ignorable including U+180B..U+180E, but a planted path `gguf/model\u180F.bin` or lease id `spark1\u1BCA0` still echoed as the unadorned name. Those sequences are refused now; incomplete encodings and visible neighbours in the same UTF-8 blocks (U+1810, U+1BC9F) stay legal display text.
 
