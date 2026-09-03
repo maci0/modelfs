@@ -37,7 +37,7 @@ jobs:
         run: ./scripts/build_static.sh ${{ matrix.target }} --prefix .scratch/release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: modelfs-${{ matrix.target }}
+          name: rel-${{ matrix.target }}
           path: .scratch/release/modelfs-*
           if-no-files-found: error
 
@@ -58,11 +58,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          # The rel-* prefix keeps the artifact directories from colliding
+          # with the binaries' own names; after the flatten, the SHA256SUMS
+          # lines name exactly the assets a downloader sees.
+          mv dist/rel-*/modelfs-* dist/
+          rmdir dist/rel-*
           cd dist
-          # Flatten the artifact directories so the SHA256SUMS lines name
-          # exactly the asset names a downloader sees.
-          mv modelfs-*/* .
-          rmdir modelfs-*
           rm -f SHA256SUMS
           sha256sum modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl > SHA256SUMS
           cat SHA256SUMS
