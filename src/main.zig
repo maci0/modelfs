@@ -584,8 +584,8 @@ fn pathIsDir(zp: [*:0]const u8) bool {
 /// and regular files fail with the same named messages mount already used,
 /// so peers/verify/dupes cannot read a typo or a file as an empty cluster
 /// or an empty duplicate scan.
-fn resolveOriginDir(gpa: std.mem.Allocator, origin: []const u8) ![]u8 {
-    const real = sys.realpathAlloc(gpa, origin) catch {
+fn resolveOriginDir(io: std.Io, gpa: std.mem.Allocator, origin: []const u8) ![]u8 {
+    const real = sys.realpathAlloc(io, gpa, origin) catch {
         if (!builtin.is_test) std.log.err("origin {s} is not reachable", .{origin});
         return error.BadPath;
     };
@@ -1060,14 +1060,14 @@ fn dupeHeaderSafePsk(gpa: std.mem.Allocator, secret: []const u8) ![]u8 {
 
 /// realpath of path, creating the directory first when missing. label names
 /// the directory ("mountpoint", "cache") in failure messages.
-fn ensureDirReal(gpa: std.mem.Allocator, path: []const u8, label: []const u8) ![]u8 {
-    const abs = sys.realpathAlloc(gpa, path) catch blk: {
+fn ensureDirReal(io: std.Io, gpa: std.mem.Allocator, path: []const u8, label: []const u8) ![]u8 {
+    const abs = sys.realpathAlloc(io, gpa, path) catch blk: {
         const rc = sys.mkdirAll(path, 0o755);
         if (rc != 0) {
             std.log.err("cannot create {s} {s} (errno {d})", .{ label, path, -rc });
             return error.MkdirFailed;
         }
-        break :blk sys.realpathAlloc(gpa, path) catch {
+        break :blk sys.realpathAlloc(io, gpa, path) catch {
             std.log.err("{s} {s} is not reachable", .{ label, path });
             return error.BadPath;
         };
@@ -1174,13 +1174,13 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         std.debug.print("mount needs --origin (the NFS path, e.g. /mnt/nas/models; or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
-    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    const origin = resolveOriginDir(init.io, gpa, origin_raw) catch return 1;
     defer gpa.free(origin);
 
-    const mount_abs = ensureDirReal(gpa, mount, "mountpoint") catch return 1;
+    const mount_abs = ensureDirReal(init.io, gpa, mount, "mountpoint") catch return 1;
     defer gpa.free(mount_abs);
 
-    const cache = ensureDirReal(gpa, opts.cache, "cache") catch return 1;
+    const cache = ensureDirReal(init.io, gpa, opts.cache, "cache") catch return 1;
     defer gpa.free(cache);
 
     // Dependent-path gate: the kernel routes by mount, so origin preads or
@@ -1307,7 +1307,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     // killed by the absence of this line. A nonzero rc means the mount never
     // served; libfuse already narrated the failure on stderr.
     if (rc == 0) std.log.info("unmounted {s}", .{mount_abs});
-    return @intCast(if (rc < 0) 1 else rc);
+    return @intCast(@min(if (rc < 0) 1 else rc, 255));
 }
 
 /// Heap-State counterpart of `State.deinit`: the mount path allocates
@@ -1339,8 +1339,28 @@ fn disableCoreDumps() !void {
 /// auto_unmount fusermount helper (spawned from fuse_main) and
 /// /proc/<pid>/environ cannot inherit the inline secret. The daemon
 /// already holds its own copy from loadPsk.
+///
+/// The value is blanked in place rather than c.unsetenv'd: start.zig hands
+/// std an Environ.Block that ALIASES the libc environ array, and libc
+/// compacts that array in place on unsetenv, parking its NULL terminator
+/// inside a slot std still counts as live -- the first std.log after this
+/// scrub then unwrapped that NULL on musl static builds (and the trace
+/// printer deadlocked re-entering the environ lock mid-scan). Blank the
+/// value bytes instead: the array keeps its shape, children inherit the
+/// known knob with an empty value, and the secret actually leaves memory,
+/// which unsetenv never did (it only dropped the pointer).
 fn scrubPskEnv() void {
-    _ = sys.c.unsetenv("MODELFS_PSK_VALUE");
+    const prefix = "MODELFS_PSK_VALUE=";
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const str = std.mem.span(entry);
+        if (std.mem.startsWith(u8, str, prefix)) {
+            // Overwrite the whole entry, key included: children keep a
+            // same-shaped but meaningless variable instead of an empty
+            // MODELFS_PSK_VALUE, which loadPsk would rightly refuse.
+            @memset(str, 'X');
+        }
+    }
 }
 
 /// True when the process named by pid still exists. kill(pid, 0) signals
@@ -1438,10 +1458,9 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 const update_wait_ms: u32 = 30_000;
 const update_poll_ms: u32 = 50;
 
-fn selfExe(buf: *[sys.c.PATH_MAX]u8) ![]const u8 {
-    const n = std.os.linux.readlink("/proc/self/exe", buf, buf.len);
-    const signed: isize = @bitCast(n);
-    if (signed < 0 or n == 0 or n >= buf.len) return error.NoExe;
+fn selfExe(io: std.Io, buf: *[sys.c.PATH_MAX]u8) ![]const u8 {
+    const n = try std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", buf);
+    if (n == 0 or n >= buf.len) return error.NoExe;
     return buf[0..n];
 }
 
@@ -1454,7 +1473,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     defer if (blob) |b| gpa.free(b);
 
     var exe_buf: [sys.c.PATH_MAX]u8 = undefined;
-    const bin = selfExe(&exe_buf) catch {
+    const bin = selfExe(io, &exe_buf) catch {
         printErr("modelfs: cannot resolve this binary via /proc/self/exe\n", .{});
         return 1;
     };
@@ -1476,6 +1495,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     }
     std.posix.kill(@intCast(pid), .USR2) catch {
         printErr("modelfs: cannot signal pid {d} to replace its image\n", .{pid});
+        _ = sys.unlink(req_path);
         return 1;
     };
 
@@ -1504,6 +1524,10 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         sys.sleepMs(io, update_poll_ms);
     }
     printErr("modelfs: update timed out waiting for pid {d} to replace its image\n", .{pid});
+    // Same consumed-so-it-cannot-replay rule cmdHandover applies after a
+    // read: a leftover req would let a later SIGUSR2 re-exec to the stale
+    // binary path and ack a token nobody waits on.
+    _ = sys.unlink(req_path);
     return 1;
 }
 
@@ -1532,10 +1556,19 @@ fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Envir
         return 2;
     }
 
-    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    const origin = resolveOriginDir(io, gpa, origin_raw) catch return 1;
     defer gpa.free(origin);
 
-    const token = hf.loadToken(gpa, environ) catch null;
+    // Only a genuine read miss falls back to anonymous: an OOM must not
+    // masquerade as "no token" and 401 against a private repo, and an
+    // oversized HF_TOKEN is a wrong value worth reporting.
+    const token: ?[]u8 = hf.loadToken(gpa, environ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TokenTooLarge => {
+            printErr("modelfs: {s} is longer than {d} bytes; that is not a token\n", .{ hf.token_env, hf.max_token_bytes });
+            return 1;
+        },
+    };
     defer if (token) |t| {
         std.crypto.secureZero(u8, t);
         gpa.free(t);
@@ -1571,9 +1604,13 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
         return 1;
     };
     var owned = handover.readStateFd(gpa, @intCast(handoff.state_fd)) catch |err| {
+        sys.close(handoff.state_fd);
         printErr("modelfs: cannot read handover state fd {d} ({t})\n", .{ handoff.state_fd, err });
         return 1;
     };
+    // The memfd carries the raw PSK: close it as soon as the state is read
+    // so it does not sit in /proc/<pid>/fd for the daemon's whole lifetime.
+    sys.close(handoff.state_fd);
     defer {
         std.crypto.secureZero(u8, owned.psk);
         owned.deinit();
@@ -1646,7 +1683,7 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
     }
     const rc = fuse_fs.attach(st, owned.fuse_fd);
     teardownMount(st);
-    return @intCast(if (rc < 0) 1 else rc);
+    return @intCast(@min(if (rc < 0) 1 else rc, 255));
 }
 
 fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
@@ -1656,7 +1693,7 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     };
     // Same reachability and directory gate mount applies: a typo'd path or
     // a regular file must fail loudly instead of listing as an empty cluster.
-    const real = resolveOriginDir(gpa, origin) catch return 1;
+    const real = resolveOriginDir(io, gpa, origin) catch return 1;
     defer gpa.free(real);
 
     // Collect before printing: readdir order is filesystem-dependent (and
@@ -1874,7 +1911,7 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         std.debug.print("verify needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
-    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    const origin = resolveOriginDir(io, gpa, origin_raw) catch return 1;
     defer gpa.free(origin);
     const cache = opts.cache;
     if (cache.len == 0) {
@@ -2225,7 +2262,7 @@ test "fuzz cli flag value parsers fail loudly without wrapping or panicking" {
 }
 
 test "pidAlive answers for live and exited processes" {
-    try std.testing.expect(pidAlive(@intCast(std.os.linux.getpid())));
+    try std.testing.expect(pidAlive(@intCast(sys.pidSelf())));
     // Nonpositive and out-of-range ids name no process.
     try std.testing.expect(!pidAlive(0));
     try std.testing.expect(!pidAlive(-5));
@@ -2361,7 +2398,7 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
 
     // A live writer's document is served verbatim with success.
     var live_buf: [160]u8 = undefined;
-    const live_doc = try std.fmt.bufPrint(&live_buf, "{{\"id\":\"me\",\"pid\":{d},\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"stats\":{{}}}}\n", .{std.os.linux.getpid()});
+    const live_doc = try std.fmt.bufPrint(&live_buf, "{{\"id\":\"me\",\"pid\":{d},\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"stats\":{{}}}}\n", .{sys.pidSelf()});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live_doc));
     // The live pid must read as running (exit 0) and the document must
     // reach stdout unchanged; the stale-document cases below pin exit 1.
@@ -2389,12 +2426,12 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     // are the older-build fallback.
     {
         var old_buf: [128]u8 = undefined;
-        const old_doc = try std.fmt.bufPrint(&old_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) - 121 });
+        const old_doc = try std.fmt.bufPrint(&old_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ sys.pidSelf(), sys.nowSec(std.testing.io) - 121 });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), old_doc));
         try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
 
         var fresh_buf: [128]u8 = undefined;
-        const fresh_doc = try std.fmt.bufPrint(&fresh_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) });
+        const fresh_doc = try std.fmt.bufPrint(&fresh_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ sys.pidSelf(), sys.nowSec(std.testing.io) });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), fresh_doc));
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(gpa);
@@ -2410,7 +2447,7 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     {
         var ntp_ok_buf: [192]u8 = undefined;
         const ntp_ok = try std.fmt.bufPrint(&ntp_ok_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
-            std.os.linux.getpid(),
+            sys.pidSelf(),
             sys.nowSec(std.testing.io) - 121,
             sys.monoSec(std.testing.io),
         });
@@ -2419,7 +2456,7 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
 
         var ntp_dead_buf: [192]u8 = undefined;
         const ntp_dead = try std.fmt.bufPrint(&ntp_dead_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
-            std.os.linux.getpid(),
+            sys.pidSelf(),
             sys.nowSec(std.testing.io),
             sys.monoSec(std.testing.io) - 121,
         });
@@ -2434,7 +2471,7 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     {
         var reboot_buf: [192]u8 = undefined;
         const reboot_doc = try std.fmt.bufPrint(&reboot_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
-            std.os.linux.getpid(),
+            sys.pidSelf(),
             sys.nowSec(std.testing.io),
             sys.monoSec(std.testing.io) + 1000,
         });
@@ -2443,7 +2480,7 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
 
         var max_buf: [192]u8 = undefined;
         const max_doc = try std.fmt.bufPrint(&max_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
-            std.os.linux.getpid(),
+            sys.pidSelf(),
             sys.nowSec(std.testing.io),
             std.math.maxInt(i64),
         });
@@ -2455,7 +2492,7 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
     // (panic in safe builds). Saturating treat it as stale, not live.
     {
         var min_buf: [128]u8 = undefined;
-        const min_doc = try std.fmt.bufPrint(&min_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), std.math.minInt(i64) });
+        const min_doc = try std.fmt.bufPrint(&min_buf, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ sys.pidSelf(), std.math.minInt(i64) });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), min_doc));
         try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
     }
@@ -2524,7 +2561,7 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
     }
 
     {
-        const old_doc = try std.fmt.allocPrint(gpa, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ std.os.linux.getpid(), sys.nowSec(std.testing.io) - 121 });
+        const old_doc = try std.fmt.allocPrint(gpa, "{{\"id\":\"me\",\"pid\":{d},\"now_s\":{d}}}\n", .{ sys.pidSelf(), sys.nowSec(std.testing.io) - 121 });
         defer gpa.free(old_doc);
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), old_doc));
         var err: std.ArrayList(u8) = .empty;
@@ -2672,15 +2709,15 @@ test "ensureDirReal creates a missing dir and refuses a file" {
     var fb: [160]u8 = undefined;
     const fp = try std.fmt.bufPrint(&fb, "{s}/regular", .{d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, fp), "x"));
-    try std.testing.expectError(error.NotDir, ensureDirReal(gpa, fp, "cache"));
+    try std.testing.expectError(error.NotDir, ensureDirReal(std.testing.io, gpa, fp, "cache"));
 
-    const existing = try ensureDirReal(gpa, d, "cache");
+    const existing = try ensureDirReal(std.testing.io, gpa, d, "cache");
     defer gpa.free(existing);
     try std.testing.expect(pathIsDir(try sys.toZ(&zb, existing)));
 
     var nb: [160]u8 = undefined;
     const missing = try std.fmt.bufPrint(&nb, "{s}/new-cache", .{d});
-    const created = try ensureDirReal(gpa, missing, "cache");
+    const created = try ensureDirReal(std.testing.io, gpa, missing, "cache");
     defer gpa.free(created);
     try std.testing.expect(pathIsDir(try sys.toZ(&zb, created)));
 }
@@ -3016,7 +3053,7 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
-    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    const origin = resolveOriginDir(io, gpa, origin_raw) catch return 1;
     defer gpa.free(origin);
     var store = store_mod.Store.init(gpa, io, origin, opts.cache, opts.piece);
     defer store.deinit();
@@ -3120,7 +3157,7 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
         std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
-    const origin = resolveOriginDir(gpa, origin_raw) catch return 1;
+    const origin = resolveOriginDir(io, gpa, origin_raw) catch return 1;
     defer gpa.free(origin);
     // Gate every rel before any origin I/O (same refusals as verify): a
     // bad path must not create cache dirs or read anything.

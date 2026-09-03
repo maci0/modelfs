@@ -39,7 +39,7 @@ pub fn phase(free_pct: u32, w: Water, culling: bool) Phase {
 }
 
 /// Percent of filesystem blocks available to an unprivileged writer
-/// (`statvfs.f_bavail`), matching cachefilesd. Root-reserved `f_bfree` would
+/// (`statfs.f_bavail`), matching cachefilesd. Root-reserved `f_bfree` would
 /// understate the pressure this daemon actually hits. Empty or unknown
 /// capacity reads as 100 (culling off).
 pub fn freePercent(bavail: u64, blocks: u64) u32 {

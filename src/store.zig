@@ -328,7 +328,7 @@ pub const Store = struct {
     /// Edge-triggered origin I/O outage flag. FUSE getattr/open/read/write
     /// and originPread/originPwrite share this so an NFS outage logs once
     /// (path + errno) instead of once per syscall, and recovery logs once
-    /// too, the same shape as cullLoop's statvfs suspension. Discovery-tick
+    /// too, the same shape as cullLoop's statfs suspension. Discovery-tick
     /// lease publish/refresh feed it as well (`tickCluster`), so an idle
     /// node with a dead origin is visible without waiting for a FUSE op.
     /// status.json publishes it as origin_down (0/1) so `modelfs status`
@@ -1161,7 +1161,12 @@ pub const Store = struct {
         for (cands.items) |f| {
             var evict = false;
             f.mu.lockUncancelable(self.io);
-            if (f.filling.count() == 0 and
+            // Same xfer gate punchPiece, truncateCacheFd, and copyIntoCache
+            // take: a peer sendfile or FUSE warm read is inside the cache fd
+            // without holding a fill claim, and closing under it hands the
+            // number to the next open -- bytes flowing to a different file.
+            // The entry just stays pinned; the next round reaps it.
+            if (f.filling.count() == 0 and f.xfer.load(.monotonic) == 0 and
                 now_sec -| f.last_access.load(.monotonic) >= min_idle_secs)
             {
                 if (f.cache_fd >= 0) {
@@ -1654,9 +1659,17 @@ pub const Store = struct {
             return;
         };
         var tbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const ztmp = sys.appendExt(&tbuf, p, ".tmp") catch {
-            std.log.warn("piece manifest publish failed for {s}; temp path does not fit; retried on next close", .{file.rel});
-            return;
+        // Temp name unique per publish: libfuse runs releases on a thread
+        // pool, so two closes of one entry can publish concurrently, and a
+        // shared .tmp let the second O_TRUNC open tear the first's
+        // half-written temp before its rename landed.
+        const ztmp = blk: {
+            var sbuf: [24]u8 = undefined;
+            const ext = std.fmt.bufPrint(&sbuf, ".tmp.{x}", .{std.Thread.getCurrentId()}) catch ".tmp";
+            break :blk sys.appendExt(&tbuf, p, ext) catch {
+                std.log.warn("piece manifest publish failed for {s}; temp path does not fit; retried on next close", .{file.rel});
+                return;
+            };
         };
         var w = sys.writeFileNoFollow(ztmp, enc);
         if (w == -c.ENOENT) {
@@ -1796,7 +1809,14 @@ pub const Store = struct {
     pub fn readServed(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64) isize {
         file.mu.lockUncancelable(self.io);
         const fsize = file.size;
+        const dead = file.dead.load(.acquire);
         file.mu.unlock(self.io);
+        // A forget (unlink, rename-over) that raced the hydration left the
+        // entry dead: pieces this span was supposed to hydrate are sparse
+        // holes in the surviving cache fd, and answering from it would serve
+        // hole zeros behind a successful reply. Origin is the trust root;
+        // go there instead (ENOENT for an unlinked name is the right answer).
+        if (dead) return self.originPread(file.rel, buf, off);
         if (!piece.rangeTracked(.{ .off = off, .len = buf.len }, fsize, self.piece_size))
             return self.originPread(file.rel, buf, off);
         const n = self.readCache(file, buf, off, now_sec);
@@ -1873,14 +1893,14 @@ pub const Store = struct {
     }
 
     /// Filesystem stats for the origin name. A planted final symlink would
-    /// otherwise make statvfs(2) report the target's filesystem (df of a
+    /// otherwise make statfs(2) report the target's filesystem (df of a
     /// link to `/` leaks the host root's size/free through the mount).
     /// ELOOP matches originPread/originPwrite: open O_NOFOLLOW, not lstat
-    /// then statvfs, so a racer cannot swap the name to a link in between.
-    pub fn originStatvfs(self: *const Store, rel: []const u8, vs: *c.struct_statvfs) i32 {
+    /// then statfs, so a racer cannot swap the name to a link in between.
+    pub fn originStatfs(self: *const Store, rel: []const u8, vs: *c.struct_statfs) i32 {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&buf, rel) catch return -c.ENAMETOOLONG;
-        return sys.statvfsNoFollow(p, vs);
+        return sys.statfsNoFollow(p, vs);
     }
 
     /// Origin unlink plus cache-identity drop, with FUSE-retry semantics.
@@ -1926,14 +1946,12 @@ pub const Store = struct {
             if (orel.len != 0) self.forget(orel);
             if (nrel.len != 0) self.forget(nrel);
         }
-        const rc = c.renameat2(c.AT_FDCWD, oa, c.AT_FDCWD, ob, flags);
-        const e: i32 = if (rc != 0) sys.errno() else 0;
+        const e = sys.renameAt2(c.AT_FDCWD, oa, c.AT_FDCWD, ob, flags);
         if (!std.mem.eql(u8, orel, nrel)) {
             if (orel.len != 0) self.forget(orel);
             if (nrel.len != 0) self.forget(nrel);
         }
-        if (e != 0) return -e;
-        return 0;
+        return e;
     }
 
     /// Origin mkdir with FUSE-retry semantics. A lost reply after a
@@ -1979,6 +1997,25 @@ pub const Store = struct {
         self.cacheFillIdentified(rel, end, off, data, OriginId{}, now_sec);
     }
 
+    /// Growth past a size that was not piece-aligned widens the short last
+    /// piece: a set mark there described only the bytes the old size held,
+    /// so carrying it across the grow would claim a full piece the cache fd
+    /// never held, and warm reads of the gap would serve hole zeros. Drop
+    /// that one mark and its stale digest before the size moves; the write
+    /// landing through copyIntoCache re-marks the piece via fullCover once
+    /// it actually completes it. Caller holds file.mu (plus content_mu on
+    /// the paths that take both).
+    pub fn dropWideningPieceMark(self: *Store, file: *Cached) void {
+        if (file.size == 0 or file.size % @as(u64, self.piece_size) == 0) return;
+        const k: u32 = @intCast(@min(file.size / @as(u64, self.piece_size), @as(u64, std.math.maxInt(u32))));
+        if (file.bits.get(k)) {
+            file.bits.clear(k);
+            std.log.warn("growing {s} widens short piece {d}; its mark dropped and the piece refills", .{ file.rel, k });
+        }
+        if (file.hashes.remove(k)) file.manifest_dirty = true;
+        _ = self.saveBits(file, false);
+    }
+
     /// Like cacheFill(), recording the post-write origin identity so a later
     /// getIdentified does not treat this node's own write as a foreign
     /// rewrite (NFS mtime lag is ignored: an older stamp is not adopted).
@@ -2007,7 +2044,12 @@ pub const Store = struct {
             file.mu.lockUncancelable(self.io);
             defer file.mu.unlock(self.io);
             if (end > file.size) {
-                // Our own append: earlier piece marks stay valid.
+                // Our own append: earlier piece marks stay valid. But when
+                // the old size was not piece-aligned, the old last piece is
+                // short and its mark only covered the bytes the old size
+                // held -- carrying it across the grow would claim bytes the
+                // cache fd never wrote.
+                self.dropWideningPieceMark(file);
                 file.bits.resize(self.gpa, piece.count(end, self.piece_size)) catch {
                     // OOM leaves the field undersized: appended pieces stay
                     // unmarked and re-hydrate instead of serving hole zeros.
@@ -2190,10 +2232,10 @@ pub const Store = struct {
     /// Null when the cache filesystem cannot be stat'ed; callers must not
     /// read that as "plenty free" without saying so.
     pub fn freePercentChecked(self: *const Store) ?u32 {
-        var vs: c.struct_statvfs = undefined;
+        var vs: c.struct_statfs = undefined;
         var z: [sys.c.PATH_MAX]u8 = undefined;
         const p = sys.toZ(&z, self.cache) catch return null;
-        if (sys.statvfsPath(p, &vs) != 0) return null;
+        if (sys.statfsPath(p, &vs) != 0) return null;
         return cull.freePercent(@as(u64, vs.f_bavail), @as(u64, vs.f_blocks));
     }
 
@@ -2888,6 +2930,80 @@ test "cacheFill grows entry preserving earlier piece marks" {
     try std.testing.expectEqualSlices(u8, &w1, rd[0..16]);
     try std.testing.expectEqualSlices(u8, &w2_full, rd[16..40]);
     try std.testing.expectEqualSlices(u8, &w3, rd[40..48]);
+}
+
+test "cacheFill grow drops a hydrated short tail's mark instead of widening it" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-grow");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-grow");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    // Piece size 16: a hydrated short tail (piece 2 holds only bytes
+    // [32,40)) followed by a write landing past the grown gap must not
+    // carry piece 2's mark across the grow. Regression: the grow preserved
+    // every mark, so the bit silently widened from "bytes [32,40) cached"
+    // to "bytes [32,48) cached" while the cache fd never held [40,44) --
+    // a warm read served hole zeros as model data.
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var fb: [160]u8 = undefined;
+    var zz0: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fb, "{s}/grow.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zz0, fp), ""));
+
+    var w1: [40]u8 = undefined;
+    @memset(&w1, 0xAA);
+    try std.testing.expectEqual(@as(isize, 40), st.originPwrite("grow.bin", &w1, 0));
+    st.cacheFill("grow.bin", 40, 0, &w1, sys.monoSec(std.testing.io));
+
+    {
+        const f = st.lookupRef("grow.bin").?;
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        // A read hydrated the short tail: piece 2 marked with the digest of
+        // the 8 bytes the old size held, exactly what completeFill records
+        // for a short last piece.
+        try std.testing.expect(!f.bits.get(2));
+        f.bits.set(2);
+        var h: [piece.digest_len]u8 = undefined;
+        piece.digest(w1[32..40], &h);
+        try f.hashes.put(2, h);
+        f.mu.unlock(std.testing.io);
+    }
+
+    // A co-writer appended [40,44) on another node; this node's next chunk
+    // lands at [44,48) with the observed origin size == end, the shape
+    // mf_write fills through cacheFill.
+    var w2: [4]u8 = undefined;
+    @memset(&w2, 0xBB);
+    try std.testing.expectEqual(@as(isize, 4), st.originPwrite("grow.bin", &w2, 44));
+    st.cacheFill("grow.bin", 48, 44, &w2, sys.monoSec(std.testing.io));
+
+    {
+        const f = st.lookupRef("grow.bin").?;
+        defer st.releaseFile(f);
+        f.mu.lockUncancelable(std.testing.io);
+        defer f.mu.unlock(std.testing.io);
+        try std.testing.expectEqual(@as(u64, 48), f.size);
+        // Earlier full pieces keep their marks; the widened piece does not:
+        // [40,44) was never in this node's cache fd, and this write started
+        // above it, so nothing re-completed piece 2.
+        try std.testing.expect(f.bits.get(0));
+        try std.testing.expect(f.bits.get(1));
+        try std.testing.expect(!f.bits.get(2));
+        try std.testing.expect(!Store.rangeFilled(f, .{ .off = 32, .len = 16 }, f.size, st.piece_size));
+        // The stale tail digest went with the mark.
+        try std.testing.expect(!f.hashes.contains(2));
+    }
 }
 
 test "cacheFill resets every mark when an external truncate shrinks the file" {
@@ -6084,9 +6200,9 @@ test "origin access refuses a symlink planted at the model path" {
 
     // O_NOFOLLOW contract on the origin tier: the origin is shared storage a
     // co-tenant can plant names in, so a symlink at a model path must never
-    // turn the daemon's stat/pread/pwrite/fsync/statvfs into reads or writes
+    // turn the daemon's stat/pread/pwrite/fsync/statfs into reads or writes
     // of the link's client-local target. statOrigin reports S_IFLNK (every
-    // caller's S_IFREG gate then rejects fail-closed), and data/statvfs/fsync
+    // caller's S_IFREG gate then rejects fail-closed), and data/statfs/fsync
     // answer ELOOP.
     var tb: [192]u8 = undefined;
     const target = try std.fmt.bufPrint(&tb, "{s}/secret.txt", .{origin_d});
@@ -6107,8 +6223,8 @@ test "origin access refuses a symlink planted at the model path" {
     try std.testing.expectEqual(-c.ELOOP, st.originPwrite("planted.gguf", &rbuf, 0));
     try std.testing.expectEqual(-c.ELOOP, st.originFsync("planted.gguf", false));
     try std.testing.expectEqual(-c.ELOOP, st.originFsync("planted.gguf", true));
-    var vs: c.struct_statvfs = undefined;
-    try std.testing.expectEqual(-c.ELOOP, st.originStatvfs("planted.gguf", &vs));
+    var vs: c.struct_statfs = undefined;
+    try std.testing.expectEqual(-c.ELOOP, st.originStatfs("planted.gguf", &vs));
     // The planted target keeps its bytes: nothing read or wrote through.
     try std.testing.expectEqualStrings("s3cret", try sys.readFileBuf(&rbuf, target_z));
 
@@ -6118,7 +6234,7 @@ test "origin access refuses a symlink planted at the model path" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(real_z, "model"));
     try std.testing.expectEqual(@as(isize, 5), st.originPread("real.bin", rbuf[0..5], 0));
     try std.testing.expectEqualStrings("model", rbuf[0..5]);
-    try std.testing.expectEqual(@as(i32, 0), st.originStatvfs("real.bin", &vs));
+    try std.testing.expectEqual(@as(i32, 0), st.originStatfs("real.bin", &vs));
     try std.testing.expect(vs.f_blocks > 0);
 }
 

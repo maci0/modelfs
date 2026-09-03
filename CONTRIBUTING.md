@@ -132,7 +132,7 @@ section under `[Unreleased]`. Adding one is not itself gated, but the file's
 shape is: `## [Unreleased]` first, then dated semver versions in strictly
 descending order with one matching `build.zig.zon`, each with a `[name]:`
 footer link, and `v<version>` named in README.md, SECURITY.md, and
-docs/THREAT_MODEL.md. `##` is reserved for those two forms, so history that
+docs/threat-model.md. `##` is reserved for those two forms, so history that
 shipped in a version nests as `###` under it: a sibling `## [Name] - date`
 reads as a release.
 
@@ -156,7 +156,7 @@ the CycloneDX record and `python3 scripts/sbom.py --check` holds the tree to it:
 `.version` in [build.zig.zon](build.zig.zon) is the single source the binary
 prints: `build.zig` extracts it into `build_options`, `modelfs version`
 prints it, and the "embedded version parses as semver" unit test rejects a
-malformed value. README.md, SECURITY.md, docs/THREAT_MODEL.md, CHANGELOG
+malformed value. README.md, SECURITY.md, docs/threat-model.md, CHANGELOG
 headings, and the `v<version>` tag must name that same value;
 `scripts/check.sh` pins the headings, the compare/tag footer links, and
 that those three docs mention `v<version>`.
@@ -177,7 +177,7 @@ A release is these steps, kept in sync:
    the top of the file. Point the `[Unreleased]` compare link at the new
    tag and add a `[x.y.z]` tag link beside it.
 3. Update the current-tag sentences in [README.md](README.md),
-   [SECURITY.md](SECURITY.md), and [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)
+   [SECURITY.md](SECURITY.md), and [docs/threat-model.md](docs/threat-model.md)
    so they name the new `v<version>`.
 4. Tag `v<version>`, exactly matching the manifest (`v0.1.0` for
    `.version = "0.1.0"`), so a checkout can be matched to a version.
@@ -201,6 +201,13 @@ candidate locally the same way CI does:
 or by hand by building twice from two different paths and comparing
 `sha256sum zig-out/bin/modelfs` output.
 
-There is no publish step beyond the tag: consumers fetch this repository as a
-Zig package (the tarball is whatever `.paths` lists) or build from the tagged
-commit.
+Publishing is the tag itself: pushing `v<version>` runs the `release`
+workflow (`.github/workflows/release.yml`), which builds the static
+single-file binaries for `x86_64-linux-musl` and `aarch64-linux-musl`
+(`scripts/build_static.sh`: vendored libfuse3 compiled in, no interpreter,
+no shared libraries), refuses a tag that does not name `build.zig.zon`'s
+version, and attaches the two binaries plus a `SHA256SUMS` to a GitHub
+release named after the tag. Re-tagging buys nothing: the workflow fires on
+tag creation, and a mismatched tag fails the build. The repository itself
+stays the source of truth for package consumers (the Zig package tarball is
+whatever `.paths` lists) and for anyone building from the tagged commit.

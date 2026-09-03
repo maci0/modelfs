@@ -60,7 +60,8 @@ MAX_AGE=$((10#${MAX_AGE}))
 zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
     || die "offsite dataset ${DATASET} does not exist (site-loss copy missing or not imported; docs/recovery.md section 3)"
 
-SNAP_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${DATASET}" | tail -n 1)"
+SNAP_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${DATASET}" | tail -n 1)" \
+    || die "cannot list snapshots of ${DATASET} (docs/recovery.md section 3)"
 SNAP="${SNAP_LINE%%$'\t'*}"
 if [[ -z "${SNAP}" ]]; then
     die "offsite ${DATASET} has no snapshots: the rotation or hosted pull never landed a restore point (docs/recovery.md section 3)"

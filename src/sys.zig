@@ -1,6 +1,20 @@
 //! Syscall and libc wrappers: fd I/O with EINTR retry, CLOEXEC fds, clocks,
 //! path helpers, nofollow/owner-only writes. Mount-time core-dump disable
 //! and PSK env scrub live in main.zig (`disableCoreDumps` / `scrubPskEnv`).
+//!
+//! House policy for this layer: prefer Zig's own abstractions and reach for
+//! the C door (`c.*` / raw `std.os.linux`) only where no abstraction exists.
+//! Clocks and sleeps go through `std.Io.Clock`/`std.Io.sleep` (injectable for
+//! simulation), pids through `pidSelf`, test mtime aging through `touchPath`
+//! (`Io.File.setTimestamps`), and /proc/self/exe through
+//! `Io.Dir.readLinkAbsolute` (main.zig). What must stay low-level, and why:
+//! the libfuse3 session and reply calls are C by design; `sendfile`,
+//! `fallocate(PUNCH_HOLE)`, `statfs`, `O_NOFOLLOW`/`O_PATH` opens, sealed
+//! memfds, socket options (`SO_SNDTIMEO` drives every deadline here), and
+//! `poll` have no `std` coverage; `fcntl` CLOEXEC toggling, libc `environ`
+//! mutation, and `errno` have no native equivalent either.
+//! `std.crypto.random` does not exist in 0.16, so `randomBytes` keeps the
+//! raw getrandom loop.
 const std = @import("std");
 pub const c = @import("c.zig").c;
 
@@ -92,12 +106,38 @@ pub fn joinZ(buf: []u8, root: []const u8, rel: []const u8) ![*:0]u8 {
     return buf[0..n :0];
 }
 
-pub fn realpathAlloc(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    var src: [c.PATH_MAX]u8 = undefined;
-    const z = try toZ(&src, path);
-    var out: [c.PATH_MAX]u8 = undefined;
-    const r = std.c.realpath(z, &out) orelse return error.BadPath;
-    return gpa.dupe(u8, std.mem.span(r));
+/// The daemon's own pid, the one syscall that has no higher Zig
+/// abstraction. Centralized here so the raw std.os.linux call appears once
+/// instead of at every journal and scratch-name site.
+pub fn pidSelf() i32 {
+    return std.os.linux.getpid();
+}
+
+/// Sets a file's atime and mtime to `sec` (errno-style, -EIO on any
+/// failure). The sweep tests age lease artifacts past their cutoff with
+/// this instead of a raw utimensat: `Io.File.setTimestamps` is the same
+/// syscall through the Io abstraction and follows a final symlink exactly
+/// like utimensat's flags = 0 did. Caller owns a write-eligible file;
+/// anything else surfaces as -EACCES-flavored -EIO.
+pub fn touchPath(io: std.Io, path: []const u8, sec: i64) i32 {
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return -c.EIO;
+    defer f.close(io);
+    const ts: std.Io.Timestamp = .{ .nanoseconds = @as(i96, sec) * std.time.ns_per_s };
+    const set: std.Io.File.SetTimestampsOptions = .{
+        .access_timestamp = .{ .new = ts },
+        .modify_timestamp = .{ .new = ts },
+    };
+    f.setTimestamps(io, set) catch return -c.EIO;
+    return 0;
+}
+
+pub fn realpathAlloc(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const z = try std.Io.Dir.realPathFileAlloc(.cwd(), io, path, gpa);
+    // Re-dupe without the sentinel: callers free the result as a plain
+    // []u8, and a sentinel slice freed through the coerced type reports a
+    // size mismatch against the testing allocator.
+    defer gpa.free(z);
+    return gpa.dupe(u8, z);
 }
 
 pub fn toZ(buf: []u8, s: []const u8) ![*:0]u8 {
@@ -464,13 +504,13 @@ pub fn lstatPath(path: [*:0]const u8, st: *c.struct_stat) i32 {
     return 0;
 }
 
-pub fn statvfsPath(path: [*:0]const u8, vs: *c.struct_statvfs) i32 {
-    if (c.statvfs(path, vs) != 0) return negErrno();
+pub fn statfsPath(path: [*:0]const u8, vs: *c.struct_statfs) i32 {
+    if (c.statfs(path, vs) != 0) return negErrno();
     return 0;
 }
 
-fn fstatvfs(fd: c_int, vs: *c.struct_statvfs) i32 {
-    if (c.fstatvfs(fd, vs) != 0) return negErrno();
+fn fstatfs(fd: c_int, vs: *c.struct_statfs) i32 {
+    if (c.fstatfs(fd, vs) != 0) return negErrno();
     return 0;
 }
 
@@ -484,17 +524,17 @@ fn fstatNotLink(fd: c_int) i32 {
     return 0;
 }
 
-/// statvfs(2) without following a final symlink. Open O_PATH|O_NOFOLLOW so a
+/// statfs(2) without following a final symlink. Open O_PATH|O_NOFOLLOW so a
 /// co-tenant racing the name to a link cannot make df report the target's
 /// filesystem (a link to `/` would leak the host root's size/free), and so a
 /// mode-000 file still stats: O_RDONLY would EACCES after chmod 000.
-pub fn statvfsNoFollow(path: [*:0]const u8, vs: *c.struct_statvfs) i32 {
+pub fn statfsNoFollow(path: [*:0]const u8, vs: *c.struct_statfs) i32 {
     const fd = open(path, c.O_PATH | c.O_NOFOLLOW, 0);
     if (fd < 0) return negErrno();
     defer close(fd);
     const lk = fstatNotLink(fd);
     if (lk != 0) return lk;
-    return fstatvfs(fd, vs);
+    return fstatfs(fd, vs);
 }
 
 pub fn mkdir(path: [*:0]const u8, mode: c.mode_t) i32 {
@@ -529,10 +569,37 @@ pub fn chmod(path: [*:0]const u8, mode: c.mode_t) i32 {
         close(fd);
         return lk;
     }
-    const rc = c.fchmodat(fd, "", mode, c.AT_EMPTY_PATH);
-    const e: i32 = if (rc != 0) negErrno() else 0;
+    var rc = c.fchmodat(fd, "", mode, c.AT_EMPTY_PATH);
+    if (rc != 0) {
+        const e0: i32 = negErrno();
+        // fchmodat(AT_EMPTY_PATH) needs the fchmodat2 syscall (kernel 6.6+)
+        // or a new-enough libc; older stacks answer EINVAL/ENOSYS. Reopen
+        // through /proc/self/fd -- its magic link is ours to follow -- and
+        // fchmod the file itself, which works everywhere. Any other errno
+        // (EACCES, EROFS, ...) is the real answer and returns as-is, as do
+        // fallback failures: the platform's own errno, never a fake one.
+        if (e0 != -c.EINVAL and e0 != -c.ENOSYS) {
+            close(fd);
+            return e0;
+        }
+        var pbuf: [32]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pbuf, "/proc/self/fd/{d}", .{fd}) catch {
+            close(fd);
+            return e0;
+        };
+        const rfd = open(p, c.O_RDONLY | c.O_NONBLOCK, 0);
+        if (rfd < 0) {
+            close(fd);
+            return e0;
+        }
+        rc = c.fchmod(rfd, mode);
+        const e1: i32 = if (rc != 0) negErrno() else 0;
+        close(rfd);
+        close(fd);
+        return e1;
+    }
     close(fd);
-    return e;
+    return 0;
 }
 
 /// opendir(3) without following a final symlink. O_NOFOLLOW (not O_PATH: that
@@ -576,6 +643,25 @@ pub fn readdir(dir: *c.DIR) ?*c.struct_dirent {
 
 pub fn rename(old_path: [*:0]const u8, new_path: [*:0]const u8) i32 {
     if (c.rename(old_path, new_path) != 0) return negErrno();
+    return 0;
+}
+
+/// renameat2(2) via the raw syscall, returning -errno: glibc ships a
+/// renameat2 wrapper but the zig toolchain's musl libc.a does not, so the
+/// syscall is the one call site that serves both libcs. A raw syscall does
+/// not touch TLS errno, which is why this returns the code instead of
+/// letting callers read errno().
+pub fn renameAt2(olddirfd: c_int, oldpath: [*:0]const u8, newdirfd: c_int, newpath: [*:0]const u8, flags: c_uint) i32 {
+    const rc = std.os.linux.syscall5(
+        .renameat2,
+        @bitCast(@as(isize, olddirfd)),
+        @intFromPtr(oldpath),
+        @bitCast(@as(isize, newdirfd)),
+        @intFromPtr(newpath),
+        flags,
+    );
+    const signed: isize = @bitCast(rc);
+    if (signed < 0) return @intCast(signed);
     return 0;
 }
 
@@ -894,7 +980,7 @@ pub fn deleteTree(io: std.Io, path: []const u8) void {
 /// resolution stamps collide otherwise). Returns the path in buf; remove it
 /// with deleteTree.
 pub fn scratchDir(buf: []u8, name: []const u8) ![]const u8 {
-    const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSecRaw(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSecRaw(), pidSelf() });
     if (mkdirAll(p, 0o755) != 0) return error.MkdirFailed;
     return p;
 }
@@ -943,7 +1029,7 @@ test "fsync and fdatasync report a bad fd and succeed after a write" {
 
     var path_buf: [128]u8 = undefined;
     var z_buf: [128]u8 = undefined;
-    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/fs-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/fs-{d}-{d}.tmp", .{ nowSecRaw(), pidSelf() });
     const z = try toZ(&z_buf, p);
     const fd = open(z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, 0o644);
     try std.testing.expect(fd >= 0);
@@ -959,7 +1045,7 @@ test "closeWrite reports a bad fd and succeeds after a write" {
 
     var path_buf: [128]u8 = undefined;
     var z_buf: [128]u8 = undefined;
-    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/cw-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/cw-{d}-{d}.tmp", .{ nowSecRaw(), pidSelf() });
     const z = try toZ(&z_buf, p);
     const fd = open(z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, 0o644);
     try std.testing.expect(fd >= 0);
@@ -984,7 +1070,7 @@ test "sizeFromStat rejects a signed overflow" {
 test "I/O wrappers refuse offsets that do not fit off_t" {
     var path_buf: [128]u8 = undefined;
     var z_buf: [128]u8 = undefined;
-    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/off-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/off-{d}-{d}.tmp", .{ nowSecRaw(), pidSelf() });
     const z = try toZ(&z_buf, p);
     try std.testing.expectEqual(@as(i32, 0), writeFile(z, "x"));
     defer _ = c.unlink(z);
@@ -1042,7 +1128,7 @@ test "parentOf" {
 test "open, socket, and accept are close-on-exec" {
     var path_buf: [128]u8 = undefined;
     var z_buf: [128]u8 = undefined;
-    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/cloexec-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/cloexec-{d}-{d}.tmp", .{ nowSecRaw(), pidSelf() });
     const z = try toZ(&z_buf, p);
     const file_fd = open(z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, 0o644);
     try std.testing.expect(file_fd >= 0);
@@ -1085,7 +1171,7 @@ test "open, socket, and accept are close-on-exec" {
 test "setNonblocking clears the flag an origin file was opened with" {
     var path_buf: [128]u8 = undefined;
     var z_buf: [128]u8 = undefined;
-    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/nonblock-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/nonblock-{d}-{d}.tmp", .{ nowSecRaw(), pidSelf() });
     const z = try toZ(&z_buf, p);
     // The open flags a pull uses: non-blocking so a FIFO planted at the name
     // cannot hang the open, then cleared before the fd reaches a writer that
@@ -1182,7 +1268,7 @@ test "sendfileAll zero copy" {
     var z_buf: [128]u8 = undefined;
     // pid suffix: two test processes starting in the same second must not
     // share the scratch file (second-resolution stamps collide otherwise)
-    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/sf-{d}-{d}.tmp", .{ nowSecRaw(), std.os.linux.getpid() });
+    const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/sf-{d}-{d}.tmp", .{ nowSecRaw(), pidSelf() });
     const z = try toZ(&z_buf, p);
     const data = "hello zero-copy sendfile world!";
     try std.testing.expectEqual(@as(i32, 0), writeFile(z, data));
@@ -1243,7 +1329,7 @@ test "readFile NoFollow refuses a planted symlink that the following form would 
     try std.testing.expectEqualStrings("s3cret", try readFileBuf(&rbuf, target_z));
 }
 
-test "chmod statvfs and opendir NoFollow refuse a planted symlink" {
+test "chmod statfs and opendir NoFollow refuse a planted symlink" {
     var db: [128]u8 = undefined;
     const scratch = try scratchDir(&db, "modelfs-path-nofollow");
     defer deleteTree(std.testing.io, scratch);
@@ -1266,9 +1352,9 @@ test "chmod statvfs and opendir NoFollow refuse a planted symlink" {
     try std.testing.expectEqual(@as(i32, 0), statPath(target_z, &st));
     try std.testing.expectEqual(orig_mode, st.st_mode);
 
-    var vs: c.struct_statvfs = undefined;
-    try std.testing.expectEqual(@as(i32, -c.ELOOP), statvfsNoFollow(try toZ(&lz, link), &vs));
-    try std.testing.expectEqual(@as(i32, 0), statvfsNoFollow(target_z, &vs));
+    var vs: c.struct_statfs = undefined;
+    try std.testing.expectEqual(@as(i32, -c.ELOOP), statfsNoFollow(try toZ(&lz, link), &vs));
+    try std.testing.expectEqual(@as(i32, 0), statfsNoFollow(target_z, &vs));
     try std.testing.expect(vs.f_blocks > 0);
 
     try std.testing.expect(opendirNoFollow(try toZ(&lz, link)) == null);

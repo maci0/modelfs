@@ -155,7 +155,7 @@ zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported u
 # Version headings after Unreleased must be unique and strictly descending
 # so a cut cannot insert 0.5.1 above 0.6.0 or repeat a tag. Footer [name]:
 # links are the compare/tag URLs; a heading without one cannot be fetched.
-# README/SECURITY.md/THREAT_MODEL.md name the current tag so a cut cannot
+# README/SECURITY.md/threat-model.md name the current tag so a cut cannot
 # leave those sentences on the previous release.
 echo "=== changelog headings ==="
 zon_ver="$(sed -n 's/^[[:space:]]*\.version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
@@ -261,7 +261,7 @@ if [[ "${#versions[@]}" -gt 0 ]]; then
     done
 fi
 
-for f in README.md SECURITY.md docs/THREAT_MODEL.md; do
+for f in README.md SECURITY.md docs/threat-model.md; do
     if ! grep -Fq "v${zon_ver}" "${ROOT_DIR}/${f}"; then
         fail "${f} does not mention v${zon_ver} (build.zig.zon .version)"
     fi

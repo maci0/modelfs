@@ -41,7 +41,10 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # MF_NAS_DEST (install_nas_backup.sh), MF_OFFSITE_DATASET,
 # MF_OFFSITE_MAX_AGE (check_offsite.sh), MF_RESTORE_FROM,
 # MF_RESTORE_LOCAL_FROM, MF_RESTORE_MOUNTPOINT, MF_RESTORE_SHARENFS,
-# MF_RESTORE_LOG (dr_pool_restore.sh).
+# MF_RESTORE_LOG (dr_pool_restore.sh), MF_HOTRELOAD_PORT
+# (test_hot_reload.sh), MF_SYNCOID_SRC, MF_SYNCOID_DEST
+# (nas/syncoid-models.service), MF_DRILL_DATASET (nas/modelfs-drill.service,
+# nas/modelfs-snap-age.service).
 
 # Dotted numeric compare: 0.16.1 >= 0.16.0, 3.12.4 >= 3.12, 0.15.99 < 0.16.0.
 # Extra trailing components on cur count as 0 against a longer min.
@@ -168,6 +171,88 @@ assert_aarch64_elf() {
     fi
     if [[ "${machine}" != "b700" ]]; then
         echo "not ARM aarch64 (e_machine ${machine}, want b700): ${bin}" >&2
+        return 1
+    fi
+    return 0
+}
+
+# True when path is a fully static 64-bit little-endian ELF of the given
+# machine ("3e00" = x86-64, "b700" = aarch64): ET_DYN (static-PIE, the
+# release binaries keep ASLR), a program header table with no PT_INTERP, a
+# dynamic table with no DT_NEEDED, and a PT_GNU_RELRO entry. Reads raw
+# header bytes (POSIX od) like assert_aarch64_elf, not file(1) text. Does
+# not rely on set -e (callers use the status in &&/||).
+assert_static_elf() {
+    local bin="$1" machine_want="$2"
+    local ident etype machine phoff phentsize phnum i off ptype saw_relro=0 saw_interp=0 saw_dyn=0 dyn_off dtag
+    ident="$(od -An -t x1 -N 6 "${bin}")" || return 1
+    ident="$(printf '%s' "${ident}" | tr -d '[:space:]')"
+    if [[ "${ident}" != "7f454c460201" ]]; then
+        echo "not a 64-bit little-endian ELF: ${bin} (e_ident ${ident})" >&2
+        return 1
+    fi
+    etype="$(od -An -t x1 -N 2 -j 16 "${bin}")" || return 1
+    etype="$(printf '%s' "${etype}" | tr -d '[:space:]')"
+    if [[ "${etype}" != "0300" ]]; then
+        echo "not ET_DYN static-PIE: ${bin} (e_type ${etype})" >&2
+        return 1
+    fi
+    machine="$(od -An -t x1 -N 2 -j 18 "${bin}")" || return 1
+    machine="$(printf '%s' "${machine}" | tr -d '[:space:]')"
+    if [[ "${machine}" != "${machine_want}" ]]; then
+        echo "wrong machine (e_machine ${machine}, want ${machine_want}): ${bin}" >&2
+        return 1
+    fi
+    phoff="$(od -An -t u8 -j 32 -N 8 "${bin}")" || return 1
+    phoff="${phoff//[[:space:]]/}"
+    phentsize="$(od -An -t u2 -j 54 -N 2 "${bin}")" || return 1
+    phentsize="${phentsize//[[:space:]]/}"
+    phnum="$(od -An -t u2 -j 56 -N 2 "${bin}")" || return 1
+    phnum="${phnum//[[:space:]]/}"
+    for ((i = 0; i < phnum; i++)); do
+        off=$(( phoff + i * phentsize ))
+        ptype="$(od -An -t x1 -j "${off}" -N 4 "${bin}")" || return 1
+        ptype="$(printf '%s' "${ptype}" | tr -d '[:space:]')"
+        case "${ptype}" in
+            03000000) saw_interp=1 ;;
+            52e57464) saw_relro=1 ;;
+            02000000)
+                saw_dyn=1
+                dyn_off="$(od -An -t u8 -j $(( off + 8 )) -N 8 "${bin}")" || return 1
+                dyn_off="${dyn_off//[[:space:]]/}"
+                ;;
+            *)
+                # PT_NULL / PT_LOAD / PT_GNU_STACK / the rest: nothing to
+                # assert on here, the RELRO and INTERP cases above are the
+                # whole check.
+                ;;
+        esac
+    done
+    if [[ ${saw_interp} -ne 0 ]]; then
+        echo "not static: PT_INTERP present (dynamically linked) : ${bin}" >&2
+        return 1
+    fi
+    if [[ ${saw_dyn} -eq 0 ]]; then
+        echo "no PT_DYNAMIC; cannot verify no DT_NEEDED: ${bin}" >&2
+        return 1
+    fi
+    if [[ ${saw_relro} -eq 0 ]]; then
+        echo "static ELF without PT_GNU_RELRO: ${bin}" >&2
+        return 1
+    fi
+    # The dynamic table holds 16-byte entries (d_tag, d_val) and ends at
+    # DT_NULL (0). DT_NEEDED is tag 1; a static binary must name no library.
+    for ((i = 0; i < 4096; i++)); do
+        dtag="$(od -An -t u8 -j $(( dyn_off + i * 16 )) -N 8 "${bin}")" || return 1
+        dtag="${dtag//[[:space:]]/}"
+        [[ "${dtag}" == "0" ]] && break
+        if [[ "${dtag}" == "1" ]]; then
+            echo "not static: DT_NEEDED present in the dynamic table: ${bin}" >&2
+            return 1
+        fi
+    done
+    if [[ "${dtag:-}" != "0" ]]; then
+        echo "dynamic table has no DT_NULL within 4096 entries: ${bin}" >&2
         return 1
     fi
     return 0

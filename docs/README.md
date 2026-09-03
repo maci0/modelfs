@@ -9,16 +9,14 @@ Setup and CLI usage are in the [top-level README](../README.md). Recent changes 
 | [operations.md](operations.md) | The ZFS/NFS/FS-Cache layers underneath, per-host mount setup, Hugging Face downloads, failure modes |
 | [recovery.md](recovery.md) | Durability: state inventory, snapshot/replica schedule, per-disaster restore steps, RPO/RTO, the monthly restore drill and its alarms |
 | [benchmarks.md](benchmarks.md) | Measured latency and throughput, with the loopback caveat that qualifies them |
-| [THREAT_MODEL.md](THREAT_MODEL.md) | Attack surface, trust boundaries, risk-ranked threats, and which controls exist versus which are missing |
+| [threat-model.md](threat-model.md) | Attack surface, trust boundaries, risk-ranked threats, and which controls exist versus which are missing |
 | [audits.md](audits.md) | Findings from the 2026-08-22 review passes and how each was fixed |
 | [design.md](design.md) | The original architecture sketch, goals G1-G10, and key decisions, each with ship status. Kept for history; current behavior is architecture.md |
-| [reviews/](reviews/) | Output of the review passes below: findings, severity, and what was fixed |
 
 ## review-guides/
 
 Prompts for agent review passes, one subject each, with no overlapping verdicts. Each states an
-applicability gate, a checklist naming real symbols in this tree, a severity scale, and the
-`docs/reviews/` file it writes.
+applicability gate, a checklist naming real symbols in this tree, and a severity scale.
 
 | Guide | Subject | Owns the verdict on |
 |---|---|---|

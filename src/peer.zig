@@ -382,6 +382,32 @@ fn peerAddrText(peer: c.struct_sockaddr_in, buf: []u8) []const u8 {
     }) catch "unknown";
 }
 
+/// A request that declares a body gets a bounded drain before the reply:
+/// closing a socket with unread receive data sends RST instead of FIN, and
+/// an RST discards the client's unread response queue -- the 401/405/404
+/// replies exist to educate exactly the clients that send bodies, so they
+/// must survive the close. Best-effort and bounded, so the drain cannot
+/// become a new way to pin an inflight slot; every in-protocol request is a
+/// bodyless GET, so only broken or probing clients pay this path.
+const drain_body_cap_bytes: usize = 64 * 1024;
+const drain_deadline_ms: i64 = 10_000;
+
+fn drainDeclaredBody(io: std.Io, fd: std.posix.fd_t, head: []const u8) void {
+    const cl = proto.headerGet(head, "Content-Length") orelse return;
+    const want = proto.parseU64Fast(cl) orelse return;
+    var left: u64 = @min(want, drain_body_cap_bytes);
+    if (left == 0) return;
+    const deadline_ms = sys.monoMs(io) +| drain_deadline_ms;
+    var buf: [4096]u8 = undefined;
+    while (left > 0) {
+        if (!armChunkTimeout(io, fd, deadline_ms)) return;
+        const take: usize = @intCast(@min(left, @as(u64, buf.len)));
+        const n = sys.readOnce(fd, buf[0..take]) catch return;
+        if (n == 0) return;
+        left -= n;
+    }
+}
+
 fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) void {
     defer {
         _ = self.http_inflight.fetchSub(1, .monotonic);
@@ -422,6 +448,9 @@ fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) voi
         _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
         return;
     };
+    // Before any reply path, so the status line survives the close even for
+    // a client that sent a body with its (broken) request.
+    drainDeclaredBody(self.io, fd, head);
     const auth = proto.headerGet(head, "Authorization") orelse "";
     if (!proto.bearerOk(auth, self.psk)) {
         // Security-relevant event: without this line a wrong-PSK node or an
@@ -643,12 +672,30 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
     // already read the reply cannot race it, matching replyStatus.
     _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
     _ = self.store.stats.bytes_to_peer.fetchAdd(snap.len, .monotonic);
-    const put = sys.writeAll(fd, snap);
-    if (put < 0) {
-        // The 200 header is already on the wire, so the fetching peer only
-        // sees a truncated body; this line is the sender-side trace of why
-        // (EPIPE/ECONNRESET for a departed peer, ETIMEDOUT for a stalled one).
-        std.log.warn("have bits send failed for {s} (errno {d}); dropping peer transfer", .{ rel, -put });
+    // Same whole-body budget streamRange gives /data (see bodyDeadlineFor):
+    // SO_SNDTIMEO resets on every drained byte, so a receiver trickling one
+    // byte per window could otherwise pin this inflight slot -- thread,
+    // socket, and snapshot -- for as long as the trickle continues, and
+    // sixteen of those deaden the peer service permanently.
+    const deadline_ms = bodyDeadlineFor(self.io, snap.len);
+    const have_chunk: usize = 4 * 1024 * 1024;
+    var done: usize = 0;
+    while (done < snap.len) {
+        if (!armChunkTimeout(self.io, fd, deadline_ms)) {
+            std.log.warn("have send budget expired for {s} at {d}/{d} bytes; dropping peer transfer", .{ rel, done, snap.len });
+            return;
+        }
+        const take = @min(snap.len - done, have_chunk);
+        const put = sys.writeAll(fd, snap[done..][0..take]);
+        if (put < 0) {
+            // The 200 header is already on the wire, so the fetching peer
+            // only sees a truncated body; this line is the sender-side trace
+            // of why (EPIPE/ECONNRESET for a departed peer, EAGAIN for the
+            // budget expiry above).
+            std.log.warn("have bits send failed for {s} (errno {d}); dropping peer transfer", .{ rel, -put });
+            return;
+        }
+        done += take;
     }
 }
 
@@ -1916,7 +1963,7 @@ test "groupPathsByPeerId orders ties by ip and port, never by arrival order" {
 
 test "peerAddrText formats the accepted peer address for security logs" {
     // The 401 rejection line names its source: a probing campaign must be
-    // attributable after the fact (THREAT_MODEL R8). Loopback and a routable
+    // attributable after the fact (threat-model.md R8). Loopback and a routable
     // address both format exactly, port included.
     var buf: [64]u8 = undefined;
     const lo = loopbackAddr(18080);

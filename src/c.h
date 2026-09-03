@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
+#include <sys/statfs.h>
 #include <sys/socket.h>
 #include <sys/sendfile.h>
 #include <sys/time.h>

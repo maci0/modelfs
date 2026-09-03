@@ -15,6 +15,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import escape
@@ -258,17 +259,7 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
     try:
         origin_dir, psk_file = make_origin_and_psk(temp_dir)
 
-        chunk_configs = [
-            ("256K", 256 * 1024),
-            ("512K", 512 * 1024),
-            ("1M", 1 * 1024 * 1024),
-            ("2M", 2 * 1024 * 1024),
-            ("4M", 4 * 1024 * 1024),
-            ("8M", 8 * 1024 * 1024),
-            ("16M", 16 * 1024 * 1024),
-            ("32M", 32 * 1024 * 1024),
-            ("64M", 64 * 1024 * 1024),
-        ]
+        chunk_configs = _PIECE_CONFIGS
 
         chunk_labels = [c[0] for c in chunk_configs]
         throughputs_mbps = []
@@ -343,6 +334,187 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+
+def _best_of(reps: int, fn: Callable[[], None]) -> float:
+    """Smallest elapsed wall time of `reps` runs: one-shot timing on a
+    shared host records warmup noise as a real slowdown, so every timed
+    benchmark here takes the best of a few identical passes."""
+    best = float("inf")
+    for _ in range(reps):
+        t0 = time.monotonic()
+        fn()
+        best = min(best, time.monotonic() - t0)
+    return best
+
+
+def _drain_read(path: Path, chunk: int = 1024 * 1024) -> None:
+    with path.open("rb") as f:
+        while f.read(chunk):
+            pass
+
+
+def _copy_through(src: Path, dst: Path, chunk: int = 1024 * 1024) -> None:
+    with src.open("rb") as src_f, dst.open("wb") as dst_f:
+        while True:
+            block = src_f.read(chunk)
+            if not block:
+                break
+            dst_f.write(block)
+
+
+def _fetch_span(port: int, headers: dict[str, str], span_bytes: int, label: str) -> None:
+    """One peer-style range fetch of the first `span_bytes` of big.bin."""
+    path_enc = urllib.parse.quote("big.bin", safe="")
+    data_url = f"http://127.0.0.1:{port}/data?path={path_enc}"
+    req = urllib.request.Request(
+        data_url, headers={**headers, "Range": f"bytes=0-{span_bytes - 1}"}
+    )
+    with peer_ping.open_http(req, timeout=60) as resp:
+        got = 0
+        while True:
+            block = resp.read(1024 * 1024)
+            if not block:
+                break
+            got += len(block)
+    if got != span_bytes:
+        sys.exit(f"span size mismatch for {label}: {got}")
+
+
+@dataclass(slots=True)
+class _EngineSweep:
+    """Everything one engine-sweep config needs beyond its piece size."""
+
+    bin_path: str
+    origin_dir: str
+    psk_file: str
+    temp_dir: str
+    file_mib: int
+    span_bytes: int
+
+
+def _measure_engine_config(
+    sweep: _EngineSweep,
+    idx: int,
+    cfg: tuple[str, int],
+) -> tuple[float, float, float]:
+    label = cfg[0]
+    """One piece-size point of the engine sweep: mount a fresh daemon, warm
+    the cache with one full read, then time (read, write-through, HTTP span)
+    as best-of-N MB/s. Fresh cache per point: a sidecar written under a
+    different piece grid is discarded on load."""
+    cache_dir = Path(sweep.temp_dir) / f"cache_{idx}"
+    mount_dir = Path(sweep.temp_dir) / f"mount_{idx}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    mount_dir.mkdir(parents=True, exist_ok=True)
+    port = 19700 + idx
+    p = start_mount(
+        sweep.bin_path,
+        sweep.origin_dir,
+        sweep.psk_file,
+        _MountSpec(
+            os.fspath(mount_dir),
+            os.fspath(cache_dir),
+            f"node_engine_{label}",
+            port,
+            label,
+        ),
+    )
+    try:
+        headers = bench_headers()
+        peer_ping.wait_for_ping(port, headers, 30.0)
+
+        mounted_big = mount_dir / "big.bin"
+        # Cold pass: hydrate every piece once so the timed read is the warm
+        # NVMe path, not the origin fill.
+        _drain_read(mounted_big)
+        r_sec = _best_of(2, lambda: _drain_read(mounted_big))
+
+        out = mount_dir / "written.bin"
+        big = Path(sweep.origin_dir) / "big.bin"
+        w_sec = _best_of(2, lambda: _copy_through(big, out))
+        out.unlink(missing_ok=True)
+
+        h_sec = _best_of(3, lambda: _fetch_span(port, headers, sweep.span_bytes, label))
+
+        return (
+            round(sweep.file_mib / max(r_sec, 0.0001), 2),
+            round(sweep.file_mib / max(w_sec, 0.0001), 2),
+            round((sweep.span_bytes / (1024.0 * 1024.0)) / max(h_sec, 0.0001), 2),
+        )
+    finally:
+        stop_mount(p, os.fspath(mount_dir))
+
+
+def run_engine_io_vs_piece_size_benchmark(
+    bin_path: str,
+) -> tuple[list[str], list[float], list[float], list[float]]:
+    """Engine-shaped I/O against a real multi-piece file, across piece
+    sizes: warm read and write-through through the FUSE mount (what
+    llama.cpp and vLLM actually do), plus a peer-style HTTP range fetch of
+    a 64 MiB span. The file is a fixed 256 MiB, decoupled from the piece
+    size, so the sweep measures grid granularity rather than file size --
+    the single-piece-per-file shape of Benchmark 2 cannot show that."""
+    print("=== Benchmark 3: engine I/O vs piece size (256 MiB file) ===")
+    _SCRATCH.mkdir(parents=True, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(prefix="bench-engine-", dir=_SCRATCH)
+    sweep = _EngineSweep(
+        bin_path=bin_path,
+        origin_dir="",
+        psk_file="",
+        temp_dir=temp_dir,
+        file_mib=256,
+        span_bytes=64 * 1024 * 1024,
+    )
+    try:
+        origin_dir, psk_file = make_origin_and_psk(temp_dir)
+        sweep.origin_dir = origin_dir
+        sweep.psk_file = psk_file
+        # One 256 MiB incompressible file shared by every config: the origin
+        # does not care about the piece grid, and regenerating 256 MiB of
+        # urandom per point would only burn wall time.
+        big_src = Path(origin_dir) / "big.bin"
+        seed = os.urandom(4 * 1024 * 1024)
+        with big_src.open("wb") as f:
+            for _ in range(sweep.file_mib // 4):
+                f.write(seed)
+
+        labels = [c[0] for c in _PIECE_CONFIGS]
+        read_mbps: list[float] = []
+        write_mbps: list[float] = []
+        http_mbps: list[float] = []
+
+        for idx, cfg in enumerate(_PIECE_CONFIGS):
+            label = cfg[0]
+            r, w, h = _measure_engine_config(sweep, idx, cfg)
+            read_mbps.append(r)
+            write_mbps.append(w)
+            http_mbps.append(h)
+            print(
+                f"  Piece size: {label:>4} -> warm read {r:>7.2f} MB/s, "
+                f"write-through {w:>7.2f} MB/s, HTTP span {h:>7.2f} MB/s"
+            )
+
+        return labels, read_mbps, write_mbps, http_mbps
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# The piece-size sweep both measured sweeps walk. 128M and 256M sit past the
+# 16M default to show where bigger chunks stop paying; every entry is a legal
+# --piece value (parseSize accepts 1024-based K/M/G up to u32 max bytes).
+_PIECE_CONFIGS = [
+    ("256K", 256 * 1024),
+    ("512K", 512 * 1024),
+    ("1M", 1 * 1024 * 1024),
+    ("2M", 2 * 1024 * 1024),
+    ("4M", 4 * 1024 * 1024),
+    ("8M", 8 * 1024 * 1024),
+    ("16M", 16 * 1024 * 1024),
+    ("32M", 32 * 1024 * 1024),
+    ("64M", 64 * 1024 * 1024),
+    ("128M", 128 * 1024 * 1024),
+    ("256M", 256 * 1024 * 1024),
+]
 
 _FONT = "DejaVu Sans, sans-serif"
 _HEADROOM = 1.15
@@ -481,6 +653,86 @@ def _write_line_chart(path: Path, ys: list[float], x_labels: list[str], title: s
     _write_svg(path, body, box)
 
 
+@dataclass(slots=True)
+class _TwoSeriesSpec:
+    """Labels and layout for _write_two_line_chart, mirroring _BarSpec."""
+
+    title: str
+    xlabel: str
+    ylabel: str
+    legend_a: str
+    legend_b: str
+
+
+def _write_two_line_chart(
+    path: Path,
+    ys_a: list[float],
+    ys_b: list[float],
+    x_labels: list[str],
+    spec: _TwoSeriesSpec,
+) -> None:
+    """Two series over the same x positions, blue and green with a small
+    legend, in the same hand-rendered style as the other charts."""
+    _require_parallel(len(ys_a), len(x_labels), "line chart series A and labels")
+    _require_parallel(len(ys_b), len(x_labels), "line chart series B and labels")
+    box = _Box(*_LINE_BOX)
+    y_max = _axis_max(ys_a + ys_b)
+    frame = _chart_frame(box, spec.title, spec.xlabel, spec.ylabel, y_max)
+    n = len(x_labels)
+    span = n - 1 if n > 1 else 1
+
+    def pts_of(ys: list[float]) -> list[str]:
+        out: list[str] = []
+        for i, y in enumerate(ys):
+            px = box.left + (i / span) * box.plot_w
+            py = box.top + box.plot_h * (1 - y / y_max)
+            out.append(f"{px:.1f},{py:.1f}")
+        return out
+
+    dots_a: list[str] = []
+    dots_b: list[str] = []
+    for i, (ya, yb) in enumerate(zip(ys_a, ys_b, strict=True)):
+        px = box.left + (i / span) * box.plot_w
+        pa = box.top + box.plot_h * (1 - ya / y_max)
+        pb = box.top + box.plot_h * (1 - yb / y_max)
+        dots_a.append(f'<circle cx="{px:.1f}" cy="{pa:.1f}" r="4" fill="#1f77b4"/>')
+        dots_b.append(f'<circle cx="{px:.1f}" cy="{pb:.1f}" r="4" fill="#2ca02c"/>')
+        dots_b.append(
+            f'<text x="{px:.1f}" y="{box.top + box.plot_h + 16}" text-anchor="middle" '
+            f'font-family="{_FONT}" font-size="10">{_svg_escape(x_labels[i])}</text>'
+        )
+    # Legend top-right inside the plot: two swatch lines and labels.
+    lx = box.left + box.plot_w - 220
+    legend_a_svg = _svg_escape(spec.legend_a)
+    legend_b_svg = _svg_escape(spec.legend_b)
+    legend = (
+        f'<line x1="{lx}" y1="{box.top + 14}" x2="{lx + 28}" y2="{box.top + 14}" '
+        f'stroke="#1f77b4" stroke-width="2.2"/>'
+        f'<text x="{lx + 34}" y="{box.top + 18}" font-family="{_FONT}" '
+        f'font-size="10">{legend_a_svg}</text>'
+        f'<line x1="{lx}" y1="{box.top + 32}" x2="{lx + 28}" y2="{box.top + 32}" '
+        f'stroke="#2ca02c" stroke-width="2.2"/>'
+        f'<text x="{lx + 34}" y="{box.top + 36}" font-family="{_FONT}" '
+        f'font-size="10">{legend_b_svg}</text>'
+    )
+    nl = chr(10)
+    pts_a = " ".join(pts_of(ys_a))
+    pts_b = " ".join(pts_of(ys_b))
+    dots = nl.join(dots_a + dots_b)
+    body = (
+        frame
+        + f'<polyline fill="none" stroke="#1f77b4" stroke-width="2.2" points="{pts_a}"/>'
+        + nl
+        + f'<polyline fill="none" stroke="#2ca02c" stroke-width="2.2" points="{pts_b}"/>'
+        + nl
+        + dots
+        + nl
+        + legend
+        + nl
+    )
+    _write_svg(path, body, box)
+
+
 def _write_bar_chart(
     path: Path,
     labels: list[str],
@@ -517,13 +769,21 @@ def _write_bar_chart(
     _write_svg(path, frame + "\n".join(extras) + "\n", box)
 
 
-def plot_figures(
-    node_counts: list[int],
-    latencies_ms: list[float],
-    chunk_labels: list[str],
-    throughputs_mbps: list[float],
-    out_dir: Path,
-) -> None:
+@dataclass(slots=True)
+class BenchmarkResults:
+    """Everything one full run measured, handed to the plotter and report."""
+
+    node_counts: list[int]
+    latencies_ms: list[float]
+    chunk_labels: list[str]
+    chunk_throughputs_mbps: list[float]
+    engine_labels: list[str]
+    engine_read_mbps: list[float]
+    engine_write_mbps: list[float]
+    engine_http_mbps: list[float]
+
+
+def plot_figures(results: BenchmarkResults, out_dir: Path) -> None:
     print("=== Plotting figures ===")
     figures_dir = out_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
@@ -531,8 +791,8 @@ def plot_figures(
     fig1_path = figures_dir / "fig1_cluster_latency_scaling.svg"
     _write_line_chart(
         fig1_path,
-        latencies_ms,
-        [str(n) for n in node_counts],
+        results.latencies_ms,
+        [str(n) for n in results.node_counts],
         "modelfs Cluster Endpoint Query Latency Scaling",
     )
     print(f"Saved Figure 1: {fig1_path}")
@@ -540,9 +800,9 @@ def plot_figures(
     fig2_path = figures_dir / "fig2_throughput_vs_piece_size.svg"
     _write_bar_chart(
         fig2_path,
-        chunk_labels,
-        throughputs_mbps,
-        ["#2ca02c"] * len(throughputs_mbps),
+        results.chunk_labels,
+        results.chunk_throughputs_mbps,
+        ["#2ca02c"] * len(results.chunk_throughputs_mbps),
         _BarSpec(
             "modelfs Zero-Copy HTTP Piece Throughput Across Chunk Sizes",
             _Box(*_BAR_BOX),
@@ -572,20 +832,60 @@ def plot_figures(
     )
     print(f"Saved Figure 3: {fig3_path}")
 
+    fig4_path = figures_dir / "fig4_engine_io_vs_piece_size.svg"
+    _write_two_line_chart(
+        fig4_path,
+        results.engine_read_mbps,
+        results.engine_write_mbps,
+        results.engine_labels,
+        _TwoSeriesSpec(
+            "modelfs Warm Read and Write-Through vs Piece Size (256 MiB File)",
+            "Piece Chunk Size",
+            "Throughput (MB/s)",
+            "Warm FUSE read",
+            "Write-through",
+        ),
+    )
+    print(f"Saved Figure 4: {fig4_path}")
 
-def generate_report(
-    node_counts: list[int],
-    latencies_ms: list[float],
-    chunk_labels: list[str],
-    throughputs_mbps: list[float],
-    out_dir: Path,
-) -> None:
+    fig5_path = figures_dir / "fig5_http_span_vs_piece_size.svg"
+    _write_bar_chart(
+        fig5_path,
+        results.engine_labels,
+        results.engine_http_mbps,
+        ["#ff7f0e"] * len(results.engine_http_mbps),
+        _BarSpec(
+            "modelfs Peer-Style HTTP 64 MiB Range Fetch vs Piece Size (256 MiB File)",
+            _Box(*_BAR_BOX),
+            "Piece Chunk Size",
+            "Transfer Throughput (MB/s)",
+            "{:.0f} MB/s",
+        ),
+    )
+    print(f"Saved Figure 5: {fig5_path}")
+
+
+def generate_report(results: BenchmarkResults, out_dir: Path) -> None:
     latency_table = "\n".join(
-        f"| {n} | {ms} ms |" for n, ms in zip(node_counts, latencies_ms, strict=True)
+        f"| {n} | {ms} ms |"
+        for n, ms in zip(results.node_counts, results.latencies_ms, strict=True)
     )
     sweep_table = "\n".join(
         f"| {label} | {mbps:.0f} MB/s |"
-        for label, mbps in zip(chunk_labels, throughputs_mbps, strict=True)
+        for label, mbps in zip(results.chunk_labels, results.chunk_throughputs_mbps, strict=True)
+    )
+    engine_table = "\n".join(
+        f"| {label} | {read:.0f} MB/s | {write:.0f} MB/s |"
+        for label, read, write in zip(
+            results.engine_labels,
+            results.engine_read_mbps,
+            results.engine_write_mbps,
+            strict=True,
+        )
+    )
+    span_table = "\n".join(
+        f"| {label} | {mbps:.0f} MB/s |"
+        for label, mbps in zip(results.engine_labels, results.engine_http_mbps, strict=True)
     )
     report_date = datetime.now(UTC).date().isoformat()
     report_content = f"""# Benchmarks
@@ -594,7 +894,7 @@ def generate_report(
 |---|---|
 | Status | Generated by `scripts/run_benchmarks_and_plots.py`; edit that, not this file |
 | Date | {report_date} |
-| Topology | **{max(node_counts)} `modelfs` instances on one host, TCP loopback.** Not a cluster |
+| Topology | **{max(results.node_counts)} instances on one host, TCP loopback.** Not a cluster |
 
 Loopback removes the NIC, the switch, and the remote page cache, so these numbers
 bound the software rather than a deployment. Read them as ceilings and ratios.
@@ -631,7 +931,42 @@ costs the reader the whole piece before the read returns.
 
 ![Throughput vs piece size](figures/fig2_throughput_vs_piece_size.svg)
 
-## 3. Tier comparison
+## 3. Engine I/O vs piece size
+
+The shape engines actually produce: a fixed 256 MiB file (decoupled from the
+piece size, so this sweep measures grid granularity rather than file size),
+read warm through the FUSE mount after one hydrating pass, and rewritten
+through the mount, timed per pass with the best of a few runs:
+
+| Piece | Warm FUSE read | Write-through |
+|---|---|---|
+{engine_table}
+
+Warm reads ride the host page cache and memory bandwidth, so they bound this
+software rather than the disk and they wobble run to run. Write-through is the
+stable line: the origin pwrite plus the cache copy dominate, and the piece
+grid barely moves them at this file size.
+
+![Engine I/O vs piece size](figures/fig4_engine_io_vs_piece_size.svg)
+
+## 4. Peer-style HTTP range fetch vs piece size
+
+A 64 MiB `Range` against the same 256 MiB file -- the transfer a fetching
+peer issues -- across the same piece sizes:
+
+| Piece | Throughput |
+|---|---|
+{span_table}
+
+One file, many pieces. On this host the span slows as the piece grows -- the
+opposite corner from Benchmark 2, where bigger single-piece files fetched
+faster. Read the two sweeps together: piece size trades one-piece fetch speed
+against streaming across a real file's grid, and the 16 MiB default is a
+mid-curve choice, not a corner-case optimum.
+
+![HTTP span vs piece size](figures/fig5_http_span_vs_piece_size.svg)
+
+## 5. Tier comparison
 
 **Illustrative, not measured.** These are the order-of-magnitude figures the
 design assumes, drawn to show the shape of the hierarchy; nothing in this script
@@ -687,9 +1022,20 @@ def main() -> None:
     out_dir = _ROOT / "docs" if args.update_docs else _SCRATCH / "benchmarks"
     bin_path = build_modelfs()
     node_counts, latencies_ms = run_cluster_latency_benchmark(bin_path)
-    chunk_labels, throughputs_mbps = run_throughput_vs_piece_size_benchmark(bin_path)
-    plot_figures(node_counts, latencies_ms, chunk_labels, throughputs_mbps, out_dir)
-    generate_report(node_counts, latencies_ms, chunk_labels, throughputs_mbps, out_dir)
+    chunk_labels, chunk_throughputs = run_throughput_vs_piece_size_benchmark(bin_path)
+    e_labels, e_read, e_write, e_http = run_engine_io_vs_piece_size_benchmark(bin_path)
+    results = BenchmarkResults(
+        node_counts=node_counts,
+        latencies_ms=latencies_ms,
+        chunk_labels=chunk_labels,
+        chunk_throughputs_mbps=chunk_throughputs,
+        engine_labels=e_labels,
+        engine_read_mbps=e_read,
+        engine_write_mbps=e_write,
+        engine_http_mbps=e_http,
+    )
+    plot_figures(results, out_dir)
+    generate_report(results, out_dir)
     if not args.update_docs:
         print(
             f"Outputs in {out_dir} (gitignored): these are this machine's numbers. "

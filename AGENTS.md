@@ -13,6 +13,7 @@ and an NFS origin as the write authority. Linux only.
 | `scripts/` | Gates and harnesses. `lib.sh` defines `ROOT_DIR`/`SCRATCH_DIR`/`SCRIPTS_DIR`; harnesses source it |
 | `docs/` | `README.md` indexes them. `architecture.md` is shipped behavior; `design.md` is history |
 | `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files, `SHA256SUMS`, NOTICE, and copyright. `build.zig` and `scripts/extract_fuse3_arm64.sh` verify the digests; extract writes under `.scratch/fuse3-arm64/`; `check.sh` checks them too |
+| `.deps/libfuse3-3.16.2/` | Vendored libfuse3 3.16.2 source for the static single-file release builds (`-Dfuse-static` compiles it in; `scripts/build_static.sh` drives it, `.github/workflows/release.yml` publishes the artifacts). `build.zig` and `check.sh` verify its `SHA256SUMS` too |
 
 ## Gates
 
@@ -23,10 +24,10 @@ It runs:
 - every `src/*.zig` other than `c.zig` imported from `src/root.zig`
 - CHANGELOG `##` headings: `[Unreleased]` first, dated semver matching
   `build.zig.zon`, `[name]:` footer links, and current-tag sentences in
-  README/SECURITY.md/THREAT_MODEL.md. Dated notes are `###`
+  README/SECURITY.md/threat-model.md. Dated notes are `###`
 - shellcheck (`.shellcheckrc` on every `scripts/**/*.sh`), and
   contributor-script `--help` handlers (`test_scripts_help.sh`)
-- vendored libfuse3 digest and extract checks
+- vendored libfuse3 digest and extract checks (both vendored dirs)
 - `test_dr_restore_drill.sh`
 - `ruff check`, `ruff format --check`, `mypy`, `scripts/sbom.py --self-test`,
   and `scripts/sbom.py --check`

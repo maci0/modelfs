@@ -425,6 +425,22 @@ When the live sample has nothing punchable, `cullOneOnDisk` samples cache `data/
 skipped, but that path has no 10 s recency window. Unclaimed data files with no matching
 sidecar are punched as a whole KEEP_SIZE extent.
 
+```mermaid
+flowchart TD
+    free["cull.freePercent: f_bavail of the cache fs"] --> cmp{"against the watermarks"}
+    cmp --> "|>= brun|" idle["idle: no round"]
+    cmp --> "|bcull..brun|" round["cull one round"]
+    cmp --> "|<= bstop|" hard["cull harder: keep going to brun"]
+    round --> sample["considerIdle: sample the 32 oldest idle live entries"]
+    hard --> sample
+    sample --> skip["skip: pin, < 10 s idle, filling, or xfer in flight"]
+    sample --> punch["punchPiece: save sidecar, then PUNCH_HOLE, clear bit"]
+    punch --> empty{"nothing punchable in the sample?"}
+    empty --> "|yes|" disk["cullOneOnDisk: sample data/ by mtime, punch orphan pieces or whole files"]
+    empty --> |no| reap
+    disk --> reap["reapIdle, every 30 s: unlink empty unpinned artifacts idle 300 s"]
+```
+
 `pin` is a marker under `pin/`. Culling itself never unlinks: after every piece is punched,
 `reapIdle` (every 30 s, 300 s idle) unlinks empty unpinned data and meta artifacts so the
 in-memory map stays bounded on nodes that churn paths. `Store.forget` unlinks cache artifacts
@@ -481,7 +497,7 @@ conservative:
   `file_size`, and admitting them would let a peer fill resurrect pre-rewrite bytes.
 
 A file with no manifest anywhere has no trust reference, so its fills stay origin-only. That is
-the cost of never serving unverified bytes (THREAT_MODEL.md, former gap R2).
+the cost of never serving unverified bytes (threat-model.md, former gap R2).
 
 ### Digest lifetime
 
@@ -504,7 +520,26 @@ names).
 ## Writes and races
 
 A write is NFS 1:1, then a copy into this node's cache. If NFS fails, the write fails. There is
-no write-back buffer. `originPwrite` (and FUSE create/truncate, lease/status/sidecar
+no write-back buffer.
+
+```mermaid
+sequenceDiagram
+    participant K as kernel (FUSE)
+    participant W as mf_write
+    participant O as NFS origin
+    participant C as this node's cache
+    K->>W: write(buf, off)
+    W->>O: originPwrite
+    O-->>W: n bytes landed
+    W->>O: statOrigin (size + identity sample)
+    alt observed size == write end
+        W->>C: cacheFillIdentified (marks preserved, short tail dropped)
+    else size diverged (NFS lag or foreign write)
+        W->>C: getIdentified (conservative mark reset)
+    end
+    C->>C: pwrite cache fd, mark fullCover pieces, record digests
+    W-->>K: n
+``` `originPwrite` (and FUSE create/truncate, lease/status/sidecar
 `writeFile*`) treat a failed close after a successful write as failure: NFS reports delayed
 write errors there.
 
@@ -623,6 +658,21 @@ with no `.`/`..` segments, file names are percent-encoded into the download URL,
 listed path passes `relOk` and `relIsCluster` against the joined destination before it reaches
 the origin (`cmdPull` src/main.zig, src/hf.zig).
 
+```mermaid
+flowchart TD
+    start["modelfs pull owner/name @revision --dest"] --> token{"HF_TOKEN or the huggingface token file?"}
+    token --> "|yes|" listing["GET the revision tree; token rides a privileged header,<br/>stripped on the CDN redirect"]
+    token --> "|no|" anon["anonymous GET tree"]
+    listing --> parse["parseTree: files only, every path through<br/>relOk + relIsCluster against the destination"]
+    anon --> parse
+    parse --> have{"lstat: regular file already at the listed size?"}
+    have --> "|yes|" skip["skip; a rerun resumes here"]
+    have --> "|no|" get["GET resolve URL into name.part (O_NOFOLLOW, O_TRUNC)"]
+    get --> size{"bytes landed == listed size?"}
+    size --> "|yes|" rename["rename part onto the real name"]
+    size --> "|no|" refuse["refuse the file; rerun refetches it"]
+```
+
 ### `update`
 
 Finds the live daemon the same way `status` does (`status.json` pid plus the 120 s heartbeat
@@ -644,6 +694,23 @@ Two things make that possible:
   replayed into the new session (`replayInit`) with the reply dropped. The kernel sends INIT
   once per connection and libfuse answers every request with EIO until it has seen one; nothing
   derived from that request round-trips, so it is kept as bytes.
+
+```mermaid
+sequenceDiagram
+    participant CLI as modelfs update
+    participant D as live daemon
+    participant N as replacement image
+    CLI->>CLI: /proc/self/exe + random handshake token
+    CLI->>D: write update.req (token) under --cache
+    CLI->>D: SIGUSR2
+    Note over D: session exits; state is captured, not re-read
+    D->>D: knobs, PSK, inode/fh tables, captured FUSE_INIT -> sealed memfd
+    D->>N: exec self _handover --state-fd N /models (no secret on argv)
+    N->>N: restoreMaps, replayInit (reply dropped)
+    N->>CLI: update.ack (same token) under --cache
+    CLI->>CLI: poll, match token, report pid
+    Note over CLI,N: the kernel FUSE connection and the peer listen fds stay open throughout
+```
 
 Teardown of a replaced image rides the `auto_unmount` helper the original mount left behind.
 `scripts/test_hot_reload.sh` drives the whole path on a live mount.

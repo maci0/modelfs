@@ -12,19 +12,22 @@ fn isLowerHex(s: []const u8) bool {
     return true;
 }
 
-/// Digests in `.deps/fuse3-arm64/SHA256SUMS` (the same list
-/// `scripts/extract_fuse3_arm64.sh` checks). Verified before any compile so
-/// the vendored cross-build inputs cannot silently drift. Absent SHA256SUMS
-/// (Zig package consumers: `.deps` is not in `build.zig.zon` `.paths`) skips
-/// the check; a present file with no entries, a missing listed .deb, or a
-/// digest mismatch fails the build.
-fn vendoredFuseMismatch(b: *std.Build) ?[]const u8 {
-    const sums_rel = ".deps/fuse3-arm64/SHA256SUMS";
+/// Digests in a vendored `.deps/<dir>/SHA256SUMS` (`fuse3-arm64`'s list is
+/// the same one `scripts/extract_fuse3_arm64.sh` checks; `libfuse3-3.16.2`'s
+/// covers the vendored static-build source). Verified before any compile so
+/// vendored inputs cannot silently drift. Entries are paths relative to the
+/// vendored directory (`./name` for flat lists, `lib/fuse.c` for nested
+/// ones); `..`, absolute paths, and empty names are rejected. Absent
+/// SHA256SUMS (Zig package consumers: `.deps` is not in `build.zig.zon`
+/// `.paths`) skips the check; a present file with no entries, a missing
+/// listed file, or a digest mismatch fails the build.
+fn vendoredMismatch(b: *std.Build, dir_rel: []const u8) ?[]const u8 {
+    const sums_rel = allocPrint(b, "{s}/SHA256SUMS", .{dir_rel});
     const sums = std.Io.Dir.cwd().readFileAlloc(
         b.graph.io,
         b.pathFromRoot(sums_rel),
         b.allocator,
-        .limited(64 << 10),
+        .limited(256 << 10),
     ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return allocPrint(b, "cannot read {s}: {t}", .{ sums_rel, err }),
@@ -48,16 +51,17 @@ fn vendoredFuseMismatch(b: *std.Build) ?[]const u8 {
         }
         var name = std.mem.trim(u8, line[64..], " \t");
         if (name.len > 0 and name[0] == '*') name = std.mem.trim(u8, name[1..], " \t");
+        if (std.mem.startsWith(u8, name, "./")) name = name[2..];
         if (name.len == 0 or
-            std.mem.indexOfScalar(u8, name, '/') != null or
-            std.mem.eql(u8, name, ".") or
-            std.mem.eql(u8, name, ".."))
+            name[0] == '/' or
+            std.mem.indexOf(u8, name, "..") != null or
+            name[name.len - 1] == '/')
         {
-            return allocPrint(b, "{s}: illegal filename (must be a basename in .deps/fuse3-arm64/)", .{sums_rel});
+            return allocPrint(b, "{s}: illegal path {s} (must be relative to the vendored dir)", .{ sums_rel, name });
         }
 
         saw_entry = true;
-        const rel = allocPrint(b, ".deps/fuse3-arm64/{s}", .{name});
+        const rel = allocPrint(b, "{s}/{s}", .{ dir_rel, name });
         const bytes = std.Io.Dir.cwd().readFileAlloc(
             b.graph.io,
             b.pathFromRoot(rel),
@@ -74,8 +78,8 @@ fn vendoredFuseMismatch(b: *std.Build) ?[]const u8 {
         if (!std.mem.eql(u8, &got, hex)) {
             return allocPrint(
                 b,
-                "vendored libfuse3 integrity check failed for {s}: expected sha256 {s}, got {s}; refresh per .deps/fuse3-arm64/README.md",
-                .{ rel, hex, &got },
+                "vendored integrity check failed for {s}: expected sha256 {s}, got {s}; refresh per the README in {s}",
+                .{ rel, hex, &got, dir_rel },
             );
         }
     }
@@ -103,7 +107,8 @@ fn fuseHeadersMissing(b: *std.Build, fuse_inc: []const u8) ?[]const u8 {
 
 /// One libfuse3 link contract for the executable and the test binary alike:
 /// an explicit -Dfuse-lib dir (cross builds, pkg-config disabled) or the
-/// system default.
+/// system default. `-Dfuse-static` callers must not route here: the vendored
+/// source is compiled in instead, and there is no library left to link.
 fn linkFuse(m: *std.Build.Module, fuse_lib: ?[]const u8) void {
     if (fuse_lib) |dir| {
         m.addLibraryPath(.{ .cwd_relative = dir });
@@ -112,6 +117,38 @@ fn linkFuse(m: *std.Build.Module, fuse_lib: ?[]const u8) void {
     } else {
         m.linkSystemLibrary("fuse3", .{});
     }
+}
+
+/// The vendored libfuse3 for `-Dfuse-static` builds: the exact source list of
+/// upstream lib/meson.build for Linux (mount.c, not mount_bsd.c; the iconv
+/// option module is left out and HAVE_ICONV stays undefined to match), built
+/// with the same non-default macros upstream meson passes. FUSERMOUNT_DIR is
+/// only mount.c's first exec guess before the PATH fallback, so /usr/bin is
+/// right everywhere this ships (Debian/Ubuntu, Arch, Alpine).
+const fuse_static_root = ".deps/libfuse3-3.16.2";
+const fuse_static_sources = [_][]const u8{
+    "buffer.c",     "compat.c",         "cuse_lowlevel.c", "fuse.c",
+    "fuse_log.c",   "fuse_loop.c",      "fuse_loop_mt.c",  "fuse_lowlevel.c",
+    "fuse_opt.c",   "fuse_signals.c",   "helper.c",        "mount.c",
+    "mount_util.c", "modules/subdir.c",
+};
+const fuse_static_source_paths: [fuse_static_sources.len][]const u8 = blk: {
+    var out: [fuse_static_sources.len][]const u8 = undefined;
+    for (&fuse_static_sources, 0..) |src, i| out[i] = fuse_static_root ++ "/lib/" ++ src;
+    break :blk out;
+};
+const fuse_static_cflags = [_][]const u8{
+    "-DFUSE_USE_VERSION=312",
+    "-DFUSERMOUNT_DIR=\"/usr/bin\"",
+    "-D_GNU_SOURCE",
+    "-D_REENTRANT",
+    "-D_FILE_OFFSET_BITS=64",
+};
+
+fn addVendoredFuse(m: *std.Build.Module) void {
+    m.addIncludePath(.{ .cwd_relative = fuse_static_root ++ "/include" });
+    m.addIncludePath(.{ .cwd_relative = fuse_static_root ++ "/lib" });
+    m.addCSourceFiles(.{ .files = &fuse_static_source_paths, .flags = &fuse_static_cflags });
 }
 
 /// Fail `zig build` / `zig build test` unless the shipped ELF is a PIE with
@@ -169,15 +206,30 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(&ci_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
-    if (vendoredFuseMismatch(b)) |msg| {
-        const fail = b.addFail(msg);
-        b.getInstallStep().dependOn(&fail.step);
-        test_step.dependOn(&fail.step);
-        return;
+    for ([_][]const u8{ ".deps/fuse3-arm64", ".deps/libfuse3-3.16.2" }) |dir| {
+        if (vendoredMismatch(b, dir)) |msg| {
+            const fail = b.addFail(msg);
+            b.getInstallStep().dependOn(&fail.step);
+            test_step.dependOn(&fail.step);
+            return;
+        }
     }
 
-    const fuse_inc = b.option([]const u8, "fuse-include", "libfuse3 headers") orelse "/usr/include/fuse3";
-    const fuse_lib = b.option([]const u8, "fuse-lib", "libfuse3 library dir");
+    // -Dfuse-static compiles the vendored libfuse3 in place of linking a
+    // system library. With a musl target this is what produces the
+    // single-file release binaries; on the host glibc toolchain it only
+    // drops the libfuse3.so dependency (glibc itself stays dynamic).
+    const fuse_static = b.option(
+        bool,
+        "fuse-static",
+        "compile the vendored libfuse3 into the binary instead of linking a system libfuse3",
+    ) orelse false;
+
+    const fuse_inc = if (fuse_static)
+        fuse_static_root ++ "/include"
+    else
+        b.option([]const u8, "fuse-include", "libfuse3 headers") orelse "/usr/include/fuse3";
+    const fuse_lib = if (fuse_static) null else b.option([]const u8, "fuse-lib", "libfuse3 library dir");
 
     // Edit-test loop: substring match on test *names* (Zig collects tests
     // from the whole import graph, so a file name is not a filter). A
@@ -224,12 +276,23 @@ pub fn build(b: *std.Build) void {
 
     // @cImport is deprecated in 0.16: C interop moves to the build system.
     // src/c.h + these macros reproduce the former @cImport block verbatim.
+    // musl targets translate src/c_musl.h instead: it includes src/c.h after
+    // working around translate-c's demotion of musl's struct timespec (see
+    // that file). The same demotion hits musl's struct statvfs (anonymous
+    // bitfield again), so the shim directory goes first on the include path
+    // to serve an ABI-identical sys/statvfs.h without the bitfield. The
+    // include path below is the vendored fuse3 tree under -Dfuse-static and
+    // the -Dfuse-include dir otherwise.
+    const c_root = if (target.result.abi == .musl) "src/c_musl.h" else "src/c.h";
     const tc = b.addTranslateC(.{
-        .root_source_file = b.path("src/c.h"),
+        .root_source_file = b.path(c_root),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    if (target.result.abi == .musl) {
+        tc.addIncludePath(.{ .cwd_relative = "src/c-musl-shim" });
+    }
     tc.defineCMacro("_GNU_SOURCE", "1");
     tc.defineCMacro("FUSE_USE_VERSION", "31");
     tc.defineCMacro("_FILE_OFFSET_BITS", "64");
@@ -249,8 +312,12 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("c", c_mod);
     exe_mod.addImport("build_options", version_mod);
-    linkFuse(exe_mod, fuse_lib);
-    exe_mod.addIncludePath(.{ .cwd_relative = fuse_inc });
+    if (fuse_static) {
+        addVendoredFuse(exe_mod);
+    } else {
+        linkFuse(exe_mod, fuse_lib);
+        exe_mod.addIncludePath(.{ .cwd_relative = fuse_inc });
+    }
 
     // Stack canaries and stack probes in every mode: Zig enables both by
     // default only in safe modes, so an unhardened -Doptimize=ReleaseFast
@@ -281,7 +348,9 @@ pub fn build(b: *std.Build) void {
         .use_lld = true,
     });
     // ASLR for the main image: without this Zig links ET_EXEC, so the
-    // long-lived networked daemon runs at a fixed address.
+    // long-lived networked daemon runs at a fixed address. Static-PIE
+    // (musl) keeps it too: the release binaries link as ET_DYN with no
+    // interpreter and relocate themselves at entry.
     exe.pie = true;
     // Zig already defaults these on; pin them so a default flip cannot ship
     // a lazy-binding or partial-RELRO networked image.
@@ -313,7 +382,11 @@ pub fn build(b: *std.Build) void {
         .stack_check = stack_check_supported,
         .pic = true,
     });
-    linkFuse(test_mod, fuse_lib);
+    if (fuse_static) {
+        addVendoredFuse(test_mod);
+    } else {
+        linkFuse(test_mod, fuse_lib);
+    }
     test_mod.addIncludePath(.{ .cwd_relative = fuse_inc });
     test_mod.addImport("c", c_mod);
     test_mod.addImport("build_options", version_mod);

@@ -361,6 +361,15 @@ pub fn parseLease(gpa: std.mem.Allocator, json: []const u8) !std.json.Parsed(Lea
 }
 
 pub fn formatLease(buf: []u8, id: []const u8, until: i64, addrs: []const LeaseAddr) ![]u8 {
+    // The verbatim embedding is the contract leaseJsonClean documents, and
+    // the refresh-side parser refuses documents that break it; enforcing
+    // the gate here too means a caller that skips its own validation fails
+    // its publish instead of sending a lease every peer's parser rejects
+    // and silently dropping out of the cluster.
+    if (!leaseJsonClean(id)) return error.LeaseStringUnclean;
+    for (addrs) |a| {
+        if (!leaseJsonClean(a.ip)) return error.LeaseStringUnclean;
+    }
     var w = std.Io.Writer.fixed(buf);
     try w.print("{{\"id\":\"{s}\",\"until\":{d},\"addrs\":[", .{ id, until });
     for (addrs, 0..) |a, i| {

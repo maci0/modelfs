@@ -560,13 +560,13 @@ test "rename flag passthrough keeps NOREPLACE and EXCHANGE semantics" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(b_z, "BBB"));
 
     // NOREPLACE onto an existing destination fails EEXIST; b keeps its bytes.
-    try std.testing.expect(fuse.renameat2(sys.c.AT_FDCWD, a_z, sys.c.AT_FDCWD, b_z, sys.c.RENAME_NOREPLACE) != 0);
-    try std.testing.expectEqual(sys.c.EEXIST, sys.errno());
+    const rc = sys.renameAt2(sys.c.AT_FDCWD, a_z, sys.c.AT_FDCWD, b_z, sys.c.RENAME_NOREPLACE);
+    try std.testing.expectEqual(-sys.c.EEXIST, rc);
     var rb: [4]u8 = undefined;
     try std.testing.expectEqualStrings("BBB", try sys.readFileBuf(&rb, b_z));
 
     // EXCHANGE swaps the two names' contents in place.
-    try std.testing.expectEqual(@as(i32, 0), fuse.renameat2(sys.c.AT_FDCWD, a_z, sys.c.AT_FDCWD, b_z, sys.c.RENAME_EXCHANGE));
+    try std.testing.expectEqual(@as(i32, 0), sys.renameAt2(sys.c.AT_FDCWD, a_z, sys.c.AT_FDCWD, b_z, sys.c.RENAME_EXCHANGE));
     try std.testing.expectEqualStrings("BBB", try sys.readFileBuf(&rb, a_z));
     try std.testing.expectEqualStrings("AAA", try sys.readFileBuf(&rb, b_z));
 }
@@ -641,7 +641,6 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
 }
 
 export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
-    _ = fi;
     const st = statePtr();
     const p = cPath(path);
     var rel: []const u8 = "";
@@ -653,7 +652,13 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     // names in: a symlink staged at this name on the shared origin must not
     // turn the create's O_TRUNC into a truncate of the link's target.
     // O_NONBLOCK: an existing FIFO at the name must not hang this handler.
-    const fd = sys.open(op, sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_TRUNC | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK, clientCreateMode(mode));
+    // O_EXCL from the caller reaches the origin instead of being dropped:
+    // on a shared write authority, an exclusive creator racing another
+    // node's file must fail EEXIST, not O_TRUNC it out of existence.
+    const excl = (fiFlags(fi) & sys.c.O_EXCL) != 0;
+    const cflags: c_int = sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK |
+        (if (excl) sys.c.O_EXCL else sys.c.O_TRUNC);
+    const fd = sys.open(op, cflags, clientCreateMode(mode));
     if (fd < 0) return sys.negErrno();
     const cr = sys.closeWrite(fd);
     // O_TRUNC replaced the origin bytes at this path. Cache identity is the
@@ -1044,7 +1049,10 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
         const old_size = file.size;
         if (end > old_size) {
             // NFS attribute lag can report the pre-write size; grow the
-            // bitfield alongside so appended pieces stay markable.
+            // bitfield alongside so appended pieces stay markable. A
+            // non-piece-aligned old size makes the old last piece short:
+            // drop its mark first, same contract as cacheFill's grow.
+            st.store.dropWideningPieceMark(file);
             file.bits.resize(st.gpa, piece.count(end, st.store.piece_size)) catch {
                 // Same policy as cacheFill's grow: undersized field means
                 // appended pieces stay unmarked and re-hydrate.
@@ -1260,6 +1268,11 @@ export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_i
 /// 1-based ordinals (".", "..", then origin order); entries at or below the
 /// incoming offset are skipped and emitted entries carry their ordinal,
 /// which is exactly the value the kernel returns to resume after them.
+/// Ordinals are positions over the listing as sampled, so an origin add or
+/// remove between two READDIR calls of one large directory shifts the tail:
+/// a resumed read can then repeat or skip an entry, the accepted tradeoff
+/// of offset-based resume for read-mostly model directories (stable-name
+/// offsets would need a snapshot the path-identity design does not keep).
 /// Separate from ll_readdir so the resume contract is drivable in tests
 /// without mounting.
 fn readdirResume(names: anytype, emit: anytype, off: fuse.off_t) void {
@@ -1307,10 +1320,35 @@ export fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.
     // Lookup-shaped denial: /.cluster is hidden from readdir and getattr.
     const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
     if (rerr != 0) return rerr;
-    var vs: sys.c.struct_statvfs = undefined;
-    const rc = st.store.originStatvfs(rel, &vs);
+    var vs: sys.c.struct_statfs = undefined;
+    const rc = st.store.originStatfs(rel, &vs);
     if (rc != 0) return rc;
-    if (stbuf) |out| out.* = vs;
+    if (stbuf) |out| {
+        // libfuse's answer type is POSIX statvfs-shaped (fuse.h includes
+        // <sys/statvfs.h>) while the origin supplies statfs; every counter
+        // the reply names comes from the same kernel call. The libcs sign
+        // statfs's word fields differently (glibc __fsword_t is signed,
+        // musl's is not), so the copies cast explicitly. f_fsid is the one
+        // spelling trap: glibc types it struct __fsid_t (what fuse.h sees
+        // too), musl packs the same 8 bytes into one unsigned long, so it
+        // moves as bytes.
+        out.f_bsize = @intCast(vs.f_bsize);
+        out.f_frsize = @intCast(vs.f_frsize);
+        out.f_blocks = vs.f_blocks;
+        out.f_bfree = vs.f_bfree;
+        out.f_bavail = vs.f_bavail;
+        out.f_files = vs.f_files;
+        out.f_ffree = vs.f_ffree;
+        // statfs has no f_favail: the libcs' own statvfs wrappers derive it
+        // as f_ffree, and this reply keeps that derivation.
+        out.f_favail = vs.f_ffree;
+        out.f_flag = @intCast(vs.f_flags);
+        // statfs spells it f_namelen; statvfs callers know it as f_namemax.
+        out.f_namemax = @intCast(vs.f_namelen);
+        comptime std.debug.assert(@sizeOf(@TypeOf(out.f_fsid)) == 8);
+        comptime std.debug.assert(@sizeOf(@TypeOf(vs.f_fsid)) == 8);
+        @memcpy(std.mem.asBytes(&out.f_fsid), std.mem.asBytes(&vs.f_fsid));
+    }
     return 0;
 }
 
@@ -1359,7 +1397,7 @@ fn napMs(st: *State, ms: u32) void {
 
 fn cullLoop(st: *State) void {
     var culling = false;
-    // statvfs failure reads as "100% free" downstream, i.e. culling off.
+    // statfs failure reads as "100% free" downstream, i.e. culling off.
     // Without this line a broken cache mount silently suspends culling until
     // the disk fills; log each failure run once instead of every 2s tick.
     var statfs_failing = false;
@@ -1382,7 +1420,7 @@ fn cullLoop(st: *State) void {
             last_reap = now;
         }
         const free_pct = st.store.freePercentChecked() orelse {
-            if (!statfs_failing) std.log.err("cache statvfs failed on {s}; culling suspended", .{st.store.cache});
+            if (!statfs_failing) std.log.err("cache statfs failed on {s}; culling suspended", .{st.store.cache});
             statfs_failing = true;
             napMs(st, 2000);
             continue;
@@ -1390,7 +1428,7 @@ fn cullLoop(st: *State) void {
         // Closure for the suspension line above: without it a suspended
         // stretch reads as permanent -- nothing in the journal ever says
         // culling came back after the cache fs healed or was remounted.
-        if (statfs_failing) std.log.info("cache statvfs recovered on {s}; culling resumed", .{st.store.cache});
+        if (statfs_failing) std.log.info("cache statfs recovered on {s}; culling resumed", .{st.store.cache});
         statfs_failing = false;
         const ph = cull.phase(free_pct, st.store.water, culling);
         culling = ph != .run;
@@ -1561,7 +1599,7 @@ fn statusJson(st: *State) !void {
     var w = std.Io.Writer.fixed(&buf);
     try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"origin_down\":{d},\"now_s\":{d},\"mono_s\":{d},\"stats\":{{", .{
         st.catalog.self_id,
-        std.os.linux.getpid(),
+        sys.pidSelf(),
         now_mono -| st.start_secs,
         npeers,
         st.store.piece_size,
@@ -1617,6 +1655,14 @@ fn fiFh(fi: ?*fuse.fuse_file_info) u64 {
     const p = fi orelse return 0;
     const bytes: [*]const u8 = @ptrCast(p);
     return std.mem.readInt(u64, bytes[fi_fh_off..][0..8], .little);
+}
+
+/// The open flags the kernel passed (O_CREAT, O_EXCL, O_TRUNC, access
+/// modes): a plain int32 at the head of the struct, before the bitfields.
+fn fiFlags(fi: ?*fuse.fuse_file_info) c_int {
+    const p = fi orelse return 0;
+    const bytes: [*]const u8 = @ptrCast(p);
+    return std.mem.readInt(i32, bytes[0..4], .little);
 }
 
 fn setFiFh(fi: ?*fuse.fuse_file_info, fh: u64) void {
@@ -1892,6 +1938,11 @@ export fn ll_setattr(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, attr: [*c]fuse.
     const st = llEnter(req);
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const p = pathForOp(st, ino, fi, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
+    // Refuse the unsupported bits before applying anything: answering ENOSYS
+    // after the supported subset landed made a chown+chmod (or
+    // truncate+utimes) report an error whose mode/size change stuck, and
+    // retry loops would repeat it forever.
+    if ((to_set & ~settable_attrs) != 0) return replyErr(req, sys.c.ENOSYS);
     var zbuf: [sys.c.PATH_MAX]u8 = undefined;
     const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
     if ((to_set & fuse.FUSE_SET_ATTR_MODE) != 0) {
@@ -1902,7 +1953,6 @@ export fn ll_setattr(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, attr: [*c]fuse.
         const rc = mf_truncate(z, attr.*.st_size, fi);
         if (rc != 0) return replyErr(req, rc);
     }
-    if ((to_set & ~settable_attrs) != 0) return replyErr(req, sys.c.ENOSYS);
     var out: sys.c.struct_stat = undefined;
     const rc = mf_getattr(z, &out, fi);
     if (rc != 0) return replyErr(req, rc);
@@ -2123,7 +2173,7 @@ export fn ll_statfs(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t) callconv(.c) voi
     const p = pathForIno(st, ino, &pbuf) orelse return replyErr(req, sys.c.ENOENT);
     var zbuf: [sys.c.PATH_MAX]u8 = undefined;
     const z = sys.toZ(&zbuf, p) catch return replyErr(req, sys.c.ENAMETOOLONG);
-    var vs: sys.c.struct_statvfs = undefined;
+    var vs: fuse.struct_statvfs = undefined;
     const rc = mf_statfs(z, &vs);
     if (rc != 0) return replyErr(req, rc);
     _ = fuse.fuse_reply_statfs(req, &vs);
@@ -2333,12 +2383,19 @@ fn serve(st: *State, inherit_fd: ?c_int) c_int {
 }
 
 fn ioRead(fd: c_int, buf: ?*anyopaque, size: usize, userdata: ?*anyopaque) callconv(.c) isize {
-    const n = sys.c.read(fd, buf, size);
-    if (n <= 0) return n;
-    const st: *State = @ptrCast(@alignCast(userdata.?));
-    const bytes: [*]const u8 = @ptrCast(buf.?);
-    captureInit(st, bytes[0..@intCast(n)]);
-    return n;
+    while (true) {
+        const n = sys.c.read(fd, buf, size);
+        if (n > 0) {
+            const st: *State = @ptrCast(@alignCast(userdata.?));
+            const bytes: [*]const u8 = @ptrCast(buf.?);
+            captureInit(st, bytes[0..@intCast(n)]);
+            return n;
+        }
+        // Retry EINTR like every read wrapper in sys.zig: libfuse's handling
+        // of a -EINTR from custom io is version-dependent, and a signal
+        // landing here would otherwise tear down the session (unmount).
+        if (n == 0 or sys.errno() != sys.c.EINTR) return n;
+    }
 }
 
 /// Keeps the connection's FUSE_INIT request verbatim the one time it comes
@@ -2426,7 +2483,13 @@ fn installHandoverSignal(st: *State, se: *fuse.fuse_session) void {
     live_state = st;
     live_session = se;
     var sa = std.mem.zeroes(sys.c.struct_sigaction);
-    sa.__sigaction_handler.sa_handler = onUsr2;
+    // Same union, two libc spellings: glibc nests the handler behind a named
+    // __sigaction_handler union, musl names it __sa_handler.
+    if (comptime @import("builtin").target.abi == .musl) {
+        sa.__sa_handler.sa_handler = onUsr2;
+    } else {
+        sa.__sigaction_handler.sa_handler = onUsr2;
+    }
     _ = sys.c.sigemptyset(&sa.sa_mask);
     sa.sa_flags = sys.c.SA_RESTART;
     _ = sys.c.sigaction(sys.c.SIGUSR2, &sa, null);
@@ -2915,12 +2978,12 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     const doc = try std.json.parseFromSlice(StatusDoc, gpa, blob, .{});
     defer doc.deinit();
     try std.testing.expectEqualStrings("me", doc.value.id);
-    try std.testing.expectEqual(@as(i64, std.os.linux.getpid()), doc.value.pid);
+    try std.testing.expectEqual(@as(i64, sys.pidSelf()), doc.value.pid);
     try std.testing.expect(doc.value.uptime_s >= 0);
     try std.testing.expectEqual(@as(u32, 2), doc.value.peers);
     try std.testing.expectEqual(@as(u32, 4096), doc.value.piece);
     try std.testing.expectEqual(@as(u32, 0), doc.value.inflight);
-    // The saturation gauge rides along: statvfs works here, so a real
+    // The saturation gauge rides along: statfs works here, so a real
     // percentage, not the -1 unknown marker.
     try std.testing.expect(doc.value.cache_free_pct >= 0);
     try std.testing.expectEqual(@as(i32, 0), doc.value.origin_down);

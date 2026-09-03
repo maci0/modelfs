@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="750" height="420" viewBox="0 0 750 420">
+<rect width="750" height="420" fill="#ffffff"/>
+<text x="375.0" y="24" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="14" font-weight="bold">modelfs Peer-Style HTTP 64 MiB Range Fetch vs Piece Size (256 MiB File)</text>
+<text x="393.0" y="410" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="11">Piece Chunk Size</text>
+<text x="16" y="200.0" text-anchor="middle" transform="rotate(-90 16 200.0)" font-family="DejaVu Sans, sans-serif" font-size="11">Transfer Throughput (MB/s)</text>
+<rect x="56" y="44" width="674" height="312" fill="none" stroke="#333333" stroke-width="0.8"/>
+<line x1="56" y1="356.0" x2="730" y2="356.0" stroke="#333333" stroke-dasharray="4 4" stroke-opacity="0.35"/>
+<text x="50" y="359.0" text-anchor="end" font-family="DejaVu Sans, sans-serif" font-size="9">0</text>
+<line x1="56" y1="278.0" x2="730" y2="278.0" stroke="#333333" stroke-dasharray="4 4" stroke-opacity="0.35"/>
+<text x="50" y="281.0" text-anchor="end" font-family="DejaVu Sans, sans-serif" font-size="9">1532.56</text>
+<line x1="56" y1="200.0" x2="730" y2="200.0" stroke="#333333" stroke-dasharray="4 4" stroke-opacity="0.35"/>
+<text x="50" y="203.0" text-anchor="end" font-family="DejaVu Sans, sans-serif" font-size="9">3065.12</text>
+<line x1="56" y1="122.0" x2="730" y2="122.0" stroke="#333333" stroke-dasharray="4 4" stroke-opacity="0.35"/>
+<text x="50" y="125.0" text-anchor="end" font-family="DejaVu Sans, sans-serif" font-size="9">4597.69</text>
+<line x1="56" y1="44.0" x2="730" y2="44.0" stroke="#333333" stroke-dasharray="4 4" stroke-opacity="0.35"/>
+<text x="50" y="47.0" text-anchor="end" font-family="DejaVu Sans, sans-serif" font-size="9">6130.25</text>
+<rect x="69.8" y="86.8" width="33.7" height="269.2" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="86.6" y="80.8" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">5290 MB/s</text>
+<text x="86.6" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">256K</text>
+<rect x="131.1" y="84.7" width="33.7" height="271.3" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="147.9" y="78.7" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">5331 MB/s</text>
+<text x="147.9" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">512K</text>
+<rect x="192.3" y="156.9" width="33.7" height="199.1" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="209.2" y="150.9" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">3912 MB/s</text>
+<text x="209.2" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">1M</text>
+<rect x="253.6" y="96.7" width="33.7" height="259.3" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="270.5" y="90.7" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">5095 MB/s</text>
+<text x="270.5" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">2M</text>
+<rect x="314.9" y="124.0" width="33.7" height="232.0" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="331.7" y="118.0" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">4559 MB/s</text>
+<text x="331.7" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">4M</text>
+<rect x="376.2" y="105.3" width="33.7" height="250.7" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="393.0" y="99.3" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">4926 MB/s</text>
+<text x="393.0" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">8M</text>
+<rect x="437.4" y="116.1" width="33.7" height="239.9" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="454.3" y="110.1" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">4714 MB/s</text>
+<text x="454.3" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">16M</text>
+<rect x="498.7" y="169.7" width="33.7" height="186.3" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="515.5" y="163.7" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">3660 MB/s</text>
+<text x="515.5" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">32M</text>
+<rect x="560.0" y="199.3" width="33.7" height="156.7" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="576.8" y="193.3" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">3079 MB/s</text>
+<text x="576.8" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">64M</text>
+<rect x="621.2" y="271.6" width="33.7" height="84.4" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="638.1" y="265.6" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">1658 MB/s</text>
+<text x="638.1" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">128M</text>
+<rect x="682.5" y="312.9" width="33.7" height="43.1" fill="#ff7f0e" stroke="#333333" stroke-width="0.8"/>
+<text x="699.4" y="306.9" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="8" font-weight="bold">846 MB/s</text>
+<text x="699.4" y="372" text-anchor="middle" font-family="DejaVu Sans, sans-serif" font-size="10">256M</text>
+</svg>

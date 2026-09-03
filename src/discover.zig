@@ -831,6 +831,11 @@ pub const Catalog = struct {
         var quad: [4]u8 = undefined;
         if (!parseV4(addr.ip, &quad)) return;
         if (addr.port == 0) return;
+        // Same destination gate shouldAdvertise applies to our own NICs:
+        // parseV4 admits 0.0.0.0 and 255.255.255.255, and neither is a peer
+        // -- a planted lease naming one must not occupy a path slot that
+        // fillFromPeers will burn a dial-timeout on.
+        if (!isDialableHost(&quad)) return;
         const id = arena.dupe(u8, peer_id) catch return;
         const ip = arena.dupe(u8, addr.ip) catch return;
         var hops: u32 = 1;
@@ -1819,14 +1824,9 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     // aged file sits exactly sweep_min_age_secs outside that clock no
     // matter how long the test takes between those steps.
     const sweep_now = sys.nowSec(std.testing.io);
-    const past = [2]std.os.linux.timespec{
-        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-    };
+    const past_sec = sweep_now - 2 * Catalog.sweep_min_age_secs;
     for ([_][]const u8{ old_fp, tmp_fp }) |fp| {
-        var zb: [192]u8 = undefined;
-        const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, fp), &past, 0);
-        try std.testing.expectEqual(@as(usize, 0), rc);
+        try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, fp, past_sec));
     }
 
     const addrs = [_]proto.LeaseAddr{};
@@ -1843,14 +1843,9 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     // Own lease with stale mtime: still kept (publish failures must stay
     // visible). Cutoff then follows that stale stamp, so a second pass
     // must not start deleting survivors.
-    const own_past = [2]std.os.linux.timespec{
-        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-    };
     {
-        var zb: [192]u8 = undefined;
-        const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, me_fp), &own_past, 0);
-        try std.testing.expectEqual(@as(usize, 0), rc);
+        const own_past = sweep_now - 2 * Catalog.sweep_min_age_secs;
+        try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, me_fp, own_past));
     }
 
     // Re-execution is the sweep's normal shape: every node runs one per
@@ -1892,13 +1887,9 @@ test "sweepLeases unlinks stale names as a set, not readdir arrival order" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, me_fp), lease_json));
 
     const sweep_now = sys.nowSec(std.testing.io);
-    const past = [2]std.os.linux.timespec{
-        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-        .{ .sec = sweep_now - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-    };
+    const past_sec = sweep_now - 2 * Catalog.sweep_min_age_secs;
     for ([_][]const u8{ zzz_fp, mmm_fp, aaa_fp }) |fp| {
-        var zb: [192]u8 = undefined;
-        try std.testing.expectEqual(@as(usize, 0), std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, fp), &past, 0));
+        try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, fp, past_sec));
     }
 
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
@@ -1939,24 +1930,12 @@ test "sweepLeases ages origin mtimes against our own lease, not CLOCK_REALTIME" 
 
     const sweep_now = sys.nowSec(std.testing.io);
     const nas_lag: i64 = Catalog.sweep_min_age_secs + 100;
-    const own_ts = [2]std.os.linux.timespec{
-        .{ .sec = sweep_now - nas_lag, .nsec = 0 },
-        .{ .sec = sweep_now - nas_lag, .nsec = 0 },
-    };
-    const live_ts = [2]std.os.linux.timespec{
-        .{ .sec = sweep_now - nas_lag + 10, .nsec = 0 },
-        .{ .sec = sweep_now - nas_lag + 10, .nsec = 0 },
-    };
-    const dead_ts = [2]std.os.linux.timespec{
-        .{ .sec = sweep_now - nas_lag - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-        .{ .sec = sweep_now - nas_lag - 2 * Catalog.sweep_min_age_secs, .nsec = 0 },
-    };
-    {
-        var zb: [192]u8 = undefined;
-        try std.testing.expectEqual(@as(usize, 0), std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, me_fp), &own_ts, 0));
-        try std.testing.expectEqual(@as(usize, 0), std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, new_fp), &live_ts, 0));
-        try std.testing.expectEqual(@as(usize, 0), std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zb, old_fp), &dead_ts, 0));
-    }
+    const own_ts = sweep_now - nas_lag;
+    const live_ts = sweep_now - nas_lag + 10;
+    const dead_ts = sweep_now - nas_lag - 2 * Catalog.sweep_min_age_secs;
+    try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, me_fp, own_ts));
+    try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, new_fp, live_ts));
+    try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, old_fp, dead_ts));
 
     const addrs = [_]proto.LeaseAddr{};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});

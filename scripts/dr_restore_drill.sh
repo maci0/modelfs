@@ -151,7 +151,8 @@ zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
 # creation stamp rides along (-p keeps it a parseable epoch) so the drill can
 # refuse to bless a restore point too old for the RPO: snapshots existing but
 # stale is how a dead sanoid.timer hides behind last month's green drill.
-SNAP_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${DATASET}" | tail -n 1)"
+SNAP_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${DATASET}" | tail -n 1)" \
+    || die "cannot list snapshots of ${DATASET} (docs/recovery.md section 3)"
 SNAP="${SNAP_LINE%%$'\t'*}"
 if [[ -z "${SNAP}" ]]; then
     die "no snapshots of ${DATASET}: sanoid.timer is down or was never enabled (docs/recovery.md section 3)"
@@ -212,7 +213,8 @@ REPLICA_STATUS="unchecked"
 if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
     zfs list -H -o name "${MF_DRILL_REPLICA}" >/dev/null 2>&1 \
         || die "replica dataset ${MF_DRILL_REPLICA} does not exist (pool-loss copy missing; docs/recovery.md section 3)"
-    REPLICA_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${MF_DRILL_REPLICA}" | tail -n 1)"
+    REPLICA_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${MF_DRILL_REPLICA}" | tail -n 1)" \
+        || die "cannot list snapshots of ${MF_DRILL_REPLICA} (docs/recovery.md section 3)"
     REPLICA_SNAP="${REPLICA_LINE%%$'\t'*}"
     if [[ -z "${REPLICA_SNAP}" ]]; then
         die "replica ${MF_DRILL_REPLICA} has no snapshots: syncoid is down or was never enabled (docs/recovery.md section 3)"
@@ -247,7 +249,8 @@ CHILD_LIST="$(zfs list -H -o name -r -t filesystem "${DATASET}")" \
 while IFS= read -r child; do
     [[ -n "${child}" ]] || continue
     [[ "${child}" == "${DATASET}" ]] && continue
-    CHILD_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${child}" | tail -n 1)"
+    CHILD_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${child}" | tail -n 1)" \
+        || die "cannot list snapshots of ${child} (docs/recovery.md section 3)"
     CHILD_SNAP="${CHILD_LINE%%$'\t'*}"
     if [[ -z "${CHILD_SNAP}" ]]; then
         die "child dataset ${child} has no snapshots: sanoid recursive did not cover it (docs/recovery.md section 3)"

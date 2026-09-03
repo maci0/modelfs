@@ -63,6 +63,46 @@
       "hashes": [
         {
           "alg": "SHA-1",
+          "content": "d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "actions/download-artifact",
+      "purl": "pkg:github/actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+      "scope": "excluded",
+      "type": "library",
+      "version": "d3f86a106a0bac45b974a628896c90dbdf5c8093"
+    },
+    {
+      "hashes": [
+        {
+          "alg": "SHA-1",
+          "content": "ea165f8d65b6e75b540449e92b4886f43607fa02"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "actions/upload-artifact",
+      "purl": "pkg:github/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+      "scope": "excluded",
+      "type": "library",
+      "version": "ea165f8d65b6e75b540449e92b4886f43607fa02"
+    },
+    {
+      "hashes": [
+        {
+          "alg": "SHA-1",
           "content": "37802adc94f370d6bfd71619e3f0bf239e1f3b78"
         }
       ],

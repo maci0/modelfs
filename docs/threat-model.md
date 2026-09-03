@@ -149,7 +149,8 @@ daemon's uid can plant one.
 ### Not present
 
 No scheduled jobs, IPC endpoints, message consumers, webhooks, or debug/admin services. The
-binary links only libfuse3, libc, and pthread; `build.zig.zon` declares no dependencies.
+binary links only libfuse3, libc, and pthread; `build.zig.zon` declares no dependencies. The
+static release binaries go one further: the vendored libfuse3 (`.deps/libfuse3-3.16.2/`) is compiled in, and nothing is dynamically linked at all.
 
 ---
 

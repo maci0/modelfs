@@ -94,7 +94,7 @@ Status is against the shipped code and [architecture.md](architecture.md).
 | G4 | Nodes exchange missing pieces with each other, torrent-style, in the background. | Partial: peers serve miss pieces on demand; no background swarm. |
 | G5 | Mount is immediately usable: names and sizes exist before bytes arrive. | Shipped (origin `stat`/`readdir`; no local catalog). |
 | G6 | Optional pin: pinned chunks are never LRU-evicted. | Shipped (path-level `pin/` marker; not per-chunk). |
-| G7 | Ingest on any node (download, `cp`, `modelfs pull`). Replicate back to origin. | Partial: writes are write-through to origin; no `modelfs pull`. |
+| G7 | Ingest on any node (download, `cp`, `modelfs pull`). Replicate back to origin. | Partial: writes are write-through to origin; `modelfs pull` shipped in 0.7.0 (HF download onto the origin, no back-replication daemon). |
 | G8 | Two-node mode with no extra store. Replication factor 2. No Redis, no etcd required. | Not shipped (origin-less RF=2; section 13 Two-node). "No Redis, no etcd" still holds. |
 | G9 | Content-addressed dedup across files and nodes. | Not shipped (shelved: Level 1 integrity shipped; CAS/CDC wait on `modelfs dupes`; section 14). |
 | G10 | llama.cpp, vLLM, SGLang consume a path. No engine plugins. | Shipped. |
@@ -728,9 +728,9 @@ cached bytes verify before every `/data` serve, and `modelfs verify` audits the 
 
 Still unshipped from this table: mTLS (what exists is a bearer PSK over plaintext HTTP), origin
 tampering (which stays outside the trust model, since the manifest trusts the origin exactly as
-the file bytes do), and local cache-artifact tampering (THREAT_MODEL.md R7).
+the file bytes do), and local cache-artifact tampering (threat-model.md R7).
 
-The current threat model is [THREAT_MODEL.md](THREAT_MODEL.md). Do not cite rows below as
+The current threat model is [threat-model.md](threat-model.md). Do not cite rows below as
 shipped posture.
 
 | Risk | Mitigation (sketch) | Shipped? |
@@ -764,7 +764,7 @@ Logs at piece granularity are too noisy. Log file-level start/finish, verify fai
 
 ## 11. Risks
 
-Original sketch risks. Passthrough, sqlite, CDC, and `commit=origin`/`rf=2` mitigations did not ship; mmap stalls are addressed by `direct_io` (section 13 Frontend). Current failure modes are [architecture.md](architecture.md) and [THREAT_MODEL.md](THREAT_MODEL.md).
+Original sketch risks. Passthrough, sqlite, CDC, and `commit=origin`/`rf=2` mitigations did not ship; mmap stalls are addressed by `direct_io` (section 13 Frontend). Current failure modes are [architecture.md](architecture.md) and [threat-model.md](threat-model.md).
 
 | Risk | Severity | Mitigation |
 |---|---|---|
@@ -836,7 +836,7 @@ verified peer fills); published to the origin as a piece-hash manifest at
 close (`mf_release`); loaded lazily by readers as the trust reference for
 peer fills; verified again before every `/data` and `/stage` serve; auditable with
 `modelfs verify <rel>`. This is an integrity mechanism first (closes
-THREAT_MODEL.md R2) and a dedup foundation second: the digest is the
+threat-model.md R2) and a dedup foundation second: the digest is the
 identity a future CAS can key on, and the manifest is the "file = ordered
 chunk hashes" object of section 4.3 without the CAS storage behind it.
 

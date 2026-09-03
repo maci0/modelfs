@@ -21,6 +21,9 @@ __pycache__/
 .deps/fuse3-arm64/data.tar.zst
 .deps/fuse3-arm64/control.tar.zst
 .deps/fuse3-arm64/debian-binary
+!.deps/libfuse3-3.16.2/
+# No extraction subdirs here: the vendored tree IS the source, all of it
+# (README, SHA256SUMS, include/, lib/, licenses) ships tracked.
 
 # Crash artifacts: a core dump from a failed zig test or daemon run lands in
 # the crashing process's cwd, usually the repo root, and must never reach the

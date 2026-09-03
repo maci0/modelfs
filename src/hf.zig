@@ -179,7 +179,14 @@ pub fn joinRel(buf: []u8, dest: []const u8, path: []const u8) ![]const u8 {
 pub fn loadToken(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) !?[]u8 {
     if (environ.get(token_env)) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len != 0) return try gpa.dupe(u8, trimmed);
+        // A whitespace-only value counts as unset (fall through to the token
+        // file), like every other secret this tree reads.
+        if (trimmed.len != 0) {
+            // Same wrong-file rule as the token file: past the cap it is not
+            // a token, and the bearer buffer below cannot name it anyway.
+            if (trimmed.len > max_token_bytes) return error.TokenTooLarge;
+            return try gpa.dupe(u8, trimmed);
+        }
     }
     var path_buf: [sys.c.PATH_MAX]u8 = undefined;
     const path = blk: {
@@ -222,7 +229,7 @@ pub fn pull(
     token: ?[]const u8,
     report: *Report,
 ) !void {
-    var auth_buf: [512]u8 = undefined;
+    var auth_buf: [max_token_bytes + "Bearer ".len]u8 = undefined;
     var auth_store: [1]std.http.Header = undefined;
     // The privileged set, not extra_headers: a `resolve` URL redirects to a
     // signed CDN host, and the token must not follow it there.
@@ -233,13 +240,21 @@ pub fn pull(
 
     const listing_url = try treeUrl(gpa, repo, revision);
     defer gpa.free(listing_url);
-    var listing_writer = std.Io.Writer.Allocating.init(gpa);
-    defer listing_writer.deinit();
+    // Fixed bound, not a growing buffer: the cap must hold while the body
+    // streams, not only once it has landed, or a broken or hostile endpoint
+    // drives an unbounded allocation before any check runs. A body past the
+    // bound fails the fixed writer mid-stream as WriteFailed.
+    const listing_buf = try gpa.alloc(u8, max_listing_bytes);
+    defer gpa.free(listing_buf);
+    var listing_writer = std.Io.Writer.fixed(listing_buf);
     const listing_res = client.fetch(.{
         .location = .{ .url = listing_url },
         .privileged_headers = auth,
-        .response_writer = &listing_writer.writer,
-    }) catch return error.ListingFailed;
+        .response_writer = &listing_writer,
+    }) catch |err| switch (err) {
+        error.WriteFailed => return error.ListingTooLarge,
+        else => return error.ListingFailed,
+    };
     if (listing_res.status != .ok) {
         std.log.err("{s} listing {s}@{s} answered {d}", .{ host, repo, revision, @intFromEnum(listing_res.status) });
         return switch (listing_res.status) {
@@ -248,9 +263,8 @@ pub fn pull(
             else => error.ListingFailed,
         };
     }
-    if (listing_writer.written().len > max_listing_bytes) return error.ListingTooLarge;
 
-    var listing = try parseTree(gpa, listing_writer.written(), dest);
+    var listing = try parseTree(gpa, listing_writer.buffered(), dest);
     defer listing.deinit();
     if (listing.entries.len == 0) return error.EmptyRevision;
 
@@ -264,9 +278,16 @@ pub fn pull(
         const path = try sys.joinZ(&path_buf, origin, rel);
 
         var st: sys.c.struct_stat = undefined;
-        if (sys.statPath(path, &st) == 0) {
+        // lstat, not stat, and only a regular file counts as present: the
+        // write side opens O_NOFOLLOW and lands through the .part rename,
+        // so a symlink planted at this name is never the file. A stat here
+        // would let a planted link of the right length report "already
+        // here" and leave a name every O_NOFOLLOW reader then fails on;
+        // lstat sees it and the fetch below replaces it.
+        if (sys.lstatPath(path, &st) == 0) {
+            const regular = (st.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG;
             const have = sys.sizeFromStat(st.st_size) orelse 0;
-            if (have == entry.size) {
+            if (regular and have == entry.size) {
                 report.skipped += 1;
                 continue;
             }
@@ -342,6 +363,17 @@ fn fetchOne(
         return error.DownloadFailed;
     }
     file_writer.interface.flush() catch return error.WriteFailed;
+    // A 200 whose body stopped short (or ran long) must not take the real
+    // name: the skip check above compares listed size, so the next run
+    // would count the mismatched file as already there -- or serve a
+    // truncated model. Compare against the bytes that actually landed.
+    var done: sys.c.struct_stat = undefined;
+    if (sys.fstat(fd, &done) != 0) return error.WriteFailed;
+    const wrote = sys.sizeFromStat(done.st_size) orelse return error.WriteFailed;
+    if (wrote != entry.size) {
+        std.log.err("{s} sent {d} of {d} bytes for {s}", .{ host, wrote, entry.size, entry.path });
+        return error.DownloadFailed;
+    }
 
     closed = true;
     if (sys.closeWrite(fd) != 0) {

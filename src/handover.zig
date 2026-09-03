@@ -119,6 +119,14 @@ fn jsonStr(w: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
         switch (ch) {
             '"' => try w.appendSlice(gpa, "\\\""),
             '\\' => try w.appendSlice(gpa, "\\\\"),
+            // A raw C0 control makes the decoded blob fail std.json, so a
+            // control byte in a mountpoint would hang every update of that
+            // mount with no ack. \uXXXX is an exact byte round-trip below
+            // 0x80, where every control lives.
+            0x00...0x1f => {
+                var esc: [6]u8 = undefined;
+                try w.appendSlice(gpa, std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{ch}) catch return error.NoSpaceLeft);
+            },
             else => try w.append(gpa, ch),
         }
     }
@@ -291,6 +299,10 @@ pub fn writeStateFd(blob: []const u8) !std.posix.fd_t {
 
 pub fn readStateFd(gpa: std.mem.Allocator, fd: std.posix.fd_t) !Owned {
     const blob = try sys.readAllFdAlloc(gpa, fd, max_state_bytes);
+    // The blob's tail is the raw PSK: wipe before the free so the secret
+    // does not linger in the allocator's recycle pool, like every other
+    // PSK-holding buffer in the daemon.
+    defer std.crypto.secureZero(u8, blob);
     defer gpa.free(blob);
     return decode(gpa, blob);
 }
@@ -299,7 +311,14 @@ pub const Req = struct { bin: []const u8, token: []const u8 };
 pub const Ack = struct { token: []const u8 };
 
 pub fn encodeReq(gpa: std.mem.Allocator, bin: []const u8, token: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{{\"bin\":\"{s}\",\"token\":\"{s}\"}}\n", .{ bin, token });
+    var w: std.ArrayList(u8) = .empty;
+    errdefer w.deinit(gpa);
+    try w.appendSlice(gpa, "{\"bin\":");
+    try jsonStr(&w, gpa, bin);
+    try w.appendSlice(gpa, ",\"token\":");
+    try jsonStr(&w, gpa, token);
+    try w.appendSlice(gpa, "}\n");
+    return w.toOwnedSlice(gpa);
 }
 
 pub fn decodeReq(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Req) {
@@ -420,6 +439,45 @@ test "handover encode/decode round-trips knobs and keeps the PSK off argv" {
     try std.testing.expectEqualStrings(psk, from_fd.psk);
     try std.testing.expectEqual(knobs.listen, from_fd.listen);
     try std.testing.expectEqual(knobs.piece, from_fd.piece);
+}
+
+test "handover JSON escapes control bytes so odd argv paths still round-trip" {
+    const gpa = std.testing.allocator;
+    // A raw C0 byte in a mountpoint or binary path used to publish a
+    // document std.json refuses: the replacement image's decode failed and,
+    // with the req-decode failure swallowed, `modelfs update` of that mount
+    // silently timed out forever.
+    const knobs = Knobs{
+        .origin = "/nas/mo\"dels",
+        .cache = "/var/cache/m\todelfs",
+        .id = "spa\rk1",
+        .mount = "/mo\nmodels",
+        .piece = 4096,
+        .listen = 1,
+        .water = .{},
+        .direct_io = true,
+        .allow_other = false,
+        .fuse_fd = 3,
+        .listen_fds = &.{3},
+        .advertise = &.{},
+        .seeds = &.{},
+        .psk = "secret",
+    };
+    const blob = try encode(gpa, knobs);
+    defer gpa.free(blob);
+    var got = try decode(gpa, blob);
+    defer got.deinit();
+    try std.testing.expectEqualStrings(knobs.origin, got.origin);
+    try std.testing.expectEqualStrings(knobs.cache, got.cache);
+    try std.testing.expectEqualStrings(knobs.id, got.id);
+    try std.testing.expectEqualStrings(knobs.mount, got.mount);
+
+    const req = try encodeReq(gpa, "/opt/bi\nnary", "tok\"0\\");
+    defer gpa.free(req);
+    const parsed = try decodeReq(gpa, req);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/opt/bi\nnary", parsed.value.bin);
+    try std.testing.expectEqualStrings("tok\"0\\", parsed.value.token);
 }
 
 test "handover decode refuses a truncated or mismatched PSK trailer" {

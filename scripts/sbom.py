@@ -55,6 +55,8 @@ _SPDX: dict[str, str] = {
     "libfuse3-3": "LGPL-2.1-or-later",
     "libfuse3-dev": "GPL-2.0-only AND LGPL-2.1-or-later",
     "actions/checkout": "MIT",
+    "actions/download-artifact": "MIT",
+    "actions/upload-artifact": "MIT",
     "astral-sh/setup-uv": "MIT",
     "mlugg/setup-zig": "MIT",
     "zig": "MIT",
