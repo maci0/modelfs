@@ -30,7 +30,7 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       - name: tag names the build.zig.zon version
         run: |
-          zon="$(sed -n 's/^\.version = "\(.*\)"/\1/p' build.zig.zon)"
+          zon="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
           if [ "${GITHUB_REF_NAME}" != "v${zon}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not name build.zig.zon version v${zon}" >&2
             exit 1
@@ -57,7 +57,7 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       - name: tag names the build.zig.zon version
         run: |
-          zon="$(sed -n 's/^\.version = "\(.*\)"/\1/p' build.zig.zon)"
+          zon="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
           if [ "${GITHUB_REF_NAME}" != "v${zon}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not name build.zig.zon version v${zon}" >&2
             exit 1
