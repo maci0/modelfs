@@ -298,6 +298,21 @@ echo "=== vendored fuse3 hashes ==="
     sha256sum -c SHA256SUMS
 ) || fail "vendored libfuse3 sha256 mismatch; refresh per .deps/fuse3-arm64/README.md"
 
+echo "=== vendored libfuse3 static-source hashes ==="
+(
+    cd "${ROOT_DIR}/.deps/libfuse3-3.16.2"
+    sha256sum -c SHA256SUMS
+    # Two-way coverage: build.zig's digest check only validates files the
+    # sums LIST; this catches a file added to the tree but omitted from the
+    # sums (it would otherwise compile into the release binary unchecked).
+    listed="$(grep -c '^[0-9a-f]\{64\}' SHA256SUMS)"
+    present="$(find . -type f ! -name SHA256SUMS | wc -l)"
+    if [ "${listed}" -ne "${present}" ]; then
+        echo "SHA256SUMS lists ${listed} files but the tree holds ${present}; regenerate per README.md" >&2
+        exit 1
+    fi
+) || fail "vendored libfuse3 static-source integrity failed; refresh per .deps/libfuse3-3.16.2/README.md"
+
 echo "=== shellcheck ==="
 # Optional checks live in .shellcheckrc so a glob of every scripts/**/*.sh
 # matches this gate. Recurse: scripts/*.sh would skip a nested script.

@@ -17,16 +17,17 @@ Total `/ping` round-trip time across the first N live instances:
 
 | Instances | Total |
 |---|---|
-| 1 | 0.09 ms |
-| 3 | 0.27 ms |
-| 5 | 0.34 ms |
-| 7 | 0.44 ms |
-| 9 | 0.62 ms |
+| 1 | 0.19 ms |
+| 3 | 0.31 ms |
+| 5 | 0.38 ms |
+| 7 | 0.87 ms |
+| 9 | 0.65 ms |
 
-Total query time stays near a millisecond from three instances upward, so the
-per-peer cost falls as the cluster grows instead of scaling linearly. The first
-call carries process warmup. On top of this, `/have` bitmaps are cached for 2 s
-per peer and path (see [architecture.md](architecture.md)).
+Total query time stays sub-millisecond from two instances upward, so the
+per-peer cost falls as the cluster grows instead of scaling linearly. Every
+daemon is polled to readiness before the timed sweep. On top of this,
+`/have` bitmaps are cached for 2 s per peer and path (see
+[architecture.md](architecture.md)).
 
 ![Query latency vs cluster size](figures/fig1_cluster_latency_scaling.svg)
 
@@ -36,17 +37,17 @@ Zero-copy `sendfile` streaming:
 
 | Piece | Throughput |
 |---|---|
-| 256K | 565 MB/s |
-| 512K | 856 MB/s |
-| 1M | 995 MB/s |
-| 2M | 1715 MB/s |
-| 4M | 2124 MB/s |
-| 8M | 1161 MB/s |
-| 16M | 1117 MB/s |
-| 32M | 1307 MB/s |
-| 64M | 1011 MB/s |
-| 128M | 1270 MB/s |
-| 256M | 380 MB/s |
+| 256K | 637 MB/s |
+| 512K | 686 MB/s |
+| 1M | 1090 MB/s |
+| 2M | 1553 MB/s |
+| 4M | 1983 MB/s |
+| 8M | 1872 MB/s |
+| 16M | 2082 MB/s |
+| 32M | 1107 MB/s |
+| 64M | 1150 MB/s |
+| 128M | 2037 MB/s |
+| 256M | 2033 MB/s |
 
 Throughput climbs with piece size and then wobbles, which is per-request fixed
 cost being amortised against page-cache and socket-buffer effects rather than a
@@ -59,22 +60,23 @@ costs the reader the whole piece before the read returns.
 
 The shape engines actually produce: a fixed 256 MiB file (decoupled from the
 piece size, so this sweep measures grid granularity rather than file size),
-read warm through the FUSE mount after one hydrating pass, and rewritten
-through the mount, timed per pass with the best of a few runs:
+read warm through the FUSE mount after one hydrating pass, and written
+through the mount -- each timed pass starting from a fresh name -- with the
+best of 2 passes (3 for the fetch below):
 
 | Piece | Warm FUSE read | Write-through |
 |---|---|---|
-| 256K | 12181 MB/s | 998 MB/s |
-| 512K | 5899 MB/s | 726 MB/s |
-| 1M | 8801 MB/s | 731 MB/s |
-| 2M | 10744 MB/s | 711 MB/s |
-| 4M | 6601 MB/s | 1422 MB/s |
-| 8M | 10501 MB/s | 1373 MB/s |
-| 16M | 9994 MB/s | 1176 MB/s |
-| 32M | 10848 MB/s | 1290 MB/s |
-| 64M | 6171 MB/s | 1268 MB/s |
-| 128M | 6564 MB/s | 1277 MB/s |
-| 256M | 11459 MB/s | 1316 MB/s |
+| 256K | 10104 MB/s | 1160 MB/s |
+| 512K | 9096 MB/s | 1204 MB/s |
+| 1M | 7083 MB/s | 1231 MB/s |
+| 2M | 10714 MB/s | 1205 MB/s |
+| 4M | 10199 MB/s | 1183 MB/s |
+| 8M | 10448 MB/s | 1172 MB/s |
+| 16M | 10261 MB/s | 1179 MB/s |
+| 32M | 11170 MB/s | 1198 MB/s |
+| 64M | 10275 MB/s | 1202 MB/s |
+| 128M | 11932 MB/s | 1215 MB/s |
+| 256M | 12174 MB/s | 1241 MB/s |
 
 Warm reads ride the host page cache and memory bandwidth, so they bound this
 software rather than the disk and they wobble run to run. Write-through is the
@@ -90,17 +92,17 @@ peer issues -- across the same piece sizes:
 
 | Piece | Throughput |
 |---|---|
-| 256K | 5290 MB/s |
-| 512K | 5331 MB/s |
-| 1M | 3912 MB/s |
-| 2M | 5095 MB/s |
-| 4M | 4559 MB/s |
-| 8M | 4926 MB/s |
-| 16M | 4714 MB/s |
-| 32M | 3660 MB/s |
-| 64M | 3079 MB/s |
-| 128M | 1658 MB/s |
-| 256M | 846 MB/s |
+| 256K | 5137 MB/s |
+| 512K | 5193 MB/s |
+| 1M | 4476 MB/s |
+| 2M | 5015 MB/s |
+| 4M | 4430 MB/s |
+| 8M | 4848 MB/s |
+| 16M | 4166 MB/s |
+| 32M | 3540 MB/s |
+| 64M | 3002 MB/s |
+| 128M | 1598 MB/s |
+| 256M | 850 MB/s |
 
 One file, many pieces. On this host the span slows as the piece grows -- the
 opposite corner from Benchmark 2, where bigger single-piece files fetched

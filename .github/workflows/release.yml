@@ -30,7 +30,7 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       - name: tag names the build.zig.zon version
         run: |
-          zon="$(grep -m1 -oP '(?<=.version = ")[^"]+' build.zig.zon)"
+          zon="$(sed -n 's/^\.version = "\(.*\)"/\1/p' build.zig.zon)"
           if [ "${GITHUB_REF_NAME}" != "v${zon}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not name build.zig.zon version v${zon}" >&2
             exit 1
@@ -57,7 +57,7 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       - name: tag names the build.zig.zon version
         run: |
-          zon="$(grep -m1 -oP '(?<=.version = ")[^"]+' build.zig.zon)"
+          zon="$(sed -n 's/^\.version = "\(.*\)"/\1/p' build.zig.zon)"
           if [ "${GITHUB_REF_NAME}" != "v${zon}" ]; then
             echo "tag ${GITHUB_REF_NAME} does not name build.zig.zon version v${zon}" >&2
             exit 1
@@ -98,9 +98,9 @@ jobs:
           rmdir dist/rel-*
           cd dist
           rm -f SHA256SUMS
-          sha256sum modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl modelfs-aarch64-linux-gnu > SHA256SUMS
+          sha256sum modelfs-* > SHA256SUMS
           cat SHA256SUMS
           gh release view "${TAG}" >/dev/null 2>&1 \
             || gh release create "${TAG}" --verify-tag --title "modelfs ${TAG}" --generate-notes
           gh release upload "${TAG}" --clobber \
-            modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl modelfs-aarch64-linux-gnu SHA256SUMS
+            modelfs-* SHA256SUMS

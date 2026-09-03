@@ -459,7 +459,11 @@ echo "✓ dupes --all scanned the published manifest"
 echo "=== cache bounds ==="
 for vm in "${C1_VM}" "${C2_VM}" "${C3_VM}"; do
     ip="${VM_IP[$vm]}"
-    du_out="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "du -sk /home/ubuntu/cache 2>/dev/null | cut -f1" || echo "0")"
+    du_out="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "du -sk /home/ubuntu/cache 2>/dev/null | cut -f1" || true)"
+    if [[ -z "${du_out}" ]]; then
+        echo "Error: cannot measure cache on ${vm} (ssh failed); refusing to fake a passing bound" >&2
+        exit 1
+    fi
     usage_mb=$((du_out / 1024))
     if [[ "${usage_mb}" -gt "${FILE_SIZE_MB}" ]]; then
         echo "Error: ${vm} cache (${usage_mb} MB) exceeds the ${FILE_SIZE_MB} MB file" >&2

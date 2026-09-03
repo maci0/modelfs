@@ -917,8 +917,11 @@ pub const Catalog = struct {
         };
         var json_buf: [2048]u8 = undefined;
         const until = now_sec +| lease_ttl_secs;
-        const json = proto.formatLease(&json_buf, self.self_id, until, self.addrs) catch {
-            std.log.warn("lease publish skipped: {d} addresses do not fit the lease document", .{self.addrs.len});
+        const json = proto.formatLease(&json_buf, self.self_id, until, self.addrs) catch |err| {
+            // WriteFailed is the historical (addresses do not fit) case;
+            // LeaseStringUnclean is the defense-in-depth gate formatLease
+            // now enforces itself. Name whichever fired.
+            std.log.warn("lease publish skipped ({t})", .{err});
             self.publish_rc = 0;
             return;
         };

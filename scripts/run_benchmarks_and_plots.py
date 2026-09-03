@@ -335,12 +335,18 @@ def run_throughput_vs_piece_size_benchmark(bin_path: str) -> tuple[list[str], li
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _best_of(reps: int, fn: Callable[[], None]) -> float:
+def _best_of(reps: int, fn: Callable[[], None], setup: Callable[[], None] | None = None) -> float:
     """Smallest elapsed wall time of `reps` runs: one-shot timing on a
     shared host records warmup noise as a real slowdown, so every timed
-    benchmark here takes the best of a few identical passes."""
+    benchmark here takes the best of a few identical passes. `setup`, when
+    given, runs before each timed pass and is not measured (the write
+    benchmark uses it to remove the previous pass's file, so every pass
+    creates fresh -- a rewrite over an already-cached, already-allocated
+    file would measure the wrong thing)."""
     best = float("inf")
     for _ in range(reps):
+        if setup is not None:
+            setup()
         t0 = time.monotonic()
         fn()
         best = min(best, time.monotonic() - t0)
@@ -422,6 +428,13 @@ def _measure_engine_config(
     try:
         headers = bench_headers()
         peer_ping.wait_for_ping(port, headers, 30.0)
+        # wait_for_ping answers green against ANY listener on the port; after
+        # a crashed earlier run an orphan daemon could hold it with the same
+        # hardcoded bench PSK. The child dying on bind is the tell.
+        if p.poll() is not None:
+            sys.exit(
+                f"daemon for {label} exited during startup (port {port} held by a stale process?)"
+            )
 
         mounted_big = mount_dir / "big.bin"
         # Cold pass: hydrate every piece once so the timed read is the warm
@@ -431,7 +444,14 @@ def _measure_engine_config(
 
         out = mount_dir / "written.bin"
         big = Path(sweep.origin_dir) / "big.bin"
-        w_sec = _best_of(2, lambda: _copy_through(big, out))
+        # Each timed pass starts from a fresh name: a rewrite over the
+        # previous pass's file would measure an in-place overwrite with
+        # extents already allocated and pieces already cached.
+        w_sec = _best_of(
+            2,
+            lambda: _copy_through(big, out),
+            setup=lambda: out.unlink(missing_ok=True),
+        )
         out.unlink(missing_ok=True)
 
         h_sec = _best_of(3, lambda: _fetch_span(port, headers, sweep.span_bytes, label))
@@ -701,11 +721,14 @@ def _write_two_line_chart(
             f'<text x="{px:.1f}" y="{box.top + box.plot_h + 16}" text-anchor="middle" '
             f'font-family="{_FONT}" font-size="10">{_svg_escape(x_labels[i])}</text>'
         )
-    # Legend top-right inside the plot: two swatch lines and labels.
+    # Legend top-right inside the plot over an opaque plate: a data peak
+    # landing under it must not strike through the labels.
     lx = box.left + box.plot_w - 220
     legend_a_svg = _svg_escape(spec.legend_a)
     legend_b_svg = _svg_escape(spec.legend_b)
     legend = (
+        f'<rect x="{lx - 8}" y="{box.top + 4}" width="212" height="40" '
+        f'fill="#ffffff" stroke="#333333" stroke-width="0.5"/>'
         f'<line x1="{lx}" y1="{box.top + 14}" x2="{lx + 28}" y2="{box.top + 14}" '
         f'stroke="#1f77b4" stroke-width="2.2"/>'
         f'<text x="{lx + 34}" y="{box.top + 18}" font-family="{_FONT}" '
@@ -909,10 +932,11 @@ Total `/ping` round-trip time across the first N live instances:
 |---|---|
 {latency_table}
 
-Total query time stays near a millisecond from three instances upward, so the
-per-peer cost falls as the cluster grows instead of scaling linearly. The first
-call carries process warmup. On top of this, `/have` bitmaps are cached for 2 s
-per peer and path (see [architecture.md](architecture.md)).
+Total query time stays sub-millisecond from two instances upward, so the
+per-peer cost falls as the cluster grows instead of scaling linearly. Every
+daemon is polled to readiness before the timed sweep. On top of this,
+`/have` bitmaps are cached for 2 s per peer and path (see
+[architecture.md](architecture.md)).
 
 ![Query latency vs cluster size](figures/fig1_cluster_latency_scaling.svg)
 
@@ -935,8 +959,9 @@ costs the reader the whole piece before the read returns.
 
 The shape engines actually produce: a fixed 256 MiB file (decoupled from the
 piece size, so this sweep measures grid granularity rather than file size),
-read warm through the FUSE mount after one hydrating pass, and rewritten
-through the mount, timed per pass with the best of a few runs:
+read warm through the FUSE mount after one hydrating pass, and written
+through the mount -- each timed pass starting from a fresh name -- with the
+best of 2 passes (3 for the fetch below):
 
 | Piece | Warm FUSE read | Write-through |
 |---|---|---|

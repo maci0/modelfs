@@ -252,7 +252,15 @@ pub fn pull(
         .privileged_headers = auth,
         .response_writer = &listing_writer,
     }) catch |err| switch (err) {
-        error.WriteFailed => return error.ListingTooLarge,
+        // WriteFailed is ambiguous: the fixed writer overflowing is the
+        // too-large case, but a connection dropped while the request head
+        // was still being sent surfaces the same error. A writer overflow
+        // always fills the buffer to exactly its cap; a send failure leaves
+        // it short.
+        error.WriteFailed => {
+            if (listing_writer.end >= listing_buf.len) return error.ListingTooLarge;
+            return error.ListingFailed;
+        },
         else => return error.ListingFailed,
     };
     if (listing_res.status != .ok) {

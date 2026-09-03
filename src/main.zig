@@ -1347,8 +1347,10 @@ fn disableCoreDumps() !void {
 /// scrub then unwrapped that NULL on musl static builds (and the trace
 /// printer deadlocked re-entering the environ lock mid-scan). Blank the
 /// value bytes instead: the array keeps its shape, children inherit the
-/// known knob with an empty value, and the secret actually leaves memory,
-/// which unsetenv never did (it only dropped the pointer).
+/// known knob with a meaningless name, and the env block's copy of the
+/// secret is destroyed, which unsetenv never did (it only dropped the
+/// pointer). The startup heap dupe in the environ map still lives until
+/// process exit, exactly like the daemon's own loadPsk copy does.
 fn scrubPskEnv() void {
     const prefix = "MODELFS_PSK_VALUE=";
     var i: usize = 0;

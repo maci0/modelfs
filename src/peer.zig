@@ -392,11 +392,20 @@ fn peerAddrText(peer: c.struct_sockaddr_in, buf: []u8) []const u8 {
 const drain_body_cap_bytes: usize = 64 * 1024;
 const drain_deadline_ms: i64 = 10_000;
 
-fn drainDeclaredBody(io: std.Io, fd: c_int, head: []const u8) void {
+fn drainDeclaredBody(io: std.Io, fd: c_int, head: []const u8, head_len: usize, total_read: usize) void {
     const cl = proto.headerGet(head, "Content-Length") orelse return;
     const want = proto.parseU64Fast(cl) orelse return;
     var left: u64 = @min(want, drain_body_cap_bytes);
+    // readHeadFull may have pulled body bytes past the head into head_buf
+    // in the same readOnce; those are already off the socket and must not
+    // be waited for again (a pipelined small body would otherwise stall
+    // the full drain budget before the reply goes out).
+    left -|= total_read -| head_len;
     if (left == 0) return;
+    // armChunkTimeout only ever lowers the socket timeout, and every serve
+    // path after this relies on the steady-state budget readHeadFull
+    // restored; the drain gets the same epilogue.
+    defer sys.setSockTimeout(fd, sock_timeout_ms);
     const deadline_ms = sys.monoMs(io) +| drain_deadline_ms;
     var buf: [4096]u8 = undefined;
     while (left > 0) {
@@ -450,7 +459,7 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
     };
     // Before any reply path, so the status line survives the close even for
     // a client that sent a body with its (broken) request.
-    drainDeclaredBody(self.io, fd, head);
+    drainDeclaredBody(self.io, fd, head, n, total_read);
     const auth = proto.headerGet(head, "Authorization") orelse "";
     if (!proto.bearerOk(auth, self.psk)) {
         // Security-relevant event: without this line a wrong-PSK node or an

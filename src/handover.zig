@@ -114,6 +114,12 @@ const JsonDoc = struct {
 };
 
 fn jsonStr(w: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    // The escaping below is byte-exact only for valid UTF-8: anything the
+    // decoder's UTF-8 validator rejects (a stray 0x80-0xFF byte in a path
+    // argv carried verbatim) must fail HERE, at the encode, with a named
+    // error -- never after the exec, where a decode failure silently times
+    // out every future update of the mount.
+    if (!std.unicode.utf8ValidateSlice(s)) return error.NonUtf8Knob;
     try w.append(gpa, '"');
     for (s) |ch| {
         switch (ch) {
@@ -301,9 +307,10 @@ pub fn readStateFd(gpa: std.mem.Allocator, fd: c_int) !Owned {
     const blob = try sys.readAllFdAlloc(gpa, fd, max_state_bytes);
     // The blob's tail is the raw PSK: wipe before the free so the secret
     // does not linger in the allocator's recycle pool, like every other
-    // PSK-holding buffer in the daemon.
-    defer std.crypto.secureZero(u8, blob);
+    // PSK-holding buffer in the daemon. Defers run LIFO, so the wipe is
+    // declared second and executes first.
     defer gpa.free(blob);
+    defer std.crypto.secureZero(u8, blob);
     return decode(gpa, blob);
 }
 
@@ -478,6 +485,20 @@ test "handover JSON escapes control bytes so odd argv paths still round-trip" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("/opt/bi\nnary", parsed.value.bin);
     try std.testing.expectEqualStrings("tok\"0\\", parsed.value.token);
+
+    // A byte std.json's UTF-8 validator rejects must fail the ENCODE with a
+    // named error, not the decode after the exec (the silent-timeout bug
+    // this gate replaces). Valid multi-byte UTF-8 still round-trips.
+    var bad = knobs;
+    bad.origin = "/nas/\xff\xfe";
+    try std.testing.expectError(error.NonUtf8Knob, encode(gpa, bad));
+    var good = knobs;
+    good.mount = "/models/überutf8";
+    const blob2 = try encode(gpa, good);
+    defer gpa.free(blob2);
+    var got2 = try decode(gpa, blob2);
+    defer got2.deinit();
+    try std.testing.expectEqualStrings(good.mount, got2.mount);
 }
 
 test "handover decode refuses a truncated or mismatched PSK trailer" {

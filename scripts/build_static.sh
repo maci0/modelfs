@@ -36,7 +36,12 @@ fi
 target="${1:-}"
 prefix=""
 if [[ "${2:-}" == "--prefix" ]]; then
-    prefix="${3:---prefix needs a directory}"
+    if [[ -z "${3:-}" || "${3:0:1}" == "-" ]]; then
+        usage >&2
+        echo "--prefix needs a directory argument" >&2
+        exit 2
+    fi
+    prefix="${3}"
 fi
 
 case "${target}" in
@@ -48,6 +53,11 @@ case "${target}" in
         exit 2
         ;;
 esac
+
+fail() {
+    echo "FAIL: $1" >&2
+    exit 1
+}
 
 command -v zig >/dev/null || fail "zig not on PATH (minimum_zig_version in build.zig.zon is the toolchain pin)"
 

@@ -206,14 +206,6 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(&ci_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ ".deps/fuse3-arm64", ".deps/libfuse3-3.16.2" }) |dir| {
-        if (vendoredMismatch(b, dir)) |msg| {
-            const fail = b.addFail(msg);
-            b.getInstallStep().dependOn(&fail.step);
-            test_step.dependOn(&fail.step);
-            return;
-        }
-    }
 
     // -Dfuse-static compiles the vendored libfuse3 in place of linking a
     // system library. With a musl target this is what produces the
@@ -224,18 +216,43 @@ pub fn build(b: *std.Build) void {
         "fuse-static",
         "compile the vendored libfuse3 into the binary instead of linking a system libfuse3",
     ) orelse false;
-
-    const fuse_inc = if (fuse_static)
-        fuse_static_root ++ "/include"
-    else
-        b.option([]const u8, "fuse-include", "libfuse3 headers") orelse "/usr/include/fuse3";
-    const fuse_lib = if (fuse_static) null else b.option([]const u8, "fuse-lib", "libfuse3 library dir");
+    const fuse_inc_opt = b.option([]const u8, "fuse-include", "libfuse3 headers");
+    const fuse_lib_opt = b.option([]const u8, "fuse-lib", "libfuse3 library dir");
 
     // Edit-test loop: substring match on test *names* (Zig collects tests
     // from the whole import graph, so a file name is not a filter). A
     // distinctive fragment like relOk or cacheFill keeps the loop short.
     // zig build test -Dtest-filter=relOk
     const test_filter = b.option([]const u8, "test-filter", "only run unit tests whose name contains this substring");
+
+    const fail_step = struct {
+        fn add(b2: *std.Build, step: *std.Build.Step, msg: []const u8) void {
+            const f = b2.addFail(msg);
+            b2.getInstallStep().dependOn(&f.step);
+            step.dependOn(&f.step);
+        }
+    }.add;
+
+    // -Dfuse-static owns the headers and the library sources; the link
+    // knobs would be silently dropped, so refuse the combination instead
+    // of building something other than what was asked for.
+    if (fuse_static and (fuse_inc_opt != null or fuse_lib_opt != null)) {
+        fail_step(b, test_step, "-Dfuse-static ignores -Dfuse-include/-Dfuse-lib; the vendored libfuse3 provides both");
+        return;
+    }
+
+    const fuse_inc = if (fuse_static)
+        fuse_static_root ++ "/include"
+    else
+        fuse_inc_opt orelse "/usr/include/fuse3";
+    const fuse_lib = if (fuse_static) null else fuse_lib_opt;
+
+    for ([_][]const u8{ ".deps/fuse3-arm64", ".deps/libfuse3-3.16.2" }) |dir| {
+        if (vendoredMismatch(b, dir)) |msg| {
+            fail_step(b, test_step, msg);
+            return;
+        }
+    }
 
     // Options are registered above so `zig build --help` still lists them
     // when this early-return fires. Linux is the only claimed OS: FUSE3,
@@ -294,6 +311,12 @@ pub fn build(b: *std.Build) void {
         tc.addIncludePath(.{ .cwd_relative = "src/c-musl-shim" });
     }
     tc.defineCMacro("_GNU_SOURCE", "1");
+    // 31 while the daemon calls only the plain/_31-suffixed libfuse3
+    // symbols; the vendored C under -Dfuse-static compiles at 312 (what
+    // upstream meson passes). The only shapes that differ in that range are
+    // struct fuse_loop_config and ioctl's cmd width, neither used here --
+    // calling fuse_loop_mt/fuse_parse_cmdline would fail the build loudly
+    // (they are function-like macros at 31), which is the intended guard.
     tc.defineCMacro("FUSE_USE_VERSION", "31");
     tc.defineCMacro("_FILE_OFFSET_BITS", "64");
     // No _FORTIFY_SOURCE here: this step only translates headers to Zig, it
