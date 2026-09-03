@@ -1357,7 +1357,7 @@
       ],
       "name": "modelfs",
       "type": "application",
-      "version": "0.8.0"
+      "version": "0.9.0"
     }
   },
   "specVersion": "1.5",

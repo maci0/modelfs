@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-03
+
 Two batches. First, a deep review pass over the whole tree (all of `src/`,
 the harnesses, and the docs), closing every confirmed finding: the one
 data-corruption bug is in the write-through cache grow; the rest are leak,
@@ -1004,7 +1006,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/maci0/modelfs/releases/tag/v0.9.0
 [0.8.0]: https://github.com/maci0/modelfs/releases/tag/v0.8.0
 [0.7.0]: https://github.com/maci0/modelfs/releases/tag/v0.7.0
 [0.6.0]: https://github.com/maci0/modelfs/releases/tag/v0.6.0
