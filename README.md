@@ -47,7 +47,7 @@ Security reports: [SECURITY.md](SECURITY.md).
 
 ## Requirements
 
-* Linux (x86_64 or aarch64) with `/dev/fuse` and **libfuse3** (headers to build: `libfuse3-dev` / `fuse3-devel`). Sparks deploy `aarch64-linux-gnu.2.39` (Ubuntu 24.04 glibc); CI tests the x86_64 build on ubuntu-24.04 and cross-compiles that aarch64 ABI. GitHub releases attach static single-file binaries for both (`x86_64-linux-musl`, `aarch64-linux-musl`: libfuse3 compiled in, nothing to install, checksums published); building from source uses the distro libfuse3.
+* Linux (x86_64 or aarch64) with `/dev/fuse` and **libfuse3** (headers to build: `libfuse3-dev` / `fuse3-devel`). Sparks deploy `aarch64-linux-gnu.2.39` (Ubuntu 24.04 glibc); CI runs the full gate natively on x86_64 and aarch64 runners and cross-compiles that ABI. GitHub releases attach static single-file binaries for both (`x86_64-linux-musl`, `aarch64-linux-musl`: libfuse3 compiled in, nothing to install) plus the glibc spark build (`aarch64-linux-gnu`), all with SHA256SUMS; building from source uses the distro libfuse3.
 * **Zig 0.16.0** or newer
 * A shared POSIX directory every node can see (NFS or anything else) to act as the origin
 

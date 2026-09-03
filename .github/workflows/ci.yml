@@ -97,6 +97,42 @@ jobs:
       - name: Static analysis gate
         run: ./scripts/check.sh
 
+  # The same gate natively on aarch64: GitHub's arm64 runners run every test
+  # the x86_64 job runs, so aarch64-only breakage (a signed/unsigned shift, a
+  # translate-c quirk, a musl/glibc assumption) fails CI instead of shipping
+  # to the sparks unnoticed. Same pinned runner family, same hang guard.
+  check-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Install libfuse3 development files
+        run: ./scripts/install_libfuse3_dev.sh
+      - name: Read Python version pin
+        id: py
+        run: |
+          version="$(tr -d '[:space:]' < .python-version)"
+          if [[ -z "${version}" ]]; then
+            echo "empty .python-version" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          activate-environment: true
+          venv-path: .venv
+          python-version: ${{ steps.py.outputs.version }}
+          cache-dependency-glob: |
+            requirements*.txt
+            .python-version
+      - name: Install pinned Python tooling
+        run: uv pip install --require-hashes -r requirements-dev.lock.txt
+      - name: Static analysis gate
+        run: ./scripts/check.sh
+
   # The sparks deploy as aarch64: README documents the cross-build against the
   # vendored arm64 libfuse3, but nothing else here exercises that target, so a
   # broken aarch64 compile would ship unnoticed. Compile-only gate: the runner

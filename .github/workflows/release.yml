@@ -25,6 +25,8 @@ jobs:
         target: [x86_64-linux-musl, aarch64-linux-musl]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       - name: tag names the build.zig.zon version
         run: |
@@ -41,8 +43,35 @@ jobs:
           path: .scratch/release/modelfs-*
           if-no-files-found: error
 
+  # The sparks' documented deploy ABI: aarch64 glibc 2.39 (Ubuntu 24.04
+  # libfuse3, vendored arm64 .debs) as built by scripts/cross_aarch64.sh.
+  # The musl static binaries above run anywhere; this one is for the fleet
+  # that already standardizes on the distro libfuse3.
+  sparks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: tag names the build.zig.zon version
+        run: |
+          zon="$(grep -m1 -oP '(?<=.version = ")[^"]+' build.zig.zon)"
+          if [ "${GITHUB_REF_NAME}" != "v${zon}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not name build.zig.zon version v${zon}" >&2
+            exit 1
+          fi
+      - name: cross-compile the spark binary
+        run: ./scripts/cross_aarch64.sh --prefix .scratch/release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rel-sparks
+          path: .scratch/release/bin/modelfs
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, sparks]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -60,13 +89,18 @@ jobs:
         run: |
           # The rel-* prefix keeps the artifact directories from colliding
           # with the binaries' own names; after the flatten, the SHA256SUMS
-          # lines name exactly the assets a downloader sees.
-          mv dist/rel-*/modelfs-* dist/
+          # lines name exactly the assets a downloader sees. The sparks
+          # artifact is a single file named just "modelfs"; it takes its
+          # release name here.
+          mv dist/rel-x86_64-linux-musl/modelfs-x86_64-linux-musl dist/
+          mv dist/rel-aarch64-linux-musl/modelfs-aarch64-linux-musl dist/
+          mv dist/rel-sparks/modelfs dist/modelfs-aarch64-linux-gnu
           rmdir dist/rel-*
           cd dist
           rm -f SHA256SUMS
-          sha256sum modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl > SHA256SUMS
+          sha256sum modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl modelfs-aarch64-linux-gnu > SHA256SUMS
           cat SHA256SUMS
           gh release view "${TAG}" >/dev/null 2>&1 \
             || gh release create "${TAG}" --verify-tag --title "modelfs ${TAG}" --generate-notes
-          gh release upload "${TAG}" --clobber modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl SHA256SUMS
+          gh release upload "${TAG}" --clobber \
+            modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl modelfs-aarch64-linux-gnu SHA256SUMS

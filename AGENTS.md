@@ -34,7 +34,7 @@ It runs:
 
 The Python tools must come from `.venv/bin` with an interpreter matching
 `.python-version`; an empty venv is not enough. CI runs that gate plus the
-aarch64 cross-compile and the reproducibility rebuild; `./scripts/ci.sh` runs
+aarch64 glibc cross-compile, a native aarch64 runner running the same gate, and the reproducibility rebuild; `./scripts/ci.sh` runs
 all three locally.
 
 Suites outside the gate, because each needs hardware CI lacks:
