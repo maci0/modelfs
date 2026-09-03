@@ -5551,12 +5551,7 @@ test "walkData samples oldest-first disk-only files across subdirs" {
         var fb: [320]u8 = undefined;
         const fp = try std.fmt.bufPrint(&fb, "{s}/data/{s}", .{ cache_d, e.rel });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "cached"));
-        const past = [2]std.os.linux.timespec{
-            .{ .sec = walk_now - e.age, .nsec = 0 },
-            .{ .sec = walk_now - e.age, .nsec = 0 },
-        };
-        const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zbuf, fp), &past, 0);
-        try std.testing.expectEqual(@as(usize, 0), rc);
+        try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, fp, walk_now - e.age));
     }
     try std.testing.expectEqual(@as(i32, 0), st.setPin("pinned.bin", true));
 
@@ -5606,12 +5601,7 @@ test "walkData keeps the oldest cap files when candidates exceed the sample" {
         // One wall sample for the whole set so a second boundary mid-loop
         // cannot reorder two files whose ages differ by that second.
         const age: i64 = @intCast(100 * (n - i));
-        const past = [2]std.os.linux.timespec{
-            .{ .sec = walk_now - age, .nsec = 0 },
-            .{ .sec = walk_now - age, .nsec = 0 },
-        };
-        const rc = std.os.linux.utimensat(std.posix.AT.FDCWD, try sys.toZ(&zbuf, fp), &past, 0);
-        try std.testing.expectEqual(@as(usize, 0), rc);
+        try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, fp, walk_now - age));
     }
 
     var rb: [sys.c.PATH_MAX]u8 = undefined;

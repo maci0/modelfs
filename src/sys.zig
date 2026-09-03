@@ -243,7 +243,7 @@ pub fn setReuseAddr(fd: c_int) void {
 /// std.c.accept4 takes `*sockaddr` on every Linux ABI Zig ships; translate-c
 /// of glibc's `__SOCKADDR_ARG` union (`.__sockaddr__`) is glibc-only.
 pub fn accept(listen_fd: c_int, peer: *c.struct_sockaddr_in) c_int {
-    var peer_len: std.c.socklen_t = @intCast(@sizeOf(c.struct_sockaddr_in));
+    var peer_len: c_uint = @intCast(@sizeOf(c.struct_sockaddr_in));
     return std.c.accept4(listen_fd, @ptrCast(peer), &peer_len, @intCast(c.SOCK_CLOEXEC));
 }
 
@@ -254,7 +254,7 @@ pub fn bind(fd: c_int, addr: *const c.struct_sockaddr_in) c_int {
 
 /// getsockname(2) into an IPv4 address. Same std.c `*sockaddr` door as accept.
 pub fn getsockname(fd: c_int, addr: *c.struct_sockaddr_in) c_int {
-    var len: std.c.socklen_t = @intCast(@sizeOf(c.struct_sockaddr_in));
+    var len: c_uint = @intCast(@sizeOf(c.struct_sockaddr_in));
     return std.c.getsockname(fd, @ptrCast(addr), &len);
 }
 
@@ -323,7 +323,7 @@ pub fn setNonblocking(fd: c_int, on: bool) i32 {
 /// daemon would share the port instead of failing Bind.
 pub fn reuseportIsOn(fd: c_int) bool {
     var val: c_int = 0;
-    var len: std.c.socklen_t = @intCast(@sizeOf(c_int));
+    var len: c_uint = @intCast(@sizeOf(c_int));
     if (std.c.getsockopt(fd, c.SOL_SOCKET, @intCast(c.SO_REUSEPORT), &val, &len) != 0) return false;
     return val != 0;
 }
@@ -895,7 +895,7 @@ pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in,
         break;
     }
     var soerr: c_int = 0;
-    var slen: std.c.socklen_t = @intCast(@sizeOf(c_int));
+    var slen: c_uint = @intCast(@sizeOf(c_int));
     if (std.c.getsockopt(fd, c.SOL_SOCKET, @intCast(c.SO_ERROR), &soerr, &slen) != 0) return negErrno();
     if (soerr != 0) return -soerr;
     return 0;

@@ -21,7 +21,7 @@ pub const Server = struct {
     io: std.Io,
     psk: []const u8,
     store: *store_mod.Store,
-    listen_fds: std.ArrayList(std.posix.fd_t) = .empty,
+    listen_fds: std.ArrayList(c_int) = .empty,
     /// Guards listen_fds between serve()'s accept-loop spawner and stop():
     /// an unmount landing while the freshly spawned serve thread is still
     /// walking the list would otherwise close fds and free the list under it.
@@ -80,11 +80,11 @@ pub const Server = struct {
     /// listen. SO_REUSEPORT is refused so a replacement cannot split the
     /// port with another daemon. CLOEXEC is set: the auto_unmount helper
     /// must not inherit this fd after attach.
-    pub fn adoptListenFd(self: *Server, fd: std.posix.fd_t) !void {
+    pub fn adoptListenFd(self: *Server, fd: c_int) !void {
         var addr = std.mem.zeroes(c.struct_sockaddr_in);
         if (sys.getsockname(fd, &addr) != 0) return error.BadFd;
         var accept_on: c_int = 0;
-        var slen: std.c.socklen_t = @intCast(@sizeOf(c_int));
+        var slen: c_uint = @intCast(@sizeOf(c_int));
         if (std.c.getsockopt(fd, c.SOL_SOCKET, @intCast(c.SO_ACCEPTCONN), &accept_on, &slen) != 0)
             return error.BadFd;
         if (accept_on == 0) return error.NotListening;
@@ -314,7 +314,7 @@ fn bodyDeadlineFor(io: std.Io, want_len: u64) i64 {
 /// clamp never needs restoring mid-stage (readHeadFull restores it for the
 /// body stages that follow a completed head). Saturating remainder so a
 /// deadline behind monoMs cannot wrap to a huge positive wait.
-fn armChunkTimeout(io: std.Io, fd: std.posix.fd_t, deadline_ms: i64) bool {
+fn armChunkTimeout(io: std.Io, fd: c_int, deadline_ms: i64) bool {
     const remain_ms = deadline_ms -| sys.monoMs(io);
     if (remain_ms <= 0) return false;
     if (remain_ms < sock_timeout_ms)
@@ -335,11 +335,11 @@ const max_alloc_body_bytes: usize = 512 * 1024 * 1024;
 /// entries), pinning copies of it past the probe.
 const max_have_body_bytes: usize = 16 * 1024 * 1024;
 
-fn readHeadFull(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize) !void {
+fn readHeadFull(io: std.Io, fd: c_int, buf: []u8, out_head_len: *usize, out_total_read: *usize) !void {
     return readHeadFullDeadline(io, fd, buf, out_head_len, out_total_read, sys.monoMs(io) +| head_deadline_ms);
 }
 
-fn readHeadFullDeadline(io: std.Io, fd: std.posix.fd_t, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: i64) !void {
+fn readHeadFullDeadline(io: std.Io, fd: c_int, buf: []u8, out_head_len: *usize, out_total_read: *usize, deadline_ms: i64) !void {
     var n: usize = 0;
     while (n < buf.len) {
         if (!armChunkTimeout(io, fd, deadline_ms)) return error.HeadTimeout;
@@ -392,7 +392,7 @@ fn peerAddrText(peer: c.struct_sockaddr_in, buf: []u8) []const u8 {
 const drain_body_cap_bytes: usize = 64 * 1024;
 const drain_deadline_ms: i64 = 10_000;
 
-fn drainDeclaredBody(io: std.Io, fd: std.posix.fd_t, head: []const u8) void {
+fn drainDeclaredBody(io: std.Io, fd: c_int, head: []const u8) void {
     const cl = proto.headerGet(head, "Content-Length") orelse return;
     const want = proto.parseU64Fast(cl) orelse return;
     var left: u64 = @min(want, drain_body_cap_bytes);
@@ -408,7 +408,7 @@ fn drainDeclaredBody(io: std.Io, fd: std.posix.fd_t, head: []const u8) void {
     }
 }
 
-fn handleConn(self: *Server, fd: std.posix.fd_t, peer: c.struct_sockaddr_in) void {
+fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
     defer {
         _ = self.http_inflight.fetchSub(1, .monotonic);
         sys.close(fd);
@@ -586,7 +586,7 @@ const OriginReg = struct {
 /// cannot 404 on one route and 502 on another, and an unusable st_size stays
 /// 502 on every route. Identity rides with the size so a same-size rewrite
 /// wipes this node's marks before /have advertises them or /data serves them.
-fn originRegular(self: *Server, fd: std.posix.fd_t, rel: []const u8) ?OriginReg {
+fn originRegular(self: *Server, fd: c_int, rel: []const u8) ?OriginReg {
     var st: sys.c.struct_stat = undefined;
     const rc = self.store.statOrigin(rel, &st);
     if (rc != 0) {
@@ -614,7 +614,7 @@ fn originRegular(self: *Server, fd: std.posix.fd_t, rel: []const u8) ?OriginReg 
 /// Live cache entry for `rel`, or null after a 500. Shared by /have, /data,
 /// and /stage so an open failure cannot 500 on one route and drop the
 /// connection on the other.
-fn cacheEntry(self: *Server, fd: std.posix.fd_t, rel: []const u8, orig: OriginReg) ?*store_mod.Store.Cached {
+fn cacheEntry(self: *Server, fd: c_int, rel: []const u8, orig: OriginReg) ?*store_mod.Store.Cached {
     return self.store.getIdentified(rel, orig.size, orig.id, sys.monoSec(self.io)) catch |err| {
         // The fetching peer only sees 500; without this line the serving
         // node's log says nothing about why.
@@ -624,7 +624,7 @@ fn cacheEntry(self: *Server, fd: std.posix.fd_t, rel: []const u8, orig: OriginRe
     };
 }
 
-fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
+fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
     const orig = originRegular(self, fd, rel) orelse return;
     // Fetchers refuse a /have body above max_have_body_bytes. Serving one
     // would still open a cache entry (Bitfield.init of up to 512 MiB at
@@ -711,7 +711,7 @@ fn serveHave(self: *Server, fd: std.posix.fd_t, rel: []const u8) void {
 /// peer falls back to /data. The xfer guard covers hydration and the read
 /// into the staging buffer; once the bytes are in the backend's registered
 /// copy the cache fd no longer matters, so a punch after stage is safe.
-fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, idx: u32) void {
+fn serveStage(self: *Server, fd: c_int, rel: []const u8, idx: u32) void {
     const orig = originRegular(self, fd, rel) orelse return;
     const size = orig.size;
     const file = cacheEntry(self, fd, rel, orig) orelse return;
@@ -808,7 +808,7 @@ fn serveStage(self: *Server, fd: std.posix.fd_t, rel: []const u8, idx: u32) void
 /// alloc/free pair per 16 MiB piece, allocated only when a covered piece
 /// actually lacks its bit: fully-cached ranges skip the allocation.
 /// Sends the error reply itself; false means streaming cannot proceed.
-fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
+fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
     const cov = piece.cover(span, file_size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
     const piece_size = self.store.piece_size;
@@ -922,7 +922,7 @@ fn hydrateRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached
 /// bodyDeadlineFor): SO_SNDTIMEO resets on every drained byte, so the
 /// per-chunk clamp to its remainder is what keeps a dribbling receiver from
 /// holding an inflight slot forever.
-fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64, deadline_ms: i64) void {
+fn streamRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64, deadline_ms: i64) void {
     // Sendfile copies the cache fd, including sparse holes. A range the
     // bitfield cannot name would ship those zeros as a 206 body and the
     // fetching peer would mark them filled. file_size is the origin sample
@@ -1016,7 +1016,7 @@ fn streamRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
 /// entries that predate hashing, or files with no manifest and no origin
 /// fill this session) stream as before: their provenance cannot be proven,
 /// and refusing them would turn every pre-upgrade cache into a full refill.
-fn verifyRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
+fn verifyRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
     const cov = piece.cover(span, file_size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
     const piece_size = self.store.piece_size;
@@ -1060,7 +1060,7 @@ fn verifyRange(self: *Server, fd: std.posix.fd_t, file: *store_mod.Store.Cached,
     return true;
 }
 
-fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range) void {
+fn serveData(self: *Server, fd: c_int, rel: []const u8, rg: proto.Range) void {
     const orig = originRegular(self, fd, rel) orelse return;
     const size = orig.size;
     if (rg.start >= size or rg.end < rg.start) {
@@ -1122,7 +1122,7 @@ fn serveData(self: *Server, fd: std.posix.fd_t, rel: []const u8, rg: proto.Range
     streamRange(self, fd, file, .{ .off = rg.start, .len = want }, size, bodyDeadlineFor(self.io, want));
 }
 
-fn reply(fd: std.posix.fd_t, s: []const u8) void {
+fn reply(fd: c_int, s: []const u8) void {
     _ = sys.writeAll(fd, s);
 }
 
@@ -1131,7 +1131,7 @@ fn reply(fd: std.posix.fd_t, s: []const u8) void {
 /// status.json without grepping the journal. 501 is a capability answer
 /// (/stage without a data-plane backend): the fetching peer falls back to
 /// /data, and counting it would make an HTTP-only node look failing.
-fn replyStatus(self: *Server, fd: std.posix.fd_t, status: []const u8) void {
+fn replyStatus(self: *Server, fd: c_int, status: []const u8) void {
     if (status.len >= 3 and status[0] == '5' and !std.mem.startsWith(u8, status, "501"))
         _ = self.store.stats.http_5xx.fetchAdd(1, .monotonic);
     var buf: [96]u8 = undefined;
@@ -1146,7 +1146,7 @@ fn replyStatus(self: *Server, fd: std.posix.fd_t, status: []const u8) void {
 /// succeed), 502 when the origin itself failed (NFS I/O error, stale mount):
 /// a fetching peer and an operator must be able to tell a missing file from
 /// an unavailable one.
-fn replyOriginStat(self: *Server, fd: std.posix.fd_t, rel: []const u8, rc: i32) void {
+fn replyOriginStat(self: *Server, fd: c_int, rel: []const u8, rc: i32) void {
     if (rc == -sys.c.ENOENT or rc == -sys.c.ENOTDIR) {
         replyStatus(self, fd, "404 Not Found");
     } else if (rc == -sys.c.ENAMETOOLONG) {
@@ -1179,11 +1179,11 @@ fn fetchHave(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8
 /// Parses one /have response head (already read, body bytes possibly
 /// pipelined behind it in head_buf) and completes the bitmap body. The
 /// seam between dialing and parsing so tests can drive replies directly.
-fn haveFromHead(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize) !proto.HaveBits {
+fn haveFromHead(gpa: std.mem.Allocator, io: std.Io, fd: c_int, head_buf: []const u8, head_len: usize, total_read: usize) !proto.HaveBits {
     return haveFromHeadDeadline(gpa, io, fd, head_buf, head_len, total_read, null);
 }
 
-fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, deadline_ms: ?i64) !proto.HaveBits {
+fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: c_int, head_buf: []const u8, head_len: usize, total_read: usize, deadline_ms: ?i64) !proto.HaveBits {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
@@ -1330,7 +1330,7 @@ fn checkRangeReply(head: []const u8, start: u64, end: u64) !void {
     if (cl != want) return error.LengthMismatch;
 }
 
-fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, start: u64, end: u64, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
+fn readRangeBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: c_int, start: u64, end: u64, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
@@ -1402,11 +1402,11 @@ fn dial(io: std.Io, ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     return fd;
 }
 
-fn readFlexBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, out: ?[]u8) ![]u8 {
+fn readFlexBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: c_int, out: ?[]u8) ![]u8 {
     return readFlexBodyAllocDeadline(gpa, io, fd, out, null);
 }
 
-fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
+fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: c_int, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
     var head_buf: [8192]u8 = undefined;
     var head_len: usize = 0;
     var total_read: usize = 0;
@@ -1421,7 +1421,7 @@ fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.f
 /// The one body reader every fetch path shares, so the length-matching
 /// contract cannot drift between them. head_buf must stay alive for the
 /// call; the returned slice never aliases it.
-fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: std.posix.fd_t, head_buf: []const u8, head_len: usize, total_read: usize, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
+fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: c_int, head_buf: []const u8, head_len: usize, total_read: usize, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
@@ -2232,7 +2232,7 @@ test "haveFromHeadDeadline pairs refusal at an expired budget with success at a 
     // Drains exactly the head bytes off the socket, leaving only the bitmap
     // body staged -- the state fetchHave hands to this function.
     const drainHead = struct {
-        fn go(fd: std.posix.fd_t, head_bytes: usize) !void {
+        fn go(fd: c_int, head_bytes: usize) !void {
             var sink: [96]u8 = undefined;
             var got: usize = 0;
             while (got < head_bytes) {

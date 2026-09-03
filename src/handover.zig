@@ -292,12 +292,12 @@ pub fn freeExecArgvZ(gpa: std.mem.Allocator, argv: [:null]?[*:0]const u8) void {
     gpa.free(argv);
 }
 
-pub fn writeStateFd(blob: []const u8) !std.posix.fd_t {
+pub fn writeStateFd(blob: []const u8) !c_int {
     const fd = try sys.memfdSealed(blob);
     return fd;
 }
 
-pub fn readStateFd(gpa: std.mem.Allocator, fd: std.posix.fd_t) !Owned {
+pub fn readStateFd(gpa: std.mem.Allocator, fd: c_int) !Owned {
     const blob = try sys.readAllFdAlloc(gpa, fd, max_state_bytes);
     // The blob's tail is the raw PSK: wipe before the free so the secret
     // does not linger in the allocator's recycle pool, like every other
