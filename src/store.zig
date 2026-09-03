@@ -1239,7 +1239,7 @@ pub const Store = struct {
     /// clearHashes, and a recorded hash for a piece whose bit never
     /// landed would let a peer fill verify against bytes that were never
     /// written.
-    pub fn finishPiece(self: *Store, file: *Cached, idx: u32, ok: bool, hash: ?[piece.digest_len]u8, now_sec: i64) void {
+    pub fn finishPiece(self: *Store, file: *Cached, idx: u32, ok: bool, fill_len: u32, hash: ?[piece.digest_len]u8, now_sec: i64) void {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
         // A forget that raced this fill removed the entry and unlinked its
@@ -1259,7 +1259,18 @@ pub const Store = struct {
             // may have swapped bits). Marking the fill's bytes would
             // publish pre-mutation content over the new inode.
             if (gen) |g| {
-                if (g == file.writes) {
+                // Two invalidations meet at this mark. The generation
+                // catches a truncate/distrust/reconcile that bumped writes
+                // mid-fill. The length catches the other grow interplay: a
+                // write-through grow widens the piece WITHOUT bumping
+                // writes until its own copyIntoCache lands, so a fill
+                // claimed at the old short geometry could otherwise
+                // complete inside that window and set a bit naming bytes
+                // the cache fd only partially holds -- the grow's mark
+                // drop cannot see it, because the bit was not set yet.
+                // Re-derive the length from the CURRENT size at the mark
+                // instant.
+                if (g == file.writes and piece.len(file.size, idx, self.piece_size) == fill_len) {
                     file.bits.set(idx);
                     // Landing bytes is access. The claim's stamp predates the fill,
                     // so a fill slower than recency_secs would leave this fresh piece
@@ -1355,6 +1366,11 @@ pub const Store = struct {
             if (file.bits.get(idx)) break :blk true;
             const gen = file.filling.get(idx) orelse break :blk true;
             if (gen != file.writes) break :blk true;
+            // A grow that landed after the claim widened this piece: the
+            // claimed bytes describe the old short geometry and must not
+            // even hit the cache fd (finishPiece's length gate is the
+            // authoritative one; this just skips the pointless pwrite).
+            if (piece.len(file.size, idx, self.piece_size) != buf.len) break :blk true;
             break :blk false;
         };
         if (skip) {
@@ -1365,7 +1381,7 @@ pub const Store = struct {
         file.mu.unlock(self.io);
 
         const w = self.writePiece(file, idx, buf);
-        self.finishPiece(file, idx, w == 0, hash, now_sec);
+        self.finishPiece(file, idx, w == 0, @intCast(buf.len), hash, now_sec);
         return w;
     }
 
@@ -2008,12 +2024,23 @@ pub const Store = struct {
     pub fn dropWideningPieceMark(self: *Store, file: *Cached) void {
         if (file.size == 0 or file.size % @as(u64, self.piece_size) == 0) return;
         const k: u32 = @intCast(@min(file.size / @as(u64, self.piece_size), @as(u64, std.math.maxInt(u32))));
-        if (file.bits.get(k)) {
+        const cleared = file.bits.get(k);
+        if (cleared) {
             file.bits.clear(k);
             std.log.warn("growing {s} widens short piece {d}; its mark dropped and the piece refills", .{ file.rel, k });
         }
+        // Sidecar work only when a bit was actually cleared: the
+        // never-piece-aligned sequential ingest hits the grow on every
+        // chunk, and an unconditional save would double its sidecar writes.
+        // A hash-only removal rides manifest_dirty and the next release's
+        // manifest publish instead (the sidecar does not carry hashes).
         if (file.hashes.remove(k)) file.manifest_dirty = true;
-        _ = self.saveBits(file, false);
+        // Sidecar work only when a bit was actually cleared: the
+        // never-piece-aligned sequential ingest hits the grow on every
+        // chunk, and an unconditional save would double its sidecar writes.
+        // A hash-only removal rides manifest_dirty and the next release's
+        // manifest publish instead (the sidecar does not carry hashes).
+        if (cleared) _ = self.saveBits(file, false);
     }
 
     /// Like cacheFill(), recording the post-write origin identity so a later
@@ -2932,6 +2959,68 @@ test "cacheFill grows entry preserving earlier piece marks" {
     try std.testing.expectEqualSlices(u8, &w3, rd[40..48]);
 }
 
+test "a fill claimed at the old short geometry cannot mark the widened piece" {
+    // The other half of the grow interplay: a hydration claimed while the
+    // file was 40 bytes must not mark piece 2 after a concurrent write-
+    // through grows the file to 48. The grow does not bump writes until its
+    // own copyIntoCache lands, so the generation check alone has a window;
+    // finishPiece re-derives the piece length at the mark instant.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-race-grow");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-race-grow");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    var fb: [160]u8 = undefined;
+    var zz: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&fb, "{s}/race.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zz, fp), ""));
+    var body: [40]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = @truncate(i *% 7 + 3);
+    try std.testing.expectEqual(@as(isize, 40), st.originPwrite("race.bin", &body, 0));
+
+    const now = sys.monoSec(std.testing.io);
+    const f = try st.get("race.bin", 40, now);
+    defer st.releaseFile(f);
+
+    // The hydration claims piece 2 at the 40-byte geometry: 8 bytes.
+    try std.testing.expect((try st.beginFill(f, 2, now)) == .len);
+
+    // Mid-fill, a write-through through the mount grows the file to 48.
+    var tail: [8]u8 = undefined;
+    @memset(&tail, 0xBB);
+    try std.testing.expectEqual(@as(isize, 8), st.originPwrite("race.bin", &tail, 40));
+    st.cacheFill("race.bin", 48, 40, &tail, now);
+
+    // The stale 8-byte completion must be dropped without even touching the
+    // cache fd, and the mark instant itself refuses a mismatched length.
+    var short: [8]u8 = undefined;
+    @memset(&short, 0xAA);
+    var dig: [piece.digest_len]u8 = undefined;
+    piece.digest(&short, &dig);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 2, &short, dig, now));
+    try std.testing.expect(!f.bits.get(2));
+
+    // Direct pin of finishPiece's gate: a claim at the current geometry
+    // marks only when the fill length matches it.
+    try std.testing.expect((try st.beginFill(f, 2, now)) == .len);
+    st.finishPiece(f, 2, true, 8, dig, now);
+    try std.testing.expect(!f.bits.get(2));
+    try std.testing.expect((try st.beginFill(f, 2, now)) == .len);
+    st.finishPiece(f, 2, true, 16, dig, now);
+    try std.testing.expect(f.bits.get(2));
+}
+
 test "cacheFill grow drops a hydrated short tail's mark instead of widening it" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
@@ -3356,7 +3445,7 @@ test "finishPiece does not mark a fill whose write generation raced" {
     f.mu.lockUncancelable(std.testing.io);
     f.writes += 1;
     f.mu.unlock(std.testing.io);
-    st.finishPiece(f, 0, true, null, sys.monoSec(std.testing.io));
+    st.finishPiece(f, 0, true, piece.len(f.size, 0, st.piece_size), null, sys.monoSec(std.testing.io));
     try std.testing.expect(!st.hasPiece(f, 0, sys.monoSec(std.testing.io)));
 }
 
@@ -4325,7 +4414,7 @@ test "a finisher racing distrust never republishes the wiped marks" {
                 // Piece 3 is the concurrent filler's own fresh post-write
                 // hydration: re-marking it across a distrust is legitimate.
                 if ((s.beginFill(file, 3, sys.monoSec(std.testing.io)) catch return) == .len)
-                    s.finishPiece(file, 3, true, null, sys.monoSec(std.testing.io));
+                    s.finishPiece(file, 3, true, piece.len(file.size, 3, s.piece_size), null, sys.monoSec(std.testing.io));
             }
         }
     }.run, .{ &st, f, &stop });
@@ -5341,6 +5430,46 @@ test "punchDisk reclaims a data file whose sidecar names another geometry" {
     try std.testing.expectEqual(@as(u32, 0), decoded.filled());
 }
 
+test "readServed answers from origin once the entry is dead" {
+    // A forget that raced a hydration leaves the entry dead with pieces
+    // that were never hydrated; serving the surviving cache fd would hand
+    // back sparse-hole zeros. The dead gate routes the read to the origin.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-rsrv-dead");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-rsrv-dead");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    // Origin bytes deliberately differ from what the cache tier holds, so
+    // the test can tell which tier answered.
+    const origin_pattern = "origin-bytes!!!";
+    const cache_pattern = "cacheD..bytes..";
+    var zbuf: [192]u8 = undefined;
+    var fbuf: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&zbuf, "{s}/dead.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fbuf, fp), ""));
+    try std.testing.expectEqual(@as(isize, @intCast(origin_pattern.len)), st.originPwrite("dead.bin", origin_pattern, 0));
+    const f = try st.get("dead.bin", origin_pattern.len, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    var cached: [cache_pattern.len]u8 = undefined;
+    @memcpy(&cached, cache_pattern);
+    try std.testing.expectEqual(@as(isize, @intCast(cache_pattern.len)), st.readCache(f, &cached, 0, sys.monoSec(std.testing.io)));
+
+    // The forget that raced the hydration marks the entry dead.
+    f.dead.store(true, .release);
+
+    var rd: [origin_pattern.len]u8 = undefined;
+    const n = st.readServed(f, &rd, 0, sys.monoSec(std.testing.io));
+    try std.testing.expectEqual(@as(isize, @intCast(rd.len)), n);
+    try std.testing.expectEqualStrings(origin_pattern, &rd);
+}
+
 test "readServed falls back to origin when the cache tier cannot answer" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
@@ -6305,7 +6434,7 @@ test "late finisher on a forgotten entry does not resurrect the sidecar" {
     const f = try st.get("late.bin", 64, sys.monoSec(std.testing.io));
     try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
     st.forget("late.bin");
-    st.finishPiece(f, 0, true, null, sys.monoSec(std.testing.io));
+    st.finishPiece(f, 0, true, piece.len(f.size, 0, st.piece_size), null, sys.monoSec(std.testing.io));
     const mp = try st.cacheMetaPath(&mb, "late.bin");
     try std.testing.expect(sys.statPath(mp, &stbuf) != 0);
     st.releaseFile(f);

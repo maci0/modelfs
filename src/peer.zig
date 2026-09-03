@@ -881,7 +881,7 @@ fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: p
                         _ = self.store.stats.bytes_from_origin.fetchAdd(ln, .monotonic);
                         _ = self.store.stats.fill_origin_nanos.fetchAdd(fill_dt, .monotonic);
                     } else {
-                        self.store.finishPiece(file, pi, false, null, sys.monoSec(self.io));
+                        self.store.finishPiece(file, pi, false, 0, null, sys.monoSec(self.io));
                         // statOrigin passed, so the file exists: a failed or short
                         // read is an upstream (origin) failure. Reporting 404 here
                         // would make peers believe the path is gone. Log it too:

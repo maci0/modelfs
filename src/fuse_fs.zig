@@ -687,7 +687,7 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
 fn originFillBuf(st: *State, file: *store_mod.Store.Cached, idx: u32, buf: []u8) i32 {
     const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
     if (n == @as(isize, @intCast(buf.len))) return 0;
-    st.store.finishPiece(file, idx, false, null, sys.monoSec(st.io));
+    st.store.finishPiece(file, idx, false, 0, null, sys.monoSec(st.io));
     _ = st.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
     // The reader sees EIO and nothing else names the cause; keep the
     // same sender-side trace serveData's hydration branch does,
@@ -1329,9 +1329,10 @@ export fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.
         // the reply names comes from the same kernel call. The libcs sign
         // statfs's word fields differently (glibc __fsword_t is signed,
         // musl's is not), so the copies cast explicitly. f_fsid is the one
-        // spelling trap: glibc types it struct __fsid_t (what fuse.h sees
-        // too), musl packs the same 8 bytes into one unsigned long, so it
-        // moves as bytes.
+        // spelling trap: glibc's statfs types it struct __fsid_t while
+        // glibc's statvfs holds one unsigned long, and musl is the mirror
+        // image (statfs word, statvfs struct). Same 8 bytes in all four
+        // spellings on LP64, so it moves as bytes.
         out.f_bsize = @intCast(vs.f_bsize);
         out.f_frsize = @intCast(vs.f_frsize);
         out.f_blocks = vs.f_blocks;
@@ -1930,8 +1931,8 @@ export fn ll_getattr(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, fi: ?*fuse.fuse
 
 /// The attribute bits the mount can actually apply. Ownership and
 /// timestamps have no handler, exactly as they had none under the
-/// high-level ops table, and answer ENOSYS in the same order libfuse used
-/// to: mode first, then size, then the unsupported rest.
+/// high-level ops table. Supported subsets apply mode then size; the
+/// unsupported bits are refused before anything is applied.
 const settable_attrs: c_int = fuse.FUSE_SET_ATTR_MODE | fuse.FUSE_SET_ATTR_SIZE;
 
 export fn ll_setattr(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, attr: [*c]fuse.struct_stat, to_set: c_int, fi: ?*fuse.fuse_file_info) callconv(.c) void {
