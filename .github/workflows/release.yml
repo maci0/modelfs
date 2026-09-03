@@ -54,12 +54,18 @@ jobs:
       - name: checksum and publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so gh cannot learn the repo from git.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           cd dist
+          # Flatten the artifact directories so the SHA256SUMS lines name
+          # exactly the asset names a downloader sees.
+          mv modelfs-*/* .
+          rmdir modelfs-*
           rm -f SHA256SUMS
-          sha256sum modelfs-*/* > SHA256SUMS
+          sha256sum modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl > SHA256SUMS
           cat SHA256SUMS
           gh release view "${TAG}" >/dev/null 2>&1 \
             || gh release create "${TAG}" --verify-tag --title "modelfs ${TAG}" --generate-notes
-          gh release upload "${TAG}" --clobber modelfs-*/* SHA256SUMS
+          gh release upload "${TAG}" --clobber modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl SHA256SUMS
