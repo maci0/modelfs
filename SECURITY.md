@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-`v0.9.0` is the current release: tag `v0.9.0`, matching `.version = "0.9.0"` in
+`v0.10.0` is the current release: tag `v0.10.0`, matching `.version = "0.10.0"` in
 [build.zig.zon](build.zig.zon), which `modelfs version` prints. The `0.8.x` line
 receives security fixes.
 

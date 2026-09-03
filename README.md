@@ -39,7 +39,7 @@ Writes: **origin first → then fill the local cache**.
 A read that misses blocks until that one piece is filled from a single source. If the local cache cannot land the fill (full or broken cache disk), that one read is served from the origin and the piece stays unmarked. There is no background whole-file striping: it OOMed the unified memory on the target hardware.
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
-Current release `v0.9.0`, which is what a build from this tree prints.
+Current release `v0.10.0`, which is what a build from this tree prints.
 Upgrade notes per release, including the breaking ones, are in [CHANGELOG.md](CHANGELOG.md).
 Security reports: [SECURITY.md](SECURITY.md).
 

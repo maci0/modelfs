@@ -4,7 +4,7 @@
 |---|---|
 | Status | Living document; describes `src/` as of the date below |
 | Last reviewed | 2026-09-02 |
-| Covers | modelfs daemon (`mount`) and CLI as of `v0.9.0`, peer HTTP protocol, lease discovery, FUSE surface |
+| Covers | modelfs daemon (`mount`) and CLI as of `v0.10.0`, peer HTTP protocol, lease discovery, FUSE surface |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
 
@@ -712,7 +712,7 @@ saturation (`http_dropped`). status.json exposes lifetime aggregates, `origin_do
 the status write, src/fuse_fs.zig). Still missing: a persistent, centralized record, and
 per-client attribution of successful requests.
 
-**Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.9.0`
+**Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.10.0`
 is current; the `0.8.x` line receives security fixes) and the route from report to shipped fix.
 GitHub private vulnerability reporting is not enabled on the repository, so that route has no
 intake until a repository admin turns the feature on, and there is no other disclosed contact.

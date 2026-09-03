@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-04
+
+Post-0.9.0 hardening and reach: a fresh adversarial review of everything
+that shipped in 0.9.0 found and fixed one real data-integrity window (a
+hydration claimed at the old short geometry could mark the widened piece),
+a handover memory-safety slip, and a handful of robustness and diagnostic
+gaps. CI now runs the full gate natively on an aarch64 runner, and releases
+attach the sparks' glibc deploy build alongside the two musl static
+binaries. No wire, on-disk, or CLI change; a mixed fleet with `0.9.0` peers
+is unaffected.
+
+### Fill length gate at the mark - 2026-09-04
+- **A hydration claimed at the old short geometry can no longer mark the widened piece.** A fill claimed while the file was 40 bytes (piece 2 = 8 bytes) could complete after a concurrent write-through grew the file to 48: the generation check passes because the grow does not bump writes until its own copyIntoCache lands, and finishPiece then set a bit naming `[32,48)` while the cache fd held only `[32,40)+[44,48)` -- warm reads of the gap shipped hole zeros. finishPiece re-derives the piece length from the CURRENT size at the mark instant and refuses a mismatched fill; completeFill skips the stale pwrite up front. Regression tests drive both the interleave and the direct mark gate.
+
+### Fresh-review fixes - 2026-09-04
+- **The handover state wipe actually happens now.** readStateFd's defers ran LIFO -- free first, secureZero second -- so the PSK was never wiped and the zeros landed on already-freed memory (a heap-corruption primitive on glibc). Defers swapped.
+- **Handover JSON rejects non-UTF-8 knob bytes at the encode** with a named error. A stray 0x80-0xFF byte in a path failed std.json's UTF-8 validator at the decode -- after the exec -- silently timing out every future update of that mount; valid multi-byte UTF-8 round-trips, pinned by test.
+- **The peer request-body drain restores the steady-state socket timeout** (its clamp was leaking into the serve paths, truncating transfers that stalled 10-30 s) and discounts body bytes the head read already consumed (a pipelined small body stalled the full drain budget before the reply went out).
+- **`modelfs pull` maps a dropped connection mid-request to ListingFailed again**; only a genuinely full listing buffer reports ListingTooLarge. **`update.req` cleanup is token-checked**, so a timed-out update cannot delete a concurrent retry's fresh request. **Lease publish names the actual formatLease error.**
+- **Benchmark honesty:** the write figure measures a fresh create per timed pass (not a rewrite over an already-cached file), the report states best-of-2/3 exactly, the engine sweep refuses a port answered by a stale orphan daemon, fig4's legend sits on an opaque plate, and the VM e2e cache probe refuses to fake a passing bound when ssh dies.
+
+### aarch64 CI/CD and native-ABI finish - 2026-09-04
+- **CI runs the full gate natively on an aarch64 runner** (`check-aarch64` on ubuntu-24.04-arm): every test now executes on arm64, so aarch64-only breakage fails CI instead of shipping to the sparks. Releases now also attach the sparks' documented deploy ABI -- `aarch64-linux-gnu.2.39` (glibc, vendored arm64 libfuse3) built by `scripts/cross_aarch64.sh` -- alongside the two musl static binaries, all under SHA256SUMS.
+- **The fd/socklen vocabulary no longer borrows std.posix/std.c**: fd signatures spell `c_int`, socket lengths `c_uint`, and the last two raw utimensat call sites (walkData tests) moved to `sys.touchPath`.
+
 ## [0.9.0] - 2026-09-03
 
 Two batches. First, a deep review pass over the whole tree (all of `src/`,
@@ -1006,7 +1031,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/maci0/modelfs/releases/tag/v0.10.0
 [0.9.0]: https://github.com/maci0/modelfs/releases/tag/v0.9.0
 [0.8.0]: https://github.com/maci0/modelfs/releases/tag/v0.8.0
 [0.7.0]: https://github.com/maci0/modelfs/releases/tag/v0.7.0
