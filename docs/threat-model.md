@@ -254,7 +254,8 @@ request in a plaintext header (src/peer.zig), and implicitly to any passive list
 connections.
 
 After `loadPsk` succeeds, mount zeros `RLIMIT_CORE` (`disableCoreDumps`) so a crash cannot dump
-the secret, drops `MODELFS_PSK_VALUE` from the process environment (`scrubPskEnv`) so the
+the secret, overwrites `MODELFS_PSK_VALUE` in the environment in place (`scrubPskEnv`: the
+entry stays, X-filled) so the
 `auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown. A
 `setrlimit` failure refuses to start rather than running with a dumpable secret.
 
@@ -304,8 +305,8 @@ and `..` are skipped), so hidden cache files cannot fill the filesystem past the
 after a restart. `--kernel-cache` RAM use is operator-chosen.
 
 **Elevation controls.** Path escape is blocked at `resolveRel`/`relOk`. Symlink redirection of
-staged writes is blocked by O_NOFOLLOW (src/sys.zig). chmod, statvfs, and directory opens use
-O_NOFOLLOW (`sys.chmod`, `sys.statvfsNoFollow`, `sys.opendirNoFollow`) rather than
+staged writes is blocked by O_NOFOLLOW (src/sys.zig). chmod, statfs, and directory opens use
+O_NOFOLLOW (`sys.chmod`, `sys.statfsNoFollow`, `sys.opendirNoFollow`) rather than
 lstat-then-follow, so a racer swapping a name to a link cannot chmod the target, list it through
 the mount, or report the host root's size and free space via `df`. `statOrigin` is lstat, and
 `mf_open` answers ELOOP on `S_IFLNK`. Client-supplied create/mkdir/chmod modes are stripped of
@@ -343,7 +344,9 @@ per event, to deny scanners a log-flooding lever. Successful requests carry no p
 trail.
 
 **Denial-of-service controls.** The handler cap is 16 with claim-then-check accounting. The head
-read deadline is 10 s, defeating dribble-holds; body deadlines scale with Content-Length.
+read deadline is 10 s, defeating dribble-holds; body deadlines scale with Content-Length; a
+declared request body is drained pre-auth under a second bounded hold (64 KiB / 10 s,
+`drainDeclaredBody` src/peer.zig) so a close after the reply cannot RST it away.
 Oversized and malformed heads are counted, not logged per event. 401 and 405 journal lines are
 capped to one per second, so a serial scanner cannot fill the journal. Connections refused at
 the cap are counted (`http_dropped`), so saturation is visible from status.json without
@@ -380,7 +383,7 @@ Controls that exist in code, grouped by what they defend.
 | Timing-safe token comparison (SHA-256 then constant-time eql) | src/proto.zig | Timing oracle on the auth check |
 | Empty-PSK refusal at startup, plus refusal of secrets containing CR/LF that would corrupt the request head | `loadPsk` and the header-safety gate, src/main.zig | Accidental unauthenticated service; self-inflicted auth drift where every fetch 401s |
 | PSK file mode gate: world-readable refuses to start, group bits warn | `loadPsk` src/main.zig | Local PSK theft by any uid. Group-readable is detection only |
-| Mount zeros `RLIMIT_CORE`, drops `MODELFS_PSK_VALUE` from the environment so the `auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown | `disableCoreDumps` / `scrubPskEnv` src/main.zig, called from `cmdMount` | Closes [R8](#r8-crash-time-psk-spill-mitigated). A `setrlimit` failure refuses to start. Residual: the secret still lives in process memory for the mount's lifetime |
+| Mount zeros `RLIMIT_CORE`, X-fills `MODELFS_PSK_VALUE` in the environment in place so the `auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown | `disableCoreDumps` / `scrubPskEnv` src/main.zig, called from `cmdMount` | Closes [R8](#r8-crash-time-psk-spill-mitigated). A `setrlimit` failure refuses to start. Residual: the secret still lives in process memory for the mount's lifetime |
 | Duplicate-bind refusal: listeners use SO_REUSEADDR only, never SO_REUSEPORT | src/peer.zig, with a regression test | B2/S: a co-tenant daemon (usually with a different PSK) silently splitting connections with the real one |
 
 ### Attribution
@@ -405,7 +408,7 @@ Controls that exist in code, grouped by what they defend.
 |---|---|---|
 | Client-supplied FUSE create/mkdir/chmod modes masked to permission bits, stripping setuid, setgid, and sticky before any origin create or attribute change | `clientCreateMode` src/fuse_fs.zig, applied at `mf_create`, `mf_mkdir`, `mf_chmod` | B1/E: planting daemon-owned special-bit executables through the mount, or granting special bits to existing daemon-owned files post-create |
 | O_NOFOLLOW on origin and cache data-plane opens, status.json, lease reads, and staged writes | src/sys.zig, src/discover.zig, src/store.zig, src/fuse_fs.zig, src/main.zig | Local attackers redirecting privileged reads or writes: a planted `status.json` or `.cluster` lease name fails closed instead of serving its target |
-| O_NOFOLLOW on FUSE chmod, readdir, and statfs, with no lstat-then-follow window (`statOrigin` is still lstat; `mf_open` rejects `S_IFLNK`) | `sys.chmod` / `sys.opendirNoFollow` / `sys.statvfsNoFollow`; `mf_chmod`/`mf_readdir` src/fuse_fs.zig; `originStatvfs` src/store.zig | B1/E: a planted origin symlink steering the daemon's chmod (setuid included), listing a client-local directory through the mount, or leaking the host root's size and free space via `df` |
+| O_NOFOLLOW on FUSE chmod, readdir, and statfs, with no lstat-then-follow window (`statOrigin` is still lstat; `mf_open` rejects `S_IFLNK`) | `sys.chmod` / `sys.opendirNoFollow` / `sys.statfsNoFollow`; `mf_chmod`/`mf_readdir` src/fuse_fs.zig; `originStatfs` src/store.zig | B1/E: a planted origin symlink steering the daemon's chmod (setuid included), listing a client-local directory through the mount, or leaking the host root's size and free space via `df` |
 | Cache data 0600, cache dirs 0700, sidecars and pins 0600, `status.json` 0600, with leftover looser modes tightened on the next open or publish | `cache_data_mode` / `cache_dir_mode` / `openCache` / `ensureLayout` / `tightenCacheDir` / `setPin` src/store.zig; `writeFileOwnerOnly` src/sys.zig | B1/I: a local uid blocked by origin modes and FUSE `default_permissions` cannot read cached weights, list which nested paths are cached or pinned, read piece bitfields or pin markers, or read operational state |
 | Disk-cull walk samples cache entries with lstat and skips non-regular files, with a depth cap on nesting; leading-dot `relOk` names are sampled | `walkData` src/store.zig | B1/E: planted symlinks in a writable cache tree steering fallocate punches outside `data/`. B1/D: hidden cache files filling the filesystem past the watermarks after a restart |
 | Cull punch refuses to hole a piece with bytes in flight: the `xfer` counter is held across peer `/data` hydration and send and across FUSE warm cache reads, and entries are punchable only when recency-idle and transfer-free | `punchPiece` / `xfer` src/store.zig (`readCache` holds `xfer` for the warm-read path) | B1/D and the R2/R7 residual: closes the punch-versus-in-flight-read race that would serve hole zeros behind set bits |
@@ -580,8 +583,10 @@ requires cluster-wide key regeneration by hand.
 
 **Partially bounded.** The 16-slot cap (src/peer.zig) is global, not per-source, and slots are
 occupied before and during auth. Sixteen cycling connections, each held to the 10 s head
-deadline, deny all peer fills cluster-wide while the node itself stays up, degrading every other
-node's miss path to origin speed.
+deadline plus up to another 10 s of bounded body drain when the head declares a
+Content-Length (`drainDeclaredBody`: 64 KiB / 10 s cap, before auth), deny all peer fills
+cluster-wide while the node itself stays up, degrading every other node's miss path to origin
+speed.
 
 ### R5: lease poisoning enables PSK capture
 
@@ -625,9 +630,9 @@ retry after a lost reply cannot resurrect a deleted file's bits over a same-size
 
 ### R8: crash-time PSK spill (mitigated)
 
-Mount zeros `RLIMIT_CORE` after loading the secret (`disableCoreDumps` src/main.zig), drops
-`MODELFS_PSK_VALUE` from the environment (`scrubPskEnv`), and `secureZero`s the in-memory copy
-on teardown. A `setrlimit` failure refuses to start (`cmdMount`).
+Mount zeros `RLIMIT_CORE` after loading the secret (`disableCoreDumps` src/main.zig), X-fills
+`MODELFS_PSK_VALUE` in the environment in place (`scrubPskEnv`: the entry stays, the bytes go),
+and `secureZero`s the in-memory copy on teardown. A `setrlimit` failure refuses to start (`cmdMount`).
 
 Residual: the secret still lives in process memory for the mount's lifetime.
 

@@ -113,7 +113,7 @@ then serves it. Files already there at the listed size are skipped, so a rerun r
 | `--cache PATH` | `/var/cache/modelfs` | local piece cache |
 | `--id NAME` | short hostname | node id in the lease |
 | `--listen [IP:]PORT` | `18080` | peer port; the IP is ignored, binding is always all interfaces |
-| `--advertise IP[:PORT],...` | every non-loopback IPv4 | replaces the auto-detected list, not additive |
+| `--advertise IP[:PORT],...` | every non-loopback IPv4 except 169.254 | replaces the auto-detected list, not additive |
 | `--seed HOST[:PORT]` | none | peer to try while `.cluster` has no live lease; repeatable |
 | `--piece SIZE` | `16M` | piece size |
 | `--direct-io` / `--kernel-cache` | `--direct-io` | the page cache is off by default because it is UMA RAM shared with the GPU; turning it on permits mmap and can OOM |

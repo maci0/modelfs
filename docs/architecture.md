@@ -75,7 +75,7 @@ shared store is not implemented.
 
 Every origin open is hostile-tree-safe. The data plane (`originPread` / `originPwrite` in
 src/store.zig) uses `O_NOFOLLOW`, so a planted symlink is `ELOOP`, and `O_NONBLOCK`, so a FIFO
-at the name cannot hang a FUSE worker. `sys.chmod`, `sys.statvfsNoFollow`, and
+at the name cannot hang a FUSE worker. `sys.chmod`, `sys.statfsNoFollow`, and
 `sys.opendirNoFollow` are `O_NOFOLLOW` the same way (`opendirNoFollow` is `O_NONBLOCK` too).
 `preadAll` / `pwriteAll` / `writeAll` in src/sys.zig return `-errno` like `sendfileAll`, so an
 origin I/O failure surfaces as the real errno (EIO, ESTALE) rather than EPERM.
@@ -110,7 +110,9 @@ New code goes in the module that already owns that concern.
 that reaches a host outside the cluster (HTTPS through `std.http.Client`, CLI only).
 
 `@cImport` is deprecated in Zig 0.16, so C declarations are translated once from `src/c.h` by
-`build.zig`; `c.zig` re-exports that module and every other module goes through it.
+`build.zig` (musl targets translate `src/c_musl.h`, which includes `c.h` after working around
+translate-c's musl timespec demotion, with `src/c-musl-shim/` first on the include path);
+`c.zig` re-exports that module and every other module goes through it.
 
 The commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`, `pull`, `update`)
 import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and
@@ -150,7 +152,8 @@ would be visible to every other node and orphaned if this one died.
 
 Marks are only trusted while they provably describe the object currently at the path.
 
-* `create` (`O_TRUNC`) and `truncate` with no live cache entry drop persisted marks through
+* `create` (`O_TRUNC`, or `O_EXCL` which fails EEXIST and leaves the origin untouched) and
+  `truncate` with no live cache entry drop persisted marks through
   `Store.distrust`, for the same replay reason.
 * A cold `Store.get` whose sidecar geometry does not match the origin size persists that wipe,
   so a restart cannot reload the old marks.
@@ -302,7 +305,8 @@ environment. The mount refuses to start without one. A world-readable PSK file i
 load; group-readable warns.
 
 On mount the daemon zeros `RLIMIT_CORE` so a crash cannot dump the secret (the mount exits if
-that limit cannot be set), drops `MODELFS_PSK_VALUE` from the process environment so the
+that limit cannot be set), overwrites `MODELFS_PSK_VALUE` in the process environment in
+place (X-filled, key and value) so the
 `auto_unmount` helper cannot inherit it, and wipes the in-memory copy on teardown
 (`disableCoreDumps` / `scrubPskEnv` in src/main.zig).
 
@@ -400,7 +404,7 @@ of a conversation parse only the status line.
 ## Cache cull
 
 Like cachefilesd, on **percent free** of the filesystem that holds `/var/cache/modelfs` (here
-the 3.6T root): unprivileged available blocks (`statvfs.f_bavail` via `cull.freePercent`), not
+the 3.6T root): unprivileged available blocks (`statfs.f_bavail` via `cull.freePercent`), not
 root-reserved `f_bfree`.
 
 | flag | default | meaning |
@@ -622,7 +626,7 @@ green. Artifacts from older builds fall back to wall-clock `now_s`.
 |---|---|
 | Liveness | `id`, `pid`, `uptime_s`, `now_s`, `mono_s` |
 | Topology | `peers`, `piece`, `inflight` (HTTP handlers) |
-| Saturation | `cache_free_pct`, the same sample culling runs on; `-1` when statvfs fails, i.e. culling suspended |
+| Saturation | `cache_free_pct`, the same sample culling runs on; `-1` when statfs fails, i.e. culling suspended |
 | Origin health | `origin_down`, 1 while an EIO/ESTALE/ETIMEDOUT getattr/open/stat, write, origin pread, lease publish, or `.cluster` walk has not yet recovered |
 | Lifetime counters (`stats`) | reads/writes with errors, warm-cache reads (`reads_warm`), cumulative read/write/peer-HTTP durations in ns (`http_nanos` covers `/have` `/data` `/stage`, not `/ping`), piece fills by source with byte totals including `bytes_to_peer`, per-tier fill failures (including origin hydrations done to serve a peer), `probe_err`, `lease_err`, `meta_err`, pieces culled, `http_ok`, rejected auths, `http_405`, 5xx replies, malformed request heads, connections dropped at the inflight cap, and `serve_verify_fail` |
 
@@ -776,7 +780,7 @@ recurring logs its first failure and its recovery, and rides a counter in betwee
 | `.cluster` walk unreadable | `cluster leases unreadable` | `cluster leases recovered` |
 | Accept loop | `accept failed` | `accept recovered` |
 | `/have` probe to a peer, per peer (a 404 counts as answering) | `peer <ip>:<port> /have probe failed` with the error class | logged on the next success |
-| Cache-filesystem statvfs (suspends culling) | logged | `culling resumed` |
+| Cache-filesystem statfs (suspends culling) | logged | `culling resumed` |
 
 The lease-publish and `.cluster`-walk failures feed the same `origin_down` flag as FUSE I/O
 (`tickCluster` in src/fuse_fs.zig), so an idle node with a dead origin is visible without

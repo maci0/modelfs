@@ -53,8 +53,9 @@ Formatting, CHANGELOG headings and tag links versus `build.zig.zon`, unit tests,
 restore-drill stub suite, vendored libfuse3 digest and extract checks,
 contributor-script `--help` handlers, shellcheck, `ruff check`,
 `ruff format --check`, mypy, and the CycloneDX inventory: exactly what
-the `check` CI job runs. Every CI job (that gate, the
-aarch64 cross-compile, and the reproducibility rebuild) as one local step:
+the `check` CI job runs. The CI jobs (that gate, the native aarch64
+gate, the aarch64 cross-compile, the static musl smoke build, and the
+reproducibility rebuild -- the first three also as one local step):
 
 ```bash
 ./scripts/ci.sh
@@ -124,8 +125,10 @@ is the runbook they belong to.
 ## PR expectations
 
 The only blocking requirement is green CI: `./scripts/check.sh`, the
-`cross-aarch64` compile job, and the `reproducibility` job, all three of which
-`./scripts/ci.sh` runs locally. There is no sign-off gate.
+`cross-aarch64` compile job, the two `static-linux` musl builds, and the
+`reproducibility` job. `./scripts/ci.sh` runs the gate, the cross-compile,
+and the reproducibility rebuild locally; the native aarch64 gate and the
+static smoke build run only on GitHub's runners. There is no sign-off gate.
 
 **Behavior changes belong in [CHANGELOG.md](CHANGELOG.md)**, as a dated `###`
 section under `[Unreleased]`. Adding one is not itself gated, but the file's
@@ -206,8 +209,9 @@ workflow (`.github/workflows/release.yml`), which builds the static
 single-file binaries for `x86_64-linux-musl` and `aarch64-linux-musl`
 (`scripts/build_static.sh`: vendored libfuse3 compiled in, no interpreter,
 no shared libraries), refuses a tag that does not name `build.zig.zon`'s
-version, and attaches the two binaries plus a `SHA256SUMS` to a GitHub
-release named after the tag. Re-tagging buys nothing: the workflow fires on
+version, and attaches the two musl static binaries, the
+`aarch64-linux-gnu` spark build (from `scripts/cross_aarch64.sh`), and a
+`SHA256SUMS` to a GitHub release named after the tag. Re-tagging buys nothing: the workflow fires on
 tag creation, and a mismatched tag fails the build. The repository itself
 stays the source of truth for package consumers (the Zig package tarball is
 whatever `.paths` lists) and for anyone building from the tagged commit.
