@@ -163,6 +163,27 @@ jobs:
       - name: Cross-compile the spark-node binary
         run: ./scripts/cross_aarch64.sh
 
+  # The static single-file release builds are only exercised at tag time by
+  # the release workflow; this job runs the exact same recipe on every push
+  # and PR so a breakage (vendored-source drift, a link regression, an
+  # assert_static_elf gap) fails CI weeks before a release depends on it.
+  # Compile/link/ELF-assert only: the runners have no /dev/fuse for a live
+  # mount, and the full test suite runs natively in the two check jobs.
+  static-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux-musl, aarch64-linux-musl]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Build and verify the static single-file binary
+        run: ./scripts/build_static.sh ${{ matrix.target }} --prefix .scratch/static
+
   # Enforces what CONTRIBUTING promises under "Cutting a release": two
   # ReleaseFast builds from differently named trees, with TZ/locale/
   # SOURCE_DATE_EPOCH varied between them, must produce byte-identical

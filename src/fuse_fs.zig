@@ -239,6 +239,89 @@ fn clientCreateMode(mode: fuse.mode_t) fuse.mode_t {
     return mode & 0o777;
 }
 
+test "mf_create honors O_EXCL at the origin and keeps the legacy truncate" {
+    // The caller's O_EXCL used to be dropped, so an exclusive creator racing
+    // another node's file O_TRUNC'd it out of existence instead of failing
+    // EEXIST. Flags reach the origin open through fiFlags (offset 0 of the
+    // opaque fuse_file_info head, the same raw-access contract as the
+    // bitfield and fh accessors above).
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-excl");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-excl");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    st.mountpoint = "/models";
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    tls_state = &st;
+    defer tls_state = null;
+
+    // Handlers take mount-relative C strings (libfuse hands them over
+    // NUL-terminated; cPath spans to the terminator, so the buffer must be
+    // sentinel-terminated like the real thing): relFromFuse strips the
+    // leading slash and originPath resolves the rest under the origin.
+    var rel_buf: [64:0]u8 = undefined;
+    const rel = try std.fmt.bufPrintZ(&rel_buf, "/excl.bin", .{});
+
+    // fuse_file_info is opaque to translate-c, so the test speaks the same
+    // raw dialect as the accessors: a zeroed byte buffer whose first int32
+    // is the flags word.
+    var fi_buf: [64]u8 align(8) = undefined;
+    const fi: ?*fuse.fuse_file_info = @ptrCast(&fi_buf);
+
+    @memset(&fi_buf, 0);
+    std.mem.writeInt(
+        i32,
+        fi_buf[0..4],
+        sys.c.O_CREAT | sys.c.O_EXCL | sys.c.O_WRONLY,
+        .little,
+    );
+
+    // First exclusive create succeeds and lands the mode.
+    try std.testing.expectEqual(@as(c_int, 0), mf_create(rel.ptr, 0o644, fi));
+    var sb: sys.c.struct_stat = undefined;
+    var zb: [256]u8 = undefined;
+    var pb: [256]u8 = undefined;
+    const zp = try sys.toZ(&zb, try std.fmt.bufPrint(&pb, "{s}/excl.bin", .{origin_d}));
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(zp, &sb));
+    try std.testing.expectEqual(@as(c_uint, 0o644), @as(c_uint, @intCast(sb.st_mode & 0o7777)));
+
+    // A second exclusive create fails EEXIST instead of truncating, and the
+    // first creator's bytes survive.
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(zp, "keep"));
+    try std.testing.expectEqual(@as(c_int, -sys.c.EEXIST), mf_create(rel.ptr, 0o644, fi));
+    var rb: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("keep", try sys.readFileBuf(&rb, zp));
+
+    // Without O_EXCL the historical truncate-on-create still applies.
+    @memset(&fi_buf, 0);
+    std.mem.writeInt(
+        i32,
+        fi_buf[0..4],
+        sys.c.O_CREAT | sys.c.O_WRONLY,
+        .little,
+    );
+    try std.testing.expectEqual(@as(c_int, 0), mf_create(rel.ptr, 0o644, fi));
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(zp, &sb));
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @intCast(sb.st_size)));
+
+    // fi null (no flags reachable) keeps the legacy truncate too.
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(zp, "keep"));
+    try std.testing.expectEqual(@as(c_int, 0), mf_create(rel.ptr, 0o644, null));
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(zp, &sb));
+    try std.testing.expectEqual(@as(u64, 0), @as(u64, @intCast(sb.st_size)));
+}
+
 test "clientCreateMode strips setuid, setgid, and sticky bits" {
     try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o4755));
     try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o2755));
