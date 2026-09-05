@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Sourced by every script in this directory. Locates the project root by
+# Sourced by the scripts here that use ROOT_DIR/SCRATCH_DIR (the standalone
+# alarm and installer scripts run without it). Locates the project root by
 # walking up for build.zig.zon, so no script hardcodes how deep below the
 # root it sits, and names the one place run artifacts may be written.
 

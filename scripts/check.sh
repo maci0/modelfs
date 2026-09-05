@@ -45,6 +45,7 @@ answers --help):
   ./scripts/hold_monthlies.sh               hold monthly snapshots (syncoid ExecStartPost)
   ./scripts/install_nas_backup.sh           copy NAS snapshot/replica/drill units (dry-run by default)
   ./scripts/repro_check.sh                  two ReleaseFast builds, compare bytes
+build_static.sh <target>        static musl release build (also run by release.yml)
 
 Setup, once per clone: see CONTRIBUTING.md.
 EOF
