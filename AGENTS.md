@@ -34,8 +34,10 @@ It runs:
 
 The Python tools must come from `.venv/bin` with an interpreter matching
 `.python-version`; an empty venv is not enough. CI runs that gate plus the
-aarch64 glibc cross-compile, a native aarch64 runner running the same gate, and the reproducibility rebuild; `./scripts/ci.sh` runs
-all three locally.
+aarch64 glibc cross-compile, a native aarch64 runner running the same gate, the static
+single-file musl smoke build (`scripts/build_static.sh`), and the reproducibility rebuild;
+`./scripts/ci.sh` runs the x86_64 gate, the cross-compile, and the rebuild locally -- the
+native aarch64 gate runs only on GitHub's runner.
 
 Suites outside the gate, because each needs hardware CI lacks:
 
@@ -57,8 +59,9 @@ Suites outside the gate, because each needs hardware CI lacks:
 - **`hf.zig` is the only outbound reach.** The daemon talks to peers and the
   origin; `modelfs pull` is the one path that contacts a host outside the
   cluster, from the CLI, never from the mount.
-- **Run artifacts go to `.scratch/`**, never `/tmp`: it is tmpfs here, and a
-  piece cache written there is charged to RAM.
+- **Run artifacts in the repo go to `.scratch/`**, never `/tmp`: it is tmpfs here, and a
+  piece cache written there is charged to RAM. (The NAS drill's scratch is
+  `/var/tmp/modelfs-drill` via `MF_DRILL_SCRATCH` -- no checkout on that host.)
 - **Harness knobs use `MF_`, never `MODELFS_`.** The daemon refuses unknown
   `MODELFS_*` as typo'd knobs.
 - **Every external path is untrusted.** Request heads, lease JSON, and encoded
