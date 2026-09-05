@@ -2524,6 +2524,94 @@ test "fault tolerance: bad psk fetchHave fails with http status" {
     try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
 }
 
+test "request bodies are drained: pipelined bytes are not re-waited and replies survive" {
+    // The drain runs pre-auth so 401/405 replies survive a close that would
+    // otherwise RST them away. Three shapes pinned here:
+    // - pipelined: readHeadFull consumed the body bytes in the same read;
+    //   the drain must discount them or it stalls the full 10 s budget
+    //   re-reading bytes that are already off the socket;
+    // - unsent: a declared body the client actually sends is consumed and
+    //   the reply still lands;
+    // - unauthorized: a body-sending prober still gets its 401.
+    const gpa = std.testing.allocator;
+    var bb: [128]u8 = undefined;
+    const base_d = try sys.scratchDir(&bb, "modelfs-srv-drain-base");
+    defer sys.deleteTree(std.testing.io, base_d);
+    var obuf: [160]u8 = undefined;
+    const origin_d = try std.fmt.bufPrint(&obuf, "{s}/origin", .{base_d});
+    var cbuf: [160]u8 = undefined;
+    const cache_d = try std.fmt.bufPrint(&cbuf, "{s}/cache", .{base_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(origin_d, 0o755));
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cache_d, 0o755));
+    defer sys.deleteTree(std.testing.io, base_d);
+
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "correct_secret");
+    defer srv.stop();
+    const port = srv.port();
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    // Pipelined: head and body in one segment. If the drain re-waited for
+    // the consumed bytes, this reply would arrive only after the socket
+    // timeout; five seconds means the discount worked.
+    {
+        const fd = try dial(std.testing.io, "127.0.0.1", port, null);
+        defer sys.close(fd);
+        const msg = "GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer correct_secret\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+        try std.testing.expect(sys.writeAll(fd, msg) > 0);
+        const t0 = sys.monoMs(std.testing.io);
+        var acc: [512]u8 = undefined;
+        var got: usize = 0;
+        while (got < acc.len) {
+            const n = sys.readOnce(fd, acc[got..]) catch break;
+            if (n == 0) break;
+            got += n;
+            if (std.mem.indexOf(u8, acc[0..got], "ok") != null) break;
+        }
+        const elapsed = sys.monoMs(std.testing.io) - t0;
+        try std.testing.expect(std.mem.indexOf(u8, acc[0..got], "200") != null);
+        try std.testing.expect(elapsed < 5000);
+    }
+
+    // Unsent: head declares a body the client sends right after; the drain
+    // consumes it and /ping still answers.
+    {
+        const fd = try dial(std.testing.io, "127.0.0.1", port, null);
+        defer sys.close(fd);
+        const head = "GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer correct_secret\r\nContent-Length: 8\r\nConnection: close\r\n\r\n";
+        try std.testing.expect(sys.writeAll(fd, head) > 0);
+        try std.testing.expect(sys.writeAll(fd, "12345678") > 0);
+        var acc: [512]u8 = undefined;
+        var got: usize = 0;
+        while (got < acc.len) {
+            const n = sys.readOnce(fd, acc[got..]) catch break;
+            if (n == 0) break;
+            got += n;
+            if (std.mem.indexOf(u8, acc[0..got], "ok") != null) break;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, acc[0..got], "200") != null);
+    }
+
+    // Unauthorized with a body: the 401 must survive the close.
+    {
+        const fd = try dial(std.testing.io, "127.0.0.1", port, null);
+        defer sys.close(fd);
+        const msg = "GET /ping HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc";
+        try std.testing.expect(sys.writeAll(fd, msg) > 0);
+        var acc: [512]u8 = undefined;
+        var got: usize = 0;
+        while (got < acc.len) {
+            const n = sys.readOnce(fd, acc[got..]) catch break;
+            if (n == 0) break;
+            got += n;
+            if (std.mem.indexOf(u8, acc[0..got], "401") != null) break;
+        }
+        try std.testing.expect(std.mem.indexOf(u8, acc[0..got], "401") != null);
+    }
+}
+
 test "fault tolerance: traversal path is rejected with 400" {
     const gpa = std.testing.allocator;
     var bb: [128]u8 = undefined;
