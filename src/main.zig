@@ -1357,10 +1357,13 @@ fn scrubPskEnv() void {
     while (std.c.environ[i]) |entry| : (i += 1) {
         const str = std.mem.span(entry);
         if (std.mem.startsWith(u8, str, prefix)) {
-            // Overwrite the whole entry, key included: children keep a
-            // same-shaped but meaningless variable instead of an empty
-            // MODELFS_PSK_VALUE, which loadPsk would rightly refuse.
-            @memset(str, 'X');
+            // X-fill only the value: the entry must keep its '='. std's
+            // Environ.scan slices the value as entry[key_end + 1 .. nul],
+            // and an entry with no '=' at all (start > end) is a panic in
+            // safe builds and UB in release -- this exact crash shipped in
+            // 0.10.0 when the scrub X-filled the whole entry. Children
+            // inherit a meaningless all-X value instead of the secret.
+            @memset(str[prefix.len..], 'X');
         }
     }
 }
@@ -4249,11 +4252,20 @@ test "disableCoreDumps zeros RLIMIT_CORE" {
     try std.testing.expectEqual(@as(std.posix.rlim_t, 0), lim.max);
 }
 
-test "scrubPskEnv removes MODELFS_PSK_VALUE" {
+test "scrubPskEnv X-fills MODELFS_PSK_VALUE in place" {
+    // The entry must keep its '=': std's Environ.scan slices the value as
+    // entry[key_end + 1 .. nul], and a keyless '='-less entry (start > end)
+    // panics the first std.log of the process. Children therefore inherit
+    // the known knob with a meaningless value instead of the secret.
     try std.testing.expectEqual(@as(c_int, 0), sys.c.setenv("MODELFS_PSK_VALUE", "inline-secret", 1));
     try std.testing.expect(sys.c.getenv("MODELFS_PSK_VALUE") != null);
     scrubPskEnv();
-    try std.testing.expect(sys.c.getenv("MODELFS_PSK_VALUE") == null);
+    const scrubbed = sys.c.getenv("MODELFS_PSK_VALUE") orelse return error.TestUnexpectedValue;
+    // getenv returns the value past the '=': X-filled, exactly as long as
+    // the secret was, entry (and its '=') otherwise intact.
+    const scrubbed_str = std.mem.span(scrubbed);
+    try std.testing.expectEqual(@as(usize, "inline-secret".len), scrubbed_str.len);
+    try std.testing.expect(std.mem.allEqual(u8, scrubbed_str, 'X'));
 }
 
 test "buildSeeds passes numeric ips through and resolves names" {
