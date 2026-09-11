@@ -130,7 +130,7 @@ Measured with nine `modelfs` instances on **one host over TCP loopback**, not ac
 | `sendfile` at 16 MiB default | 1.5 GB/s |
 | `/ping` sweep across 9 instances | 1.4 ms total |
 
-<img src="docs/figures/fig2_throughput_vs_piece_size.svg" alt="Throughput against piece size, 256 KiB to 256 MiB" width="640">
+<img src="docs/figures/throughput-vs-piece.png" alt="sendfile throughput vs piece size, 256 KiB to 256 MiB. Peak 2176 MB/s at 8 MiB; 1503 MB/s at the 16 MiB default." width="900">
 
 The piece-size sweep is why the default piece is 16 MiB: past it the gain is small, and every miss costs the reader a whole piece before the read returns.
 
