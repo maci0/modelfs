@@ -11,27 +11,7 @@ A POSIX `/models` mount for LLM weights. One Zig binary per node: FUSE via `libf
 | `/var/cache/modelfs` | local NVMe piece cache, 16 MiB pieces |
 | `:18080` | peer HTTP protocol, PSK bearer auth |
 
-```mermaid
-flowchart TD
-  E["engine reads<br/>/models/foo.gguf"] --> Q{"piece in the<br/>local cache?"}
-  Q -- yes --> L[("local NVMe<br/>16 MiB piece")]
-  Q -- no --> P{"any peer<br/>advertises it?"}
-  P -- yes --> S["peer :18080<br/>sendfile, PSK auth"]
-  P -- no --> O[("NFS origin")]
-  S --> F["fill the hole"]
-  O --> F
-  F --> L
-  L --> B["bytes back to the engine"]
-
-  classDef entry fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
-  classDef inflight fill:#fef9c3,stroke:#eab308,color:#713f12
-  classDef cached fill:#bbf7d0,stroke:#16a34a,color:#14532d
-  classDef shared fill:#f3e8ff,stroke:#9333ea,color:#581c87
-  class E entry
-  class S,F inflight
-  class L,B cached
-  class O shared
-```
+<img src="docs/figures/read-path.png" alt="Read path: local NVMe, then a cluster peer, then the NFS origin" width="900">
 
 Reads: **local piece → cluster peer (`sendfile`) → origin**.
 Writes: **origin first → then fill the local cache**.
@@ -146,10 +126,11 @@ Measured with nine `modelfs` instances on **one host over TCP loopback**, not ac
 
 | Benchmark | Result |
 | :--- | :--- |
-| Peak `sendfile` throughput (64 MiB pieces) | 3.5 GB/s |
-| `/ping` sweep across 9 instances | 1.1 ms total |
+| Peak `sendfile` throughput (8 MiB pieces) | 2.2 GB/s |
+| `sendfile` at 16 MiB default | 1.5 GB/s |
+| `/ping` sweep across 9 instances | 1.4 ms total |
 
-<img src="docs/figures/fig2_throughput_vs_piece_size.svg" alt="Throughput against piece size, 256 KiB to 64 MiB" width="640">
+<img src="docs/figures/fig2_throughput_vs_piece_size.svg" alt="Throughput against piece size, 256 KiB to 256 MiB" width="640">
 
 The piece-size sweep is why the default piece is 16 MiB: past it the gain is small, and every miss costs the reader a whole piece before the read returns.
 

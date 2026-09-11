@@ -8,34 +8,9 @@
 
 Shipped in `modelfs` (Zig, libfuse3). A process on a spark only opens `/models/...`.
 
-```mermaid
-sequenceDiagram
-  participant P as vLLM / llama.cpp
-  participant F as FUSE /models
-  participant L as local NVMe
-  participant Peers as other sparks
-  participant N as NFS
+![Read path: local NVMe, then a cluster peer, then the NFS origin](figures/read-path.png)
 
-  P->>F: pread piece k
-  F->>L: hole filled?
-  alt hit
-    L-->>P: bytes
-  else miss
-    F->>Peers: GET /have (one walk per peer; 2s cache)
-    alt some peer has k
-      F->>F: pick path by score
-      F->>Peers: Range GET
-      Peers-->>F: 16 MiB
-    else nobody
-      F->>N: pread
-      N-->>F: 16 MiB
-    end
-    F->>L: pwrite hole
-    L-->>P: bytes
-  end
-```
-
-One piece, one source. Misses block the read until that hole is filled.
+Source: [read-path.drawio](figures/read-path.drawio). One piece, one source. Misses block the read until that hole is filled. `/have` bitmaps are cached 2 s per peer and path; on a miss the daemon walks peers, picks a path by score, and Range-GETs the piece.
 
 If the local cache cannot land the fill (full or broken cache disk), that one read is served
 from the origin rather than failing EIO over a healthy origin (`serveHydrated` in
