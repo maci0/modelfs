@@ -1494,7 +1494,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         printErr("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, handover.req_file });
         return 1;
     };
-    if (sys.writeFileOwnerOnly(req_path, req) != 0) {
+    if (sys.writeFileOwnerOnlyDurable(req_path, req) != 0) {
         printErr("modelfs: cannot write {s}/{s}\n", .{ opts.cache, handover.req_file });
         return 1;
     }

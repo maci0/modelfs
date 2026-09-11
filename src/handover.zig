@@ -21,8 +21,10 @@ pub const Addr = struct {
 
 /// Cap on the captured FUSE_INIT request. Today's wire form is a 40-byte
 /// header plus a 64-byte payload; the slack covers a protocol that grows
-/// the payload without needing a new handover format.
-pub const init_max: usize = 256;
+/// the payload without needing a new handover format. Sized past one
+/// libfuse receive (the kernel can coalesce INIT with the next request
+/// into a single read).
+pub const init_max: usize = 4096;
 
 /// Cap on the sealed state blob a replacement image reads back. The knobs
 /// are a few hundred bytes plus one path per cached inode and open handle;

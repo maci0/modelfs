@@ -33,6 +33,10 @@ pub const State = struct {
     detach: bool = false,
     listen_port: u16 = 0,
     fuse_fd: c_int = -1,
+    /// Wakes `ioRead` from a blocking FUSE read when SIGUSR2 asks for a
+    /// handover (`fuse_session_exit` only sets a flag). CLOEXEC; not inherited.
+    wakeup_r: c_int = -1,
+    wakeup_w: c_int = -1,
     /// Set by SIGUSR2: the session loop exits without unmounting so
     /// `execHandover` can hand the FUSE and listen fds to a new image.
     handover_asked: std.atomic.Value(bool) = .init(false),
@@ -185,6 +189,10 @@ pub const State = struct {
             if (slot) |b| self.gpa.free(b);
         }
         if (self.update_token) |t| self.gpa.free(t);
+        if (self.wakeup_r >= 0) sys.close(self.wakeup_r);
+        if (self.wakeup_w >= 0) sys.close(self.wakeup_w);
+        self.wakeup_r = -1;
+        self.wakeup_w = -1;
     }
 };
 
@@ -2431,6 +2439,19 @@ fn serve(st: *State, inherit_fd: ?c_int) c_int {
         std.log.warn("custom io on FUSE fd {d} failed (rc {d}); serving normally, but 'modelfs update' cannot replace this image", .{ st.fuse_fd, iorc });
     }
     _ = sys.setCloexec(st.fuse_fd, true);
+    {
+        var p: [2]c_int = .{ -1, -1 };
+        if (sys.c.pipe(&p) != 0) {
+            std.log.err("handover: wakeup pipe failed", .{});
+            return 1;
+        }
+        _ = sys.setCloexec(p[0], true);
+        _ = sys.setCloexec(p[1], true);
+        _ = sys.setNonblocking(p[0], true);
+        _ = sys.setNonblocking(p[1], true);
+        st.wakeup_r = p[0];
+        st.wakeup_w = p[1];
+    }
     if (inherit_fd == null) {
         _ = fuse.fuse_daemonize(@intFromBool(!st.detach));
     } else {
@@ -2457,6 +2478,7 @@ fn serve(st: *State, inherit_fd: ?c_int) c_int {
         // whole point is to hand that connection to the next image. execve
         // does not come back, so reaching the return means it failed.
         keep_session = true;
+        _ = sys.setNonblocking(st.fuse_fd, false);
         execHandover(st) catch |err| {
             std.log.err("handover exec failed: {t}; the mount is unserved, restart the daemon", .{err});
         };
@@ -2467,17 +2489,28 @@ fn serve(st: *State, inherit_fd: ?c_int) c_int {
 }
 
 fn ioRead(fd: c_int, buf: ?*anyopaque, size: usize, userdata: ?*anyopaque) callconv(.c) isize {
+    const st: *State = @ptrCast(@alignCast(userdata.?));
     while (true) {
+        if (st.handover_asked.load(.acquire)) return -sys.c.EINTR;
+        if (st.wakeup_r >= 0) {
+            var pfds = [2]sys.c.pollfd{
+                .{ .fd = fd, .events = sys.c.POLLIN, .revents = 0 },
+                .{ .fd = st.wakeup_r, .events = sys.c.POLLIN, .revents = 0 },
+            };
+            const pr = sys.c.poll(&pfds, 2, -1);
+            if (pr < 0) {
+                if (sys.errno() == sys.c.EINTR) continue;
+                return pr;
+            }
+            if (st.handover_asked.load(.acquire)) return -sys.c.EINTR;
+            if (pfds[0].revents & sys.c.POLLIN == 0) continue;
+        }
         const n = sys.c.read(fd, buf, size);
         if (n > 0) {
-            const st: *State = @ptrCast(@alignCast(userdata.?));
             const bytes: [*]const u8 = @ptrCast(buf.?);
             captureInit(st, bytes[0..@intCast(n)]);
             return n;
         }
-        // Retry EINTR like every read wrapper in sys.zig: libfuse's handling
-        // of a -EINTR from custom io is version-dependent, and a signal
-        // landing here would otherwise tear down the session (unmount).
         if (n == 0 or sys.errno() != sys.c.EINTR) return n;
     }
 }
@@ -2489,10 +2522,15 @@ fn ioRead(fd: c_int, buf: ?*anyopaque, size: usize, userdata: ?*anyopaque) callc
 /// buffer, which the connection reports as EINVAL on every read.
 fn captureInit(st: *State, msg: []const u8) void {
     if (st.init_len.load(.acquire) != 0) return;
-    if (msg.len < @sizeOf(FuseInHeader) or msg.len > st.init_raw.len) return;
+    if (msg.len < @sizeOf(FuseInHeader)) return;
     if (std.mem.readInt(u32, msg[4..8], .little) != fuse_opcode_init) return;
-    @memcpy(st.init_raw[0..msg.len], msg);
-    st.init_len.store(msg.len, .release);
+    const len = std.mem.readInt(u32, msg[0..4], .little);
+    if (len < @sizeOf(FuseInHeader) or len > st.init_raw.len or len > msg.len) {
+        std.log.warn("FUSE_INIT length {d} not capturable (read {d}, cap {d}); 'modelfs update' cannot replace this image", .{ len, msg.len, st.init_raw.len });
+        return;
+    }
+    @memcpy(st.init_raw[0..len], msg[0..len]);
+    st.init_len.store(len, .release);
 }
 
 fn ioWritev(fd: c_int, iov: ?*sys.c.iovec, count: c_int, userdata: ?*anyopaque) callconv(.c) isize {
@@ -2537,7 +2575,9 @@ fn replayInit(st: *State, se: *fuse.fuse_session) bool {
         return false;
     }
     st.swallow_reply.store(true, .release);
-    var buf = fuse.fuse_buf{ .size = len, .mem = &st.init_raw };
+    var aligned: [handover.init_max]u8 align(8) = undefined;
+    @memcpy(aligned[0..len], st.init_raw[0..len]);
+    var buf = fuse.fuse_buf{ .size = len, .mem = &aligned };
     fuse.fuse_session_process_buf(se, &buf);
     st.swallow_reply.store(false, .release);
     if (!st.init_seen.load(.acquire)) {
@@ -2558,8 +2598,27 @@ var live_state: ?*State = null;
 /// locks, or logs.
 fn onUsr2(_: c_int) callconv(.c) void {
     const st = live_state orelse return;
-    if (st.init_len.load(.acquire) == 0) return;
+    if (st.init_len.load(.acquire) == 0) {
+        const msg = "modelfs: SIGUSR2 ignored (no FUSE_INIT captured); update cannot proceed\n";
+        _ = sys.c.write(2, msg.ptr, msg.len);
+        return;
+    }
+    // USR2 is a wakeup. The request file is the authorization: tearing the
+    // session down because a stray USR2 beat `modelfs update`'s write leaves
+    // the mount unserved. open is async-signal-safe.
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const req_path = sys.joinZ(&pbuf, st.store.cache, handover.req_file) catch return;
+    const fd = sys.open(req_path, sys.c.O_RDONLY | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK, 0);
+    if (fd < 0) return;
+    _ = sys.close(fd);
     st.handover_asked.store(true, .release);
+    // fuse_session_exit only sets a flag. Workers sit in a blocking read on
+    // the FUSE fd; O_NONBLOCK makes that read return so the loop can notice
+    // the exit. Restored before exec so the replacement image blocks again.
+    if (st.wakeup_w >= 0) {
+        var b: [1]u8 = .{1};
+        _ = sys.c.write(st.wakeup_w, &b, 1);
+    }
     if (live_session) |se| fuse.fuse_session_exit(se);
 }
 
@@ -2639,8 +2698,23 @@ fn execHandover(st: *State) !void {
     const gpa = st.gpa;
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const req_path = try sys.joinZ(&pbuf, st.store.cache, handover.req_file);
-    var open_errno: i32 = 0;
-    const req_blob = sys.readFileAllocNoFollowOpenErrno(gpa, req_path, 4096, &open_errno) catch return error.NoRequest;
+    // The CLI fsyncs then SIGUSR2; still retry ENOENT briefly so a delayed
+    // directory update cannot turn a successful update into a dead mount.
+    const req_blob = blk: {
+        var waited: u32 = 0;
+        while (true) {
+            var open_errno: i32 = 0;
+            break :blk sys.readFileAllocNoFollowOpenErrno(gpa, req_path, 64 * 1024, &open_errno) catch |err| {
+                if (err == error.OpenFailed and open_errno == sys.c.ENOENT and waited < 1000) {
+                    sys.sleepMs(st.store.io, 50);
+                    waited += 50;
+                    continue;
+                }
+                std.log.err("handover: cannot read {s} ({t} errno {d})", .{ req_path, err, open_errno });
+                return error.NoRequest;
+            };
+        }
+    };
     defer gpa.free(req_blob);
     const parsed = handover.decodeReq(gpa, req_blob) catch return error.BadRequest;
     defer parsed.deinit();

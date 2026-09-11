@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Hot-reload harness - 2026-09-12
+- **`scripts/test_hot_reload.sh` compiles `-Dfuse-static`.** Distro libfuse3 returns -ENOTSUP for `fuse_session_custom_io`, so a dynamically linked image cannot capture FUSE_INIT and `modelfs update` times out. The vendored tree is the one that can.
+- **SIGUSR2 actually leaves the FUSE loop.** `fuse_session_exit` only sets a flag; workers sat in a blocking `read` on the FUSE fd, retried EINTR, and `modelfs update` waited 30s then unlinked `update.req` before `execHandover` ran. A wakeup pipe plus `poll` in the custom-io read, a req-file gate in the handler, and an 8-byte-aligned FUSE_INIT replay make the swap take.
+
 ### Default piece size 8 MiB - 2026-09-12
 - **Default `--piece` is 8 MiB** (`piece.default_size`). The loopback sendfile sweep peaked there (2.2 GB/s). Existing 16 MiB sidecars are a geometry mismatch and rehydrate empty. Mixed-piece peers do not share `/have` bits; remount the fleet together.
 

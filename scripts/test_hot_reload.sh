@@ -56,8 +56,11 @@ require_zig
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum not found on PATH (coreutils)"
 
 # Own prefix, so a native harness run does not replace a cross-compiled
-# zig-out/ someone is holding on to.
-zig build --prefix "${W}/out" >/dev/null
+# zig-out/ someone is holding on to. Distro libfuse3 returns -ENOTSUP for
+# fuse_session_custom_io (the kernel FUSE_INIT capture), so `modelfs update`
+# cannot replace that image; the vendored tree compiled in with -Dfuse-static
+# is the one that can.
+zig build --prefix "${W}/out" -Dfuse-static >/dev/null
 
 rm -rf "${W}/origin" "${W}/cache" "${MNT}"
 mkdir -p "${W}/origin/sub" "${W}/cache" "${MNT}"
