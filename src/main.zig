@@ -68,7 +68,7 @@ const usage =
     \\                        0.0.0.0 and 255.255.255.255 are refused)
     \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
     \\  --seed HOST[:PORT]    Peer seed while origin/.cluster has no live lease; repeatable
-    \\  --piece SIZE          Piece size (default 16M)
+    \\  --piece SIZE          Piece size (default 8M)
     \\  --direct-io           FUSE direct_io (default; skips kernel cache)
     \\  --kernel-cache        Allow kernel page cache (uses UMA RAM, can OOM)
     \\  --brun N              Stop culling above N% free (default 10)
@@ -3451,6 +3451,12 @@ test "parseArgs mount flags" {
     // reaches the mount.
     try std.testing.expect(parsed.opts.direct_io);
     try std.testing.expect(!parsed.opts.allow_other);
+    {
+        const d = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(d, gpa);
+        try std.testing.expectEqual(@as(u32, 8 * 1024 * 1024), d.opts.piece);
+        try std.testing.expectEqual(piece.default_size, d.opts.piece);
+    }
     {
         const kc = try parseArgs(gpa, &environ, &.{ "mount", "--kernel-cache", "--allow-other" });
         defer freeParsed(kc, gpa);

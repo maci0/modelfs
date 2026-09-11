@@ -2,7 +2,7 @@
 
 You are a senior performance engineer whose task is to find dense loops in `src/` where vectorization is a real win, and to reject the ones where it is not.
 
-**Expect to reject most of them.** modelfs is I/O bound by construction: a warm read is an NVMe `pread`, a peer serve is `sendfile` from the page cache straight to the socket without the bytes ever entering user space, and a miss is an NFS round trip. The only sustained CPU work on a live path is blake3 over 16 MiB pieces, and that is `std.crypto`, which is already vectorized and must not be hand-rolled. A review that ships three `@Vector` kernels here has almost certainly optimized something that never appears in a profile. This differs from `zig-idiomatic-review.md`, which owns code shape, and from `zig-src-review.md`, which owns defects; a wrong SIMD kernel is a correctness defect, so anything you ship needs a scalar golden.
+**Expect to reject most of them.** modelfs is I/O bound by construction: a warm read is an NVMe `pread`, a peer serve is `sendfile` from the page cache straight to the socket without the bytes ever entering user space, and a miss is an NFS round trip. The only sustained CPU work on a live path is blake3 over 8 MiB pieces, and that is `std.crypto`, which is already vectorized and must not be hand-rolled. A review that ships three `@Vector` kernels here has almost certainly optimized something that never appears in a profile. This differs from `zig-idiomatic-review.md`, which owns code shape, and from `zig-src-review.md`, which owns defects; a wrong SIMD kernel is a correctness defect, so anything you ship needs a scalar golden.
 
 ## Execution contract
 
@@ -28,7 +28,7 @@ No kernel ships on a hunch. A candidate needs, in order:
 |---|---|---|
 | `Bitfield.filled` (src/piece.zig) | population count over the bitfield | **Already done.** `@popCount` over `u64` words with a byte tail. Confirm the word loop survives; do not widen to `@Vector` without a measured win, since bitfields are KiB-scale |
 | `Bitfield.lastSet` (src/piece.zig) | reverse scan for the top set bit | **Already done.** Word-at-a-time backward scan with `@clz`. Same rule |
-| `piece.digest` (src/piece.zig) | blake3 over one 16 MiB piece | **Reject: use the stdlib.** `std.crypto.hash.Blake3` is the implementation. Hand-rolling a hash is a correctness and security regression, not an optimization |
+| `piece.digest` (src/piece.zig) | blake3 over one 8 MiB piece | **Reject: use the stdlib.** `std.crypto.hash.Blake3` is the implementation. Hand-rolling a hash is a correctness and security regression, not an optimization |
 | `containsControl` / `containsControlBytes` (src/proto.zig) | byte classification over a path | **Usually reject.** Inputs are path-length, so per-call fixed cost dominates. Only a candidate if a profile shows a metadata storm spending real time here |
 | `decodePath` (src/peer.zig) | percent-decode a request target | **Usually reject.** Same reason: bounded by path length, once per request |
 | `manifestOverlap` / `manifestOverlapPrepared` / `digestSorted` (src/piece.zig) | compare and sort per-piece digest arrays | **The best remaining candidate.** `dupes --all` scans every manifest on the origin, so the entry count scales with the store, not with one request. Measure before touching, and note it is a CLI path, not a serve path |

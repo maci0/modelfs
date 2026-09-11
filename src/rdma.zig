@@ -1,7 +1,7 @@
 //! RDMA data-plane transport seam for peer piece staging.
 //!
 //! The control plane (auth, routing, /have, /stage negotiation) stays on
-//! HTTP/1.1; the data plane moves 16 MiB pieces through registered memory.
+//! HTTP/1.1; the data plane moves 8 MiB pieces through registered memory.
 //! This module is the seam between the two: a `Backend` owns registered
 //! buffers and exposes stage/read, and the `/stage` window codec is the
 //! wire contract between the serving node's staged buffer and the fetching

@@ -293,7 +293,7 @@ const max_head_bytes: usize = 4096 * 3 + proto.max_psk_bytes + 512;
 /// reading one byte per timeout window cannot pin a /data handler slot (plus
 /// thread, socket, and entry reference) forever -- sixteen of those deaden the
 /// peer service permanently. Scaled so healthy but slow links never trip it:
-/// a 16 MiB piece gets 76s (needs ~0.2 MB/s).
+/// an 8 MiB piece gets 68s (needs ~0.1 MB/s).
 const body_deadline_base_ms: i64 = 60_000;
 const body_deadline_per_mib_ms: i64 = 1_000;
 
@@ -328,8 +328,8 @@ fn armChunkTimeout(io: std.Io, fd: c_int, deadline_ms: i64) bool {
 const max_alloc_body_bytes: usize = 512 * 1024 * 1024;
 
 /// Tighter cap on a peer-chosen /have body, which is a piece bitmap:
-/// bytesLen(pieces) for the serving grid. 16 MiB names 2^27 pieces -- a 2 PiB
-/// file at the default 16 MiB grid -- so any larger answer is broken or
+/// bytesLen(pieces) for the serving grid. 16 MiB names 2^27 pieces -- a 1 PiB
+/// file at the default 8 MiB grid -- so any larger answer is broken or
 /// hostile. Honoring it up to max_alloc_body_bytes would drive a half-gigabyte
 /// allocation per probe, and havePut caches the answer (have_cache_cap
 /// entries), pinning copies of it past the probe.
@@ -814,7 +814,7 @@ fn serveStage(self: *Server, fd: c_int, rel: []const u8, idx: u32) void {
 /// Hydrates every piece the range touches before streaming; unhydrated
 /// holes read back as zeros, so a multi-piece range must fill each one.
 /// One reusable buffer for every hydration in the range instead of an
-/// alloc/free pair per 16 MiB piece, allocated only when a covered piece
+/// alloc/free pair per piece, allocated only when a covered piece
 /// actually lacks its bit: fully-cached ranges skip the allocation.
 /// Sends the error reply itself; false means streaming cannot proceed.
 fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {

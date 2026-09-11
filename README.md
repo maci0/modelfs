@@ -8,7 +8,7 @@ A POSIX `/models` mount for LLM weights. One Zig binary per node: FUSE via `libf
 | :--- | :--- |
 | `/net/<nas>/models` | NFS origin, the read/write authority. Required |
 | `/models` | FUSE mount point on the GPU nodes |
-| `/var/cache/modelfs` | local NVMe piece cache, 16 MiB pieces |
+| `/var/cache/modelfs` | local NVMe piece cache, 8 MiB pieces |
 | `:18080` | peer HTTP protocol, PSK bearer auth |
 
 <img src="docs/figures/read-path.png" alt="Read path: local NVMe, then a cluster peer, then the NFS origin" width="900">
@@ -95,7 +95,7 @@ then serves it. Files already there at the listed size are skipped, so a rerun r
 | `--listen [IP:]PORT` | `18080` | peer port; the IP is ignored, binding is always all interfaces |
 | `--advertise IP[:PORT],...` | every non-loopback IPv4 except 169.254 | replaces the auto-detected list, not additive |
 | `--seed HOST[:PORT]` | none | peer to try while `.cluster` has no live lease; repeatable |
-| `--piece SIZE` | `16M` | piece size |
+| `--piece SIZE` | `8M` | piece size |
 | `--direct-io` / `--kernel-cache` | `--direct-io` | the page cache is off by default because it is UMA RAM shared with the GPU; turning it on permits mmap and can OOM |
 | `--allow-other` | off | the only way a uid other than the mounter reaches the mount; needs `user_allow_other` |
 | `--detach` / `-f` | `-f` | background after mount, or stay in the foreground |
@@ -126,13 +126,12 @@ Measured with nine `modelfs` instances on **one host over TCP loopback**, not ac
 
 | Benchmark | Result |
 | :--- | :--- |
-| Peak `sendfile` throughput (8 MiB pieces) | 2.2 GB/s |
-| `sendfile` at 16 MiB default | 1.5 GB/s |
+| Peak `sendfile` throughput (8 MiB default) | 2.2 GB/s |
 | `/ping` sweep across 9 instances | 1.4 ms total |
 
-<img src="docs/figures/throughput-vs-piece.png" alt="sendfile throughput vs piece size, 256 KiB to 256 MiB. Peak 2176 MB/s at 8 MiB; 1503 MB/s at the 16 MiB default." width="900">
+<img src="docs/figures/throughput-vs-piece.png" alt="sendfile throughput vs piece size, 256 KiB to 256 MiB. Peak 2176 MB/s at the 8 MiB default." width="900">
 
-The piece-size sweep is why the default piece is 16 MiB: past it the gain is small, and every miss costs the reader a whole piece before the read returns.
+The piece-size sweep is why the default piece is 8 MiB: it was the peak on this host, and every miss costs the reader a whole piece before the read returns.
 
 ## Tests
 

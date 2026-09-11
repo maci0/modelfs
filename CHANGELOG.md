@@ -2,9 +2,12 @@
 
 ## [Unreleased]
 
+### Default piece size 8 MiB - 2026-09-12
+- **Default `--piece` is 8 MiB** (`piece.default_size`). The loopback sendfile sweep peaked there (2.2 GB/s). Existing 16 MiB sidecars are a geometry mismatch and rehydrate empty. Mixed-piece peers do not share `/have` bits; remount the fleet together.
+
 ### Docs - 2026-09-12
 - **Read-path diagram** in the README and architecture.md is a draw.io figure (`docs/figures/read-path.drawio`, rendered PNG) instead of mermaid. The README throughput chart is the same treatment (`docs/figures/throughput-vs-piece.drawio`).
-- **Benchmarks regenerated** on this host. Peak `sendfile` is 2.2 GB/s at 8 MiB pieces (1.5 GB/s at the 16 MiB default); `/ping` across 9 instances is 1.4 ms. Full tables in [docs/benchmarks.md](docs/benchmarks.md).
+- **Benchmarks regenerated** on this host. Peak `sendfile` is 2.2 GB/s at the 8 MiB default; `/ping` across 9 instances is 1.4 ms. Full tables in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## [0.10.0] - 2026-09-04
 

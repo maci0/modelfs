@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Shipped-behavior reference; kept current against `src/` |
-| Date | 2026-09-02 (re-verified against `src/`) |
+| Date | 2026-09-12 (re-verified against `src/`) |
 | Design history | [design.md](design.md): original architecture, goals G1-G10 with ship status, key decisions and what did not ship |
 
 Shipped in `modelfs` (Zig, libfuse3). A process on a spark only opens `/models/...`.
@@ -217,7 +217,7 @@ score = ewma_goodput_bps / (1 + hops) / (1 + inflight)
   measured transfer (a successful piece fetch, not a `/have` probe) is 100 MB/s; a lease `mbps`
   (Mbit/s) is converted to B/s instead when nonzero. `rangeBps` returns 0, and
   `Catalog.updateGoodput` ignores the sample, for a non-positive, non-finite, or >1 TB/s rate
-  (zero or 1 ns elapsed on a 16 MiB piece), so it cannot pull the EWMA toward 0 B/s or toward
+  (zero or 1 ns elapsed on an 8 MiB piece), so it cannot pull the EWMA toward 0 B/s or toward
   an infinitely fast path.
 - **hops**: 0 if the same IPv4 /24 as a local address, else 1.
 - **inflight**: pieces already assigned to that path.
@@ -388,7 +388,7 @@ root-reserved `f_bfree`.
 | `--bcull` | 7 | start culling |
 | `--bstop` | 3 | cull harder |
 
-Culling punches piece-sized holes (default 16 MiB, `FALLOC_FL_PUNCH_HOLE`), clears that bit,
+Culling punches piece-sized holes (default 8 MiB, `FALLOC_FL_PUNCH_HOLE`), clears that bit,
 and leaves the sparse file. The next read hydrates that piece again.
 
 Live entries are LRU by last access: FUSE reads, fills, and peer `/data`/`/stage` transfers

@@ -520,7 +520,7 @@ def run_engine_io_vs_piece_size_benchmark(
 
 
 # The piece-size sweep both measured sweeps walk. 128M and 256M sit past the
-# 16M default to show where bigger chunks stop paying; every entry is a legal
+# 8M default to show where bigger chunks stop paying; every entry is a legal
 # --piece value (parseSize accepts 1024-based K/M/G up to u32 max bytes).
 _PIECE_CONFIGS = [
     ("256K", 256 * 1024),
@@ -950,7 +950,7 @@ Zero-copy `sendfile` streaming:
 
 Throughput climbs with piece size and then wobbles, which is per-request fixed
 cost being amortised against page-cache and socket-buffer effects rather than a
-clean curve. 16 MiB is the default piece: past it the gain is small, and a miss
+clean curve. 8 MiB is the default piece: it was the peak on this host, and a miss
 costs the reader the whole piece before the read returns.
 
 ![Throughput vs piece size](figures/fig2_throughput_vs_piece_size.svg)
@@ -986,8 +986,8 @@ peer issues -- across the same piece sizes:
 One file, many pieces. On this host the span slows as the piece grows -- the
 opposite corner from Benchmark 2, where bigger single-piece files fetched
 faster. Read the two sweeps together: piece size trades one-piece fetch speed
-against streaming across a real file's grid, and the 16 MiB default is a
-mid-curve choice, not a corner-case optimum.
+against streaming across a real file's grid, and the 8 MiB default is the
+one-piece sendfile peak on this host, not a span-optimum.
 
 ![HTTP span vs piece size](figures/fig5_http_span_vs_piece_size.svg)
 

@@ -8,7 +8,7 @@
         <mxCell id="2" value="One piece, one source" style="text;html=0;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=18;fontStyle=1;fontColor=#0f172a;" vertex="1" parent="1">
           <mxGeometry x="40" y="18" width="360" height="28" as="geometry"/>
         </mxCell>
-        <mxCell id="3" value="A read fills one 16 MiB hole: local NVMe, then a cluster peer, then the NFS origin." style="text;html=0;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#64748b;" vertex="1" parent="1">
+        <mxCell id="3" value="A read fills one 8 MiB hole: local NVMe, then a cluster peer, then the NFS origin." style="text;html=0;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=12;fontColor=#64748b;" vertex="1" parent="1">
           <mxGeometry x="40" y="44" width="680" height="20" as="geometry"/>
         </mxCell>
 
@@ -26,7 +26,7 @@
           <mxGeometry x="545" y="204" width="150" height="112" as="geometry"/>
         </mxCell>
 
-        <mxCell id="8" value="1 · Local NVMe&#xa;16 MiB piece cache&#xa;/var/cache/modelfs" style="shape=cylinder3;whiteSpace=wrap;html=0;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#ecfdf5;strokeColor=#059669;strokeWidth=2;fontFamily=Helvetica;fontSize=12;fontColor=#065f46;" vertex="1" parent="1">
+        <mxCell id="8" value="1 · Local NVMe&#xa;8 MiB piece cache&#xa;/var/cache/modelfs" style="shape=cylinder3;whiteSpace=wrap;html=0;boundedLbl=1;backgroundOutline=1;size=12;fillColor=#ecfdf5;strokeColor=#059669;strokeWidth=2;fontFamily=Helvetica;fontSize=12;fontColor=#065f46;" vertex="1" parent="1">
           <mxGeometry x="750" y="112" width="200" height="90" as="geometry"/>
         </mxCell>
         <mxCell id="9" value="2 · Cluster peer&#xa;GET /have, then Range GET&#xa;:18080 · sendfile · PSK" style="rounded=1;whiteSpace=wrap;html=0;arcSize=12;fillColor=#fff7ed;strokeColor=#ea580c;strokeWidth=2;fontFamily=Helvetica;fontSize=12;fontColor=#9a3412;" vertex="1" parent="1">

@@ -15,7 +15,7 @@ The origin became **required** (any POSIX dir both nodes see), and the mount def
 getattr and readdir hit the origin, and the page cache is off because of UMA OOM (see
 architecture.md).
 
-What runs on the sparks is a FUSE 16 MiB piece cache in front of NFS. The implementation is Zig,
+What runs on the sparks is a FUSE 8 MiB piece cache in front of NFS. The implementation is Zig,
 not Go; peers speak plain HTTP (`GET /ping`, `/have`, `/data`, `/stage`) rather than
 Have/Want/Piece frames; and membership lives in `.cluster/<id>.json` lease files on the origin
 instead of an embedded metadata store.
@@ -806,7 +806,7 @@ Status values: **Accepted** (still in force), **Partial** (part shipped), **Supe
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Accepted |
 | Pin | Chunk refcount; optional cluster pin | Keep the working set off LRU | Partial: path-level `pin/` marker (`modelfs pin`/`unpin`); no chunk refcount, no cluster pin |
 | Frontend | Sparse-file hydrate, then leave the I/O path | mmap for llama.cpp / vLLM | Superseded: FUSE read path with `direct_io`; agent stays in the I/O path (UMA OOM; reverses section 4.8 rules 1 and 6: getattr/readdir hit the origin, no passthrough) |
-| Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partial: fixed 16 MiB transfer pieces; CDC dormant (section 14) |
+| Pieces vs chunks | 4-16 MiB transfer, smaller CDC later | RPC vs dedup granularity | Partial: fixed 8 MiB transfer pieces; CDC dormant (section 14) |
 | Hash | blake3 | Fast, enough collision resistance for this | Accepted: Level 1 shipped (per-piece digests, manifests, verify); content-addressed storage and wire-level identity shelved (section 14, Levels 2-3) |
 | Two-node | Embedded metadata, RF=2 | No extra store | Not shipped (origin-less RF=2). Membership is origin `.cluster/<id>.json` leases (see Origin row) |
 | Origin | Optional peer that never evicts | Same protocol | Superseded: origin is required (POSIX dir); "never evicts" holds |
@@ -814,7 +814,7 @@ Status values: **Accepted** (still in force), **Partial** (part shipped), **Supe
 | Auth | static shared secret or mTLS | No anonymous P2P | Partial: bearer PSK on plaintext HTTP; mTLS did not ship (section 9) |
 | Engines | POSIX directory | No plugins | Accepted |
 | v1 language | Go | Protocol/state bound, not CPU bound | Superseded: Zig |
-| v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 16 MiB pieces (`--piece` overrides); CDC dormant (section 14) |
+| v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 8 MiB pieces (`--piece` overrides); CDC dormant (section 14) |
 | Kubernetes | Not required for v1 | Two-node first | Accepted: no Kubernetes; one foreground binary, systemd `Type=simple` |
 
 ## 14. Content identity: shipped Level 1; Levels 2-3 shelved pending telemetry
@@ -848,7 +848,7 @@ What Level 1 deliberately does NOT do:
   `/stage` (section 15) negotiates a window for the same piece, not a
   content hash. The `X-Piece-Size` handshake and 2 s probe cache are
   untouched.
-- No CDC: dedup granularity is the fixed 16 MiB grid, so only pieces that
+- No CDC: dedup granularity is the fixed 8 MiB grid, so only pieces that
   are byte-identical whole (same grid, same size, same content regions)
   share an identity.
 
@@ -903,7 +903,7 @@ justifiable; until then it is designed, not planned.
 ## 15. Peer data transport: HTTP today, the staged (RDMA) plane designed
 
 The control plane is HTTP/1.1 + bearer PSK (`/ping`, `/have`, `/stage`,
-`/data`); the data plane moves 16 MiB pieces. This section is the roadmap
+`/data`); the data plane moves 8 MiB pieces. This section is the roadmap
 the transport seam reserves: a staged plane where a piece is registered
 into pinned memory on the serving node and pulled with an RDMA Read at
 fabric speed, with HTTP remaining the negotiation and fallback channel.
@@ -946,7 +946,7 @@ fill in:
   is today. RDMA Read matches the pull model; the `/stage` window IS the
   (addr, rkey, len) the Read needs.
 - **Registered buffers**: a pool of 16 piece-sized buffers per node
-  (matching `Server.max_inflight`; 256 MiB at 16 MiB pieces), registered
+  (matching `Server.max_inflight`; 128 MiB at 8 MiB pieces), registered
   once at mount with `IBV_ACCESS_REMOTE_READ` and nothing else -- a
   window grants exactly one piece's bytes, no broader memory access. The
   fake backend's bounded pool is this pool's in-memory stand-in.

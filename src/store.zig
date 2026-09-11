@@ -880,8 +880,8 @@ pub const Store = struct {
     /// claiming filled over hole zeros). Fill-path saves stay best-effort;
     /// losing one only costs a refill over intact bytes.
     pub fn saveBits(self: *Store, file: *Cached, durable: bool) bool {
-        // Stack for any sidecar that fits (16 KiB of bits is a 2 TiB file at
-        // the default 16 MiB piece): a piece fill used to heap-allocate a
+        // Stack for any sidecar that fits (16 KiB of bits is a 1 TiB file at
+        // the default 8 MiB piece): a piece fill used to heap-allocate a
         // copy of bits the entry already holds, once per hydrated piece.
         const id_extra: usize = if (file.origin_id.known) OriginId.encoded_len else 0;
         const need = file.bits.encodedLen() + id_extra;
@@ -1414,8 +1414,8 @@ pub const Store = struct {
     pub const manifests_dir = ".cluster/manifests";
 
     /// Upper bound on a manifest blob read from shared storage. A fully
-    /// hashed file at the default 16 MiB grid costs 36 bytes per piece, so
-    /// this bounds files up to ~28 TiB; anything larger is treated as a
+    /// hashed file at the default 8 MiB grid costs 36 bytes per piece, so
+    /// this bounds files up to ~14 TiB; anything larger is treated as a
     /// missing manifest (origin fills, no peer verification) rather than an
     /// unbounded allocation from an untrusted artifact.
     pub const max_manifest_bytes: usize = 64 * 1024 * 1024;

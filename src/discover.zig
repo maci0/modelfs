@@ -333,7 +333,7 @@ pub const Catalog = struct {
     /// fillFromPeers runs once per piece; without this cache a sequential
     /// read of one large model re-probes the whole cluster for every piece
     /// (one connect plus round trip and a full bitmap transfer per peer per
-    /// 16 MiB). Hits and healthy 404 misses are cached (a 404 is stored as
+    /// piece). Hits and healthy 404 misses are cached (a 404 is stored as
     /// an empty bitmap): a stale hit can at worst send us to a peer that no
     /// longer has the piece, which the fetch-failure fallback already
     /// handles, and a stale miss delays noticing that peer for one TTL.
@@ -457,7 +457,7 @@ pub const Catalog = struct {
     /// assumed aligned). Null means no usable line -- the caller must
     /// probe. Reads the one bit under the lock and copies nothing: sequential
     /// fills of one file used to dupe the whole bitmap per peer per piece
-    /// just to test this bit, allocating bytesLen(pieces) on every 16 MiB
+    /// just to test this bit, allocating bytesLen(pieces) on every piece
     /// for the TTL window.
     pub fn haveHas(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, idx: u32, local_piece_size: u32, now_ms: i64) ?bool {
         self.have_mu.lockUncancelable(self.io);

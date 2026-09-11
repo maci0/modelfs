@@ -5,7 +5,7 @@
 const std = @import("std");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 
-pub const default_size: u32 = 16 * 1024 * 1024;
+pub const default_size: u32 = 8 * 1024 * 1024;
 pub const magic = "MFS1";
 
 /// Piece size recorded in a sidecar header (`magic` then little-endian u32).
@@ -251,7 +251,7 @@ pub const Bitfield = struct {
     pub fn lastSet(self: Bitfield) ?u32 {
         // Word-at-a-time backward scan: @clz names the top set bit of a full
         // u64 in one instruction instead of walking every byte and bit. A
-        // 16 MiB piece size makes a 1 TiB model an 8 KiB field, so the old
+        // 8 MiB piece size makes a 1 TiB model a 16 KiB field, so the old
         // byte loop cost thousands of iterations per cull candidate.
         var end = self.bytes.len;
         while (end >= 8) {
@@ -333,7 +333,7 @@ pub const Bitfield = struct {
 /// Content identity: the blake3 digest of one piece's bytes. Every piece
 /// that lands in the cache is hashed at admit; the digest is the trust
 /// reference peer fills verify against and the unit of at-rest integrity.
-/// blake3 (not SHA-256) per design.md C.3: fast enough to hash a 16 MiB
+/// blake3 (not SHA-256) per design.md C.3: fast enough to hash an 8 MiB
 /// piece on the fill path, and std ships it.
 pub const digest_len: usize = 32;
 
@@ -1064,7 +1064,7 @@ test "cover saturation near max int" {
 }
 
 test "trackedEnd matches file_size until the u32 piece count clamps" {
-    const ps: u32 = 16 * 1024 * 1024;
+    const ps: u32 = default_size;
     try std.testing.expectEqual(@as(u64, 0), trackedEnd(0, ps));
     try std.testing.expectEqual(@as(u64, 100), trackedEnd(100, ps));
     try std.testing.expectEqual(@as(u64, ps), trackedEnd(ps, ps));
@@ -1087,7 +1087,7 @@ test "trackedEnd matches file_size until the u32 piece count clamps" {
     const empty = cover(.{ .off = tail_off, .len = 8 }, huge, ps1);
     try std.testing.expectEqual(empty.start, empty.end);
 
-    // Default 16 MiB pieces clamp at 64 PiB, well below i64 max; a read in
+    // Default 8 MiB pieces clamp at 32 PiB, well below i64 max; a read in
     // the untracked tail must not look filled.
     const clamp_off = offset(std.math.maxInt(u32), ps);
     try std.testing.expect(clamp_off < std.math.maxInt(i64));
