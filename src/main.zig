@@ -3736,6 +3736,7 @@ test "parseArgs refuses unknown commands before flag scanning" {
     const gpa = std.testing.allocator;
     var environ = std.process.Environ.Map.init(gpa);
     defer environ.deinit();
+    try std.testing.expect(knownCommand("update"));
     try std.testing.expectError(error.UnknownCommand, parseArgs(gpa, &environ, &.{"frobnicate"}));
     // A trailing -h must not turn a typo'd command into a successful help
     // request (regression: it printed the usage and exited 0).
@@ -3775,6 +3776,11 @@ test "parseArgs accepts update and honors --cache" {
     try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "update", "--listen", "19090" }));
     try std.testing.expectError(error.Help, parseArgs(gpa, &environ, &.{ "update", "--help" }));
     try std.testing.expectError(error.Version, parseArgs(gpa, &environ, &.{ "update", "-V" }));
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "update", "extra" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqual(@as(usize, 1), parsed.rest.len);
+    }
 }
 
 test "parseArgs scopes the pull flags to pull and defaults the revision" {
