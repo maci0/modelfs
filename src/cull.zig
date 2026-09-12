@@ -29,6 +29,7 @@ pub const Phase = enum { run, cull, stop };
 /// brun, and always punch harder at or below bstop. `culling` is the previous
 /// tick's phase so the run/cull band does not flap while free space sits still.
 pub fn phase(free_pct: u32, w: Water, culling: bool) Phase {
+    std.debug.assert(ordered(w));
     if (free_pct <= w.bstop) return .stop;
     if (culling) {
         if (free_pct >= w.brun) return .run;

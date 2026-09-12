@@ -2683,12 +2683,6 @@ pub fn restoreMaps(st: *State, owned: *const handover.Owned) !void {
     }
 }
 
-fn asHandoverAddrs(gpa: std.mem.Allocator, addrs: []const proto.LeaseAddr) ![]handover.Addr {
-    const out = try gpa.alloc(handover.Addr, addrs.len);
-    for (addrs, 0..) |a, i| out[i] = .{ .ip = a.ip, .port = a.port };
-    return out;
-}
-
 /// Replaces this process image with the binary `update.req` names, handing
 /// it the FUSE connection, the peer listen sockets, and everything needed
 /// to keep serving them. Only returns on failure: execve does not come
@@ -2725,10 +2719,6 @@ fn execHandover(st: *State) !void {
     defer gpa.free(node_snaps);
     const open_snaps = try snapOpens(st, gpa);
     defer gpa.free(open_snaps);
-    const adv = try asHandoverAddrs(gpa, st.catalog.addrs);
-    defer gpa.free(adv);
-    const seeds = try asHandoverAddrs(gpa, st.catalog.seeds);
-    defer gpa.free(seeds);
     const listen_fds = try gpa.alloc(i32, st.server.listen_fds.items.len);
     defer gpa.free(listen_fds);
     for (st.server.listen_fds.items, 0..) |fd, i| listen_fds[i] = fd;
@@ -2745,8 +2735,8 @@ fn execHandover(st: *State) !void {
         .allow_other = st.allow_other,
         .fuse_fd = st.fuse_fd,
         .listen_fds = listen_fds,
-        .advertise = adv,
-        .seeds = seeds,
+        .advertise = st.catalog.addrs,
+        .seeds = st.catalog.seeds,
         .psk = st.server.psk,
         .init = st.init_raw[0..st.init_len.load(.acquire)],
         .nodes = node_snaps,

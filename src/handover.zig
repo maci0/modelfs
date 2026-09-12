@@ -15,11 +15,6 @@ pub const req_file = "update.req";
 pub const ack_file = "update.ack";
 pub const token_bytes: usize = 16;
 
-pub const Addr = struct {
-    ip: []const u8,
-    port: u16,
-};
-
 /// Cap on the captured FUSE_INIT request. Today's wire form is a 40-byte
 /// header plus a 64-byte payload; the slack covers a protocol that grows
 /// the payload without needing a new handover format. Sized past one
@@ -47,8 +42,8 @@ pub const Knobs = struct {
     allow_other: bool,
     fuse_fd: i32,
     listen_fds: []const i32,
-    advertise: []const Addr,
-    seeds: []const Addr,
+    advertise: []const proto.LeaseAddr,
+    seeds: []const proto.LeaseAddr,
     psk: []const u8,
     /// The FUSE_INIT request the kernel sent, verbatim. The kernel sends it
     /// once per connection, so an image that inherits the connection has to
@@ -142,7 +137,7 @@ fn jsonStr(w: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
     try w.append(gpa, '"');
 }
 
-fn jsonAddrs(w: *std.ArrayList(u8), gpa: std.mem.Allocator, addrs: []const Addr) !void {
+fn jsonAddrs(w: *std.ArrayList(u8), gpa: std.mem.Allocator, addrs: []const proto.LeaseAddr) !void {
     try w.append(gpa, '[');
     for (addrs, 0..) |a, i| {
         if (i != 0) try w.append(gpa, ',');
