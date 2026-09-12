@@ -6,6 +6,7 @@ const std = @import("std");
 const discover = @import("discover.zig");
 const store_mod = @import("store.zig");
 const sys = @import("sys.zig");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 
 pub const host = "huggingface.co";
 pub const default_revision = "main";
@@ -510,4 +511,193 @@ test "loadToken prefers the environment and never needs a flag" {
     const from_file = (try loadToken(gpa, &env)).?;
     defer gpa.free(from_file);
     try std.testing.expectEqualStrings("hf_fromfile", from_file);
+}
+
+const seed_tree_ok = fuzzcorpus.entry(
+    \\[{"type":"directory","path":"sub","size":0},
+    \\ {"type":"file","path":"config.json","size":614},
+    \\ {"type":"file","path":"sub/model.safetensors","size":16060522496,"lfs":{"size":16060522496}}]
+);
+const seed_tree_empty = fuzzcorpus.entry("[]");
+const seed_tree_escape = fuzzcorpus.entry("[{\"type\":\"file\",\"path\":\"../escape.bin\",\"size\":1}]");
+const seed_tree_abs = fuzzcorpus.entry("[{\"type\":\"file\",\"path\":\"/abs.bin\",\"size\":1}]");
+const seed_tree_cluster = fuzzcorpus.entry("[{\"type\":\"file\",\"path\":\".cluster/lease.json\",\"size\":1}]");
+const seed_tree_control = fuzzcorpus.entry("[{\"type\":\"file\",\"path\":\"a\\nb\",\"size\":1}]");
+const seed_tree_bad_json = fuzzcorpus.entry("{not json");
+const seed_tree_truncated = fuzzcorpus.entry("[{\"type\":\"file\",\"path\":\"m");
+const seed_tree_dir_only = fuzzcorpus.entry("[{\"type\":\"directory\",\"path\":\"dir\",\"size\":0}]");
+const seed_tree_extra_fields = fuzzcorpus.entry("[{\"type\":\"file\",\"path\":\"model.gguf\",\"size\":1024,\"oid\":\"abcdef\",\"lfs\":{\"size\":1024}}]");
+const seed_tree_unicode = fuzzcorpus.entry("[{\"type\":\"file\",\"path\":\"模型/model.bin\",\"size\":2048}]");
+
+const fuzz_tree_corpus = [_][]const u8{
+    &seed_tree_ok,
+    &seed_tree_empty,
+    &seed_tree_escape,
+    &seed_tree_abs,
+    &seed_tree_cluster,
+    &seed_tree_control,
+    &seed_tree_bad_json,
+    &seed_tree_truncated,
+    &seed_tree_dir_only,
+    &seed_tree_extra_fields,
+    &seed_tree_unicode,
+};
+
+/// parseTree consumes untrusted JSON from the Hugging Face tree API.
+/// It must fail closed on malformed JSON or any path escaping the destination /
+/// naming cluster control directories, enforce deterministic parsing, and
+/// ensure all returned entries are valid origin-relative paths.
+fn fuzzTreeParseOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var doc_buf: [2048]u8 = undefined;
+    const json = doc_buf[0..smith.slice(&doc_buf)];
+
+    // 1. Parse against empty destination (origin root: .cluster/ is forbidden)
+    if (parseTree(gpa, json, "")) |root_listing| {
+        var mut_root = root_listing;
+        defer mut_root.deinit();
+
+        for (mut_root.entries) |item| {
+            try std.testing.expect(store_mod.relOk(item.path));
+            try std.testing.expect(!discover.relIsCluster(item.path));
+        }
+
+        // Determinism: parsing again produces identical entries
+        var again = try parseTree(gpa, json, "");
+        defer again.deinit();
+        try std.testing.expectEqual(mut_root.entries.len, again.entries.len);
+        for (mut_root.entries, again.entries) |a, b| {
+            try std.testing.expectEqualStrings(a.path, b.path);
+            try std.testing.expectEqual(a.size, b.size);
+        }
+    } else |_| {}
+
+    // 2. Parse against nested destination
+    if (parseTree(gpa, json, "models/dest")) |dest_listing| {
+        var mut_dest = dest_listing;
+        defer mut_dest.deinit();
+
+        for (mut_dest.entries) |item| {
+            try std.testing.expect(store_mod.relOk(item.path));
+            var rel_buf: [sys.c.PATH_MAX]u8 = undefined;
+            const rel = try joinRel(&rel_buf, "models/dest", item.path);
+            try std.testing.expect(store_mod.relOk(rel));
+            try std.testing.expect(!discover.relIsCluster(rel));
+        }
+
+        var again_dest = try parseTree(gpa, json, "models/dest");
+        defer again_dest.deinit();
+        try std.testing.expectEqual(mut_dest.entries.len, again_dest.entries.len);
+        for (mut_dest.entries, again_dest.entries) |a, b| {
+            try std.testing.expectEqualStrings(a.path, b.path);
+            try std.testing.expectEqual(a.size, b.size);
+        }
+    } else |_| {}
+}
+
+test "fuzz parseTree fails closed and enforces path safety" {
+    try std.testing.fuzz({}, fuzzTreeParseOne, .{ .corpus = &fuzz_tree_corpus });
+}
+
+const seed_repo_ok = fuzzcorpus.entry("meta-llama/Llama-3.1-8B");
+const seed_repo_simple = fuzzcorpus.entry("owner/model");
+const seed_repo_no_slash = fuzzcorpus.entry("no-slash");
+const seed_repo_multi_slash = fuzzcorpus.entry("a/b/c");
+const seed_repo_dotdot = fuzzcorpus.entry("owner/..");
+const seed_repo_dot = fuzzcorpus.entry("owner/.");
+const seed_repo_query = fuzzcorpus.entry("owner/name?x=1");
+const seed_repo_hash = fuzzcorpus.entry("owner/name#frag");
+const seed_repo_space = fuzzcorpus.entry("owner/na me");
+const seed_repo_empty = fuzzcorpus.entry("");
+const seed_rev_branch = fuzzcorpus.entry("refs/pr/3");
+const seed_rev_sha = fuzzcorpus.entry("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0");
+const seed_rev_dotdot = fuzzcorpus.entry("refs/../main");
+
+const fuzz_url_corpus = [_][]const u8{
+    &seed_repo_ok,
+    &seed_repo_simple,
+    &seed_repo_no_slash,
+    &seed_repo_multi_slash,
+    &seed_repo_dotdot,
+    &seed_repo_dot,
+    &seed_repo_query,
+    &seed_repo_hash,
+    &seed_repo_space,
+    &seed_repo_empty,
+    &seed_rev_branch,
+    &seed_rev_sha,
+    &seed_rev_dotdot,
+};
+
+/// repoOk and revisionOk gate external input before URL interpolation.
+/// The harness verifies bounds, character constraints, and that treeUrl /
+/// fileUrl never produce malformed or unencoded URLs when inputs pass the gates.
+fn fuzzUrlGenOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var buf: [256]u8 = undefined;
+    const s = buf[0..smith.slice(&buf)];
+
+    const is_repo = repoOk(s);
+    if (is_repo) {
+        try std.testing.expect(s.len > 0 and s.len <= max_repo_bytes);
+        const slash = std.mem.findScalar(u8, s, '/').?;
+        try std.testing.expect(std.mem.findScalarLast(u8, s, '/').? == slash);
+        try std.testing.expect(slash > 0 and slash < s.len - 1);
+        for (s) |ch| {
+            try std.testing.expect(unreserved(ch) or ch == '/');
+        }
+    }
+
+    const is_rev = revisionOk(s);
+    if (is_rev) {
+        try std.testing.expect(s.len > 0 and s.len <= max_revision_bytes);
+        for (s) |ch| {
+            try std.testing.expect(unreserved(ch) or ch == '/');
+        }
+    }
+
+    if (is_repo and is_rev) {
+        const turl = try treeUrl(gpa, s, s);
+        defer gpa.free(turl);
+        try std.testing.expect(std.mem.startsWith(u8, turl, "https://" ++ host ++ "/api/models/"));
+        try std.testing.expect(std.mem.endsWith(u8, turl, "?recursive=1"));
+
+        const furl = try fileUrl(gpa, s, s, "model.gguf");
+        defer gpa.free(furl);
+        try std.testing.expect(std.mem.startsWith(u8, furl, "https://" ++ host ++ "/"));
+        try std.testing.expect(std.mem.indexOf(u8, furl, "/resolve/") != null);
+    } else {
+        if (!is_repo) {
+            try std.testing.expectError(error.BadRepo, treeUrl(gpa, s, "main"));
+            try std.testing.expectError(error.BadRepo, fileUrl(gpa, s, "main", "model.gguf"));
+        }
+        if (!is_rev) {
+            try std.testing.expectError(error.BadRevision, treeUrl(gpa, "owner/name", s));
+            try std.testing.expectError(error.BadRevision, fileUrl(gpa, "owner/name", s, "model.gguf"));
+        }
+    }
+
+    if (is_repo) {
+        const encoded_furl = try fileUrl(gpa, s, "main", s);
+        defer gpa.free(encoded_furl);
+        const resolve_idx = std.mem.indexOf(u8, encoded_furl, "/resolve/main/").?;
+        const path_part = encoded_furl[resolve_idx + "/resolve/main/".len ..];
+        var i: usize = 0;
+        while (i < path_part.len) {
+            const ch = path_part[i];
+            if (unreserved(ch) or ch == '/') {
+                i += 1;
+            } else if (ch == '%') {
+                try std.testing.expect(i + 2 < path_part.len);
+                _ = try std.fmt.parseInt(u8, path_part[i + 1 .. i + 3], 16);
+                i += 3;
+            } else {
+                try std.testing.expect(false);
+            }
+        }
+    }
+}
+
+test "fuzz repo and revision validation gates URL construction" {
+    try std.testing.fuzz({}, fuzzUrlGenOne, .{ .corpus = &fuzz_url_corpus });
 }
