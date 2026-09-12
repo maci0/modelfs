@@ -128,9 +128,9 @@ manifests are parsed by the fuzz-covered `manifestDecode` src/piece.zig, bounded
 `Store.max_manifest_bytes` (64 MiB in src/store.zig, capping allocations for up to ~14 TiB
 files at the default 8 MiB grid) to guard against unbounded allocation from untrusted artifacts.
 
-Known weakness: warn paths echo manifest file names verbatim with no printable gate, which lease
-names get, so a crafted name can inject log lines. Origin-write precondition, CLI-triggered
-(B3).
+Skip-warn paths filter manifest file names through `discover.displayName(name)` (src/main.zig),
+matching the printable gate on lease names so crafted manifest names cannot forge journal lines
+or inject terminal escapes. Origin-write precondition, CLI-triggered (B3).
 
 ### Secrets read from the environment or disk
 
@@ -444,7 +444,7 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 | **T** tampering with handover state | Tampering in transit across exec is mitigated: the live state blob is encoded into a sealed memfd (`sys.memfdSealed` src/sys.zig, setting `F_SEAL_SEAL \| F_SEAL_SHRINK \| F_SEAL_GROW \| F_SEAL_WRITE`) before `execve`. Request tampering is mitigated by JSON schema parsing and matching a 16-byte random hex token (`randomToken`, `update.ack` src/handover.zig) |
 | **R** repudiation of updates | Handover completion logs to stdout (`updated pid {d}`) and daemon logs record handover steps and errors, but no cryptographic audit trail or signing of the replacement binary exists. `update.req` is unlinked after consumption or timeout |
 | **I** disclosure of secrets across handover | Mitigated: the cluster PSK travels exclusively on the sealed memfd descriptor, never on argv or disk (`cmdUpdate` src/main.zig, src/handover.zig). `readStateFd` zeroes the buffer with `secureZero` before free. The state fd is closed immediately (`sys.close` src/main.zig) so it does not sit in `/proc/<pid>/fd`. Core dumps are disabled (`disableCoreDumps`) and environment is scrubbed (`scrubPskEnv`) in `cmdHandover` |
-| **D** denial of service via signal or corrupt state | Unsolicited `SIGUSR2` before `FUSE_INIT` is ignored (`st.init_len == 0` src/fuse_fs.zig). A missing or unopenable `update.req` ignores the signal without leaving the FUSE loop (`onUsr2`). State decode enforces bounds (`max_state_bytes` 1 MiB cap, `init_max` 4096 cap, fuzz-covered `decode` in src/handover.zig). However, if the replacement binary fails to exec (`execHandover`), the daemon exits, unserving the mount |
+| **D** denial of service via signal or corrupt state | Unsolicited `SIGUSR2` before `FUSE_INIT` is ignored (`st.init_len == 0` src/fuse_fs.zig). A missing or unopenable `update.req` ignores the signal without leaving the FUSE loop (`onUsr2`). State decode enforces bounds (`max_state_bytes` 1 MiB cap, `init_max` 4096 cap, fuzz-covered `decode` in src/handover.zig) and validates watermark ordering via `cull.ordered` (src/handover.zig) to reject corrupted or disordered eviction thresholds. However, if the replacement binary fails to exec (`execHandover`), the daemon exits, unserving the mount |
 | **E** elevation of privilege | Handover does not elevate OS privileges (the replacement binary executes with the same UID/GID as the daemon). However, a process with the daemon's UID can plant an arbitrary executable path, taking over the live FUSE mount session fd, peer HTTP listen sockets, and acquiring the cluster PSK from the sealed memfd without ptrace |
 
 **Authentication and gating.** Handover requests require local filesystem access to the 0700 cache root and the ability to send `SIGUSR2` to the daemon PID. The request is read via `O_NOFOLLOW | O_NONBLOCK` and parsed by `decodeReq` (src/handover.zig). Replay is prevented by generating a random 16-byte hex token (`randomToken`) written to `update.req`, which must match `update.ack`, and unlinking `update.req` upon consumption or timeout.
@@ -502,6 +502,7 @@ Controls that exist in code, grouped by what they defend.
 | Mount zeros `RLIMIT_CORE`, X-fills `MODELFS_PSK_VALUE` in the environment in place so the `auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown | `disableCoreDumps` / `scrubPskEnv` src/main.zig, called from `cmdMount` | Closes [R8](#r8-crash-time-psk-spill-mitigated). A `setrlimit` failure refuses to start. Residual: the secret still lives in process memory for the mount's lifetime |
 | Duplicate-bind refusal: listeners use SO_REUSEADDR only, never SO_REUSEPORT | src/peer.zig, with a regression test | B2/S: a co-tenant daemon (usually with a different PSK) silently splitting connections with the real one |
 | Handover PSK transport via sealed memfd, zeroed on decode, state fd closed immediately, core dumps disabled and env scrubbed in replacement image | `sys.memfdSealed` src/sys.zig, `readStateFd` src/handover.zig, `cmdHandover` src/main.zig | B4/I: secret leakage across live process-image replacement; keeps the PSK off argv, disk, or /proc/<pid>/fd |
+| `HF_TOKEN` loaded exclusively from environment or token file (no CLI flag), capped at 4096 bytes, core dumps disabled during pull when token is present, in-memory buffer wiped with `secureZero` on exit, and stripped by HTTP client on cross-host CDN redirects | `loadToken` src/hf.zig, `cmdPull` src/main.zig, `std.http.Client` | B6/I: Hugging Face bearer token leakage via argv (`/proc/<pid>/cmdline`), memory dumps, post-exit memory retention, or cross-host redirect to third-party CDNs |
 
 ### Attribution
 
