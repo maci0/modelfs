@@ -2,7 +2,8 @@
 
 Single Zig binary: a FUSE mount at `/models` backed by a local NVMe piece
 cache, peer-to-peer piece transfers over plaintext HTTP with one shared PSK,
-and an NFS origin as the write authority. Linux only.
+and an NFS origin as the write authority. Linux only. A correct change
+respects this tree's layout, gates, and constraints.
 
 ## Layout
 
@@ -21,7 +22,7 @@ and an NFS origin as the write authority. Linux only.
 It runs:
 
 - `zig fmt --check`, and `zig build test`
-- every `src/*.zig` other than `c.zig` imported from `src/root.zig`
+- every `src/*.zig` other than `root.zig` and `c.zig` imported from `src/root.zig`
 - CHANGELOG `##` headings: `[Unreleased]` first, dated semver matching
   `build.zig.zon`, `[name]:` footer links, and current-tag sentences in
   README/SECURITY.md/threat-model.md. Dated notes are `###`
