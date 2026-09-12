@@ -234,6 +234,34 @@ if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
     if [[ "${REPLICA_AGE}" -gt "${MAX_REPLICA_AGE}" ]]; then
         die "replica newest snapshot ${REPLICA_SNAP} is ${REPLICA_AGE}s old, past the ${MAX_REPLICA_AGE}s limit: the replica schedule stopped keeping restore points inside the claimed RPO (docs/recovery.md sections 3 and 5)"
     fi
+    REPL_CHILD_LIST="$(zfs list -H -o name -r -t filesystem "${MF_DRILL_REPLICA}")" \
+        || die "cannot list datasets under replica ${MF_DRILL_REPLICA}"
+    while IFS= read -r rchild; do
+        [[ -n "${rchild}" ]] || continue
+        [[ "${rchild}" == "${MF_DRILL_REPLICA}" ]] && continue
+        REPL_CHILD_LINE="$(zfs list -H -p -t snapshot -o name,creation -s creation "${rchild}" | tail -n 1)" \
+            || die "cannot list snapshots of replica child ${rchild} (docs/recovery.md section 3)"
+        REPL_CHILD_SNAP="${REPL_CHILD_LINE%%$'\t'*}"
+        if [[ -z "${REPL_CHILD_SNAP}" ]]; then
+            die "replica child dataset ${rchild} has no snapshots: syncoid recursive did not cover it (docs/recovery.md section 3)"
+        fi
+        REPL_CHILD_CTIME="${REPL_CHILD_LINE##*$'\t'}"
+        case "${REPL_CHILD_CTIME}" in
+            '' | *[!0-9]*)
+                die "replica child ${rchild} newest snapshot creation is not an epoch second: ${REPL_CHILD_LINE}"
+                ;;
+            *)
+                ;;
+        esac
+        REPL_CHILD_AGE=$((NOW - REPL_CHILD_CTIME))
+        if [[ "${REPL_CHILD_AGE}" -lt 0 ]]; then
+            die "replica child snapshot ${REPL_CHILD_SNAP} has creation ${REPL_CHILD_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"
+        fi
+        if [[ "${REPL_CHILD_AGE}" -gt "${MAX_REPLICA_AGE}" ]]; then
+            die "replica child snapshot ${REPL_CHILD_SNAP} is ${REPL_CHILD_AGE}s old, past the ${MAX_REPLICA_AGE}s limit: the replica schedule stopped covering ${rchild} (docs/recovery.md sections 3 and 5)"
+        fi
+        echo "drill: replica child ${rchild} newest ${REPL_CHILD_SNAP} (age ${REPL_CHILD_AGE}s)"
+    done <<<"${REPL_CHILD_LIST}"
     REPLICA_STATUS="ok"
     echo "drill: replica ${MF_DRILL_REPLICA} newest ${REPLICA_SNAP} (age ${REPLICA_AGE}s)"
 fi
