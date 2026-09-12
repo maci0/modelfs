@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Living document; describes `src/` as of the date below |
-| Last reviewed | 2026-09-02 |
+| Last reviewed | 2026-09-12 |
 | Covers | modelfs daemon (`mount`) and CLI as of `v0.11.0`, peer HTTP protocol, lease discovery, FUSE surface |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
@@ -71,8 +71,9 @@ one, so `/have` never advertises `X-Stage` and production behavior is HTTP-only.
 
 ### FUSE operations on the mountpoint
 
-Ops table `ops` and path policy `resolveRel`, both src/fuse_fs.zig. Accepts paths, write
-buffers, modes, and statfs from every local process that can reach the mount.
+Ops table constructor `llOps()` (returning `fuse.fuse_lowlevel_ops`) and path policy
+`resolveRel`, both src/fuse_fs.zig. Accepts paths, write buffers, modes, and statfs from every
+local process that can reach the mount.
 
 `default_permissions` is always on, and `--allow-other` is the only way a uid other than the
 mounter reaches the mount (src/main.zig). There are no `symlink`, `mknod`, `link`, or `xattr`
@@ -97,7 +98,11 @@ ceiling (`--log`), and the PSK **file path**, never the secret: `--psk-value` is
 `--seed HOST[:PORT]` hostnames are DNS-resolved once at mount (`buildSeeds` src/main.zig).
 `modelfs update` locates the daemon via `status.json` (same pid and age gates as `status`) and
 asks that process to replace its image; the PSK travels on a sealed memfd, not argv (`cmdUpdate`
-src/main.zig, src/handover.zig). `modelfs pull` takes a Hugging Face `owner/repo` and a ref,
+src/main.zig, src/handover.zig). The replacement image enters via internal subcommand
+`_handover --state-fd <fd>` (`cmdHandover` src/main.zig), which decodes the state blob from the
+sealed memfd (`handover.decode`, capped at `max_state_bytes`), inherits the FUSE session and
+peer listen descriptors, replays `FUSE_INIT`, writes `update.ack`, and unlinks `update.req`.
+`modelfs pull` takes a Hugging Face `owner/repo` and a ref,
 both held to a URL-safe charset with no `.`/`..` segments before being spliced into an endpoint
 URL (`repoOk`/`revisionOk` src/hf.zig).
 
@@ -119,7 +124,9 @@ cross-host redirect.
 `cmdDupes`/`cmdDupesAll` src/main.zig. Accepts paths relative to the mount (gated by `relOk`
 plus `relIsCluster`) and every piece-hash manifest under `<origin>/.cluster/manifests/`. The
 walk is read-only and never touches model bytes, is O_NOFOLLOW via `sys.opendirNoFollow`, and
-manifests are parsed by the fuzz-covered `manifestDecode` src/piece.zig.
+manifests are parsed by the fuzz-covered `manifestDecode` src/piece.zig, bounded by
+`Store.max_manifest_bytes` (64 MiB in src/store.zig, capping allocations for up to ~14 TiB
+files at the default 8 MiB grid) to guard against unbounded allocation from untrusted artifacts.
 
 Known weakness: warn paths echo manifest file names verbatim with no printable gate, which lease
 names get, so a crafted name can inject log lines. Origin-write precondition, CLI-triggered
@@ -148,9 +155,12 @@ daemon's uid can plant one.
 
 ### Not present
 
-No scheduled jobs, IPC endpoints, message consumers, webhooks, or debug/admin services. The
-binary links only libfuse3, libc, and pthread; `build.zig.zon` declares no dependencies. The
-static release binaries go one further: the vendored libfuse3 (`.deps/libfuse3-3.16.2/`) is compiled in, and nothing is dynamically linked at all.
+No scheduled jobs, network-based RPC or IPC sockets (Unix domain sockets / named pipes; local
+daemon replacement uses file-and-signal handover via `update.req`/`SIGUSR2` and an inherited
+sealed memfd), message consumers, webhooks, or debug/admin services. The binary links only
+libfuse3, libc, and pthread; `build.zig.zon` declares no dependencies. The static release
+binaries go one further: the vendored libfuse3 (`.deps/libfuse3-3.16.2/`) is compiled in, and
+nothing is dynamically linked at all.
 
 ---
 
@@ -218,17 +228,38 @@ Controls:
 that then receives the PSK in a Bearer header: the same handoff as a forged lease, with DNS or
 `/etc/hosts` as the precondition instead of origin write.
 
-### B4: build to runtime
+### B4: local process to daemon update (handover IPC)
+
+Local authority transition and IPC entry point: `modelfs update` asks the running daemon to
+replace its process image without unmounting (`cmdUpdate` src/main.zig, src/handover.zig).
+
+* **Trigger**: The CLI writes `<cache>/update.req` (mode 0600 durable via
+  `writeFileOwnerOnlyDurable` src/sys.zig, opened `O_NOFOLLOW`) containing an absolute binary path
+  and a random 16-byte hex handshake token, then sends `SIGUSR2` to the daemon PID.
+* **Daemon verification**: In `onUsr2` (src/fuse_fs.zig), the signal is ignored if no `FUSE_INIT`
+  was captured (`st.init_len == 0`) or if `update.req` cannot be opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`.
+  The event loop is awakened via a non-blocking internal pipe (`wakeup_w`).
+* **Authority transition**: In `serve()` and `execHandover` (src/fuse_fs.zig), the daemon verifies
+  the replacement path is absolute (`bin[0] == '/'`), encodes live daemon state into a sealed memfd
+  (`handover.encode` src/handover.zig), unsets `CLOEXEC` on the memfd, the FUSE session fd, and the
+  peer listen fds, and executes `execve(replacement_bin, ["modelfs", "_handover", "--state-fd", N], environ)`.
+* **Trust & blast radius**: Any process running as the daemon's uid or root can plant `update.req`
+  and signal `SIGUSR2`. The replacement binary inherits the active FUSE session fd, the peer HTTP
+  listen sockets, and the cluster PSK in the sealed memfd.
+
+### B5: build to runtime
 
 A single Zig binary: no Zig package dependencies, no plugins, and no config fetched at runtime
 beyond the PSK file and the environment variables above. The one compiled-in third-party surface
 is libfuse3.
 
-The cross-aarch64 build vendors two libfuse3 `.deb`s whose sha256 digests live in
-`.deps/fuse3-arm64/SHA256SUMS`, verified by `scripts/extract_fuse3_arm64.sh` before unpack (into
-`.scratch/fuse3-arm64/`, not the source tree) and again by `build.zig` before compiling. The
-host build links whatever libfuse3 dev package is installed system-wide, so host provenance is
-an operator concern.
+The static release builds vendor static libfuse3 C source in `.deps/libfuse3-3.16.2/`, and the
+cross-aarch64 build vendors two libfuse3 `.deb`s in `.deps/fuse3-arm64/`. Both directory
+`SHA256SUMS` digests are verified by `build.zig` before compiling (and verified by
+`scripts/extract_fuse3_arm64.sh` before unpack for arm64). Static release binaries compile the
+vendored libfuse3 directly (`-Dfuse-static`), producing a fully static binary with no external
+dynamic dependencies. The host build links whatever libfuse3 dev package is installed system-wide,
+so host provenance is an operator concern.
 
 The long-lived networked image is hardened at build time: a PIE (`exe.pie`) compiled PIC
 (`exe_mod.pic`) with stack canaries and stack probes in every optimize mode (`stack_protector`,
@@ -254,9 +285,10 @@ request in a plaintext header (src/peer.zig), and implicitly to any passive list
 connections.
 
 After `loadPsk` succeeds, mount zeros `RLIMIT_CORE` (`disableCoreDumps`) so a crash cannot dump
-the secret, overwrites `MODELFS_PSK_VALUE` in the environment in place (`scrubPskEnv`: the
-entry stays, X-filled) so the
-`auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown. A
+the secret, overwrites `MODELFS_PSK_VALUE` in the environment in place (`scrubPskEnv`: preserves
+`MODELFS_PSK_VALUE=` while X-filling only the secret value bytes to prevent standard library
+environment scanners like std's `Environ.scan` from crashing on a keyless entry) so child processes
+and the `auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown. A
 `setrlimit` failure refuses to start rather than running with a dumpable secret.
 
 Empty PSKs are refused before binding (both sources trim surrounding whitespace first, so a
