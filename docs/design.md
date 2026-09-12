@@ -797,7 +797,7 @@ All original open questions resolved by the shipped code (not re-decided here):
 
 Status values: **Accepted** (still in force), **Partial** (part shipped), **Superseded** (replaced; the cell names what replaced it), **Not shipped** (never implemented). Section 14 uses **shelved** / **dormant** for CAS/CDC that were designed then paused; that is not a fifth column value here. What runs is [architecture.md](architecture.md).
 
-| Decision | Choice | Why | Status (2026-09-02) |
+| Decision | Choice | Why | Status (2026-09-12) |
 |---|---|---|---|
 | Shape | CAS cache + POSIX facade, not a DFS | Workload is read-mostly immutable blobs | Partial: POSIX piece cache shipped; no content-addressed store (path-keyed; CAS shelved, section 14) |
 | Cache | Replicate-on-read, not CH cache pool | "Cache everything" means local after use | Accepted |
@@ -886,7 +886,7 @@ content hit is not worth building either.
 ### Level 3 -- CDC inside pieces (dormant)
 
 Content-defined chunking (FastCDC/gearhash, or safetensors/GGUF
-tensor-boundary splitting first, per section 4.3) inside the 16 MiB
+tensor-boundary splitting first, per section 4.3) inside the 8 MiB
 window, so re-exports that shift alignment (a changed tensor grows the
 file) still share the unchanged interior. Requires the Level 2 blob store
 plus a per-file chunk manifest instead of the fixed-grid sidecar; the
