@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-12
+
+Child-dataset coverage in the offsite and restore-drill checks, fuzz
+coverage for Hugging Face URLs and handover state, and Zig 0.16 `std.mem.find`
+on the remaining `indexOf` call sites. No wire, on-disk, or CLI change; a
+mixed fleet with `0.11.0` peers is unaffected.
+
 ### Child dataset coverage in disaster recovery checks - 2026-09-12
 - **`scripts/check_offsite.sh` verifies child dataset snapshots.** Offsite copies created with child datasets (such as `tank/models/gguf` or recursive syncoid) are now checked recursively: missing snapshots or snapshots older than `MF_OFFSITE_MAX_AGE` fail with a descriptive error.
 - **`scripts/dr_restore_drill.sh` validates replica child datasets.** The monthly restore drill now validates that syncoid recursive replication covered child datasets under the replica within `MAX_REPLICA_AGE`.
@@ -14,6 +21,9 @@
 ### Security policy and threat model documentation - 2026-09-12
 - **Supported versions updated to 0.11.x.** [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) reflect that the `0.11.x` line receives security fixes.
 - **Threat model documents external model hub boundary.** [docs/threat-model.md](docs/threat-model.md) indexes the B6 boundary for `modelfs pull`, specifying untrusted data handling, credential containment, TLS verification, and staged download protections.
+
+### Zig 0.16 mem.find and cache-fd close - 2026-09-12
+- **Remaining `std.mem.indexOf` call sites use `find`.** build.zig, hf URL fuzz, and peer drain tests. `Cached.deinit` skips `close` of a negative cache fd. `repro_check.sh` no longer passes a stray `--` into `zig build`.
 
 ## [0.11.0] - 2026-09-12
 
@@ -1069,7 +1079,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/maci0/modelfs/releases/tag/v0.12.0
 [0.11.0]: https://github.com/maci0/modelfs/releases/tag/v0.11.0
 [0.10.0]: https://github.com/maci0/modelfs/releases/tag/v0.10.0
 [0.9.0]: https://github.com/maci0/modelfs/releases/tag/v0.9.0
