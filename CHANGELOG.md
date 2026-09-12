@@ -2,12 +2,26 @@
 
 ## [Unreleased]
 
-### Hot-reload harness - 2026-09-12
-- **`scripts/test_hot_reload.sh` compiles `-Dfuse-static`.** Distro libfuse3 returns -ENOTSUP for `fuse_session_custom_io`, so a dynamically linked image cannot capture FUSE_INIT and `modelfs update` times out. The vendored tree is the one that can.
-- **SIGUSR2 actually leaves the FUSE loop.** `fuse_session_exit` only sets a flag; workers sat in a blocking `read` on the FUSE fd, retried EINTR, and `modelfs update` waited 30s then unlinked `update.req` before `execHandover` ran. A wakeup pipe plus `poll` in the custom-io read, a req-file gate in the handler, and an 8-byte-aligned FUSE_INIT replay make the swap take.
+## [0.11.0] - 2026-09-12
+
+Default piece size is 8 MiB (the sendfile peak on this host). `modelfs update`
+replaces a live mount when the image is built with vendored libfuse3. The
+0.10.0 PSK-env scrub could panic or wedge a detached mount; that is fixed.
+Existing 16 MiB sidecars rehydrate empty; mixed-piece peers do not share
+`/have` bits, so remount the fleet together. No wire change.
 
 ### Default piece size 8 MiB - 2026-09-12
 - **Default `--piece` is 8 MiB** (`piece.default_size`). The loopback sendfile sweep peaked there (2.2 GB/s). Existing 16 MiB sidecars are a geometry mismatch and rehydrate empty. Mixed-piece peers do not share `/have` bits; remount the fleet together.
+
+### Hot-reload: SIGUSR2 actually leaves the FUSE loop - 2026-09-12
+- **`scripts/test_hot_reload.sh` compiles `-Dfuse-static`.** Distro libfuse3 returns -ENOTSUP for `fuse_session_custom_io`, so a dynamically linked image cannot capture FUSE_INIT and `modelfs update` times out. The vendored tree is the one that can.
+- **SIGUSR2 actually leaves the FUSE loop.** `fuse_session_exit` only sets a flag; workers sat in a blocking `read` on the FUSE fd, retried EINTR, and `modelfs update` waited 30s then unlinked `update.req` before `execHandover` ran. A wakeup pipe plus `poll` in the custom-io read, a req-file gate in the handler, and an 8-byte-aligned FUSE_INIT replay make the swap take.
+
+### scrubPskEnv keeps the '=' - 2026-09-12
+- **The 0.10.0 PSK-env scrub no longer X-fills the '='.** `Environ.scan` slices the value as `entry[key_end + 1 .. nul]`; a keyless entry is start > end, a panic in safe builds (the first `std.log` of the mount) and UB in release, where it wedged the detached daemon. The scrub now X-fills only the value bytes. The secret is still destroyed. Found live: the fault-tolerance suite's peer mount hung its wrapper for ten hours on this.
+
+### Release recipes in the gate - 2026-09-12
+- **`repro_check.sh` proves all three shipped recipes** (host glibc, both musl static targets) byte-identical across differently named trees. CI's reproducibility job runs that script; a static-linux matrix job exercises `scripts/build_static.sh` on every push and PR instead of first at tag time.
 
 ### Docs - 2026-09-12
 - **Read-path diagram** in the README and architecture.md is a draw.io figure (`docs/figures/read-path.drawio`, rendered PNG) instead of mermaid. The README throughput chart is the same treatment (`docs/figures/throughput-vs-piece.drawio`).
@@ -1042,7 +1056,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/maci0/modelfs/releases/tag/v0.11.0
 [0.10.0]: https://github.com/maci0/modelfs/releases/tag/v0.10.0
 [0.9.0]: https://github.com/maci0/modelfs/releases/tag/v0.9.0
 [0.8.0]: https://github.com/maci0/modelfs/releases/tag/v0.8.0
