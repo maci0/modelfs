@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Child dataset coverage in disaster recovery checks - 2026-09-12
+- **`scripts/check_offsite.sh` verifies child dataset snapshots.** Offsite copies created with child datasets (such as `tank/models/gguf` or recursive syncoid) are now checked recursively: missing snapshots or snapshots older than `MF_OFFSITE_MAX_AGE` fail with a descriptive error.
+- **`scripts/dr_restore_drill.sh` validates replica child datasets.** The monthly restore drill now validates that syncoid recursive replication covered child datasets under the replica within `MAX_REPLICA_AGE`.
+
+### Fuzz testing and internal hardening - 2026-09-12
+- **Hugging Face parser and URL validation fuzz tests.** `src/hf.zig` gained fuzz suites verifying that `parseTree` fails closed on malformed JSON or directory escape attempts, and that `repoOk`/`revisionOk` prevent URL injection.
+- **Handover state decoder fuzz test.** `src/handover.zig` gained a fuzz test verifying robust decoding of handover state JSON across arbitrary inputs.
+- **Handover address memory reuse.** `src/handover.zig` and `src/fuse_fs.zig` reuse `proto.LeaseAddr` directly for handover address state, removing redundant allocation and `Addr` struct definition.
+
+### Security policy and threat model documentation - 2026-09-12
+- **Supported versions updated to 0.11.x.** [SECURITY.md](SECURITY.md) and [docs/threat-model.md](docs/threat-model.md) reflect that the `0.11.x` line receives security fixes.
+- **Threat model documents external model hub boundary.** [docs/threat-model.md](docs/threat-model.md) indexes the B6 boundary for `modelfs pull`, specifying untrusted data handling, credential containment, TLS verification, and staged download protections.
+
 ## [0.11.0] - 2026-09-12
 
 Default piece size is 8 MiB (the sendfile peak on this host). `modelfs update`

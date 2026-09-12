@@ -848,7 +848,7 @@ the status write, src/fuse_fs.zig). Still missing: a persistent, centralized rec
 per-client attribution of successful requests.
 
 **Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.11.0`
-is current; the `0.8.x` line receives security fixes) and the route from report to shipped fix.
+is current; the `0.11.x` line receives security fixes) and the route from report to shipped fix.
 GitHub private vulnerability reporting is not enabled on the repository, so that route has no
 intake until a repository admin turns the feature on, and there is no other disclosed contact.
 docs/audits.md records internal review history only, and design.md section 9 contains historical
