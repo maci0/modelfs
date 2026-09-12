@@ -735,7 +735,7 @@ shipped posture.
 
 | Risk | Mitigation (sketch) | Shipped? |
 |---|---|---|
-| Corrupt piece from a peer | blake3 on every chunk before CAS admit; never serve unverified bytes | Level 1: per-piece blake3 digests, verify-before-admit on peer fills and verify-before-serve on /data (src/fuse_fs.zig `hydratePiece`, src/peer.zig `verifyRange`); see architecture.md "Piece integrity" |
+| Corrupt piece from a peer | blake3 on every chunk before CAS admit; never serve unverified bytes | Level 1: per-piece blake3 digests, verify-before-admit on peer fills and verify-before-serve on /data and /stage (src/fuse_fs.zig `hydratePiece`, src/peer.zig `verifyRange` / `serveStage`); see architecture.md "Piece integrity" |
 | Namespace spoofing | Authenticate peers (shared token or mTLS on the QUIC/HTTP port) | Partially: bearer PSK on every endpoint (src/peer.zig), plaintext TCP, no mTLS |
 | Origin tampering | Same hashes; origin is untrusted for integrity | No. Origin bytes are served and cached without verification |
 | Path traversal in FUSE | Pin the tree to the namespace; no `..` out of mount | Yes: `relOk` gate at every external path boundary (src/store.zig `relOk`) |
@@ -783,8 +783,8 @@ Original sketch risks. Passthrough, sqlite, CDC, and `commit=origin`/`rf=2` miti
 
 All original open questions resolved by the shipped code (not re-decided here):
 
-- **Hub ingest in v1** (Hub Xet vs HTTP download): resolved in 0.7.0 by shipping direct HTTP download in `modelfs pull` (src/hf.zig); Hub Xet did not ship.
-- **Pin cluster-wide default for `modelfs pull`**: resolved in 0.7.0; downloads land on origin, pins remain local markers (`pin/` via `modelfs pin`).
+- **Hub ingest in v1** (Hub Xet vs HTTP download): section 13 Hub ingest (resolved in 0.7.0 via src/hf.zig; Hub Xet did not ship).
+- **Pin cluster-wide default for `modelfs pull`**: section 13 Pin (resolved in 0.7.0; downloads land on origin, pins remain local markers `pin/` via `modelfs pin`).
 - **Transport** (QUIC vs HTTP/2): section 13 Transport.
 - **Passthrough vs bind-mount**: section 13 Frontend.
 - **Default piece size** (4 vs 16 MiB): section 13 v1 chunking (superseded by 8 MiB).
@@ -813,6 +813,8 @@ Status values: **Accepted** (still in force), **Partial** (part shipped), **Supe
 | v1 language | Go | Protocol/state bound, not CPU bound | Superseded: Zig |
 | v1 chunking | Fixed 4 MiB | CDC is additive | Superseded: 8 MiB pieces (`--piece` overrides); CDC dormant (section 14) |
 | Kubernetes | Not required for v1 | Two-node first | Accepted: no Kubernetes; one foreground binary, systemd `Type=simple` |
+| Hub ingest | Direct HTTP download (`modelfs pull`), no Hub Xet | Simple client, direct HTTPS to Hugging Face API | Accepted: shipped in 0.7.0 (CLI `modelfs pull` in `src/hf.zig`); Hub Xet did not ship |
+| Update | In-place process-image handover (`modelfs update`) | Upgrade binary without unmounting, dropping FUSE session, or severing engine fds | Accepted: shipped in 0.7.0 (handover over sealed memfd via `src/handover.zig`) |
 
 ## 14. Content identity: shipped Level 1; Levels 2-3 shelved pending telemetry
 
