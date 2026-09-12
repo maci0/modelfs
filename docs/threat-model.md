@@ -4,7 +4,7 @@
 |---|---|
 | Status | Living document; describes `src/` as of the date below |
 | Last reviewed | 2026-09-12 |
-| Covers | modelfs daemon (`mount`) and CLI as of `v0.11.0`, peer HTTP protocol, lease discovery, FUSE surface |
+| Covers | modelfs daemon (`mount`) and CLI as of `v0.11.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
 
@@ -45,10 +45,10 @@ there; do not import them without checking `src/`.
 | Cache integrity | `data/` sparse files, `meta/*.pieces` bitfields, and per-piece blake3 digests in memory and in the origin manifest (`Store.hashes`/`expectedHash` src/store.zig) | Punched holes read as zeros. Peer fills are verified against a trusted digest before admit and serves before streaming, and `modelfs verify` rehashes against the manifest; the sidecars themselves are still trusted at load (R7) |
 | Origin write authority | The NFS export itself | Out of modelfs' control: anyone with origin write access rewrites weights and leases directly |
 | Operational state (`status.json`) | cache root, created 0600 (`writeFileOwnerOnly` src/sys.zig) | The daemon's uid and root can read pid, peer count, cache fill, and `origin_down`; not weights, not the PSK |
+| Hugging Face Hub token | `HF_TOKEN`, `$HF_HOME/token`, or `~/.cache/huggingface/token`, CLI memory during `modelfs pull` (src/hf.zig, src/main.zig) | Unauthorized read/write access to user's private models and gated repositories on huggingface.co |
 
-Not an asset here: Hugging Face hub tokens live in user environments. The daemon handles no
-credential but the PSK; `modelfs pull` is the only command that reads a token, and only from
-the environment or the token file.
+The daemon handles no credential but the cluster PSK; `modelfs pull` is the only command that
+reads a Hugging Face token, and only from the environment or token file.
 
 ---
 
@@ -170,8 +170,12 @@ nothing is dynamically linked at all.
 local engines/processes ⇄ [FUSE/kernel] ⇄ modelfs daemon ⇄ [TCP :18080, plaintext] ⇄ peer daemons
                                    ⇅                            ⇅
                           [origin dir, NFS] ⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄ origin holds .cluster leases too
-                                   ⇅
+                                   ⇅                            ⇡ (writes model files)
                           [cache dir on NVMe] (bitfields, pins, status.json)
+                                   ⇅ [update.req / SIGUSR2 / sealed memfd]
+                       modelfs update / _handover (CLI)
+                                                                ⇣ (HTTPS)
+                       modelfs pull (CLI) ⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄ Hugging Face API & CDNs
 ```
 
 ### B1: local processes to daemon (FUSE)
@@ -270,6 +274,31 @@ is off so `-Dfuse-lib` cannot become a runtime search path, build-ids stay `none
 stamp cannot make two builds disagree, and non-Debug builds strip DWARF so `DW_AT_comp_dir`
 cannot leak the build path into a shipped binary.
 
+### B6: CLI to external model hub (Hugging Face API & CDN)
+
+`modelfs pull` connects to the public internet (`huggingface.co` and redirect CDN endpoints)
+over HTTPS to fetch model file trees and weights into the origin directory (`src/hf.zig`, `src/main.zig`).
+
+* **Untrusted data**: JSON model tree listings (capped at `max_listing_bytes` = 8 MiB in `src/hf.zig`),
+  HTTP redirect URLs from `/resolve/` endpoints to CDN hosts, and binary model payloads streamed from CDNs.
+* **Outbound credentials**: Hugging Face user access token (`HF_TOKEN`, `$HF_HOME/token`, or `~/.cache/huggingface/token`).
+* **Authority transition**: Fetched files land on the shared origin directory under the destination prefix,
+  becoming authoritative models served to all cluster nodes.
+* **Validation & controls**:
+  - Outbound TLS with platform trust store (`std.http.Client`).
+  - Strict input gating on CLI inputs before URL interpolation: `repoOk` (must be `owner/name`,
+    strictly unreserved characters, single slash, bounded to 200 bytes) and `revisionOk` (branch,
+    tag, or commit sha, no `.` or `..` segments, bounded to 200 bytes) (`src/hf.zig`).
+  - Fixed-size 8 MiB writer for tree listings (`max_listing_bytes`) preventing unbounded allocation from a hostile endpoint.
+  - JSON tree parsing (`parseTree` `src/hf.zig`) validates every listed path against `relOk` and `relIsCluster`,
+    both bare and joined with `--dest`, preventing path escape or planting files inside `.cluster/`.
+  - Staged download: streams to `<name>.part` opened `O_NOFOLLOW` with owner-only/clean permissions,
+    and atomic rename to real name only upon complete download (`fetchOne` `src/hf.zig`).
+  - Credential containment: `HF_TOKEN` travels only to the primary host (`huggingface.co`) as a privileged
+    header and is stripped by `std.http.Client` on cross-host redirects to CDNs. The token is bounded to
+    4096 bytes (`max_token_bytes`), core dumps are disabled during execution (`disableCoreDumps` `src/main.zig`),
+    and memory is zeroed on exit (`std.crypto.secureZero`).
+
 ### Secrets flow
 
 The PSK enters through a file read at startup (world-readable refused, group-readable warned) or
@@ -298,7 +327,13 @@ secrets containing interior CR/LF, which would corrupt the request head (`dupeHe
 Rotation means regenerating the file on every node simultaneously. There is no versioning,
 overlap window, or revocation.
 
-Accepted residual exposures: plaintext wire transmission, `MODELFS_PSK_VALUE` in the process
+Hugging Face tokens enter via `HF_TOKEN` in the environment, `$HF_HOME/token`, or
+`~/.cache/huggingface/token` when `modelfs pull` runs (`loadToken` src/hf.zig). The token is
+capped at 4096 bytes (`max_token_bytes`), core dumps are disabled during execution (`disableCoreDumps`
+src/main.zig), and the memory buffer is wiped with `secureZero` on exit. The token leaves the host
+over HTTPS only to `huggingface.co` and is stripped on redirects to CDN hosts (`pull` src/hf.zig).
+
+Accepted residual exposures: plaintext wire transmission of the PSK, `MODELFS_PSK_VALUE` in the process
 environment until mount scrubs it (readable by the owner and root), ptrace or
 `/proc/<pid>/mem` against a live daemon, and the single-secret trust model.
 
@@ -432,6 +467,23 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 **Provenance and dependency isolation.** Shipped binaries eliminate supply chain risk by declaring no external Zig package dependencies in `build.zig.zon`. The single required C dependency (libfuse3) is vendored and cryptographically verified against pinned SHA-256 sums prior to compilation (`build.zig`, `scripts/extract_fuse3_arm64.sh`).
 
 **Binary hardening and runtime exploit mitigations.** The executable is compiled with position-independent execution (`pie`), stack protector canaries, and stack probing (on supported x86/x86_64 architectures). The linker enforces full RELRO, immediate binding (`BIND_NOW`), non-executable stack permissions, and strips search paths (RPATH/RUNPATH). All properties are asserted post-link by `checkHardenedElf`.
+
+### B6: CLI to external model hub (Hugging Face API & CDN)
+
+| Threat | State |
+|---|---|
+| **S** spoofing the model hub or CDN | Mitigated by HTTPS and TLS certificate verification using the platform system trust store |
+| **T** tampering with origin tree via malicious listing or redirect | Mitigated: listing paths must pass `relOk` and `relIsCluster` both individually and joined under `--dest`, blocking path traversal and `.cluster` overwrites; downloads stream to `.part` files opened `O_NOFOLLOW` and atomically rename on complete (`parseTree`/`fetchOne` src/hf.zig) |
+| **R** repudiation of downloaded files | The CLI logs pulled and skipped file counts to stdout; no cryptographic commit signature verification is performed beyond TLS transport integrity |
+| **I** disclosure of Hugging Face access token | Mitigated: token is sent as a privileged header to `huggingface.co` and stripped on cross-host CDN redirects; core dumps disabled during pull when token is present; token buffer wiped with `secureZero` on exit (src/hf.zig, src/main.zig) |
+| **D** denial of service via huge listing or stall | Mitigated: JSON listing is capped at 8 MiB (`max_listing_bytes`) via fixed-size writer; aborted/stalled downloads leave `.part` files without corrupting existing destination files; streaming uses 1 MiB chunk buffers |
+| **E** elevation of privilege on origin filesystem | Mitigated: paths cannot escape `--dest` or write into `.cluster` (`relOk`, `relIsCluster`); created files take standard user umask and cannot set setuid/setgid bits |
+
+**Input containment and validation.** Model IDs and revisions are validated against strict character sets and bounded lengths before URL construction (`repoOk`, `revisionOk` src/hf.zig). Repository tree listings are parsed by `parseTree` (src/hf.zig), which refuses any entry that violates `relOk` or names `.cluster`, ensuring upstream JSON cannot escape destination directories or plant discovery leases.
+
+**Transport and credential protection.** Network communication uses platform TLS. Bearer tokens travel exclusively to `huggingface.co` and are stripped on cross-host redirects to download CDNs. Core dumps are disabled while tokens reside in memory (`disableCoreDumps` src/main.zig), and token allocations are zeroed with `secureZero` upon deinitialization.
+
+**Staged downloads.** Downloads stream into temporary `.part` files created with `O_NOFOLLOW`. Files are atomically renamed into place only after the payload completes, preventing interrupted downloads from leaving partial models that could be mistaken for valid weights.
 
 ---
 
