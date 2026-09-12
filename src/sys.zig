@@ -328,6 +328,15 @@ pub fn reuseportIsOn(fd: c_int) bool {
     return val != 0;
 }
 
+/// True when the socket has listening enabled (SO_ACCEPTCONN).
+pub fn isListening(fd: c_int) !bool {
+    var val: c_int = 0;
+    var len: c_uint = @intCast(@sizeOf(c_int));
+    if (std.c.getsockopt(fd, c.SOL_SOCKET, @intCast(c.SO_ACCEPTCONN), &val, &len) != 0)
+        return error.BadFd;
+    return val != 0;
+}
+
 const mfd_cloexec: u32 = 1;
 const mfd_allow_sealing: u32 = 2;
 const f_add_seals: i32 = 1033;

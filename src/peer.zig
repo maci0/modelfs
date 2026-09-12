@@ -83,11 +83,7 @@ pub const Server = struct {
     pub fn adoptListenFd(self: *Server, fd: c_int) !void {
         var addr = std.mem.zeroes(c.struct_sockaddr_in);
         if (sys.getsockname(fd, &addr) != 0) return error.BadFd;
-        var accept_on: c_int = 0;
-        var slen: c_uint = @intCast(@sizeOf(c_int));
-        if (std.c.getsockopt(fd, c.SOL_SOCKET, @intCast(c.SO_ACCEPTCONN), &accept_on, &slen) != 0)
-            return error.BadFd;
-        if (accept_on == 0) return error.NotListening;
+        if (!try sys.isListening(fd)) return error.NotListening;
         if (sys.reuseportIsOn(fd)) return error.ReusePort;
         if (sys.setCloexec(fd, true) != 0) return error.Cloexec;
         try self.listen_fds.append(self.gpa, fd);
