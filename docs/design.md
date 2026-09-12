@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Historical design. Goals (section 2.1) and decisions (section 13) carry ship status. Shipped behavior is [architecture.md](architecture.md) |
-| Date | 2026-09-02 (goals/decisions/security rows re-verified against `src/`) |
+| Date | 2026-09-12 (goals/decisions/security rows re-verified against `src/`) |
 | Audience | Implementation |
 
 Original architecture notes. Several items here did not ship: origin-less two-node,
@@ -692,7 +692,7 @@ v1.1: FastCDC + tensor split, EROFS read path, Kubernetes CSI, Hub Xet adapter.
 
 ## 8. Incremental implementation
 
-Original sequence. The repo did not implement these steps in order (no CAS, no Have/Want/Piece, no `modelfs pull`).
+Original sequence. The repo did not implement these steps in order (no CAS, no Have/Want/Piece; `modelfs pull` shipped in 0.7.0).
 
 Each step is independently testable. Do not start with Kubernetes or CDC.
 
@@ -739,7 +739,7 @@ shipped posture.
 | Namespace spoofing | Authenticate peers (shared token or mTLS on the QUIC/HTTP port) | Partially: bearer PSK on every endpoint (src/peer.zig), plaintext TCP, no mTLS |
 | Origin tampering | Same hashes; origin is untrusted for integrity | No. Origin bytes are served and cached without verification |
 | Path traversal in FUSE | Pin the tree to the namespace; no `..` out of mount | Yes: `relOk` gate at every external path boundary (src/store.zig `relOk`) |
-| Hub token leakage | Pull credentials stay in the agent, not in the mount | N/A: no pull agent or hub credential handling ships |
+| Hub token leakage | Pull credentials stay in the agent, not in the mount | Shipped: CLI `modelfs pull` loads `HF_TOKEN` or token file (src/hf.zig `loadToken`); never on argv, disables core dumps during run. Mount daemon handles no pull credentials |
 | Accidental world-writable models | Preserve mode from ingest; default 0644 / 0755 | Yes: create/mkdir/chmod apply the caller's permission bits on the origin (src/fuse_fs.zig `clientCreateMode`; setuid/setgid/sticky stripped). Not FUSE passthrough. Cache data is 0600 so origin-restricted files are not readable as cache copies |
 | Disk fill | `--cache-size`, `--free-space-ratio`, staging on the CAS disk, never `/tmp` | Different mechanism: cachefilesd-style percent-free watermarks `--brun/--bcull/--bstop` (src/cull.zig) |
 
@@ -781,18 +781,15 @@ Original sketch risks. Passthrough, sqlite, CDC, and `commit=origin`/`rf=2` miti
 
 ## 12. Open questions
 
-Still open (v1 product choices, not decisions):
+All original open questions resolved by the shipped code (not re-decided here):
 
-1. **Pin cluster-wide default** for `modelfs pull`, or local-only until the user pins. `modelfs pull` does not exist; pins are local markers today.
-2. **Hub Xet in v1** or dumb HTTP download first. No Hub ingest ships at all.
-
-Resolved by the shipped code and recorded in section 13 (not re-decided here):
-
+- **Hub ingest in v1** (Hub Xet vs HTTP download): resolved in 0.7.0 by shipping direct HTTP download in `modelfs pull` (src/hf.zig); Hub Xet did not ship.
+- **Pin cluster-wide default for `modelfs pull`**: resolved in 0.7.0; downloads land on origin, pins remain local markers (`pin/` via `modelfs pin`).
 - **Transport** (QUIC vs HTTP/2): section 13 Transport.
 - **Passthrough vs bind-mount**: section 13 Frontend.
-- **Default piece size** (4 vs 16 MiB): section 13 v1 chunking.
+- **Default piece size** (4 vs 16 MiB): section 13 v1 chunking (superseded by 8 MiB).
 - **k8s in v1** vs systemd: section 13 Kubernetes.
-- **Pin granularity** (chunk refcount vs path marker): section 13 Pin. Cluster pin stays open in (1).
+- **Pin granularity** (chunk refcount vs path marker): section 13 Pin.
 
 ---
 
