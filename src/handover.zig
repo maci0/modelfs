@@ -86,7 +86,7 @@ pub const Owned = struct {
     }
 };
 
-const JsonAddr = struct { ip: []const u8, port: u16 };
+const JsonAddr = struct { ip: []const u8, port: u16, mbps: u32 = 0 };
 const JsonDoc = struct {
     origin: []const u8,
     cache: []const u8,
@@ -143,8 +143,8 @@ fn jsonAddrs(w: *std.ArrayList(u8), gpa: std.mem.Allocator, addrs: []const proto
         if (i != 0) try w.append(gpa, ',');
         try w.appendSlice(gpa, "{\"ip\":");
         try jsonStr(w, gpa, a.ip);
-        var pbuf: [16]u8 = undefined;
-        const p = try std.fmt.bufPrint(&pbuf, ",\"port\":{d}}}", .{a.port});
+        var pbuf: [48]u8 = undefined;
+        const p = try std.fmt.bufPrint(&pbuf, ",\"port\":{d},\"mbps\":{d}}}", .{ a.port, a.mbps });
         try w.appendSlice(gpa, p);
     }
     try w.append(gpa, ']');
@@ -164,6 +164,7 @@ fn jsonI32s(w: *std.ArrayList(u8), gpa: std.mem.Allocator, fds: []const i32) !vo
 /// JSON knobs plus a trailing raw PSK. The secret is never UTF-8 JSON and
 /// never appears in exec argv.
 pub fn encode(gpa: std.mem.Allocator, k: Knobs) ![]u8 {
+    if (!cull.ordered(k.water)) return error.BadWatermarks;
     var w: std.ArrayList(u8) = .empty;
     errdefer w.deinit(gpa);
     try w.appendSlice(gpa, magic);
@@ -227,6 +228,7 @@ pub fn decode(gpa: std.mem.Allocator, blob: []const u8) !Owned {
     if (d.psk_len != psk_bytes.len) return error.PskLen;
     if (d.psk_len > proto.max_psk_bytes) return error.PskTooLarge;
     if (d.init.len % 2 != 0 or d.init.len / 2 > init_max) return error.BadInit;
+    if (!cull.ordered(.{ .brun = d.brun, .bcull = d.bcull, .bstop = d.bstop })) return error.BadWatermarks;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -261,10 +263,10 @@ pub fn decode(gpa: std.mem.Allocator, blob: []const u8) !Owned {
         out.opens[i] = .{ .fh = o.fh, .path = try a.dupe(u8, o.path) };
     }
     for (d.advertise, 0..) |ad, i| {
-        out.advertise[i] = .{ .ip = try a.dupe(u8, ad.ip), .port = ad.port, .mbps = 0 };
+        out.advertise[i] = .{ .ip = try a.dupe(u8, ad.ip), .port = ad.port, .mbps = ad.mbps };
     }
     for (d.seeds, 0..) |sd, i| {
-        out.seeds[i] = .{ .ip = try a.dupe(u8, sd.ip), .port = sd.port, .mbps = 0 };
+        out.seeds[i] = .{ .ip = try a.dupe(u8, sd.ip), .port = sd.port, .mbps = sd.mbps };
     }
     return out;
 }
@@ -374,8 +376,8 @@ test "handover encode/decode round-trips knobs and keeps the PSK off argv" {
         .allow_other = false,
         .fuse_fd = 7,
         .listen_fds = &.{ 4, 5 },
-        .advertise = &.{.{ .ip = "10.0.0.1", .port = 18080 }},
-        .seeds = &.{.{ .ip = "10.0.0.9", .port = 19091 }},
+        .advertise = &.{.{ .ip = "10.0.0.1", .port = 18080, .mbps = 200000 }},
+        .seeds = &.{.{ .ip = "10.0.0.9", .port = 19091, .mbps = 10000 }},
         .psk = psk,
         .init = "\x68\x00\x00\x00\x1a\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00",
         .nodes = &.{.{ .ino = 5, .path = "/gguf/a.gguf", .nlookup = 3 }},
@@ -405,9 +407,11 @@ test "handover encode/decode round-trips knobs and keeps the PSK off argv" {
     try std.testing.expectEqual(@as(usize, 1), got.advertise.len);
     try std.testing.expectEqualStrings("10.0.0.1", got.advertise[0].ip);
     try std.testing.expectEqual(@as(u16, 18080), got.advertise[0].port);
+    try std.testing.expectEqual(@as(u32, 200000), got.advertise[0].mbps);
     try std.testing.expectEqual(@as(usize, 1), got.seeds.len);
     try std.testing.expectEqualStrings("10.0.0.9", got.seeds[0].ip);
     try std.testing.expectEqual(@as(u16, 19091), got.seeds[0].port);
+    try std.testing.expectEqual(@as(u32, 10000), got.seeds[0].mbps);
     try std.testing.expectEqualStrings(psk, got.psk);
     // The kernel sends FUSE_INIT once per connection: losing those bytes
     // would leave the replacement image unable to replay the negotiation.
@@ -628,7 +632,17 @@ fn fuzzHandoverDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expectEqual(mut_owned.nodes.len, again.nodes.len);
         try std.testing.expectEqual(mut_owned.opens.len, again.opens.len);
         try std.testing.expectEqual(mut_owned.advertise.len, again.advertise.len);
+        for (mut_owned.advertise, again.advertise) |a, b| {
+            try std.testing.expectEqualStrings(a.ip, b.ip);
+            try std.testing.expectEqual(a.port, b.port);
+            try std.testing.expectEqual(a.mbps, b.mbps);
+        }
         try std.testing.expectEqual(mut_owned.seeds.len, again.seeds.len);
+        for (mut_owned.seeds, again.seeds) |a, b| {
+            try std.testing.expectEqualStrings(a.ip, b.ip);
+            try std.testing.expectEqual(a.port, b.port);
+            try std.testing.expectEqual(a.mbps, b.mbps);
+        }
         try std.testing.expectEqual(mut_owned.next_ino, again.next_ino);
         try std.testing.expectEqual(mut_owned.next_fh, again.next_fh);
     } else |_| {}
