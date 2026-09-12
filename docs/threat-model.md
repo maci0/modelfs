@@ -401,6 +401,38 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 | **D** discovery poisoning | Corrupt and expired leases are skipped rather than fatal. A flood of garbage lease files costs readdir plus parse per tick, unbounded by count. Minor, with an origin-write precondition |
 | **E** elevation | Not applicable: no authority executes from lease content beyond dial targets |
 
+### B4: local process to daemon update (handover IPC)
+
+| Threat | State |
+|---|---|
+| **S** spoofing an update request | Gated by local UID and permissions: `<cache>/update.req` must be written mode 0600 (`writeFileOwnerOnlyDurable` src/sys.zig, opened `O_NOFOLLOW \| O_NONBLOCK`) inside a 0700 cache directory, and `SIGUSR2` delivery is enforced by the kernel. An unprivileged user cannot signal the daemon or plant the request. A process running with the daemon's uid or root can plant a request naming an arbitrary binary |
+| **T** tampering with handover state | Tampering in transit across exec is mitigated: the live state blob is encoded into a sealed memfd (`sys.memfdSealed` src/sys.zig, setting `F_SEAL_SEAL \| F_SEAL_SHRINK \| F_SEAL_GROW \| F_SEAL_WRITE`) before `execve`. Request tampering is mitigated by JSON schema parsing and matching a 16-byte random hex token (`randomToken`, `update.ack` src/handover.zig) |
+| **R** repudiation of updates | Handover completion logs to stdout (`updated pid {d}`) and daemon logs record handover steps and errors, but no cryptographic audit trail or signing of the replacement binary exists. `update.req` is unlinked after consumption or timeout |
+| **I** disclosure of secrets across handover | Mitigated: the cluster PSK travels exclusively on the sealed memfd descriptor, never on argv or disk (`cmdUpdate` src/main.zig, src/handover.zig). `readStateFd` zeroes the buffer with `secureZero` before free. The state fd is closed immediately (`sys.close` src/main.zig) so it does not sit in `/proc/<pid>/fd`. Core dumps are disabled (`disableCoreDumps`) and environment is scrubbed (`scrubPskEnv`) in `cmdHandover` |
+| **D** denial of service via signal or corrupt state | Unsolicited `SIGUSR2` before `FUSE_INIT` is ignored (`st.init_len == 0` src/fuse_fs.zig). A missing or unopenable `update.req` ignores the signal without leaving the FUSE loop (`onUsr2`). State decode enforces bounds (`max_state_bytes` 1 MiB cap, `init_max` 4096 cap, fuzz-covered `decode` in src/handover.zig). However, if the replacement binary fails to exec (`execHandover`), the daemon exits, unserving the mount |
+| **E** elevation of privilege | Handover does not elevate OS privileges (the replacement binary executes with the same UID/GID as the daemon). However, a process with the daemon's UID can plant an arbitrary executable path, taking over the live FUSE mount session fd, peer HTTP listen sockets, and acquiring the cluster PSK from the sealed memfd without ptrace |
+
+**Authentication and gating.** Handover requests require local filesystem access to the 0700 cache root and the ability to send `SIGUSR2` to the daemon PID. The request is read via `O_NOFOLLOW | O_NONBLOCK` and parsed by `decodeReq` (src/handover.zig). Replay is prevented by generating a random 16-byte hex token (`randomToken`) written to `update.req`, which must match `update.ack`, and unlinking `update.req` upon consumption or timeout.
+
+**Integrity and confidentiality.** Live daemon knobs and the cluster PSK are serialized into a sealed memfd (`handover.encode`, `sys.memfdSealed`). File descriptor passing keeps the PSK off argv and /proc command lines. The receiving process (`cmdHandover` src/main.zig) verifies the mountpoint matches argv, disables core dumps, scrubs `MODELFS_PSK_VALUE` from the environment, wipes the raw PSK slice in memory with `secureZero` after decode, and closes the state descriptor immediately.
+
+**Denial-of-service and failure handling.** Signal storms prior to initialization are ignored because `st.init_len == 0`. Unparsable state blobs or corrupted requests abort cleanly without crashing the running daemon. If `execve` of the replacement binary fails, the running daemon exits and logs the error, requiring a manual restart of the mount.
+
+### B5: build to runtime
+
+| Threat | State |
+|---|---|
+| **S** spoofing dependencies | Mitigated: `build.zig.zon` declares zero external package dependencies (`dependencies = .{}`). The only compiled-in external C library is libfuse3. Static release builds vendor static libfuse3 source in `.deps/libfuse3-3.16.2/` and arm64 packages in `.deps/fuse3-arm64/`, both verified against hardcoded `SHA256SUMS` at build time. Host dynamic builds link system libfuse3 (operator provenance concern) |
+| **T** tampering with compiler output | Mitigated by build hardening: PIE (`exe.pie`), PIC (`exe_mod.pic`), stack canaries (`stack_protector`), stack probes on x86/x86_64 (`stack_check`), full RELRO (`link_z_relro`), BIND_NOW, a non-executable stack (`GNU_STACK RW`), and the absence of DT_RPATH/DT_RUNPATH are pinned and checked on the linked ELF (`checkHardenedElf` in build.zig) |
+| **R** repudiation of build artifacts | Proven reproducible: `scripts/repro_check.sh` proves static release builds byte-identical across differently named trees. Build-id is frozen at `none` to prevent UUID divergence |
+| **I** disclosure of build host paths | Mitigated: non-Debug builds strip DWARF (`strip = true`), suppressing host build paths (`DW_AT_comp_dir`). `each_lib_rpath = false` prevents host search paths from leaking into DT_RPATH |
+| **D** build-time resource exhaustion | Bounded: minimal build graph and zero remote dependencies |
+| **E** binary exploitation (ROP, memory safety) | Mitigated: ASLR/PIE, stack canaries, non-executable stack, BIND_NOW preventing GOT overwrites, and no runtime search path hijacking (no RPATH/RUNPATH) |
+
+**Provenance and dependency isolation.** Shipped binaries eliminate supply chain risk by declaring no external Zig package dependencies in `build.zig.zon`. The single required C dependency (libfuse3) is vendored and cryptographically verified against pinned SHA-256 sums prior to compilation (`build.zig`, `scripts/extract_fuse3_arm64.sh`).
+
+**Binary hardening and runtime exploit mitigations.** The executable is compiled with position-independent execution (`pie`), stack protector canaries, and stack probing (on supported x86/x86_64 architectures). The linker enforces full RELRO, immediate binding (`BIND_NOW`), non-executable stack permissions, and strips search paths (RPATH/RUNPATH). All properties are asserted post-link by `checkHardenedElf`.
+
 ---
 
 ## Mitigations in place
@@ -417,6 +449,7 @@ Controls that exist in code, grouped by what they defend.
 | PSK file mode gate: world-readable refuses to start, group bits warn | `loadPsk` src/main.zig | Local PSK theft by any uid. Group-readable is detection only |
 | Mount zeros `RLIMIT_CORE`, X-fills `MODELFS_PSK_VALUE` in the environment in place so the `auto_unmount` helper cannot inherit it, and `secureZero`s the in-memory copy on teardown | `disableCoreDumps` / `scrubPskEnv` src/main.zig, called from `cmdMount` | Closes [R8](#r8-crash-time-psk-spill-mitigated). A `setrlimit` failure refuses to start. Residual: the secret still lives in process memory for the mount's lifetime |
 | Duplicate-bind refusal: listeners use SO_REUSEADDR only, never SO_REUSEPORT | src/peer.zig, with a regression test | B2/S: a co-tenant daemon (usually with a different PSK) silently splitting connections with the real one |
+| Handover PSK transport via sealed memfd, zeroed on decode, state fd closed immediately, core dumps disabled and env scrubbed in replacement image | `sys.memfdSealed` src/sys.zig, `readStateFd` src/handover.zig, `cmdHandover` src/main.zig | B4/I: secret leakage across live process-image replacement; keeps the PSK off argv, disk, or /proc/<pid>/fd |
 
 ### Attribution
 
@@ -445,6 +478,7 @@ Controls that exist in code, grouped by what they defend.
 | Disk-cull walk samples cache entries with lstat and skips non-regular files, with a depth cap on nesting; leading-dot `relOk` names are sampled | `walkData` src/store.zig | B1/E: planted symlinks in a writable cache tree steering fallocate punches outside `data/`. B1/D: hidden cache files filling the filesystem past the watermarks after a restart |
 | Cull punch refuses to hole a piece with bytes in flight: the `xfer` counter is held across peer `/data` hydration and send and across FUSE warm cache reads, and entries are punchable only when recency-idle and transfer-free | `punchPiece` / `xfer` src/store.zig (`readCache` holds `xfer` for the warm-read path) | B1/D and the R2/R7 residual: closes the punch-versus-in-flight-read race that would serve hole zeros behind set bits |
 | Cache-identity drop on origin unlink and rename, including FUSE retries that see ENOENT | `Store.unlinkOrigin` / `Store.renameOrigin` src/store.zig | B1/T and the R7 crash window: a lost FUSE reply after origin unlink or rename used to leave `meta/*.pieces` behind, so a same-size recreate served the deleted file's bytes |
+| Handover request opened O_NOFOLLOW \| O_NONBLOCK and written 0600 durable; ack written 0600; unlinked on consumption or timeout | `writeFileOwnerOnlyDurable` / `writeFileOwnerOnly` src/sys.zig, `onUsr2` / `execHandover` src/fuse_fs.zig, `cmdUpdate` / `cmdHandover` src/main.zig | B4/T, B4/E: symlink redirection or tampering of handover control files |
 
 ### Piece integrity
 
@@ -484,16 +518,17 @@ propagated, and a detected at-rest mismatch self-heals. This closes
   under a matching window is refused.
 * An advertised `X-Piece-Size: 0` refused.
 
-**Fuzz harnesses over every untrusted-input parser**, for regression resistance on the B1/B2/B3
+**Fuzz harnesses over every untrusted-input parser**, for regression resistance on the B1/B2/B3/B4
 parsers and against drift between the ingestion and dial gates: request heads and peer replies
 (the auth/path/range pipeline, Content-Range binding on 206 bodies, `HaveBits.hasPiece` against
 packed bits and grid mismatch, `X-Stage` accepting only the token `1`), lease JSON, the URL
 codec pair across the trust boundary, the FUSE path gate, `relOk`, `parseV4` diffed against libc
 `inet_pton` across the whole input space, the `/stage` window codec, the sidecar piece-size
-header, and the piece-hash manifest codec (src/peer.zig, src/proto.zig, src/discover.zig,
-src/fuse_fs.zig, src/store.zig, src/piece.zig, src/rdma.zig). Seed corpora share one framing
-helper (src/fuzzcorpus.zig) so `Smith.slice` feeds codec bytes rather than a length prefix taken
-from the payload.
+header, the piece-hash manifest codec, handover state and req/ack decoding, CLI flag value
+parsing, and status.json liveness parsing (src/peer.zig, src/proto.zig, src/discover.zig,
+src/fuse_fs.zig, src/store.zig, src/piece.zig, src/rdma.zig, src/handover.zig, src/main.zig).
+Seed corpora share one framing helper (src/fuzzcorpus.zig) so `Smith.slice` feeds codec bytes
+rather than a length prefix taken from the payload.
 
 **Lease validation**, against discovery self-partitioning and malformed documents on B3: expired
 filtered, corrupt skipped, self skipped, id charset enforced at publish with a hostname
@@ -541,7 +576,7 @@ rather than ignore.
 
 | Control | Location | Covers |
 |---|---|---|
-| PIE, PIC, stack canaries, stack probes, full RELRO, BIND_NOW, a non-executable stack, and no DT_RPATH/DT_RUNPATH on the shipped image; DWARF stripped from every non-Debug build; build-id frozen at none | `exe.pie`, `exe_mod.pic`, `stack_protector`, `stack_check`, `link_z_relro`, `each_lib_rpath`, `build_id`, `strip`, and `checkHardenedElf` in build.zig | B4: a fixed-address networked daemon, an uninstrumented ReleaseFast stack, lazy binding, an executable stack, a build-host `-L` baked into the spark image, a random build-id, and a `DW_AT_comp_dir` build-path leak in release binaries |
+| PIE, PIC, stack canaries, stack probes, full RELRO, BIND_NOW, a non-executable stack, and no DT_RPATH/DT_RUNPATH on the shipped image; DWARF stripped from every non-Debug build; build-id frozen at none | `exe.pie`, `exe_mod.pic`, `stack_protector`, `stack_check`, `link_z_relro`, `each_lib_rpath`, `build_id`, `strip`, and `checkHardenedElf` in build.zig | B5: a fixed-address networked daemon, an uninstrumented ReleaseFast stack, lazy binding, an executable stack, a build-host `-L` baked into the spark image, a random build-id, and a `DW_AT_comp_dir` build-path leak in release binaries |
 
 ### Single points of failure, named honestly
 
@@ -690,7 +725,7 @@ document.
 
 What a hostile actor can do, with the enabling path named. Cases 1 to 5 need the PSK: a
 legitimate but curious node, a compromised spark, or anyone who captured it off the wire per R1.
-Case 6 needs write access to the cache directory.
+Case 6 needs write access to the cache directory; Case 7 needs daemon uid access (cache directory write plus signal permission).
 
 1. **Bulk weight exfiltration.** Enumerate paths (any `relOk`-clean string; `replyOriginStat`
    src/peer.zig distinguishes 404 absent from 400 over-long from 502 origin-broken), then
@@ -721,6 +756,16 @@ Case 6 needs write access to the cache directory.
    src/main.zig). Any local uid that can write the cache dir can make attacker-chosen model
    paths uncullable, compounding case 5. The same is true of planting files directly in `pin/`.
    `.cluster` names are refused.
+7. **Local process image replacement and PSK extraction via Handover.** A compromised local
+   process running as the daemon's uid (or with write access to the 0700 cache dir and signal
+   permission to the daemon PID) writes `<cache>/update.req` naming an arbitrary executable path,
+   then signals `SIGUSR2` (`cmdUpdate` src/main.zig, `onUsr2` src/fuse_fs.zig). The running daemon
+   encodes its state, unsets `CLOEXEC` on the sealed memfd and descriptors, and executes
+   `execve(replacement_bin, ["modelfs", "_handover", "--state-fd", N], environ)` (`execHandover`
+   src/fuse_fs.zig). The replacement binary extracts the cluster PSK from the memfd (`readStateFd`
+   src/handover.zig) and inherits the FUSE session and peer HTTP listen sockets. This enables
+   credential extraction and execution persistence even on systems with `ptrace` restricted
+   (`kernel.yama.ptrace_scope`).
 
 **Closed:** reading `status.json` as another uid. The artifact is 0600. Cross-uid weight theft
 stays closed by 0600 files and 0700 dirs; leftover 0755 `data/`/`meta/`/`pin/`, which listed
@@ -741,7 +786,8 @@ client-enforcement holes. An `X-Piece-Size` mismatch discards the answer.
 **Audit trail.** Per-node journald logs carry failure-only events: 401 and 405 with source
 address at most once per second, failed fetches with `ip:port`, origin errors (per-request for
 peer HTTP; edge-triggered at `Store.noteOriginIo` for FUSE origin I/O and discovery-tick lease
-publish and refresh), pin and unpin state changes, and membership changes (`cluster peers N -> M`).
+publish and refresh), pin and unpin state changes, handover execution events (`updated pid {d}` on success;
+handover exec/restore errors logged; pre-init or unopenable requests ignored silently), and membership changes (`cluster peers N -> M`).
 The tick counters add serving volume (`http_ok`, `bytes_to_peer`), wrong-method probes
 (`http_405`), handler time (`http_us`), FUSE metadata time (`md_us`), `lease_err`/`meta_err`, and
 saturation (`http_dropped`). status.json exposes lifetime aggregates, `origin_down`, a wall-clock
