@@ -386,13 +386,11 @@ fn fetchOne(
 
     closed = true;
     if (sys.closeWrite(fd) != 0) {
-        _ = sys.unlink(part);
         return error.WriteFailed;
     }
     // Only now does the file take its real name: a pull that dies mid-body
     // must not leave a short file the next run counts as already there.
     if (sys.rename(part, path) != 0) {
-        _ = sys.unlink(part);
         return error.RenameFailed;
     }
 }
@@ -665,7 +663,7 @@ fn fuzzUrlGenOne(_: void, smith: *std.testing.Smith) anyerror!void {
         const furl = try fileUrl(gpa, s, s, "model.gguf");
         defer gpa.free(furl);
         try std.testing.expect(std.mem.startsWith(u8, furl, "https://" ++ host ++ "/"));
-        try std.testing.expect(std.mem.indexOf(u8, furl, "/resolve/") != null);
+        try std.testing.expect(std.mem.find(u8, furl, "/resolve/") != null);
     } else {
         if (!is_repo) {
             try std.testing.expectError(error.BadRepo, treeUrl(gpa, s, "main"));
@@ -680,7 +678,7 @@ fn fuzzUrlGenOne(_: void, smith: *std.testing.Smith) anyerror!void {
     if (is_repo) {
         const encoded_furl = try fileUrl(gpa, s, "main", s);
         defer gpa.free(encoded_furl);
-        const resolve_idx = std.mem.indexOf(u8, encoded_furl, "/resolve/main/").?;
+        const resolve_idx = std.mem.find(u8, encoded_furl, "/resolve/main/").?;
         const path_part = encoded_furl[resolve_idx + "/resolve/main/".len ..];
         var i: usize = 0;
         while (i < path_part.len) {

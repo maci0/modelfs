@@ -444,7 +444,7 @@ pub const Store = struct {
         origin_id: OriginId = .{},
 
         pub fn deinit(self: *Cached, gpa: std.mem.Allocator) void {
-            sys.close(self.cache_fd);
+            if (self.cache_fd >= 0) sys.close(self.cache_fd);
             self.bits.deinit(gpa);
             self.filling.deinit();
             self.hashes.deinit();

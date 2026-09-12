@@ -2564,10 +2564,10 @@ test "request bodies are drained: pipelined bytes are not re-waited and replies 
             const n = sys.readOnce(fd, acc[got..]) catch break;
             if (n == 0) break;
             got += n;
-            if (std.mem.indexOf(u8, acc[0..got], "ok") != null) break;
+            if (std.mem.find(u8, acc[0..got], "ok") != null) break;
         }
         const elapsed = sys.monoMs(std.testing.io) - t0;
-        try std.testing.expect(std.mem.indexOf(u8, acc[0..got], "200") != null);
+        try std.testing.expect(std.mem.find(u8, acc[0..got], "200") != null);
         try std.testing.expect(elapsed < 5000);
     }
 
@@ -2585,9 +2585,9 @@ test "request bodies are drained: pipelined bytes are not re-waited and replies 
             const n = sys.readOnce(fd, acc[got..]) catch break;
             if (n == 0) break;
             got += n;
-            if (std.mem.indexOf(u8, acc[0..got], "ok") != null) break;
+            if (std.mem.find(u8, acc[0..got], "ok") != null) break;
         }
-        try std.testing.expect(std.mem.indexOf(u8, acc[0..got], "200") != null);
+        try std.testing.expect(std.mem.find(u8, acc[0..got], "200") != null);
     }
 
     // Unauthorized with a body: the 401 must survive the close.
@@ -2602,9 +2602,9 @@ test "request bodies are drained: pipelined bytes are not re-waited and replies 
             const n = sys.readOnce(fd, acc[got..]) catch break;
             if (n == 0) break;
             got += n;
-            if (std.mem.indexOf(u8, acc[0..got], "401") != null) break;
+            if (std.mem.find(u8, acc[0..got], "401") != null) break;
         }
-        try std.testing.expect(std.mem.indexOf(u8, acc[0..got], "401") != null);
+        try std.testing.expect(std.mem.find(u8, acc[0..got], "401") != null);
     }
 }
 

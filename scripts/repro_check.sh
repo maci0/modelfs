@@ -104,6 +104,6 @@ run_repro() {
 # The shipped build recipes, in release order. The musl recipes are the
 # static single-file release targets; their bytes must not depend on the
 # build tree any more than the host build's.
-run_repro "host-glibc" --
-run_repro "x86_64-linux-musl" -- -Dtarget=x86_64-linux-musl -Dfuse-static
-run_repro "aarch64-linux-musl" -- -Dtarget=aarch64-linux-musl -Dfuse-static
+run_repro "host-glibc"
+run_repro "x86_64-linux-musl" -Dtarget=x86_64-linux-musl -Dfuse-static
+run_repro "aarch64-linux-musl" -Dtarget=aarch64-linux-musl -Dfuse-static

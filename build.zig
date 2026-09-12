@@ -36,7 +36,7 @@ fn vendoredMismatch(b: *std.Build, dir_rel: []const u8) ?[]const u8 {
     var saw_entry = false;
     var rest: []const u8 = sums;
     while (rest.len > 0) {
-        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const nl = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
         const raw = rest[0..nl];
         rest = if (nl < rest.len) rest[nl + 1 ..] else rest[rest.len..];
         const line = std.mem.trim(u8, raw, " \t\r");
@@ -54,7 +54,7 @@ fn vendoredMismatch(b: *std.Build, dir_rel: []const u8) ?[]const u8 {
         if (std.mem.startsWith(u8, name, "./")) name = name[2..];
         if (name.len == 0 or
             name[0] == '/' or
-            std.mem.indexOf(u8, name, "..") != null or
+            std.mem.find(u8, name, "..") != null or
             name[name.len - 1] == '/')
         {
             return allocPrint(b, "{s}: illegal path {s} (must be relative to the vendored dir)", .{ sums_rel, name });
@@ -283,9 +283,9 @@ pub fn build(b: *std.Build) void {
             .limited(1 << 20),
         ) catch @panic("cannot read build.zig.zon");
         const marker = ".version = \"";
-        const start = std.mem.indexOf(u8, zon, marker) orelse @panic("no .version in build.zig.zon");
+        const start = std.mem.find(u8, zon, marker) orelse @panic("no .version in build.zig.zon");
         const rest = zon[start + marker.len ..];
-        const end = std.mem.indexOfScalar(u8, rest, '"') orelse @panic("unterminated .version in build.zig.zon");
+        const end = std.mem.findScalar(u8, rest, '"') orelse @panic("unterminated .version in build.zig.zon");
         const opts = b.addOptions();
         opts.addOption([]const u8, "version", zon[start + marker.len .. start + marker.len + end]);
         break :blk opts.createModule();
