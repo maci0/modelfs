@@ -2719,10 +2719,6 @@ fn execHandover(st: *State) !void {
     defer gpa.free(node_snaps);
     const open_snaps = try snapOpens(st, gpa);
     defer gpa.free(open_snaps);
-    const listen_fds = try gpa.alloc(i32, st.server.listen_fds.items.len);
-    defer gpa.free(listen_fds);
-    for (st.server.listen_fds.items, 0..) |fd, i| listen_fds[i] = fd;
-
     const blob = try handover.encode(gpa, .{
         .origin = st.store.origin,
         .cache = st.store.cache,
@@ -2734,7 +2730,7 @@ fn execHandover(st: *State) !void {
         .direct_io = st.direct_io,
         .allow_other = st.allow_other,
         .fuse_fd = st.fuse_fd,
-        .listen_fds = listen_fds,
+        .listen_fds = st.server.listen_fds.items,
         .advertise = st.catalog.addrs,
         .seeds = st.catalog.seeds,
         .psk = st.server.psk,
