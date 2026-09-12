@@ -131,6 +131,10 @@ case "${sub}" in
                 printf '%s\n' "${CHILD}"
                 exit 0
             fi
+            if [[ -n "${REPLICA:-}" && "${dataset}" == "${REPLICA}" ]]; then
+                printf '%s\n' "${REPLICA}"
+                exit 0
+            fi
             exit 1
         fi
         if [[ "${dataset}" == "${ORIGIN}" ]]; then
