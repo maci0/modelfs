@@ -478,9 +478,45 @@ pub const Overlap = struct {
     identical: bool = false,
 };
 
+/// Lexicographical order for 32-byte digests. Big-endian u64 comparisons
+/// evaluate 8 bytes at a time and produce identical ordering to byte-by-byte
+/// comparison, while resolving 99.6% of random digests on the first compare.
+pub fn digestOrder(a: *const [digest_len]u8, b: *const [digest_len]u8) std.math.Order {
+    const a0 = std.mem.readInt(u64, a[0..8], .big);
+    const b0 = std.mem.readInt(u64, b[0..8], .big);
+    if (a0 < b0) return .lt;
+    if (a0 > b0) return .gt;
+    const a1 = std.mem.readInt(u64, a[8..16], .big);
+    const b1 = std.mem.readInt(u64, b[8..16], .big);
+    if (a1 < b1) return .lt;
+    if (a1 > b1) return .gt;
+    const a2 = std.mem.readInt(u64, a[16..24], .big);
+    const b2 = std.mem.readInt(u64, b[16..24], .big);
+    if (a2 < b2) return .lt;
+    if (a2 > b2) return .gt;
+    const a3 = std.mem.readInt(u64, a[24..32], .big);
+    const b3 = std.mem.readInt(u64, b[24..32], .big);
+    if (a3 < b3) return .lt;
+    if (a3 > b3) return .gt;
+    return .eq;
+}
+
+/// Equality test for 32-byte digests using 64-bit word XORs.
+pub fn digestEql(a: *const [digest_len]u8, b: *const [digest_len]u8) bool {
+    const a0 = std.mem.readInt(u64, a[0..8], .little);
+    const b0 = std.mem.readInt(u64, b[0..8], .little);
+    const a1 = std.mem.readInt(u64, a[8..16], .little);
+    const b1 = std.mem.readInt(u64, b[8..16], .little);
+    const a2 = std.mem.readInt(u64, a[16..24], .little);
+    const b2 = std.mem.readInt(u64, b[16..24], .little);
+    const a3 = std.mem.readInt(u64, a[24..32], .little);
+    const b3 = std.mem.readInt(u64, b[24..32], .little);
+    return ((a0 ^ b0) | (a1 ^ b1) | (a2 ^ b2) | (a3 ^ b3)) == 0;
+}
+
 /// Digest ordering for the shared-content merge.
 fn digestLess(_: void, x: ManifestEntry, y: ManifestEntry) bool {
-    return std.mem.order(u8, &x.hash, &y.hash) == .lt;
+    return digestOrder(&x.hash, &y.hash) == .lt;
 }
 
 /// Owned digest-sorted copy of `entries`. A pair scan sorts each manifest
@@ -490,6 +526,33 @@ pub fn digestSorted(gpa: std.mem.Allocator, entries: []const ManifestEntry) ![]M
     const copy = try gpa.dupe(ManifestEntry, entries);
     std.mem.sort(ManifestEntry, copy, {}, digestLess);
     return copy;
+}
+
+/// True when two manifests are byte-identical (same file size, same piece count,
+/// all piece indices and digests matching). Fast-fails in O(1) on size or count
+/// mismatch without scanning entries.
+pub fn manifestsIdentical(a: Manifest, b: Manifest) bool {
+    if (a.file_size != b.file_size or a.entries.len != b.entries.len) return false;
+    for (a.entries, b.entries) |ae, be| {
+        if (ae.idx != be.idx or !digestEql(&ae.hash, &be.hash)) return false;
+    }
+    return true;
+}
+
+/// True when two digest-sorted manifest entry lists share at least one digest.
+/// Early-returns on the first common digest rather than computing the full
+/// intersection count.
+pub fn manifestsShareAny(a_dig: []const ManifestEntry, b_dig: []const ManifestEntry) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a_dig.len and j < b_dig.len) {
+        switch (digestOrder(&a_dig[i].hash, &b_dig[j].hash)) {
+            .lt => i += 1,
+            .gt => j += 1,
+            .eq => return true,
+        }
+    }
+    return false;
 }
 
 /// Compares two manifests' entries (both sorted by idx, as decode
@@ -510,7 +573,7 @@ pub fn manifestOverlapPrepared(
         var j: usize = 0;
         while (i < a.entries.len and j < b.entries.len) {
             if (a.entries[i].idx == b.entries[j].idx) {
-                if (std.mem.eql(u8, &a.entries[i].hash, &b.entries[j].hash)) ov.aligned += 1;
+                if (digestEql(&a.entries[i].hash, &b.entries[j].hash)) ov.aligned += 1;
                 i += 1;
                 j += 1;
             } else if (a.entries[i].idx < b.entries[j].idx) {
@@ -527,7 +590,7 @@ pub fn manifestOverlapPrepared(
     var i: usize = 0;
     var j: usize = 0;
     while (i < a_dig.len and j < b_dig.len) {
-        switch (std.mem.order(u8, &a_dig[i].hash, &b_dig[j].hash)) {
+        switch (digestOrder(&a_dig[i].hash, &b_dig[j].hash)) {
             .lt => i += 1,
             .gt => j += 1,
             .eq => {
@@ -538,8 +601,8 @@ pub fn manifestOverlapPrepared(
                 const h = a_dig[i].hash;
                 i += 1;
                 j += 1;
-                while (i < a_dig.len and std.mem.eql(u8, &a_dig[i].hash, &h)) i += 1;
-                while (j < b_dig.len and std.mem.eql(u8, &b_dig[j].hash, &h)) j += 1;
+                while (i < a_dig.len and digestEql(&a_dig[i].hash, &h)) i += 1;
+                while (j < b_dig.len and digestEql(&b_dig[j].hash, &h)) j += 1;
             },
         }
     }
