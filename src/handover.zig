@@ -6,6 +6,7 @@ const std = @import("std");
 const proto = @import("proto.zig");
 const sys = @import("sys.zig");
 const cull = @import("cull.zig");
+const fuzzcorpus = @import("fuzzcorpus.zig");
 
 pub const magic = "MFHO1\n";
 pub const internal_cmd = "_handover";
@@ -560,4 +561,99 @@ test "update req/ack carry a token the client can match" {
     const got = try decodeAck(gpa, ack);
     defer got.deinit();
     try std.testing.expectEqualStrings(&tok, got.value.token);
+}
+
+const seed_handover_ok = fuzzcorpus.entry(
+    "MFHO1\n{\"origin\":\"/o\",\"cache\":\"/c\",\"id\":\"n1\",\"mount\":\"/m\",\"piece\":4096,\"listen\":18080,\"brun\":10,\"bcull\":7,\"bstop\":3,\"direct_io\":false,\"allow_other\":false,\"fuse_fd\":3,\"listen_fds\":[4],\"advertise\":[],\"seeds\":[],\"init\":\"\",\"nodes\":[],\"opens\":[],\"next_ino\":2,\"next_fh\":1,\"psk_len\":6}\nsecret",
+);
+const seed_handover_bad_magic = fuzzcorpus.entry("BAD1\n{}");
+const seed_handover_truncated = fuzzcorpus.entry("MFHO1\n{\"origin\":\"/o\"");
+const seed_handover_bad_psk_len = fuzzcorpus.entry(
+    "MFHO1\n{\"origin\":\"/o\",\"cache\":\"/c\",\"id\":\"n1\",\"mount\":\"/m\",\"piece\":4096,\"listen\":1,\"brun\":10,\"bcull\":7,\"bstop\":3,\"direct_io\":false,\"allow_other\":false,\"fuse_fd\":3,\"listen_fds\":[],\"advertise\":[],\"seeds\":[],\"init\":\"\",\"nodes\":[],\"opens\":[],\"next_ino\":2,\"next_fh\":1,\"psk_len\":99}\nshort",
+);
+const seed_handover_odd_init = fuzzcorpus.entry(
+    "MFHO1\n{\"origin\":\"/o\",\"cache\":\"/c\",\"id\":\"n1\",\"mount\":\"/m\",\"piece\":4096,\"listen\":1,\"brun\":10,\"bcull\":7,\"bstop\":3,\"direct_io\":false,\"allow_other\":false,\"fuse_fd\":3,\"listen_fds\":[],\"advertise\":[],\"seeds\":[],\"init\":\"abc\",\"nodes\":[],\"opens\":[],\"next_ino\":2,\"next_fh\":1,\"psk_len\":0}\n",
+);
+const seed_handover_bad_hex = fuzzcorpus.entry(
+    "MFHO1\n{\"origin\":\"/o\",\"cache\":\"/c\",\"id\":\"n1\",\"mount\":\"/m\",\"piece\":4096,\"listen\":1,\"brun\":10,\"bcull\":7,\"bstop\":3,\"direct_io\":false,\"allow_other\":false,\"fuse_fd\":3,\"listen_fds\":[],\"advertise\":[],\"seeds\":[],\"init\":\"zzzz\",\"nodes\":[],\"opens\":[],\"next_ino\":2,\"next_fh\":1,\"psk_len\":0}\n",
+);
+const seed_handover_psk_huge = fuzzcorpus.entry(
+    "MFHO1\n{\"origin\":\"/o\",\"cache\":\"/c\",\"id\":\"n1\",\"mount\":\"/m\",\"piece\":4096,\"listen\":1,\"brun\":10,\"bcull\":7,\"bstop\":3,\"direct_io\":false,\"allow_other\":false,\"fuse_fd\":3,\"listen_fds\":[],\"advertise\":[],\"seeds\":[],\"init\":\"\",\"nodes\":[],\"opens\":[],\"next_ino\":2,\"next_fh\":1,\"psk_len\":4097}\n",
+);
+const seed_handover_bad_json = fuzzcorpus.entry("MFHO1\n{not json\n");
+const seed_handover_nodes = fuzzcorpus.entry(
+    "MFHO1\n{\"origin\":\"/o\",\"cache\":\"/c\",\"id\":\"n1\",\"mount\":\"/m\",\"piece\":4096,\"listen\":1,\"brun\":10,\"bcull\":7,\"bstop\":3,\"direct_io\":true,\"allow_other\":false,\"fuse_fd\":3,\"listen_fds\":[3],\"advertise\":[{\"ip\":\"127.0.0.1\",\"port\":18080}],\"seeds\":[],\"init\":\"0102\",\"nodes\":[{\"ino\":5,\"path\":\"/a.bin\",\"nlookup\":1}],\"opens\":[{\"fh\":10,\"path\":\"/a.bin\"}],\"next_ino\":6,\"next_fh\":11,\"psk_len\":4}\npsk1",
+);
+const seed_handover_req = fuzzcorpus.entry("{\"bin\":\"/usr/bin/modelfs\",\"token\":\"0123456789abcdef\"}\n");
+const seed_handover_ack = fuzzcorpus.entry("{\"token\":\"0123456789abcdef\"}\n");
+
+const fuzz_handover_corpus = [_][]const u8{
+    &seed_handover_ok,
+    &seed_handover_bad_magic,
+    &seed_handover_truncated,
+    &seed_handover_bad_psk_len,
+    &seed_handover_odd_init,
+    &seed_handover_bad_hex,
+    &seed_handover_psk_huge,
+    &seed_handover_bad_json,
+    &seed_handover_nodes,
+    &seed_handover_req,
+    &seed_handover_ack,
+};
+
+/// decode consumes untrusted handover state blobs. It must fail closed on
+/// invalid magic, truncated headers, mismatched PSK lengths, or non-hex
+/// init data, bound all allocations, and be deterministic across re-reads.
+fn fuzzHandoverDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    const gpa = std.testing.allocator;
+    var blob_buf: [2048]u8 = undefined;
+    const blob = blob_buf[0..smith.slice(&blob_buf)];
+
+    if (decode(gpa, blob)) |owned| {
+        var mut_owned = owned;
+        defer mut_owned.deinit();
+
+        try std.testing.expect(mut_owned.psk.len <= proto.max_psk_bytes);
+        try std.testing.expect(mut_owned.init.len <= init_max);
+
+        // Determinism: decoding again yields identical values
+        var again = try decode(gpa, blob);
+        defer again.deinit();
+        try std.testing.expectEqualStrings(mut_owned.origin, again.origin);
+        try std.testing.expectEqualStrings(mut_owned.cache, again.cache);
+        try std.testing.expectEqualStrings(mut_owned.id, again.id);
+        try std.testing.expectEqualStrings(mut_owned.mount, again.mount);
+        try std.testing.expectEqual(mut_owned.piece, again.piece);
+        try std.testing.expectEqual(mut_owned.listen, again.listen);
+        try std.testing.expectEqual(mut_owned.fuse_fd, again.fuse_fd);
+        try std.testing.expectEqual(mut_owned.direct_io, again.direct_io);
+        try std.testing.expectEqual(mut_owned.allow_other, again.allow_other);
+        try std.testing.expectEqualStrings(mut_owned.psk, again.psk);
+        try std.testing.expectEqualSlices(u8, mut_owned.init, again.init);
+        try std.testing.expectEqual(mut_owned.nodes.len, again.nodes.len);
+        try std.testing.expectEqual(mut_owned.opens.len, again.opens.len);
+        try std.testing.expectEqual(mut_owned.advertise.len, again.advertise.len);
+        try std.testing.expectEqual(mut_owned.seeds.len, again.seeds.len);
+        try std.testing.expectEqual(mut_owned.next_ino, again.next_ino);
+        try std.testing.expectEqual(mut_owned.next_fh, again.next_fh);
+    } else |_| {}
+
+    if (decodeReq(gpa, blob)) |req| {
+        defer req.deinit();
+        var again_req = try decodeReq(gpa, blob);
+        defer again_req.deinit();
+        try std.testing.expectEqualStrings(req.value.bin, again_req.value.bin);
+        try std.testing.expectEqualStrings(req.value.token, again_req.value.token);
+    } else |_| {}
+
+    if (decodeAck(gpa, blob)) |ack| {
+        defer ack.deinit();
+        var again_ack = try decodeAck(gpa, blob);
+        defer again_ack.deinit();
+        try std.testing.expectEqualStrings(ack.value.token, again_ack.value.token);
+    } else |_| {}
+}
+
+test "fuzz handover state decode fails closed and enforces bounds" {
+    try std.testing.fuzz({}, fuzzHandoverDecodeOne, .{ .corpus = &fuzz_handover_corpus });
 }
