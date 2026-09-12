@@ -123,6 +123,10 @@ case "${sub}" in
                 fi
                 exit 0
             fi
+            if [[ -n "${REPLICA:-}" && "${dataset}" == "${REPLICA}" ]]; then
+                printf '%s\n' "${REPLICA}"
+                exit 0
+            fi
             if [[ -n "${CHILD:-}" && "${dataset}" == "${CHILD}" ]]; then
                 printf '%s\n' "${CHILD}"
                 exit 0
