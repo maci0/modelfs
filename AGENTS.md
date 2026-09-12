@@ -25,10 +25,10 @@ It runs:
 - every `src/*.zig` other than `root.zig` and `c.zig` imported from `src/root.zig`
 - CHANGELOG `##` headings: `[Unreleased]` first, dated semver matching
   `build.zig.zon`, `[name]:` footer links, and current-tag sentences in
-  README/SECURITY.md/threat-model.md. Dated notes are `###`
+  README.md, SECURITY.md, and docs/threat-model.md. Dated notes are `###`
 - shellcheck (`.shellcheckrc` on every `scripts/**/*.sh`), and
   contributor-script `--help` handlers (`test_scripts_help.sh`)
-- vendored libfuse3 digest and extract checks (both vendored dirs)
+- vendored libfuse3 digest checks (both vendored dirs) and arm64 extract check
 - `test_dr_restore_drill.sh`
 - `ruff check`, `ruff format --check`, `mypy`, `scripts/sbom.py --self-test`,
   and `scripts/sbom.py --check`
@@ -40,7 +40,7 @@ single-file musl smoke build (`scripts/build_static.sh`), and the reproducibilit
 `./scripts/ci.sh` runs the x86_64 gate, the cross-compile, and the rebuild locally -- the
 native aarch64 gate runs only on GitHub's runner.
 
-Suites outside the gate, because each needs hardware CI lacks:
+Suites outside the gate (most need hardware CI lacks):
 
 | Script | Needs | Covers |
 |---|---|---|
