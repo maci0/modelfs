@@ -86,7 +86,6 @@ pub const Owned = struct {
     }
 };
 
-const JsonAddr = struct { ip: []const u8, port: u16, mbps: u32 = 0 };
 const JsonDoc = struct {
     origin: []const u8,
     cache: []const u8,
@@ -101,8 +100,8 @@ const JsonDoc = struct {
     allow_other: bool,
     fuse_fd: i32,
     listen_fds: []const i32,
-    advertise: []const JsonAddr,
-    seeds: []const JsonAddr,
+    advertise: []const proto.LeaseAddr,
+    seeds: []const proto.LeaseAddr,
     psk_len: usize,
     init: []const u8 = "",
     nodes: []const NodeSnap = &.{},
@@ -111,107 +110,70 @@ const JsonDoc = struct {
     next_fh: u64 = 1,
 };
 
-fn jsonStr(w: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
-    // The escaping below is byte-exact only for valid UTF-8: anything the
-    // decoder's UTF-8 validator rejects (a stray 0x80-0xFF byte in a path
-    // argv carried verbatim) must fail HERE, at the encode, with a named
-    // error -- never after the exec, where a decode failure silently times
-    // out every future update of the mount.
+fn utf8Knob(s: []const u8) ![]const u8 {
+    // Anything the decoder's UTF-8 validator rejects (a stray 0x80-0xFF byte
+    // in a path argv carried verbatim) must fail HERE, at the encode, with a
+    // named error -- never after the exec, where a decode failure silently
+    // times out every future update of the mount.
     if (!std.unicode.utf8ValidateSlice(s)) return error.NonUtf8Knob;
-    try w.append(gpa, '"');
-    for (s) |ch| {
-        switch (ch) {
-            '"' => try w.appendSlice(gpa, "\\\""),
-            '\\' => try w.appendSlice(gpa, "\\\\"),
-            // A raw C0 control makes the decoded blob fail std.json, so a
-            // control byte in a mountpoint would hang every update of that
-            // mount with no ack. \uXXXX is an exact byte round-trip below
-            // 0x80, where every control lives.
-            0x00...0x1f => {
-                var esc: [6]u8 = undefined;
-                try w.appendSlice(gpa, std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{ch}) catch return error.NoSpaceLeft);
-            },
-            else => try w.append(gpa, ch),
-        }
-    }
-    try w.append(gpa, '"');
+    return s;
 }
 
-fn jsonAddrs(w: *std.ArrayList(u8), gpa: std.mem.Allocator, addrs: []const proto.LeaseAddr) !void {
-    try w.append(gpa, '[');
-    for (addrs, 0..) |a, i| {
-        if (i != 0) try w.append(gpa, ',');
-        try w.appendSlice(gpa, "{\"ip\":");
-        try jsonStr(w, gpa, a.ip);
-        var pbuf: [48]u8 = undefined;
-        const p = try std.fmt.bufPrint(&pbuf, ",\"port\":{d},\"mbps\":{d}}}", .{ a.port, a.mbps });
-        try w.appendSlice(gpa, p);
+fn hexInit(gpa: std.mem.Allocator, init: []const u8) ![]u8 {
+    if (init.len > init_max) return error.InitTooLarge;
+    const out = try gpa.alloc(u8, init.len * 2);
+    const hex_digits = "0123456789abcdef";
+    for (init, 0..) |b, i| {
+        out[i * 2] = hex_digits[b >> 4];
+        out[i * 2 + 1] = hex_digits[b & 0xf];
     }
-    try w.append(gpa, ']');
-}
-
-fn jsonI32s(w: *std.ArrayList(u8), gpa: std.mem.Allocator, fds: []const i32) !void {
-    try w.append(gpa, '[');
-    for (fds, 0..) |fd, i| {
-        if (i != 0) try w.append(gpa, ',');
-        var buf: [16]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "{d}", .{fd});
-        try w.appendSlice(gpa, s);
-    }
-    try w.append(gpa, ']');
+    return out;
 }
 
 /// JSON knobs plus a trailing raw PSK. The secret is never UTF-8 JSON and
 /// never appears in exec argv.
 pub fn encode(gpa: std.mem.Allocator, k: Knobs) ![]u8 {
     if (!cull.ordered(k.water)) return error.BadWatermarks;
+    const init_hex = try hexInit(gpa, k.init);
+    defer gpa.free(init_hex);
+    _ = try utf8Knob(k.origin);
+    _ = try utf8Knob(k.cache);
+    _ = try utf8Knob(k.id);
+    _ = try utf8Knob(k.mount);
+    for (k.advertise) |a| _ = try utf8Knob(a.ip);
+    for (k.seeds) |a| _ = try utf8Knob(a.ip);
+    for (k.nodes) |n| _ = try utf8Knob(n.path);
+    for (k.opens) |o| _ = try utf8Knob(o.path);
+    const doc = JsonDoc{
+        .origin = k.origin,
+        .cache = k.cache,
+        .id = k.id,
+        .mount = k.mount,
+        .piece = k.piece,
+        .listen = k.listen,
+        .brun = k.water.brun,
+        .bcull = k.water.bcull,
+        .bstop = k.water.bstop,
+        .direct_io = k.direct_io,
+        .allow_other = k.allow_other,
+        .fuse_fd = k.fuse_fd,
+        .listen_fds = k.listen_fds,
+        .advertise = k.advertise,
+        .seeds = k.seeds,
+        .psk_len = k.psk.len,
+        .init = init_hex,
+        .nodes = k.nodes,
+        .opens = k.opens,
+        .next_ino = k.next_ino,
+        .next_fh = k.next_fh,
+    };
+    const json = try std.json.Stringify.valueAlloc(gpa, doc, .{});
+    defer gpa.free(json);
     var w: std.ArrayList(u8) = .empty;
     errdefer w.deinit(gpa);
     try w.appendSlice(gpa, magic);
-    try w.appendSlice(gpa, "{\"origin\":");
-    try jsonStr(&w, gpa, k.origin);
-    try w.appendSlice(gpa, ",\"cache\":");
-    try jsonStr(&w, gpa, k.cache);
-    try w.appendSlice(gpa, ",\"id\":");
-    try jsonStr(&w, gpa, k.id);
-    try w.appendSlice(gpa, ",\"mount\":");
-    try jsonStr(&w, gpa, k.mount);
-    var nbuf: [160]u8 = undefined;
-    const nums = try std.fmt.bufPrint(&nbuf, ",\"piece\":{d},\"listen\":{d},\"brun\":{d},\"bcull\":{d},\"bstop\":{d},\"direct_io\":{},\"allow_other\":{},\"fuse_fd\":{d},\"listen_fds\":", .{
-        k.piece, k.listen, k.water.brun, k.water.bcull, k.water.bstop, k.direct_io, k.allow_other, k.fuse_fd,
-    });
-    try w.appendSlice(gpa, nums);
-    try jsonI32s(&w, gpa, k.listen_fds);
-    try w.appendSlice(gpa, ",\"advertise\":");
-    try jsonAddrs(&w, gpa, k.advertise);
-    try w.appendSlice(gpa, ",\"seeds\":");
-    try jsonAddrs(&w, gpa, k.seeds);
-    if (k.init.len > init_max) return error.InitTooLarge;
-    try w.appendSlice(gpa, ",\"init\":\"");
-    const hex_digits = "0123456789abcdef";
-    for (k.init) |b| {
-        try w.append(gpa, hex_digits[b >> 4]);
-        try w.append(gpa, hex_digits[b & 0xf]);
-    }
-    try w.appendSlice(gpa, "\",\"nodes\":[");
-    for (k.nodes, 0..) |n, i| {
-        if (i != 0) try w.append(gpa, ',');
-        const pre = try std.fmt.bufPrint(&nbuf, "{{\"ino\":{d},\"path\":", .{n.ino});
-        try w.appendSlice(gpa, pre);
-        try jsonStr(&w, gpa, n.path);
-        const post = try std.fmt.bufPrint(&nbuf, ",\"nlookup\":{d}}}", .{n.nlookup});
-        try w.appendSlice(gpa, post);
-    }
-    try w.appendSlice(gpa, "],\"opens\":[");
-    for (k.opens, 0..) |o, i| {
-        if (i != 0) try w.append(gpa, ',');
-        const pre = try std.fmt.bufPrint(&nbuf, "{{\"fh\":{d},\"path\":", .{o.fh});
-        try w.appendSlice(gpa, pre);
-        try jsonStr(&w, gpa, o.path);
-        try w.appendSlice(gpa, "}");
-    }
-    const plen = try std.fmt.bufPrint(&nbuf, "],\"next_ino\":{d},\"next_fh\":{d},\"psk_len\":{d}}}\n", .{ k.next_ino, k.next_fh, k.psk.len });
-    try w.appendSlice(gpa, plen);
+    try w.appendSlice(gpa, json);
+    try w.append(gpa, '\n');
     try w.appendSlice(gpa, k.psk);
     return w.toOwnedSlice(gpa);
 }
@@ -318,16 +280,12 @@ pub const Req = struct { bin: []const u8, token: []const u8 };
 pub const Ack = struct { token: []const u8 };
 
 pub fn encodeReq(gpa: std.mem.Allocator, bin: []const u8, token: []const u8) ![]u8 {
-    var w: std.ArrayList(u8) = .empty;
-    errdefer w.deinit(gpa);
-    try w.appendSlice(gpa, "{\"bin\":");
-    try jsonStr(&w, gpa, bin);
-    try w.appendSlice(gpa, ",\"token\":");
-    try jsonStr(&w, gpa, token);
-    try w.appendSlice(gpa, "}\n");
-    return w.toOwnedSlice(gpa);
+    _ = try utf8Knob(bin);
+    _ = try utf8Knob(token);
+    const json = try std.json.Stringify.valueAlloc(gpa, Req{ .bin = bin, .token = token }, .{});
+    defer gpa.free(json);
+    return std.fmt.allocPrint(gpa, "{s}\n", .{json});
 }
-
 pub fn decodeReq(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Req) {
     return std.json.parseFromSlice(Req, gpa, std.mem.trim(u8, blob, " \t\r\n"), .{});
 }

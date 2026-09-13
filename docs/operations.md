@@ -236,7 +236,7 @@ Deleted or corrupted models, a dead pool, a dead NAS: [recovery.md](recovery.md)
 `modelfs` verifies pieces twice: **at admit** (a peer fill must match the
 trusted digest from the origin manifest, an origin fill, or this node's own
 write -- mismatches are discarded and refilled from origin, counted in
-`fill_err_verify`) and **before every `/data` or `/stage` serve** (cached
+`fill_err_verify`) and **before every `/data` serve** (cached)
 bytes are rehashed; a mismatch is refused with 500, counted in
 `serve_verify_fail`, and the piece's mark is **healed** -- cleared so the
 next fill re-hydrates from origin instead of failing forever).
@@ -263,8 +263,7 @@ Dedup decisions are measured, not guessed: `modelfs dupes <rel>... --origin
 <origin>` compares piece-hash manifests and reports aligned/shared/shifted
 overlap, and `modelfs dupes --all --origin <origin>` scans the whole
 manifest store for byte-identical and digest-sharing pairs. Run either
-before deciding whether duplicate models cost disk worth engineering for
-(design.md section 14).
+before deciding whether duplicate models cost disk worth engineering for.
 
 ### Durability caveat, kept as-is on purpose
 

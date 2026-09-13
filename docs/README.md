@@ -10,8 +10,6 @@ Setup and CLI usage are in the [top-level README](../README.md). Recent changes 
 | [recovery.md](recovery.md) | Durability: state inventory, snapshot/replica schedule, per-disaster restore steps, RPO/RTO, the monthly restore drill and its alarms |
 | [benchmarks.md](benchmarks.md) | Measured latency and throughput, with the loopback caveat that qualifies them |
 | [threat-model.md](threat-model.md) | Attack surface, trust boundaries, risk-ranked threats, and which controls exist versus which are missing |
-| [audits.md](audits.md) | Findings from the 2026-08-22 review passes and how each was fixed |
-| [design.md](design.md) | The original architecture sketch, goals G1-G10, and key decisions, each with ship status. Kept for history; current behavior is architecture.md |
 
 ## review-guides/
 
@@ -25,8 +23,6 @@ applicability gate, a checklist naming real symbols in this tree, and a severity
 | [abstractions-review.md](review-guides/abstractions-review.md) | whether a type earns its keep | delete, inline, move layer, or introduce |
 | [zig-idiomatic-review.md](review-guides/zig-idiomatic-review.md) | code shape inside a function | allocators, ownership, error sets, comptime, slices |
 | [zig-best-practices-review.md](review-guides/zig-best-practices-review.md) | structure and naming | import direction, concern ownership, `@builtin` choice |
-| [zig-0.16-changelog-review.md](review-guides/zig-0.16-changelog-review.md) | stdlib migration | removed, deprecated, and renamed APIs against the 0.16 notes |
-| [simd-review.md](review-guides/simd-review.md) | vectorization | ship or reject, with a measured baseline |
 | [scripts-review.md](review-guides/scripts-review.md) | `scripts/` | harness defects the lint gates cannot see |
 | [docs-drift-review.md](review-guides/docs-drift-review.md) | these documents | claims that no longer match the code |
 | [agentrules-review.md](review-guides/agentrules-review.md) | `AGENTS.md` | whether the rules work as agent instructions |

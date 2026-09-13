@@ -662,7 +662,7 @@ test "rename flag passthrough keeps NOREPLACE and EXCHANGE semantics" {
     try std.testing.expectEqualStrings("AAA", try sys.readFileBuf(&rb, b_z));
 }
 
-export fn mf_getattr(path: [*c]const u8, stbuf: ?*fuse.struct_stat, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_getattr(path: [*c]const u8, stbuf: ?*fuse.struct_stat, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
     const getattr_t0 = sys.monoNs(st.io);
@@ -690,7 +690,7 @@ fn cachedFor(st: *State, rel: []const u8) ?*store_mod.Store.Cached {
     return st.store.getIdentified(rel, size, store_mod.OriginId.fromStat(ost), sys.monoSec(st.io)) catch null;
 }
 
-export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
     const open_t0 = sys.monoNs(st.io);
@@ -731,7 +731,7 @@ export fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_
     return 0;
 }
 
-export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     const st = statePtr();
     const p = cPath(path);
     var rel: []const u8 = "";
@@ -767,7 +767,7 @@ export fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_
     // warmup OOM) would tell the caller the create failed over a file that
     // exists and was possibly truncated. Warmup is best-effort; the next
     // open/read rebuilds the entry.
-    if (st.store.get(rel, 0, sys.monoSec(st.io))) |file| {
+    if (st.store.getIdentified(rel, 0, .{}, sys.monoSec(st.io))) |file| {
         st.store.releaseFile(file);
     } else |err| {
         std.log.warn("cache entry warmup failed for {s} ({t}); rebuilding on next open", .{ rel, err });
@@ -1022,7 +1022,7 @@ fn fileForRead(st: *State, rel: []const u8) union(enum) { err: c_int, file: *sto
     return .{ .file = file };
 }
 
-export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     if (buf == null) return -sys.c.EFAULT;
     const st = statePtr();
@@ -1079,7 +1079,7 @@ export fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t,
     return @intCast(got);
 }
 
-export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     if (buf == null) return -sys.c.EFAULT;
     const st = statePtr();
@@ -1170,7 +1170,7 @@ export fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse
     return @intCast(n);
 }
 
-export fn mf_fsync(path: [*c]const u8, datasync: c_int, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_fsync(path: [*c]const u8, datasync: c_int, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
     var rel: []const u8 = "";
@@ -1182,7 +1182,7 @@ export fn mf_fsync(path: [*c]const u8, datasync: c_int, fi: ?*fuse.fuse_file_inf
     return st.store.originFsync(rel, datasync != 0);
 }
 
-export fn mf_release(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_release(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
     var rel: []const u8 = "";
@@ -1192,7 +1192,7 @@ export fn mf_release(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c)
     if (rerr != 0 or rel.len == 0) return 0;
     if (st.store.lookupRef(rel)) |file| {
         defer st.store.releaseFile(file);
-        // Close-to-open (design.md 4.4): the close of a file this node wrote
+        // Close-to-open: the close of a file this node wrote
         // or filled is the natural moment to publish the piece-hash manifest
         // that makes the fleet's peer fills verifiable. publishManifest
         // no-ops unless hashes changed since the last publish; read-only
@@ -1202,7 +1202,7 @@ export fn mf_release(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c)
     return 0;
 }
 
-export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
     var rel: []const u8 = "";
@@ -1285,7 +1285,7 @@ export fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file
     return 0;
 }
 
-export fn mf_unlink(path: [*c]const u8) callconv(.c) c_int {
+fn mf_unlink(path: [*c]const u8) callconv(.c) c_int {
     const st = statePtr();
     const p = cPath(path);
     var rel: []const u8 = "";
@@ -1294,7 +1294,7 @@ export fn mf_unlink(path: [*c]const u8) callconv(.c) c_int {
     return st.store.unlinkOrigin(rel);
 }
 
-export fn mf_mkdir(path: [*c]const u8, mode: fuse.mode_t) callconv(.c) c_int {
+fn mf_mkdir(path: [*c]const u8, mode: fuse.mode_t) callconv(.c) c_int {
     const st = statePtr();
     const p = cPath(path);
     var rel: []const u8 = "";
@@ -1303,7 +1303,7 @@ export fn mf_mkdir(path: [*c]const u8, mode: fuse.mode_t) callconv(.c) c_int {
     return st.store.mkdirOrigin(rel, clientCreateMode(mode));
 }
 
-export fn mf_rmdir(path: [*c]const u8) callconv(.c) c_int {
+fn mf_rmdir(path: [*c]const u8) callconv(.c) c_int {
     const st = statePtr();
     const p = cPath(path);
     var rel: []const u8 = "";
@@ -1312,7 +1312,7 @@ export fn mf_rmdir(path: [*c]const u8) callconv(.c) c_int {
     return st.store.rmdirOrigin(rel);
 }
 
-export fn mf_rename(old: [*c]const u8, new: [*c]const u8, flags: c_uint) callconv(.c) c_int {
+fn mf_rename(old: [*c]const u8, new: [*c]const u8, flags: c_uint) callconv(.c) c_int {
     const st = statePtr();
     var orel: []const u8 = "";
     var nrel: []const u8 = "";
@@ -1329,7 +1329,7 @@ export fn mf_rename(old: [*c]const u8, new: [*c]const u8, flags: c_uint) callcon
     return st.store.renameOrigin(orel, nrel, flags);
 }
 
-export fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+fn mf_chmod(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     _ = fi;
     const st = statePtr();
     var rel: []const u8 = "";
@@ -1403,7 +1403,7 @@ const OriginDirNames = struct {
     }
 };
 
-export fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.c) c_int {
+fn mf_statfs(path: [*c]const u8, stbuf: ?*fuse.struct_statvfs) callconv(.c) c_int {
     const st = statePtr();
     const statfs_t0 = sys.monoNs(st.io);
     defer _ = st.store.stats.statfs_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - statfs_t0, 0)), .monotonic);

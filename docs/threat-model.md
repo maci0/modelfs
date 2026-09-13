@@ -3,8 +3,8 @@
 | Field | Value |
 |---|---|
 | Status | Living document; describes `src/` as of the date below |
-| Last reviewed | 2026-09-12 |
-| Covers | modelfs daemon (`mount`) and CLI as of `v0.12.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull |
+| Last reviewed | 2026-09-13 |
+| Covers | modelfs daemon (`mount`) and CLI as of `v0.13.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
 
@@ -14,8 +14,7 @@ what can be attacked from outside the node, what it costs, and which controls ex
 point at code; fixes belong to sec-review passes, not here.
 
 Every claim below cites a file and symbol. When code moves, re-verify the citation before
-trusting the row. Historical security claims live in design.md section 9 and are annotated
-there; do not import them without checking `src/`.
+trusting the row.
 
 ---
 
@@ -62,12 +61,9 @@ Bound `0.0.0.0` (IPv4 only, `sockaddr_in`) on every unique advertised port, defa
 (`bindAll`/`bindOne` src/peer.zig). `--listen [IP:]PORT` consumes only the port (`listenPort`
 src/main.zig): there is no loopback-only or interface-scoped bind.
 
-Accepts `GET /ping`, `GET /have?path=`, `GET /stage?path=&piece=`, and `GET /data?path=` with a
+Accepts `GET /ping`, `GET /have?path=`, and `GET /data?path=` with a
 `Range` header, plus the `Authorization` header (`handleConn` src/peer.zig). Non-GET after a
 valid bearer answers `405 Allow: GET` and counts in `http_405`.
-
-`/stage` returns a 52-byte window body (codec src/rdma.zig). The shipped backend is the null
-one, so `/have` never advertises `X-Stage` and production behavior is HTTP-only.
 
 ### FUSE operations on the mountpoint
 
@@ -362,7 +358,7 @@ created 0700 (`cache_dir_mode`), and leftover 0755 roots are tightened on `ensur
 pinned. Sidecars, pin markers, and `status.json` are 0600 (`writeFileOwnerOnly` src/sys.zig).
 Origin create/mkdir/chmod modes arrive from the client but are masked to permission bits
 (`clientCreateMode` src/fuse_fs.zig). `.cluster` is hidden from FUSE, from peer
-`/have`/`/data`/`/stage`, and from `modelfs pin`/`unpin`/`verify`/`dupes` (`relIsCluster`); its
+`/have`/`/data`, and from `modelfs pin`/`unpin`/`verify`/`dupes` (`relIsCluster`); its
 secrecy is irrelevant anyway, since leases hold no PSK.
 
 **Exhaustion controls.** A local reader forcing misses drives origin reads and cache fills,
@@ -417,9 +413,8 @@ declared request body is drained pre-auth under a second bounded hold (64 KiB / 
 Oversized and malformed heads are counted, not logged per event. 401 and 405 journal lines are
 capped to one per second, so a serial scanner cannot fill the journal. Connections refused at
 the cap are counted (`http_dropped`), so saturation is visible from status.json without
-per-drop logging. Server-side allocation is range-bounded: ranges clamp to file size, hydration
-and staging each use one reusable piece-sized buffer, and a `/stage` reply body is fixed at 52
-bytes (`window_len` src/rdma.zig). Client-side `/have` bodies are refused above 16 MiB before
+per-drop logging. Server-side allocation is range-bounded: ranges clamp to file size, and
+hydration uses one reusable piece-sized buffer. Client-side `/have` bodies are refused above 16 MiB before
 allocation (`max_have_body_bytes`); other allocated bodies honor a 512 MiB cap
 (`max_alloc_body_bytes`). Remaining exposure: 16 slots is small enough to occupy with reconnect
 loops, and authenticated requests force per-piece origin reads plus NVMe writes
@@ -543,8 +538,8 @@ propagated, and a detected at-rest mismatch self-heals. This closes
   (`piece.digest` src/piece.zig, `Store.hashes` src/store.zig).
 * Peer fills are verified before admit and refused outright without a trusted reference
   (`expectedHash` src/store.zig, `hydratePiece` src/fuse_fs.zig).
-* Cached bytes are verified before every `/data` and `/stage` serve, with self-heal on mismatch
-  (`verifyRange`/`serveStage` src/peer.zig, `Store.healPiece` src/store.zig).
+* Cached bytes are verified before every `/data` serve, with self-heal on mismatch
+  (`verifyRange` src/peer.zig, `Store.healPiece` src/store.zig).
 * Manifests are published on the origin at close and loaded lazily as the trust reference
   (`Store.publishManifest`).
 * `modelfs verify <rel>` audits at rest (`cmdVerify` src/main.zig).
@@ -574,12 +569,12 @@ propagated, and a detected at-rest mismatch self-heals. This closes
 **Fuzz harnesses over every untrusted-input parser**, for regression resistance on the B1/B2/B3/B4
 parsers and against drift between the ingestion and dial gates: request heads and peer replies
 (the auth/path/range pipeline, Content-Range binding on 206 bodies, `HaveBits.hasPiece` against
-packed bits and grid mismatch, `X-Stage` accepting only the token `1`), lease JSON, the URL
+packed bits and grid mismatch), lease JSON, the URL
 codec pair across the trust boundary, the FUSE path gate, `relOk`, `parseV4` diffed against libc
-`inet_pton` across the whole input space, the `/stage` window codec, the sidecar piece-size
+`inet_pton` across the whole input space, the sidecar piece-size
 header, the piece-hash manifest codec, handover state and req/ack decoding, CLI flag value
 parsing, and status.json liveness parsing (src/peer.zig, src/proto.zig, src/discover.zig,
-src/fuse_fs.zig, src/store.zig, src/piece.zig, src/rdma.zig, src/handover.zig, src/main.zig).
+src/fuse_fs.zig, src/store.zig, src/piece.zig, src/handover.zig, src/main.zig).
 Seed corpora share one framing helper (src/fuzzcorpus.zig) so `Smith.slice` feeds codec bytes
 rather than a length prefix taken from the payload.
 
@@ -595,7 +590,7 @@ fail loudly (`validId` and lease filtering src/discover.zig; `buildSeeds` src/ma
 | Concurrency cap: 16 handlers with atomic claim-then-check; probe concurrency capped to the same number | `Server.max_inflight` src/peer.zig; probe cap in `fillFromPeers` | Unbounded thread and connection growth |
 | Socket timeouts: 30 s steady-state, 15 s dial, 10 s head, length-scaled body budget | src/peer.zig | Stalled-peer slot retention |
 | Range clamping to file size; one reusable piece-sized hydration buffer | `serveData` and `hydrateRange` src/peer.zig | Server-side allocation driven by attacker-chosen ranges |
-| Regular-file gate before any cache work on `/have`, `/data`, and `/stage`: directories and other non-regular origin objects answer 404 instead of reaching hydration's pread on a directory fd, which surfaced as a misattributed 502 | `originRegular` src/peer.zig | B2 validation: non-regular paths driving cache writes and wrong-status replies |
+| Regular-file gate before any cache work on `/have` and `/data`: directories and other non-regular origin objects answer 404 instead of reaching hydration's pread on a directory fd, which surfaced as a misattributed 502 | `originRegular` src/peer.zig | B2 validation: non-regular paths driving cache writes and wrong-status replies |
 
 ### CLI gates
 
@@ -653,12 +648,11 @@ with locations.
 **Unmitigated.** Every request carries `Authorization: Bearer <psk>` in cleartext
 (src/peer.zig), and every piece moves unencrypted (`streamRange` src/peer.zig). Any host on path
 (same L2, any router between racks, anyone doing ARP spoofing) reads weights and captures the
-PSK. design.md section 9 promised mTLS-or-token as v1 auth; what shipped is token-only over
-plain TCP.
+PSK. Auth is token-only over plain TCP.
 
 ### R2: peer-served piece integrity (mitigated)
 
-design.md section 9's "blake3 on every chunk, never serve unverified bytes" now ships in
+blake3 on every chunk, never serve unverified bytes, now ships in
 per-piece form.
 
 Every admitted piece (origin fill, verified peer fill, write-through) records a blake3 digest
@@ -670,7 +664,7 @@ those digests as a piece-hash manifest on the origin under `.cluster/manifests/`
 A peer fill with no trusted digest is not attempted; the piece hydrates from the origin instead.
 Fetched bytes that fail verification are discarded unmarked and refilled from the origin
 (`hydratePiece` src/fuse_fs.zig, `fill_err_verify`). Cached bytes are re-verified before every
-`/data` and `/stage` serve (`verifyRange`/`serveStage` src/peer.zig, `serve_verify_fail`), and a
+`/data` serve (`verifyRange` src/peer.zig, `serve_verify_fail`), and a
 mismatch both refuses the serve **and** heals the piece (`Store.healPiece` clears the mark so
 the next fill re-hydrates from the origin instead of failing forever). `modelfs verify <rel>`
 rehashes a whole file's cached pieces against the manifest and clears mismatched marks the same
@@ -729,8 +723,7 @@ and multiply NFS load.
 
 Per endpoint: `/data` forces origin stats plus full-piece hydration per request. `/have` is an
 origin stat plus a cache-entry load, unless the bitmap would exceed 16 MiB, in which case it is
-a 500 with no entry opened. Production `/stage` is an origin stat plus a cache-entry load plus a
-501, because the backend is null and the check happens before `hydrateRange`.
+a 500 with no entry opened.
 
 Culling eventually evicts the litter; nothing prevents the cycle.
 
@@ -848,12 +841,10 @@ saturation (`http_dropped`). status.json exposes lifetime aggregates, `origin_do
 the status write, src/fuse_fs.zig). Still missing: a persistent, centralized record, and
 per-client attribution of successful requests.
 
-**Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.12.0`
-is current; the `0.11.x` line receives security fixes) and the route from report to shipped fix.
+**Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.13.0`
+is current; the `0.12.x` line receives security fixes) and the route from report to shipped fix.
 GitHub private vulnerability reporting is not enabled on the repository, so that route has no
 intake until a repository admin turns the feature on, and there is no other disclosed contact.
-docs/audits.md records internal review history only, and design.md section 9 contains historical
-mitigation claims, annotated there, that should not be cited as current posture.
 
 **Compromise recovery that exists today.** PSK regeneration guidance is in
 [recovery.md](recovery.md), which also documents wiping caches before remounting after a

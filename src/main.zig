@@ -3048,7 +3048,7 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
 /// manifests, total pieces, byte-identical pairs, and pairs sharing any
 /// digest. Manifests are keyed by `blake3(rel)` hex, so the scan cannot
 /// name the files behind them; the aggregates are what the dedup decision
-/// needs (design.md section 14), and the per-path form `modelfs dupes
+/// needs, and the per-path form `modelfs dupes
 /// <rel>...` names specific pairs. Reads manifests only, never model
 /// bytes. A missing manifests dir is an empty scan, not an error; an
 /// unreadable one (EIO, ENOTDIR, EACCES) exits 1 like `modelfs peers` on
@@ -3152,7 +3152,7 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 /// index -- every ingested file's piece digests live there -- so this scan
 /// reads manifests only, never the model bytes, and is cheap even for
 /// hundreds of GB of files. This is the measured answer to "do we want
-/// dedup?" (design.md section 14): aligned overlap is what a same-size
+/// dedup?": aligned overlap is what a same-size
 /// re-export would share, shifted overlap is what only CDC could recover,
 /// and byte-identical files are outright duplicates. A path with no
 /// manifest (never ingested through modelfs, or never fully hashed) is

@@ -1,7 +1,7 @@
 //! Piece arithmetic (count/offset/cover/trackedEnd) and the persisted cache bitfield
 //! codec, including pad-bit defenses against corrupt sidecars, the sidecar
 //! header piece-size reader (`sidecarPieceSize`), and piece-hash manifest
-//! overlap (`manifestOverlap` / `manifestOverlapPrepared`) used by `modelfs dupes`.
+//! overlap (`manifestOverlapPrepared`) used by `modelfs dupes`.
 const std = @import("std");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 
@@ -299,17 +299,6 @@ pub const Bitfield = struct {
         return out[0..need];
     }
 
-    pub fn encode(self: Bitfield, piece_size: u32, file_size: u64, out: *std.ArrayList(u8), gpa: std.mem.Allocator) !void {
-        // Exact size up front: saves run per piece fill and per punch, and an
-        // empty-list append chain would otherwise realloc-copy the growing
-        // blob several times per save.
-        const need = self.encodedLen();
-        try out.ensureTotalCapacity(gpa, out.items.len + need);
-        const start = out.items.len;
-        out.items.len = start + need;
-        _ = self.encodeTo(piece_size, file_size, out.items[start..]) catch unreachable;
-    }
-
     pub fn decode(gpa: std.mem.Allocator, blob: []const u8, piece_size: u32, file_size: u64) !Bitfield {
         if (blob.len < 16) return error.BadBitfield;
         if (!std.mem.eql(u8, blob[0..4], magic)) return error.BadBitfield;
@@ -333,7 +322,7 @@ pub const Bitfield = struct {
 /// Content identity: the blake3 digest of one piece's bytes. Every piece
 /// that lands in the cache is hashed at admit; the digest is the trust
 /// reference peer fills verify against and the unit of at-rest integrity.
-/// blake3 (not SHA-256) per design.md C.3: fast enough to hash an 8 MiB
+/// blake3 (not SHA-256): fast enough to hash an 8 MiB
 /// piece on the fill path, and std ships it.
 pub const digest_len: usize = 32;
 
@@ -609,18 +598,17 @@ pub fn manifestOverlapPrepared(
     return ov;
 }
 
-/// Single-pair convenience wrapper (tests): builds the digest-sorted copies
-/// itself. Pair scans should build them once per manifest and call
-/// `manifestOverlapPrepared` instead.
-pub fn manifestOverlap(gpa: std.mem.Allocator, a: Manifest, b: Manifest) !Overlap {
-    const ca = try digestSorted(gpa, a.entries);
-    defer gpa.free(ca);
-    const cb = try digestSorted(gpa, b.entries);
-    defer gpa.free(cb);
-    return manifestOverlapPrepared(a, b, ca, cb);
-}
-
-test "manifestOverlap counts aligned, shared, and identical content" {
+test "manifestOverlapPrepared counts aligned, shared, and identical content" {
+    const gpa = std.testing.allocator;
+    const overlap = struct {
+        fn of(a: Manifest, b: Manifest) !Overlap {
+            const ca = try digestSorted(gpa, a.entries);
+            defer gpa.free(ca);
+            const cb = try digestSorted(gpa, b.entries);
+            defer gpa.free(cb);
+            return manifestOverlapPrepared(a, b, ca, cb);
+        }
+    };
     const h0 = [_]u8{0x11} ** digest_len;
     const h1 = [_]u8{0x22} ** digest_len;
     const h2 = [_]u8{0x33} ** digest_len;
@@ -639,19 +627,19 @@ test "manifestOverlap counts aligned, shared, and identical content" {
     const A = Manifest{ .piece_size = 16, .file_size = 32, .entries = &a_entries };
     // Same bytes at index 0, different at index 1: aligned 1, shared 1.
     const B = Manifest{ .piece_size = 16, .file_size = 32, .entries = &b_entries };
-    const ab = try manifestOverlap(std.testing.allocator, A, B);
+    const ab = try overlap.of(A, B);
     try std.testing.expectEqual(@as(u64, 1), ab.aligned);
     try std.testing.expectEqual(@as(u64, 1), ab.shared);
     try std.testing.expect(!ab.identical);
     // The same content at a shifted index: shared but not aligned (only
     // CDC could recover this -- the telemetry Level 3 waits on).
     const C = Manifest{ .piece_size = 16, .file_size = 48, .entries = &c_entries };
-    const ac = try manifestOverlap(std.testing.allocator, A, C);
+    const ac = try overlap.of(A, C);
     try std.testing.expectEqual(@as(u64, 0), ac.aligned);
     try std.testing.expectEqual(@as(u64, 2), ac.shared);
     try std.testing.expect(!ac.identical);
     // Byte-identical manifests: every piece matches.
-    const ad = try manifestOverlap(std.testing.allocator, A, A);
+    const ad = try overlap.of(A, A);
     try std.testing.expectEqual(@as(u64, 2), ad.aligned);
     try std.testing.expectEqual(@as(u64, 2), ad.shared);
     try std.testing.expect(ad.identical);
@@ -668,7 +656,7 @@ test "manifestOverlap counts aligned, shared, and identical content" {
     };
     const D = Manifest{ .piece_size = 16, .file_size = 32, .entries = &d_entries };
     const E = Manifest{ .piece_size = 16, .file_size = 48, .entries = &e_entries };
-    const de = try manifestOverlap(std.testing.allocator, D, E);
+    const de = try overlap.of(D, E);
     try std.testing.expectEqual(@as(u64, 2), de.aligned);
     try std.testing.expectEqual(@as(u64, 1), de.shared);
     try std.testing.expect(!de.identical);
@@ -935,10 +923,9 @@ test "bitfield set get persist" {
     try std.testing.expectEqual(@as(u32, 2), bf.filled());
     try std.testing.expectEqual(@as(u32, 9), bf.lastSet().?);
 
-    var blob: std.ArrayList(u8) = .empty;
-    defer blob.deinit(gpa);
-    try bf.encode(4096, 40960, &blob, gpa);
-    var bf2 = try Bitfield.decode(gpa, blob.items, 4096, 40960);
+    var blob_buf: [256]u8 = undefined;
+    const blob = try bf.encodeTo(4096, 40960, &blob_buf);
+    var bf2 = try Bitfield.decode(gpa, blob, 4096, 40960);
     defer bf2.deinit(gpa);
     try std.testing.expect(bf2.get(3));
     try std.testing.expect(bf2.get(9));
@@ -946,7 +933,7 @@ test "bitfield set get persist" {
 
     var direct: [64]u8 = undefined;
     const encoded = try bf.encodeTo(4096, 40960, &direct);
-    try std.testing.expectEqualSlices(u8, blob.items, encoded);
+    try std.testing.expectEqualSlices(u8, blob, encoded);
     try std.testing.expectError(error.NoSpaceLeft, bf.encodeTo(4096, 40960, direct[0..8]));
 }
 
@@ -956,12 +943,11 @@ test "decode masks pad bits past nbits" {
     defer bf.deinit(gpa);
     bf.set(0);
     bf.set(9);
-    var blob: std.ArrayList(u8) = .empty;
-    defer blob.deinit(gpa);
-    try bf.encode(4096, 40960, &blob, gpa);
+    var blob_buf: [256]u8 = undefined;
+    const blob = try bf.encodeTo(4096, 40960, &blob_buf);
     // Corrupt the pad bits (bits 10..15 live in byte 1 above nbits=10).
-    blob.items[16 + 1] |= 0b11111100;
-    var bf2 = try Bitfield.decode(gpa, blob.items, 4096, 40960);
+    blob_buf[16 + 1] |= 0b11111100;
+    var bf2 = try Bitfield.decode(gpa, blob, 4096, 40960);
     defer bf2.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 2), bf2.filled());
     try std.testing.expect(bf2.get(0));
@@ -973,10 +959,9 @@ test "stale bitfield size resets" {
     var bf = try Bitfield.init(gpa, 4);
     defer bf.deinit(gpa);
     bf.set(0);
-    var blob: std.ArrayList(u8) = .empty;
-    defer blob.deinit(gpa);
-    try bf.encode(16, 64, &blob, gpa);
-    var bf2 = try Bitfield.decode(gpa, blob.items, 16, 128);
+    var blob_buf: [256]u8 = undefined;
+    const blob = try bf.encodeTo(16, 64, &blob_buf);
+    var bf2 = try Bitfield.decode(gpa, blob, 16, 128);
     defer bf2.deinit(gpa);
     try std.testing.expectEqual(@as(u32, 8), bf2.nbits);
     try std.testing.expectEqual(@as(u32, 0), bf2.filled());
@@ -1327,10 +1312,10 @@ fn fuzzBitfieldPersistOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
     // Persist with the caller's geometry (piece size 1 keeps count() equal to
     // the file size) and read it back exactly.
-    var blob: std.ArrayList(u8) = .empty;
-    defer blob.deinit(gpa);
-    try bf.encode(1, nbits, &blob, gpa);
-    var back = try Bitfield.decode(gpa, blob.items, 1, nbits);
+    const persist = try gpa.alloc(u8, bf.encodedLen());
+    defer gpa.free(persist);
+    const blob = try bf.encodeTo(1, nbits, persist);
+    var back = try Bitfield.decode(gpa, blob, 1, nbits);
     defer back.deinit(gpa);
     try std.testing.expectEqual(nbits, back.nbits);
     var i: u32 = 0;
@@ -1340,7 +1325,7 @@ fn fuzzBitfieldPersistOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
     // A reader with any other geometry must see an empty field, never a
     // half-applied one sized from the blob's stale header claims.
-    var stale = try Bitfield.decode(gpa, blob.items, 1, nbits + 1);
+    var stale = try Bitfield.decode(gpa, blob, 1, nbits + 1);
     defer stale.deinit(gpa);
     try std.testing.expectEqual(count(nbits + 1, 1), stale.nbits);
     try std.testing.expectEqual(@as(u32, 0), stale.filled());

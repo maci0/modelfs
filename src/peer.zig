@@ -1,4 +1,4 @@
-//! Peer HTTP server (/ping, /have, /data, /stage) and the matching fetch
+//! Peer HTTP server (/ping, /have, /data) and the matching fetch
 //! client: bearer auth, bounded head reads, range hydration, and zero-copy
 //! streaming.
 const std = @import("std");
@@ -7,7 +7,6 @@ const proto = @import("proto.zig");
 const sys = @import("sys.zig");
 const store_mod = @import("store.zig");
 const discover = @import("discover.zig");
-const rdma = @import("rdma.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 const c = sys.c;
 
@@ -508,7 +507,7 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
     // matter what rides behind it. Validating the path parameter first used
     // to shadow the 404 branch, so e.g. "/nope" answered 400 on one request
     // shape and 404 on another.
-    const routed = std.mem.eql(u8, path, "/have") or std.mem.eql(u8, path, "/data") or std.mem.eql(u8, path, "/stage");
+    const routed = std.mem.eql(u8, path, "/have") or std.mem.eql(u8, path, "/data");
     if (!routed) {
         replyStatus(self, fd, "404 Not Found");
         return;
@@ -538,20 +537,6 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
         serveHave(self, fd, rel);
         return;
     }
-    if (std.mem.eql(u8, path, "/stage")) {
-        // Same gate as Range on /data: the required parameter is a client
-        // error answered before any storage touch or handler timer, so a
-        // missing piece cannot 404 on an absent path the way a missing
-        // Range never does.
-        const idx = parseStagePiece(target) orelse {
-            replyStatus(self, fd, "400 Bad Request");
-            return;
-        };
-        const t0 = sys.monoNs(self.io);
-        defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
-        serveStage(self, fd, rel, idx);
-        return;
-    }
     {
         const rh = proto.headerGet(head, "Range") orelse {
             replyStatus(self, fd, "400 Bad Request");
@@ -567,15 +552,6 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
     }
 }
 
-/// Required `piece=N` query on /stage: unsigned decimal that fits u32.
-/// Missing, empty, signed, grouped, or over-wide values are the same
-/// client error a missing Range is on /data.
-fn parseStagePiece(target: []const u8) ?u32 {
-    const piece_str = proto.queryGet(target, "piece") orelse return null;
-    const piece_n = proto.parseU64Fast(piece_str) orelse return null;
-    return std.math.cast(u32, piece_n);
-}
-
 fn decodePath(target: []const u8, out: []u8) ![]u8 {
     const q = proto.queryGet(target, "path") orelse return error.NoPath;
     return proto.urlDecode(out, q);
@@ -587,7 +563,7 @@ const OriginReg = struct {
 };
 
 /// Origin size and identity of a regular file at `rel`, or null after sending
-/// the matching error reply. /have, /data, and /stage share this so a directory
+/// the matching error reply. /have and /data share this so a directory
 /// cannot 404 on one route and 502 on another, and an unusable st_size stays
 /// 502 on every route. Identity rides with the size so a same-size rewrite
 /// wipes this node's marks before /have advertises them or /data serves them.
@@ -616,9 +592,8 @@ fn originRegular(self: *Server, fd: c_int, rel: []const u8) ?OriginReg {
     return .{ .size = size, .id = store_mod.OriginId.fromStat(st) };
 }
 
-/// Live cache entry for `rel`, or null after a 500. Shared by /have, /data,
-/// and /stage so an open failure cannot 500 on one route and drop the
-/// connection on the other.
+/// Live cache entry for `rel`, or null after a 500. Shared by /have and /data
+/// so an open failure cannot 500 on one route and drop the connection on the other.
 fn cacheEntry(self: *Server, fd: c_int, rel: []const u8, orig: OriginReg) ?*store_mod.Store.Cached {
     return self.store.getIdentified(rel, orig.size, orig.id, sys.monoSec(self.io)) catch |err| {
         // The fetching peer only sees 500; without this line the serving
@@ -656,11 +631,7 @@ fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
     file.mu.unlock(self.io);
     defer self.gpa.free(snap);
     var hdr: [192]u8 = undefined;
-    // X-Stage advertises the staged (RDMA) data plane for piece fetches;
-    // absent on a node whose backend cannot stage, so fetchers never probe
-    // /stage against it.
-    const stage_hdr = if (rdma.backend.available()) "X-Stage: 1\r\n" else "";
-    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Piece-Size: {d}\r\n{s}Content-Length: {d}\r\nConnection: close\r\n\r\n", .{ self.store.piece_size, stage_hdr, snap.len }) catch {
+    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nX-Piece-Size: {d}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ self.store.piece_size, snap.len }) catch {
         std.log.warn("have header format failed for {s}; replying 500", .{rel});
         replyStatus(self, fd, "500 Internal Server Error");
         return;
@@ -701,109 +672,6 @@ fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
             return;
         }
         done += take;
-    }
-}
-
-/// Stages one piece for a fetching peer's RDMA read. The piece is hydrated
-/// (origin fills, hashes recorded), then its cached bytes are verified
-/// against the trusted digest before anything is staged -- only verified
-/// bytes are ever exposed through a registered window. A piece with no
-/// trusted digest (legacy cache, no manifest) stages as-is: the fetching
-/// node verifies against its own reference, the same residual /data
-/// already documents. The 200 body is the window (rdma.window_len bytes):
-/// opaque addr/rkey/len plus the digest. 501 means this node has no
-/// staging backend (its /have never advertised X-Stage), so the fetching
-/// peer falls back to /data. The xfer guard covers hydration and the read
-/// into the staging buffer; once the bytes are in the backend's registered
-/// copy the cache fd no longer matters, so a punch after stage is safe.
-fn serveStage(self: *Server, fd: c_int, rel: []const u8, idx: u32) void {
-    const orig = originRegular(self, fd, rel) orelse return;
-    const size = orig.size;
-    const file = cacheEntry(self, fd, rel, orig) orelse return;
-    defer self.store.releaseFile(file);
-    // Same whole-transfer guard as serveData: hydration and the staging
-    // read must not race a punch, and a hole read here would stage zeros.
-    // beginXfer takes content_mu so a concurrent copyIntoCache cannot
-    // pwrite under this transfer.
-    self.store.beginXfer(file);
-    defer self.store.endXfer(file);
-    const ps = self.store.piece_size;
-    const ln = piece.len(size, idx, ps);
-    if (ln == 0) {
-        // A piece index past EOF names nothing to stage: client error.
-        replyStatus(self, fd, "400 Bad Request");
-        return;
-    }
-    const start = piece.offset(idx, ps);
-    // Capability gate before the hydration: a node with no data-plane
-    // backend can only answer 501, so answer it before paying for a
-    // full-piece hydration (origin read plus cache write) the request can
-    // never use. Same predicate serveHave gates the X-Stage advertisement
-    // on, and every request-level failure (400/404/502) still answers first.
-    if (!rdma.backend.available()) {
-        replyStatus(self, fd, "501 Not Implemented");
-        return;
-    }
-    if (!hydrateRange(self, fd, file, .{ .off = start, .len = ln }, size)) return;
-    const expect = self.store.expectedHash(file, idx, sys.monoMs(self.io));
-    const buf = self.gpa.alloc(u8, ln) catch {
-        std.log.warn("stage buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, idx });
-        replyStatus(self, fd, "500 Internal Server Error");
-        return;
-    };
-    defer self.gpa.free(buf);
-    const n = self.store.readCache(file, buf, start, sys.monoSec(self.io));
-    if (n < 0 or @as(u64, @intCast(n)) != ln) {
-        std.log.warn("stage read failed for {s} piece {d}; replying 500", .{ file.rel, idx });
-        replyStatus(self, fd, "500 Internal Server Error");
-        return;
-    }
-    var digest: [piece.digest_len]u8 = undefined;
-    piece.digest(buf, &digest);
-    if (expect) |e| {
-        if (!std.mem.eql(u8, &digest, &e)) {
-            // The cached bytes no longer match their trusted digest; they
-            // must not be staged (the fetching peer would mark them filled).
-            // Heal like verifyRange: the next fill re-hydrates from origin.
-            _ = self.store.stats.serve_verify_fail.fetchAdd(1, .monotonic);
-            std.log.warn("piece {s} {d} failed at-rest verification; refusing to stage and healing", .{ file.rel, idx });
-            self.store.healPiece(file, idx);
-            replyStatus(self, fd, "500 Internal Server Error");
-            return;
-        }
-    }
-    const win = rdma.backend.stage(buf, &digest) orelse {
-        replyStatus(self, fd, "501 Not Implemented");
-        return;
-    };
-    var body: [rdma.window_len]u8 = undefined;
-    const enc = rdma.encodeWindow(win, &body) catch {
-        rdma.backend.release(win);
-        std.log.warn("stage window encode failed for {s} piece {d}; replying 500", .{ file.rel, idx });
-        replyStatus(self, fd, "500 Internal Server Error");
-        return;
-    };
-    var hdr: [192]u8 = undefined;
-    const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{rdma.window_len}) catch {
-        rdma.backend.release(win);
-        std.log.warn("stage header format failed for {s} piece {d}; replying 500", .{ file.rel, idx });
-        replyStatus(self, fd, "500 Internal Server Error");
-        return;
-    };
-    const hw = sys.writeAll(fd, h);
-    if (hw < 0) {
-        rdma.backend.release(win);
-        std.log.warn("stage head send failed for {s} piece {d} (errno {d}); dropping peer transfer", .{ file.rel, idx, -hw });
-        return;
-    }
-    // Counted like serveHave/serveData: a node staging pieces must be
-    // visible in status.json even when every transfer succeeds.
-    _ = self.store.stats.http_ok.fetchAdd(1, .monotonic);
-    _ = self.store.stats.bytes_to_peer.fetchAdd(win.len, .monotonic);
-    const bw = sys.writeAll(fd, enc);
-    if (bw < 0) {
-        rdma.backend.release(win);
-        std.log.warn("stage window send failed for {s} piece {d} (errno {d}); dropping peer transfer", .{ file.rel, idx, -bw });
     }
 }
 
@@ -1133,11 +1001,9 @@ fn reply(fd: c_int, s: []const u8) void {
 
 /// Empty-body response; every error path shares this framing. 500 and 502
 /// feed the store's http_5xx counter so a failing node is visible in
-/// status.json without grepping the journal. 501 is a capability answer
-/// (/stage without a data-plane backend): the fetching peer falls back to
-/// /data, and counting it would make an HTTP-only node look failing.
+/// status.json without grepping the journal.
 fn replyStatus(self: *Server, fd: c_int, status: []const u8) void {
-    if (status.len >= 3 and status[0] == '5' and !std.mem.startsWith(u8, status, "501"))
+    if (status.len >= 3 and status[0] == '5')
         _ = self.store.stats.http_5xx.fetchAdd(1, .monotonic);
     var buf: [96]u8 = undefined;
     const res = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{status}) catch return;
@@ -1219,14 +1085,7 @@ fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: c_int, head_buf:
     const declared = proto.parseU64Fast(cl_str) orelse return error.BadContentLength;
     if (declared > max_have_body_bytes) return error.BodyTooLarge;
     const bits = try finishBodyAlloc(gpa, io, fd, head_buf, head_len, total_read, null, deadline_ms);
-    // X-Stage: 1 advertises the peer's staged data plane. Anything else
-    // (absent, malformed) reads as no staging; fetchers only /stage when
-    // the have line says the peer can.
-    const stage = blk: {
-        const v = proto.headerGet(head, "X-Stage") orelse break :blk false;
-        break :blk std.mem.eql(u8, v, "1");
-    };
-    return .{ .bits = bits, .piece_size = piece_size, .stage = stage };
+    return .{ .bits = bits, .piece_size = piece_size };
 }
 
 /// Dials and sends one GET (/have, or /data when range is set); returns the
@@ -1265,51 +1124,6 @@ fn fetchRangeInto(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []con
     const fd = try sendRequest(io, psk, ip, port, rel, range);
     defer sys.close(fd);
     _ = try readRangeBodyAllocDeadline(gpa, io, fd, range.start, range.end, out, null);
-}
-
-/// Attempts one staged fetch of piece idx from (ip, port) into out: the
-/// /stage control exchange returns the serving node's window (its
-/// registered buffer for this piece), and the local backend reads the
-/// window's bytes (the RDMA data plane). True when out was filled; false
-/// on any failure -- the peer cannot stage, the reply is malformed, or the
-/// backend read failed -- so the caller falls back to the HTTP /data path.
-/// The caller still verifies the landed bytes against its own trusted
-/// digest (hydratePiece); the window's digest is advisory, never trusted.
-fn fetchPieceStaged(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, idx: u32, out: []u8) bool {
-    var qbuf: [4096 * 3]u8 = undefined;
-    const enc = proto.urlEncode(&qbuf, rel) catch return false;
-    var req: [max_head_bytes]u8 = undefined;
-    const s = std.fmt.bufPrint(&req, "GET /stage?path={s}&piece={d} HTTP/1.1\r\nHost: {s}:{d}\r\nAuthorization: Bearer {s}\r\nConnection: close\r\n\r\n", .{ enc, idx, ip, port, psk }) catch return false;
-    const fd = dial(io, ip, port, null) catch return false;
-    defer sys.close(fd);
-    if (sys.writeAll(fd, s) < 0) return false;
-    var head_buf: [8192]u8 = undefined;
-    var head_len: usize = 0;
-    var total_read: usize = 0;
-    readHeadFull(io, fd, &head_buf, &head_len, &total_read) catch return false;
-    const head = head_buf[0..head_len];
-    const status_end = std.mem.find(u8, head, "\r\n") orelse return false;
-    // Any non-200 (501 no staging here, 400 bad request, 404 absent) is a
-    // clean fallback signal; only a 200 carries a window.
-    if (!proto.httpStatusIs(head[0..status_end], 200)) return false;
-    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
-    const cl = proto.parseU64Fast(cl_str) orelse return false;
-    if (cl != rdma.window_len) return false;
-    var body: [rdma.window_len]u8 = undefined;
-    // The full head buffer, not a truncated slice: finishBodyAlloc indexes
-    // pipelined body bytes at head_buf[head_len..] past the head.
-    _ = finishBodyAlloc(gpa, io, fd, &head_buf, head_len, total_read, &body, null) catch return false;
-    const win = rdma.decodeWindow(&body) orelse return false;
-    if (win.len != out.len) {
-        // A window we cannot use still holds a staged slot on the serving
-        // node; consume it so the pool is not leaked (same release contract
-        // as serveStage's send failures).
-        rdma.backend.release(win);
-        return false;
-    }
-    if (rdma.backend.read(win, out)) return true;
-    rdma.backend.release(win);
-    return false;
 }
 
 /// Binds a 206 body to the range we asked for. Content-Length alone cannot
@@ -1542,7 +1356,7 @@ fn probeWorker(ctx: *ProbeCtx) void {
                     // it has nothing. Connection failures stay uncached.
                     // A 404 proves the peer is reachable again, so it also
                     // clears any probe-down state from earlier failures.
-                    ctx.cat.havePut(ctx.rel, p.ip, p.port, &.{}, 0, false, ctx.now_ms);
+                    ctx.cat.havePut(ctx.rel, p.ip, p.port, &.{}, 0, ctx.now_ms);
                     if (ctx.cat.clearProbeDown(p.ip, p.port))
                         std.log.info("peer {s}:{d} /have probe recovered", .{ p.ip, p.port });
                     ctx.slots[gi] = false;
@@ -1562,7 +1376,7 @@ fn probeWorker(ctx: *ProbeCtx) void {
             defer ctx.gpa.free(rep.bits);
             if (ctx.cat.clearProbeDown(p.ip, p.port))
                 std.log.info("peer {s}:{d} /have probe recovered", .{ p.ip, p.port });
-            ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size, rep.stage, ctx.now_ms);
+            ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size, ctx.now_ms);
             ctx.slots[gi] = rep.hasPiece(ctx.idx, ctx.local_piece_size);
             break;
         }
@@ -1789,38 +1603,6 @@ fn fetchFromCands(
         // out-of-band truncate race today) must not underflow the range end.
         const range: proto.Range = .{ .start = start, .end = start +| out.len -| 1 };
         const t0 = sys.monoNs(cat.io);
-        // Staged (RDMA) fetch first, only when the have line says this
-        // peer advertises the data plane and its staging has not failed
-        // recently: a fleet without verbs never pays the /stage probe, and
-        // a peer whose backend broke is skipped until the backoff expires.
-        // Any staged failure falls through to the HTTP /data path below --
-        // the staged plane is best-effort by construction.
-        const now_ms = sys.monoMs(cat.io);
-        const can_stage = cat.haveStage(rel, win.ip, win.port, now_ms) == true and
-            !cat.stageDown(win.ip, win.port, now_ms);
-        const staged_ok = if (can_stage) blk: {
-            const ok = fetchPieceStaged(gpa, cat.io, psk, win.ip, win.port, rel, idx, out);
-            if (!ok) {
-                // Stamp the backoff at the failure, not the attempt start:
-                // fetchPieceStaged's dial/head budget is 15s+10s against a
-                // 2s TTL, so a start-of-attempt stamp leaves expires_ms in
-                // the past and every later piece retries /stage (the extra
-                // round trip this mark exists to skip). A fast 501 still
-                // lands the same 2s window. Edge-triggered like
-                // probe_down/fetch_down: the first failure names the peer.
-                if (cat.noteStageDown(win.ip, win.port, sys.monoMs(cat.io)))
-                    std.log.warn("staged fetch failed on {s}:{d} for {s} piece {d}; falling back to HTTP", .{ win.ip, win.port, rel, idx });
-            }
-            break :blk ok;
-        } else false;
-        if (staged_ok) {
-            _ = cat.inflight(win.ip, win.port, -1);
-            const dt = sys.monoNs(cat.io) - t0;
-            cat.updateGoodput(win.ip, win.port, rangeBps(out.len, dt));
-            if (cat.clearFetchDown(win.ip, win.port))
-                std.log.info("peer {s}:{d} piece fetch recovered", .{ win.ip, win.port });
-            return;
-        }
         // Stream the body straight into out: no piece-sized allocation or
         // copy on the fetch path.
         fetchRangeInto(gpa, cat.io, psk, win.ip, win.port, rel, range, out) catch |err| {
@@ -2649,7 +2431,7 @@ test "fault tolerance: traversal path is rejected with 400" {
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "correct_secret", "127.0.0.1", port, "/etc/passwd"));
 }
 
-test "peer /have, /data, and /stage hide .cluster the way FUSE does" {
+test "peer /have and /data hide .cluster the way FUSE does" {
     // A PSK holder used to fetch origin/.cluster/<id>.json through the piece
     // protocol (relOk admits a leading-dot component), hydrating lease JSON
     // into the cache and advertising it via /have. FUSE lookup is ENOENT;
@@ -2687,9 +2469,6 @@ test "peer /have, /data, and /stage hide .cluster the way FUSE does" {
     var data = try roundTrip(port, "GET /data?path=.cluster%2Fspark1.json HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-15\r\nConnection: close\r\n\r\n");
     defer data.deinit(gpa);
     try std.testing.expect(std.mem.startsWith(u8, data.items, "HTTP/1.1 404 Not Found\r\n"));
-    var staged = try roundTrip(port, "GET /stage?path=.cluster%2Fspark1.json&piece=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
-    defer staged.deinit(gpa);
-    try std.testing.expect(std.mem.startsWith(u8, staged.items, "HTTP/1.1 404 Not Found\r\n"));
     // Missing Range on a cluster path is still 404, not 400: the resource
     // is not a piece, so the Range gate never runs.
     var norange = try roundTrip(port, "GET /data?path=.cluster HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
@@ -2733,24 +2512,19 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
 
-    // /have, /data, and /stage must report the origin as unavailable (502,
+    // /have and /data must report the origin as unavailable (502,
     // surfacing here as HttpStatus), never as a healthy miss: a fetching
     // peer and an operator must be able to tell "nobody has this file" from
     // "the origin is broken" -- fillFromPeers keys probe_err and its
     // fallback tier on exactly this distinction.
     try std.testing.expectError(error.HttpStatus, fetchHave(gpa, std.testing.io, "secret", "127.0.0.1", port, "loop/x.bin"));
     try std.testing.expectError(error.HttpStatus, fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "loop/x.bin", 0, 8));
-    {
-        var res = try roundTrip(port, "GET /stage?path=loop%2Fx.bin&piece=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
-        defer res.deinit(gpa);
-        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 502 Bad Gateway\r\n"));
-    }
 
-    // All three failures are server-side trouble: each must land in the
+    // Both failures are server-side trouble: each must land in the
     // http_5xx counter status.json publishes (one per reply, bumped before
     // the head the client above already read), or an origin outage is
     // indistinguishable from ordinary traffic between discovery ticks.
-    try std.testing.expectEqual(@as(u64, 3), srv.store.stats.http_5xx.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_5xx.load(.monotonic));
 
     // A genuinely absent path stays a healthy miss (404 => PeerMiss), the
     // shape fillFromPeers relies on to keep probe_err clean on skewed fleets.
@@ -2758,10 +2532,10 @@ test "origin stat failures answer 502 while true misses stay healthy 404s" {
 
     // The healthy miss must not have fed the failure gauge: 404s are fleet
     // skew, not broken nodes.
-    try std.testing.expectEqual(@as(u64, 3), srv.store.stats.http_5xx.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_5xx.load(.monotonic));
 }
 
-test "a path too long for the origin answers 400 on /have, /data, and /stage alike" {
+test "a path too long for the origin answers 400 on /have and /data alike" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;
@@ -2797,14 +2571,6 @@ test "a path too long for the origin answers 400 on /have, /data, and /stage ali
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
     }
-    {
-        var req_buf: [8192]u8 = undefined;
-        const req = try std.fmt.bufPrint(&req_buf, "GET /stage?path={s}&piece=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n", .{long_rel});
-        var res = try roundTrip(port, req);
-        defer res.deinit(gpa);
-        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
-    }
-
     // And none of the replies may pollute the 5xx health gauge status.json
     // publishes: nothing server-side failed here.
     try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
@@ -3337,7 +3103,6 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
     // A routed path without its ?path= parameter is a client error answered
     // before any storage touch, not a 404 and not a crash. /data is the same
     // even when a Range is present: missing path is not a missing Range.
-    // /stage is the same even when piece= is present.
     {
         var res = try roundTrip(port, "GET /have HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
@@ -3345,11 +3110,6 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
     }
     {
         var res = try roundTrip(port, "GET /data HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-0\r\nConnection: close\r\n\r\n");
-        defer res.deinit(gpa);
-        try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
-    }
-    {
-        var res = try roundTrip(port, "GET /stage?piece=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
         defer res.deinit(gpa);
         try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 400 Bad Request\r\n"));
     }
@@ -3911,165 +3671,6 @@ test "fillFromPeers probes concurrently and streams piece into out" {
     try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
 }
 
-test "fillFromPeers fetches staged pieces when the peer advertises X-Stage" {
-    const gpa = std.testing.allocator;
-    var ob: [128]u8 = undefined;
-    var cb: [128]u8 = undefined;
-    const origin_d = try sys.scratchDir(&ob, "modelfs-ffp-stage-o");
-    defer sys.deleteTree(std.testing.io, origin_d);
-    const cache_d = try sys.scratchDir(&cb, "modelfs-ffp-stage-c");
-    defer sys.deleteTree(std.testing.io, cache_d);
-
-    var pattern: [16]u8 = undefined;
-    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 37);
-    var fbuf: [192]u8 = undefined;
-    var fz: [192]u8 = undefined;
-    const fp = try std.fmt.bufPrint(&fbuf, "{s}/one.bin", .{origin_d});
-    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
-
-    const saved = rdma.backend;
-    rdma.backend = .{ .kind = .fake, .gpa = gpa };
-    defer {
-        for (rdma.backend.staged.items) |b| gpa.free(b);
-        rdma.backend.staged.deinit(gpa);
-        rdma.backend = saved;
-    }
-
-    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
-    defer srv.stop();
-    const port = srv.port();
-    // Warm the piece through the server's own /data path so /have advertises it.
-    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "one.bin", 0, 15);
-    gpa.free(warm);
-
-    var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
-    defer cat.deinit();
-    try cat.paths.append(gpa, .{
-        .peer_id = "full",
-        .ip = "127.0.0.1",
-        .port = port,
-        .ewma_bps = 1e9,
-        .hops = 0,
-    });
-
-    var out: [16]u8 = undefined;
-    try fillFromPeers(gpa, "secret", &cat, "one.bin", 0, 16, &out, &srv.store.stats);
-    try std.testing.expectEqualSlices(u8, &pattern, &out);
-    // The staged plane was used: one window read, and the have line carries
-    // the X-Stage capability the fetch gated on.
-    try std.testing.expectEqual(@as(u64, 1), rdma.backend.reads_done);
-    try std.testing.expectEqual(@as(?bool, true), cat.haveStage("one.bin", "127.0.0.1", port, sys.monoMs(cat.io)));
-}
-
-test "fillFromPeers backs off /stage after a staged fetch fails" {
-    // A peer that advertises X-Stage but fails every /stage (broken backend,
-    // including a dial that outruns the 2s TTL) must not cost an extra
-    // round trip per piece: the first failure marks the address down from
-    // the failure instant, and later pieces go straight to /data.
-    const gpa = std.testing.allocator;
-    var ob: [128]u8 = undefined;
-    var cb: [128]u8 = undefined;
-    const origin_d = try sys.scratchDir(&ob, "modelfs-ffp-backoff-o");
-    defer sys.deleteTree(std.testing.io, origin_d);
-    const cache_d = try sys.scratchDir(&cb, "modelfs-ffp-backoff-c");
-    defer sys.deleteTree(std.testing.io, cache_d);
-
-    // 32-byte file: two 16-byte pieces.
-    var pattern: [32]u8 = undefined;
-    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 37);
-    var fbuf: [192]u8 = undefined;
-    var fz: [192]u8 = undefined;
-    const fp = try std.fmt.bufPrint(&fbuf, "{s}/two.bin", .{origin_d});
-    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
-
-    const saved = rdma.backend;
-    rdma.backend = .{ .kind = .fake, .gpa = gpa, .fake_cap = 0 };
-    defer {
-        rdma.backend.staged.deinit(gpa);
-        rdma.backend = saved;
-    }
-
-    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
-    defer srv.stop();
-    const port = srv.port();
-    // Warm both pieces through the server's own /data path.
-    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "two.bin", 0, 31);
-    gpa.free(warm);
-
-    var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
-    defer cat.deinit();
-    try cat.paths.append(gpa, .{
-        .peer_id = "full",
-        .ip = "127.0.0.1",
-        .port = port,
-        .ewma_bps = 1e9,
-        .hops = 0,
-    });
-
-    var out: [16]u8 = undefined;
-    try fillFromPeers(gpa, "secret", &cat, "two.bin", 0, 16, &out, &srv.store.stats);
-    try std.testing.expectEqualSlices(u8, pattern[0..16], &out);
-    try std.testing.expectEqual(@as(u64, 0), rdma.backend.reads_done);
-    // Piece 0's /stage attempt failed and marked the address down.
-    try std.testing.expectEqual(@as(u64, 1), rdma.backend.stage_calls);
-    const now_ms = sys.monoMs(cat.io);
-    try std.testing.expect(cat.stageDown("127.0.0.1", port, now_ms));
-    // Piece 1 skips /stage entirely (backoff): bytes still land via /data.
-    try fillFromPeers(gpa, "secret", &cat, "two.bin", 1, 16, &out, &srv.store.stats);
-    try std.testing.expectEqualSlices(u8, pattern[16..32], &out);
-    try std.testing.expectEqual(@as(u64, 1), rdma.backend.stage_calls);
-    try std.testing.expectEqual(@as(u64, 0), rdma.backend.reads_done);
-}
-
-test "fillFromPeers falls back to /data when staging is advertised but unavailable" {
-    const gpa = std.testing.allocator;
-    var ob: [128]u8 = undefined;
-    var cb: [128]u8 = undefined;
-    const origin_d = try sys.scratchDir(&ob, "modelfs-ffp-stagefail-o");
-    defer sys.deleteTree(std.testing.io, origin_d);
-    const cache_d = try sys.scratchDir(&cb, "modelfs-ffp-stagefail-c");
-    defer sys.deleteTree(std.testing.io, cache_d);
-
-    var pattern: [16]u8 = undefined;
-    for (&pattern, 0..) |*b, i| b.* = @truncate(i *% 37);
-    var fbuf: [192]u8 = undefined;
-    var fz: [192]u8 = undefined;
-    const fp = try std.fmt.bufPrint(&fbuf, "{s}/one.bin", .{origin_d});
-    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fz, fp), &pattern));
-
-    // Available (so /have advertises X-Stage) but with a zero-size pool: the
-    // server stages nothing, /stage answers 501, and the fetch must fall
-    // through to the HTTP /data path on the same peer.
-    const saved = rdma.backend;
-    rdma.backend = .{ .kind = .fake, .gpa = gpa, .fake_cap = 0 };
-    defer {
-        rdma.backend.staged.deinit(gpa);
-        rdma.backend = saved;
-    }
-
-    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
-    defer srv.stop();
-    const port = srv.port();
-    const warm = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", port, "one.bin", 0, 15);
-    gpa.free(warm);
-
-    var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
-    defer cat.deinit();
-    try cat.paths.append(gpa, .{
-        .peer_id = "full",
-        .ip = "127.0.0.1",
-        .port = port,
-        .ewma_bps = 1e9,
-        .hops = 0,
-    });
-
-    var out: [16]u8 = undefined;
-    try fillFromPeers(gpa, "secret", &cat, "one.bin", 0, 16, &out, &srv.store.stats);
-    try std.testing.expectEqualSlices(u8, &pattern, &out);
-    // No window was ever read: the bytes came from the HTTP fallback.
-    try std.testing.expectEqual(@as(u64, 0), rdma.backend.reads_done);
-}
-
 test "fillFromPeers counts failed /have probes but not healthy misses" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
@@ -4184,8 +3785,6 @@ const seed_reply_zero_ps = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 
 const seed_reply_status_2000 = fuzzcorpus.entry("HTTP/1.1 2000 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16\r\nConnection: close\r\n\r\nz");
 const seed_reply_status_4040 = fuzzcorpus.entry("HTTP/1.1 4040 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 const seed_reply_206_cl_mismatch = fuzzcorpus.entry("HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-7/8\r\nConnection: close\r\n\r\nABCD");
-const seed_reply_stage = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16\r\nX-Stage: 1\r\nConnection: close\r\n\r\n\x01");
-const seed_reply_stage_true = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nX-Piece-Size: 16\r\nX-Stage: true\r\nConnection: close\r\n\r\n\x01");
 const seed_reply_bitmap = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\n\x01\x80");
 
 const fuzz_reply_corpus = [_][]const u8{
@@ -4209,8 +3808,6 @@ const fuzz_reply_corpus = [_][]const u8{
     &seed_reply_status_2000,
     &seed_reply_status_4040,
     &seed_reply_206_cl_mismatch,
-    &seed_reply_stage,
-    &seed_reply_stage_true,
     &seed_reply_bitmap,
 };
 
@@ -4355,14 +3952,6 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                     const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
                     const ps_n = proto.parseU64Fast(ps_str) orelse return error.TestUnexpectedResult;
                     try std.testing.expectEqual(std.math.cast(u32, ps_n) orelse return error.TestUnexpectedResult, rep.piece_size);
-                    // X-Stage is the /stage probe gate: only the exact
-                    // token "1" advertises a staged data plane. Anything
-                    // else (absent, "true", "1 ") must not look staged.
-                    const want_stage = blk: {
-                        const v = proto.headerGet(head, "X-Stage") orelse break :blk false;
-                        break :blk v.len == 1 and v[0] == '1';
-                    };
-                    try std.testing.expectEqual(want_stage, rep.stage);
                     // hasPiece is the fill-routing trust boundary: a
                     // misaligned advertised grid cannot look like a hit,
                     // and an index past the bitmap stays unset. Fixed
@@ -4562,7 +4151,7 @@ fn fuzzRequestHeadOne(_: void, smith: *std.testing.Smith) anyerror!void {
     try std.testing.expectEqual(refBearerOk(formed, tok), proto.bearerOk(formed, tok));
 
     const path = proto.pathOnly(target);
-    if (!std.mem.eql(u8, path, "/have") and !std.mem.eql(u8, path, "/data") and !std.mem.eql(u8, path, "/stage")) return;
+    if (!std.mem.eql(u8, path, "/have") and !std.mem.eql(u8, path, "/data")) return;
     var rel_buf: [4096]u8 = undefined;
     const q = proto.queryGet(target, "path") orelse return;
     const rel = proto.urlDecode(&rel_buf, q) catch return;
@@ -4570,13 +4159,6 @@ fn fuzzRequestHeadOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const routed_ok = store_mod.relOk(rel);
     try std.testing.expectEqual(refRelOk(rel), routed_ok);
     if (!routed_ok) return;
-    if (std.mem.eql(u8, path, "/stage")) {
-        const idx = parseStagePiece(target) orelse return;
-        var canon: [32]u8 = undefined;
-        const canon_s = std.fmt.bufPrint(&canon, "{d}", .{idx}) catch return;
-        try std.testing.expectEqual(@as(u64, idx), proto.parseU64Fast(canon_s) orelse return error.PieceRoundTripFailed);
-        return;
-    }
     if (path[1] != 'd') return;
     const rh = proto.headerGet(head, "Range") orelse return;
     const rg = proto.parseRange(rh) orelse return;
@@ -4599,8 +4181,8 @@ test "fuzz request head parsing pipeline gates auth paths and ranges" {
 // This harness drives the real handleConn over a socketpair instead and
 // pins the published routing contract end to end: auth before method gate,
 // method gate before routing, unknown routes 404 ahead of query validation,
-// traversal/control paths refused, Range required on /data and piece=N on
-// /stage, and every outcome landed in the counter status.json publishes.
+// traversal/control paths refused, Range required on /data, and every
+// outcome landed in the counter status.json publishes.
 
 const seed_serve_ping_ok = fuzzcorpus.entry("GET /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_serve_post_ping = fuzzcorpus.entry("POST /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
@@ -4615,11 +4197,6 @@ const seed_serve_data_bad_range = fuzzcorpus.entry("GET /data?path=a.bin HTTP/1.
 const seed_serve_data_no_path = fuzzcorpus.entry("GET /data HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-0\r\n\r\n");
 const seed_serve_empty_path = fuzzcorpus.entry("GET /have?path= HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_serve_cluster_path = fuzzcorpus.entry("GET /have?path=.cluster%2Fspark1.json HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_stage_no_piece = fuzzcorpus.entry("GET /stage?path=a.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_stage_bad_piece = fuzzcorpus.entry("GET /stage?path=a.bin&piece=x HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_stage_no_path = fuzzcorpus.entry("GET /stage?piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_serve_stage_ok = fuzzcorpus.entry("GET /stage?path=a.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-
 const fuzz_serve_corpus = [_][]const u8{
     &seed_req_have_ok,
     &seed_req_traversal,
@@ -4644,17 +4221,13 @@ const fuzz_serve_corpus = [_][]const u8{
     &seed_serve_data_no_path,
     &seed_serve_empty_path,
     &seed_serve_cluster_path,
-    &seed_serve_stage_no_piece,
-    &seed_serve_stage_bad_piece,
-    &seed_serve_stage_no_path,
-    &seed_serve_stage_ok,
 };
 
 /// Every outcome handleConn's published order can produce for a head whose
 /// origin lookups all miss. `dropped` covers both unroutable shapes: a head
 /// that never terminates (EOF before \r\n\r\n) and one whose request line
 /// names no target; neither earns a reply, only the malformed counter.
-const ServeClass = enum { dropped, unauthorized, method_not_allowed, ping_ok, no_route, bad_path, bad_range, bad_piece, miss };
+const ServeClass = enum { dropped, unauthorized, method_not_allowed, ping_ok, no_route, bad_path, bad_range, miss };
 
 /// Independent walk of handleConn's decision order over the head the
 /// handler will actually see (everything up to and including the blank
@@ -4673,8 +4246,7 @@ fn classifyServedHead(head: []const u8) ServeClass {
     if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
     const is_have = std.mem.eql(u8, path, "/have");
     const is_data = std.mem.eql(u8, path, "/data");
-    const is_stage = std.mem.eql(u8, path, "/stage");
-    if (!is_have and !is_data and !is_stage) return .no_route;
+    if (!is_have and !is_data) return .no_route;
     var rel_buf: [4096]u8 = undefined;
     const q = proto.queryGet(target, "path") orelse return .bad_path;
     const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
@@ -4683,9 +4255,6 @@ fn classifyServedHead(head: []const u8) ServeClass {
     if (is_data) {
         const rh = proto.headerGet(served, "Range") orelse return .bad_range;
         _ = proto.parseRange(rh) orelse return .bad_range;
-    }
-    if (is_stage) {
-        _ = parseStagePiece(target) orelse return .bad_piece;
     }
     // Routed requests stop at statOrigin's ENOENT in the fixture below
     // and answer the healthy-miss 404.
@@ -4778,7 +4347,7 @@ fn serveConnCheck(head: []const u8) anyerror!void {
                 got,
             );
         },
-        .bad_path, .bad_range, .bad_piece => {
+        .bad_path, .bad_range => {
             try std.testing.expectEqualStrings(
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 got,
@@ -4863,23 +4432,18 @@ const DataClass = union(enum) {
     no_route,
     bad_path,
     bad_range,
-    bad_piece,
     /// Absent paths and non-regular files answer one identical 404, on
-    /// /have, /data, and /stage alike.
+    /// /have and /data alike.
     not_found,
     have_bits: struct { bits_bytes: usize, nbits: u32 },
     not_satisfiable: u64,
     partial: struct { start: u64, end: u64 },
-    /// /stage on a file that exists, with a piece that is in range, when
-    /// this node has no data-plane backend. Capability, not a 5xx failure.
-    not_implemented,
 };
 
-/// Independent restatement of handleConn's gate order plus serveData's,
-/// serveHave's, and serveStage's decisions over the fixture. Must stay a
-/// pure function of the head: no store state, no clocks. Required params
-/// (Range on /data, piece on /stage) are classified before origin kind, so
-/// a missing Range on an absent path is 400, not 404.
+/// Independent restatement of handleConn's gate order plus serveData's
+/// and serveHave's decisions over the fixture. Must stay a pure function
+/// of the head: no store state, no clocks. Range on /data is classified
+/// before origin kind, so a missing Range on an absent path is 400, not 404.
 fn classifyDataHead(head: []const u8) DataClass {
     const done = std.mem.find(u8, head, "\r\n\r\n") orelse return .dropped;
     const served = head[0 .. done + 4];
@@ -4894,8 +4458,7 @@ fn classifyDataHead(head: []const u8) DataClass {
     if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
     const is_have = std.mem.eql(u8, path, "/have");
     const is_data = std.mem.eql(u8, path, "/data");
-    const is_stage = std.mem.eql(u8, path, "/stage");
-    if (!is_have and !is_data and !is_stage) return .no_route;
+    if (!is_have and !is_data) return .no_route;
     var rel_buf: [4096]u8 = undefined;
     const q = proto.queryGet(target, "path") orelse return .bad_path;
     const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
@@ -4912,14 +4475,6 @@ fn classifyDataHead(head: []const u8) DataClass {
                 .{ .partial = .{ .start = rg.start, .end = @min(rg.end, data_file_size - 1) } },
             // size 0: every start satisfies start >= size, so every range is 416
             .file0 => .{ .not_satisfiable = 0 },
-        };
-    }
-    if (is_stage) {
-        const idx = parseStagePiece(target) orelse return .bad_piece;
-        return switch (dataKindOf(rel)) {
-            .dir, .absent => .not_found,
-            .file48 => if (piece.len(data_file_size, idx, 16) == 0) .bad_piece else .not_implemented,
-            .file0 => if (piece.len(0, idx, 16) == 0) .bad_piece else .not_implemented,
         };
     }
     return switch (dataKindOf(rel)) {
@@ -5059,12 +4614,8 @@ fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
             "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             got,
         ),
-        .bad_path, .bad_range, .bad_piece => try std.testing.expectEqualStrings(
+        .bad_path, .bad_range => try std.testing.expectEqualStrings(
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            got,
-        ),
-        .not_implemented => try std.testing.expectEqualStrings(
-            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             got,
         ),
         .not_satisfiable => |size| {
@@ -5112,12 +4663,6 @@ const seed_data_escape = fuzzcorpus.entry("GET /data?path=%zz HTTP/1.1\r\nAuthor
 const seed_data_traversal = fuzzcorpus.entry("GET /data?path=..%2Fsecret HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-1\r\n\r\n");
 const seed_have_cached = fuzzcorpus.entry("GET /have?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
 const seed_have_empty = fuzzcorpus.entry("GET /have?path=empty.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_stage_mbin = fuzzcorpus.entry("GET /stage?path=m.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_stage_past_eof = fuzzcorpus.entry("GET /stage?path=m.bin&piece=3 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_stage_empty = fuzzcorpus.entry("GET /stage?path=empty.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_stage_dir = fuzzcorpus.entry("GET /stage?path=d.gguf&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-const seed_stage_absent_norange = fuzzcorpus.entry("GET /data?path=nope.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n");
-
 const fuzz_data_corpus = [_][]const u8{
     &seed_data_full,
     &seed_data_piece,
@@ -5147,15 +4692,6 @@ const fuzz_data_corpus = [_][]const u8{
     &seed_serve_ping_unauthed,
     &seed_serve_unknown_route,
     &seed_serve_cluster_path,
-    &seed_serve_stage_no_piece,
-    &seed_serve_stage_bad_piece,
-    &seed_serve_stage_no_path,
-    &seed_serve_stage_ok,
-    &seed_stage_mbin,
-    &seed_stage_past_eof,
-    &seed_stage_empty,
-    &seed_stage_dir,
-    &seed_stage_absent_norange,
 };
 
 fn fuzzServeDataOne(fixture: *DataFixture, smith: *std.testing.Smith) anyerror!void {
@@ -5167,11 +4703,6 @@ test "fuzz data path serves attacker ranges within the published contract" {
     const gpa = std.testing.allocator;
     const fixture = try DataFixture.create(gpa);
     defer fixture.destroy();
-    // Classifier treats a well-formed /stage as 501 (no backend). Pin that
-    // so a sibling test's fake backend cannot turn those heads into 200s.
-    const saved = rdma.backend;
-    rdma.backend = .{ .kind = .none };
-    defer rdma.backend = saved;
     try std.testing.fuzz(fixture, fuzzServeDataOne, .{ .corpus = &fuzz_data_corpus });
 }
 
@@ -5183,9 +4714,6 @@ test "fuzz data path contract holds for mutated corpus heads" {
     const gpa = std.testing.allocator;
     const fixture = try DataFixture.create(gpa);
     defer fixture.destroy();
-    const saved = rdma.backend;
-    rdma.backend = .{ .kind = .none };
-    defer rdma.backend = saved;
     var prng = std.Random.DefaultPrng.init(20260827);
     const rand = prng.random();
     const specials = "\r\n ?=&%.-09";
@@ -5269,118 +4797,9 @@ fn serveDataCheckOk(srv: *Server, head: []const u8) !i32 {
     return 0;
 }
 
-test "serveStage answers 501 without a staging backend and gates its params" {
-    const gpa = std.testing.allocator;
-    const fixture = try DataFixture.create(gpa);
-    defer fixture.destroy();
-    const saved = rdma.backend;
-    rdma.backend = .{ .kind = .none };
-    defer rdma.backend = saved;
-
-    // No backend: /stage answers 501 without hydrating, /have does not
-    // advertise X-Stage, and 501 is not a node-health 5xx.
-    var resp_buf: [4096]u8 = undefined;
-    var resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expectEqualStrings("HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", resp);
-    try std.testing.expectEqual(@as(u64, 0), fixture.st.stats.http_5xx.load(.monotonic));
-    const f = try fixture.srv.store.get("m.bin", data_file_size, 0);
-    defer fixture.srv.store.releaseFile(f);
-    try std.testing.expect(!fixture.srv.store.hasPiece(f, 0, 0));
-    resp = try stageRequest(&fixture.srv, "GET /have?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.find(u8, resp, "X-Stage: 1") == null);
-
-    // Param gates: missing/oversized piece, cluster path, wrong method,
-    // no auth -- the same shape as /data's.
-    resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
-    resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=4294967296 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
-    resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=9999 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 400"));
-    resp = try stageRequest(&fixture.srv, "GET /stage?path=.cluster/spark1.json&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 404"));
-    resp = try stageRequest(&fixture.srv, "POST /stage?path=m.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 405"));
-    resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=0 HTTP/1.1\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 401"));
-}
-
-test "serveStage stages a verified piece and the backend read lands the bytes" {
-    const gpa = std.testing.allocator;
-    const fixture = try DataFixture.create(gpa);
-    defer fixture.destroy();
-    const saved = rdma.backend;
-    rdma.backend = .{ .kind = .fake, .gpa = gpa };
-    // Cleanup must walk the live global (the fake's struct copy diverges
-    // once append reallocates), then restore the previous backend.
-    defer {
-        for (rdma.backend.staged.items) |b| gpa.free(b);
-        rdma.backend.staged.deinit(gpa);
-        rdma.backend = saved;
-    }
-
-    // Piece 1 (bytes 16..32): serveStage hydrates from origin, verifies,
-    // stages, and replies with a window whose read yields the piece bytes.
-    var resp_buf: [4096]u8 = undefined;
-    var resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=1 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK\r\n"));
-    const body_at = std.mem.find(u8, resp, "\r\n\r\n") orelse return error.NoHeaderEnd;
-    const body = resp[body_at + 4 ..];
-    try std.testing.expectEqual(@as(usize, rdma.window_len), body.len);
-    const win = rdma.decodeWindow(body).?;
-    try std.testing.expectEqual(@as(u64, 16), win.len);
-    var out: [16]u8 = undefined;
-    try std.testing.expect(rdma.backend.read(win, &out));
-    try std.testing.expectEqualSlices(u8, data_pattern[16..32], &out);
-    // /have advertises the staged plane while the backend is available.
-    resp = try stageRequest(&fixture.srv, "GET /have?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expect(std.mem.find(u8, resp, "X-Stage: 1") != null);
-}
-
-test "serveStage refuses to stage a piece whose cached bytes fail verification" {
-    const gpa = std.testing.allocator;
-    const fixture = try DataFixture.create(gpa);
-    defer fixture.destroy();
-    var fake: rdma.Backend = .{ .kind = .fake, .gpa = gpa };
-    const saved = rdma.backend;
-    rdma.backend = fake;
-    defer rdma.backend = saved;
-    defer {
-        for (fake.staged.items) |b| gpa.free(b);
-        fake.staged.deinit(gpa);
-    }
-
-    // Admit piece 0 from origin (trusted digest recorded), then corrupt the
-    // cached bytes: staging must refuse (500) and stage nothing.
-    const file = try fixture.st.get("m.bin", data_file_size, sys.monoSec(std.testing.io));
-    defer fixture.st.releaseFile(file);
-    var pbuf: [16]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 16), fixture.st.originPread("m.bin", &pbuf, 0));
-    var h: [piece.digest_len]u8 = undefined;
-    piece.digest(&pbuf, &h);
-    try std.testing.expectEqual(@as(u32, 16), (try fixture.st.beginFill(file, 0, sys.monoSec(std.testing.io))).len);
-    try std.testing.expectEqual(@as(i32, 0), fixture.st.completeFill(file, 0, &pbuf, h, sys.monoSec(std.testing.io)));
-
-    var zb: [256]u8 = undefined;
-    var tb: [256]u8 = undefined;
-    const dp = try std.fmt.bufPrint(&tb, "{s}/data/m.bin", .{fixture.cache()});
-    const cfd = sys.open(try sys.toZ(&zb, dp), c.O_WRONLY, 0);
-    try std.testing.expect(cfd >= 0);
-    defer sys.close(cfd);
-    const junk = [_]u8{0xAA} ** 16;
-    try std.testing.expectEqual(@as(isize, 16), sys.pwriteAll(cfd, &junk, 0));
-
-    const before = fixture.st.stats.serve_verify_fail.load(.monotonic);
-    var resp_buf: [4096]u8 = undefined;
-    const resp = try stageRequest(&fixture.srv, "GET /stage?path=m.bin&piece=0 HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", &resp_buf);
-    try std.testing.expectEqualStrings("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", resp);
-    try std.testing.expectEqual(before + 1, fixture.st.stats.serve_verify_fail.load(.monotonic));
-    try std.testing.expectEqual(@as(usize, 0), fake.staged.items.len);
-}
-
-/// One /stage or /have request against the fixture server over a
-/// socketpair, replied into the caller's buffer; returns the full reply
-/// bytes (head + body) as a slice of it.
+/// One request against the fixture server over a socketpair, replied into
+/// the caller's buffer; returns the full reply bytes (head + body) as a
+/// slice of it.
 fn stageRequest(srv: *Server, head: []const u8, rbuf: []u8) ![]u8 {
     var fds: [2]c_int = undefined;
     if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.Socket;

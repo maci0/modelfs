@@ -89,7 +89,7 @@ pub const Stats = struct {
     fills_origin: std.atomic.Value(u64) = .init(0),
     bytes_from_peer: std.atomic.Value(u64) = .init(0),
     bytes_from_origin: std.atomic.Value(u64) = .init(0),
-    /// Content-Length of accepted /have 200, /data 206, and /stage 200 replies.
+    /// Content-Length of accepted /have 200 and /data 206 replies.
     /// Counted when the status goes on the wire, not after the body drain, so a
     /// client that has already read the reply cannot race the bump. Truncated
     /// sends keep the count and a warn. A serving node is otherwise
@@ -109,7 +109,7 @@ pub const Stats = struct {
     fill_err_origin: std.atomic.Value(u64) = .init(0),
     fill_err_cache: std.atomic.Value(u64) = .init(0),
     fill_err_verify: std.atomic.Value(u64) = .init(0),
-    /// Peer /data and /stage replies dropped because the cached bytes being
+    /// Peer /data replies dropped because the cached bytes being
     /// served failed at-rest verification against their trusted digest (hole
     /// zeros, bit rot, local tamper). The fetching peer falls through to
     /// the next path or the origin, so the fleet keeps serving; this counter
@@ -129,11 +129,9 @@ pub const Stats = struct {
     /// would otherwise look like a slow-but-healthy metadata interval.
     meta_err: std.atomic.Value(u64) = .init(0),
     pieces_culled: std.atomic.Value(u64) = .init(0),
-    /// Peer HTTP server: accepted /have 200, /data 206, and /stage 200
-    /// replies, rejected bearer tokens, and 5xx replies served. http_ok is
-    /// the missing half of the error rate: without it a node serving pieces
-    /// looks idle. 501 (no staging backend) is a capability answer, not a
-    /// 5xx for this gauge.
+    /// Peer HTTP server: accepted /have 200 and /data 206 replies, rejected
+    /// bearer tokens, and 5xx replies served. http_ok is the missing half of
+    /// the error rate: without it a node serving pieces looks idle.
     http_ok: std.atomic.Value(u64) = .init(0),
     http_unauthorized: std.atomic.Value(u64) = .init(0),
     http_5xx: std.atomic.Value(u64) = .init(0),
@@ -150,7 +148,7 @@ pub const Stats = struct {
     /// Unsupported HTTP methods (non-GET). Deduplicated at warn level; every
     /// occurrence still counts here so a probing campaign is not silent.
     http_405: std.atomic.Value(u64) = .init(0),
-    /// Cumulative wall time inside /have, /data, and /stage handlers.
+    /// Cumulative wall time inside /have and /data handlers.
     /// http_us on the tick line is the serving-side twin of rd_us: without it
     /// a node whose peer replies are slow looks healthy (http_ok climbing,
     /// inflight low between requests). 401, 405, malformed heads, and /ping
@@ -2652,9 +2650,13 @@ pub const Store = struct {
         // Encode and path resolution stay outside the lock; both failures
         // bail before anything is mutated, so no hole can outlive its
         // unpersisted mark.
-        var blob: std.ArrayList(u8) = .empty;
-        defer blob.deinit(self.gpa);
-        loaded.bits.encode(self.piece_size, size, &blob, self.gpa) catch {
+        const need = loaded.bits.encodedLen();
+        const blob_mem = self.gpa.alloc(u8, need) catch {
+            std.log.warn("bitfield encode failed for {s}; piece {d} stays cached", .{ rel, idx });
+            return false;
+        };
+        defer self.gpa.free(blob_mem);
+        const blob = loaded.bits.encodeTo(self.piece_size, size, blob_mem) catch {
             std.log.warn("bitfield encode failed for {s}; piece {d} stays cached", .{ rel, idx });
             return false;
         };
@@ -2687,7 +2689,7 @@ pub const Store = struct {
         // persisted durably before any destructive step. A save failure leaves
         // the old sidecar standing and nothing punched; a crash after the save
         // but before the punch costs only a refill over intact bytes.
-        const w = sys.writeFileOwnerOnlyDurable(mp, blob.items);
+        const w = sys.writeFileOwnerOnlyDurable(mp, blob);
         if (w != 0) {
             std.log.warn("bitfield save failed for {s} (errno {d}); piece {d} stays cached", .{ rel, -w, idx });
             return false;
@@ -2720,9 +2722,13 @@ pub const Store = struct {
     /// store.mu window and builder-epoch guard.
     fn punchDiskUnclaimed(self: *Store, rel: []const u8, fd: c_int, size: u64, bits: piece.Bitfield, epoch0: u64) bool {
         if (size == 0) return false;
-        var blob: std.ArrayList(u8) = .empty;
-        defer blob.deinit(self.gpa);
-        bits.encode(self.piece_size, size, &blob, self.gpa) catch {
+        const need = bits.encodedLen();
+        const blob_mem = self.gpa.alloc(u8, need) catch {
+            std.log.warn("bitfield encode failed for {s}; unclaimed bytes stay cached", .{rel});
+            return false;
+        };
+        defer self.gpa.free(blob_mem);
+        const blob = bits.encodeTo(self.piece_size, size, blob_mem) catch {
             std.log.warn("bitfield encode failed for {s}; unclaimed bytes stay cached", .{rel});
             return false;
         };
@@ -2735,7 +2741,7 @@ pub const Store = struct {
         defer self.mu.unlock(self.io);
         if (self.files.contains(rel)) return false;
         if (self.purge_epoch != epoch0) return false;
-        const w = writeFileMakingParent(mp, blob.items, true);
+        const w = writeFileMakingParent(mp, blob, true);
         if (w != 0) {
             std.log.warn("bitfield save failed for {s} (errno {d}); unclaimed bytes stay cached", .{ rel, -w });
             return false;
@@ -4369,10 +4375,9 @@ test "distrust drops sidecar and live marks but keeps data bytes and pins" {
     _ = try st.cacheMetaPath(&mb, "ghost.bin");
     var ghost_bits = try piece.Bitfield.init(gpa, 2);
     defer ghost_bits.deinit(gpa);
-    var blob: std.ArrayList(u8) = .empty;
-    defer blob.deinit(gpa);
-    try ghost_bits.encode(16, 32, &blob, gpa);
-    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(mp, blob.items));
+    var blob_buf: [64]u8 = undefined;
+    const blob = try ghost_bits.encodeTo(16, 32, &blob_buf);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(mp, blob));
     st.distrust("ghost.bin");
     try std.testing.expect(sys.statPath(mp, &stbuf) != 0);
 
@@ -5261,12 +5266,12 @@ fn writeFilledSidecar(st: *Store, rel: []const u8, size: u64, filled: []const u3
     var bits = try piece.Bitfield.init(std.testing.allocator, piece.count(size, st.piece_size));
     defer bits.deinit(std.testing.allocator);
     for (filled) |i| bits.set(i);
-    var blob: std.ArrayList(u8) = .empty;
-    defer blob.deinit(std.testing.allocator);
-    try bits.encode(st.piece_size, size, &blob, std.testing.allocator);
+    const blob_mem = try std.testing.allocator.alloc(u8, bits.encodedLen());
+    defer std.testing.allocator.free(blob_mem);
+    const blob = try bits.encodeTo(st.piece_size, size, blob_mem);
     var mb: [sys.c.PATH_MAX]u8 = undefined;
     const mp = try st.cacheMetaPath(&mb, rel);
-    try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(mp, blob.items));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(mp, blob));
 }
 
 test "punchDisk refuses a rel owned by a live entry" {
@@ -6284,12 +6289,11 @@ test "loadBits refuses a symlink planted at the sidecar path" {
     var bits = try piece.Bitfield.init(gpa, piece.count(16, 16));
     defer bits.deinit(gpa);
     bits.set(0);
-    var blob: std.ArrayList(u8) = .empty;
-    defer blob.deinit(gpa);
-    try bits.encode(16, 16, &blob, gpa);
+    var blob_buf: [64]u8 = undefined;
+    const blob = try bits.encodeTo(16, 16, &blob_buf);
     var tb: [sys.c.PATH_MAX]u8 = undefined;
     const target = try st.cacheMetaPath(&tb, "outside.bin");
-    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(target, blob.items));
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(target, blob));
 
     var mb: [sys.c.PATH_MAX]u8 = undefined;
     const mp = try st.cacheMetaPath(&mb, "sym.bin");

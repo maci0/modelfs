@@ -292,12 +292,6 @@ pub const Catalog = struct {
     /// inflight slots. Guarded by have_mu like the have cache. Bounded so
     /// a many-file cold start cannot grow it with the live map.
     probe_inflight: std.ArrayList(ProbeInflight) = .empty,
-    /// Addresses whose staged (RDMA) data plane failed a fetch recently,
-    /// keyed by (ip, port) and guarded by have_mu like the have cache. A
-    /// peer that advertises X-Stage and then fails /stage must not cost an
-    /// extra round trip per piece for the whole TTL; the entry expires so a
-    /// recovered backend is retried.
-    stage_down: std.ArrayList(StageDown) = .empty,
 
     /// Addresses whose /have probe has failed since the peer last answered,
     /// keyed by (ip, port) and guarded by have_mu like the have cache. The
@@ -305,7 +299,7 @@ pub const Catalog = struct {
     /// operator pivoting from a climbing probe_err has a journal line naming
     /// the down, PSK-drifted, or wedged node; repeats ride the counter and a
     /// success clears the entry and logs recovery. No TTL: a peer that stays
-    /// down logs exactly once until it answers again. Bounded like stage_down.
+    /// down logs exactly once until it answers again. Bounded like fetch_down.
     probe_down: std.ArrayList(AddrDown) = .empty,
 
     /// Addresses whose /data (HTTP) piece fetch failed since the peer last
@@ -347,14 +341,6 @@ pub const Catalog = struct {
         rel: []u8,
     };
 
-    const stage_down_cap: usize = 32;
-
-    const StageDown = struct {
-        ip: []u8,
-        port: u16,
-        expires_ms: i64,
-    };
-
     const addr_down_cap: usize = 32;
     const probe_down_cap: usize = addr_down_cap;
     const fetch_down_cap: usize = addr_down_cap;
@@ -376,10 +362,6 @@ pub const Catalog = struct {
         /// peer; cached so a TTL hit carries the same alignment context a
         /// fresh probe would.
         piece_size: u32 = 0,
-        /// Whether the peer advertised X-Stage (a staged/RDMA data plane
-        /// for piece fetches). Cached like the bits so a TTL hit decides
-        /// the fetch path without a fresh probe.
-        stage: bool = false,
     };
 
     fn freeHaveEntry(gpa: std.mem.Allocator, e: HaveEntry) void {
@@ -399,15 +381,6 @@ pub const Catalog = struct {
             if (addrTieLess(e.ip, e.port, items[victim].ip, items[victim].port)) victim = i;
         }
         return victim;
-    }
-
-    /// True when expired `a` is the better stage_down eviction victim than
-    /// expired `b`. Sooner expiry first, then (ip, port). noteStageDown
-    /// only considers already-expired lines, so this does not rank live
-    /// against dead.
-    fn stageDownVictimLess(a: StageDown, b: StageDown) bool {
-        if (a.expires_ms != b.expires_ms) return a.expires_ms < b.expires_ms;
-        return addrTieLess(a.ip, a.port, b.ip, b.port);
     }
 
     /// True when `a` is the better have-cache eviction victim than `b`.
@@ -449,7 +422,7 @@ pub const Catalog = struct {
         defer self.have_mu.unlock(self.io);
         const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
         const bits = gpa.dupe(u8, e.bits) catch return null;
-        return .{ .bits = bits, .piece_size = e.piece_size, .stage = e.stage };
+        return .{ .bits = bits, .piece_size = e.piece_size };
     }
 
     /// Whether piece `idx` is present in an unexpired (rel, ip, port) line
@@ -464,73 +437,6 @@ pub const Catalog = struct {
         defer self.have_mu.unlock(self.io);
         const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
         return (proto.HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
-    }
-
-    /// Whether an unexpired (rel, ip, port) line advertises the staged
-    /// data plane. Null means no usable line (probe first); false means
-    /// the peer answered /have without X-Stage.
-    pub fn haveStage(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, now_ms: i64) ?bool {
-        self.have_mu.lockUncancelable(self.io);
-        defer self.have_mu.unlock(self.io);
-        const e = self.haveLookup(rel, ip, port, now_ms) orelse return null;
-        return e.stage;
-    }
-
-    /// True when a recent staged fetch from (ip, port) failed, so the
-    /// caller should skip /stage and go straight to /data for the TTL. The
-    /// entry expires: a peer whose backend recovered is retried.
-    pub fn stageDown(self: *Catalog, ip: []const u8, port: u16, now_ms: i64) bool {
-        self.have_mu.lockUncancelable(self.io);
-        defer self.have_mu.unlock(self.io);
-        for (self.stage_down.items) |e| {
-            if (e.port == port and std.mem.eql(u8, e.ip, ip) and now_ms < e.expires_ms) return true;
-        }
-        return false;
-    }
-
-    /// Records a failed staged fetch from (ip, port), refreshing any
-    /// existing entry's expiry (a persistently failing peer stays down, a
-    /// one-off failure clears after the TTL). True only for a newly inserted
-    /// entry (the caller logs that one); a refresh returns false so a broken
-    /// data plane cannot flood the journal the way per-piece fetch logs
-    /// would. Bounded like the have cache: an entry that cannot fit evicts
-    /// an expired one (soonest expiry, then ip/port so insert order cannot
-    /// pick the casualty), else is dropped -- worst case the peer gets one
-    /// /stage retry, which falls back anyway.
-    pub fn noteStageDown(self: *Catalog, ip: []const u8, port: u16, now_ms: i64) bool {
-        const gpa = self.gpa;
-        self.have_mu.lockUncancelable(self.io);
-        defer self.have_mu.unlock(self.io);
-        for (self.stage_down.items) |*e| {
-            if (e.port != port or !std.mem.eql(u8, e.ip, ip)) continue;
-            const was_live = now_ms < e.expires_ms;
-            e.expires_ms = now_ms +| have_ttl_ms;
-            return !was_live;
-        }
-        if (self.stage_down.items.len >= stage_down_cap) {
-            // Evict an expired line only: a live backoff must not be
-            // dropped to admit a new failure (worst case the new peer
-            // gets one /stage retry). Among expired lines, sooner expiry
-            // then (ip, port) -- array order would otherwise be which
-            // worker locked have_mu first, the same leak havePut already
-            // closed for equal-TTL have-cache lines.
-            var victim: ?usize = null;
-            for (self.stage_down.items, 0..) |e, i| {
-                if (now_ms < e.expires_ms) continue;
-                if (victim == null or stageDownVictimLess(e, self.stage_down.items[victim.?]))
-                    victim = i;
-            }
-            if (victim) |vi| {
-                gpa.free(self.stage_down.items[vi].ip);
-                _ = self.stage_down.orderedRemove(vi);
-            } else return false;
-        }
-        const ip_own = gpa.dupe(u8, ip) catch return false;
-        self.stage_down.append(gpa, .{ .ip = ip_own, .port = port, .expires_ms = now_ms +| have_ttl_ms }) catch {
-            gpa.free(ip_own);
-            return false;
-        };
-        return true;
     }
 
     /// First failure for (ip, port) since the last clear: true so the caller
@@ -575,7 +481,7 @@ pub const Catalog = struct {
     /// failure since the peer last answered (the caller logs that one with
     /// address and error class); later failures return false and ride the
     /// probe_err counter, so a dead fleet cannot flood the journal the way
-    /// per-piece fetch logs would. Bounded like stage_down: an entry that
+    /// per-piece fetch logs would. Bounded like fetch_down: an entry that
     /// cannot fit evicts the (ip, port)-least line, else is dropped --
     /// worst case a still-down peer logs once more when the eviction
     /// clears its entry. The casualty is a function of the address set,
@@ -615,7 +521,7 @@ pub const Catalog = struct {
     /// peer that already said it has nothing. Connection failures must not
     /// reach here; a down peer is retried on the next piece. `now_ms` is
     /// the caller's monotonic-ms instant (see haveGet).
-    pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, stage: bool, now_ms: i64) void {
+    pub fn havePut(self: *Catalog, rel: []const u8, ip: []const u8, port: u16, bits: []const u8, piece_size: u32, now_ms: i64) void {
         const gpa = self.gpa;
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
@@ -630,7 +536,6 @@ pub const Catalog = struct {
             self.have_cache.items[i].bits = b;
             self.have_cache.items[i].expires_ms = now_ms +| have_ttl_ms;
             self.have_cache.items[i].piece_size = piece_size;
-            self.have_cache.items[i].stage = stage;
             return;
         }
         if (self.have_cache.items.len >= have_cache_cap) {
@@ -661,7 +566,6 @@ pub const Catalog = struct {
             .rel = rel_own,
             .ip = ip_own,
             .port = port,
-            .stage = stage,
             .bits = bits_own,
             .expires_ms = now_ms +| have_ttl_ms,
             .piece_size = piece_size,
@@ -797,8 +701,6 @@ pub const Catalog = struct {
         self.have_cache.deinit(self.gpa);
         for (self.probe_inflight.items) |e| self.gpa.free(e.rel);
         self.probe_inflight.deinit(self.gpa);
-        for (self.stage_down.items) |e| self.gpa.free(e.ip);
-        self.stage_down.deinit(self.gpa);
         for (self.probe_down.items) |e| self.gpa.free(e.ip);
         self.probe_down.deinit(self.gpa);
         for (self.fetch_down.items) |e| self.gpa.free(e.ip);
@@ -1415,7 +1317,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
 
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0) == null);
 
-    cat.havePut("a.bin", "10.0.0.1", 18080, &.{ 1, 2 }, 4096, false, t0);
+    cat.havePut("a.bin", "10.0.0.1", 18080, &.{ 1, 2 }, 4096, t0);
     {
         const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0).?;
         defer gpa.free(got.bits);
@@ -1439,7 +1341,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     try std.testing.expect(cat.haveGet(gpa, "a.bin", "10.0.0.2", 18080, t0) == null);
 
     // Same key replaces in place instead of growing the table.
-    cat.havePut("a.bin", "10.0.0.1", 18080, &.{3}, 8192, false, t0);
+    cat.havePut("a.bin", "10.0.0.1", 18080, &.{3}, 8192, t0);
     {
         const got = cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0).?;
         defer gpa.free(got.bits);
@@ -1469,7 +1371,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
         var name_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "f{d}.bin", .{i});
         const put_at = t0 - @as(i64, @intCast(Catalog.have_cache_cap - i));
-        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0, false, put_at);
+        cat.havePut(name, "10.1.0.1", 18080, &.{@intCast(i)}, 0, put_at);
     }
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
     // f31's insert evicted soonest-to-expire f0, not the newest entry.
@@ -1477,7 +1379,7 @@ test "have cache stores, replaces, evicts at cap, and frees" {
     if (cat.haveGet(gpa, "a.bin", "10.0.0.1", 18080, t0)) |fresh| {
         gpa.free(fresh.bits);
     } else return error.TestUnexpectedResult;
-    cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0}, 0, false, t0);
+    cat.havePut("spill.bin", "10.1.0.1", 18080, &.{0}, 0, t0);
     try std.testing.expectEqual(@as(usize, Catalog.have_cache_cap), cat.have_cache.items.len);
     // The next spill drains the next-soonest expiry in sequence.
     try std.testing.expect(cat.haveGet(gpa, "f1.bin", "10.1.0.1", 18080, t0) == null);
@@ -1494,14 +1396,14 @@ test "have cache evicts equal-TTL ties by key, never by insert order" {
 
     const Fill = struct {
         fn toCap(cat: *Catalog, first: []const []const u8) void {
-            for (first) |name| cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, false, t0);
+            for (first) |name| cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, t0);
             var i: usize = first.len;
             while (i < Catalog.have_cache_cap) : (i += 1) {
                 var name_buf: [32]u8 = undefined;
                 const name = std.fmt.bufPrint(&name_buf, "n{d:0>2}.bin", .{i}) catch unreachable;
-                cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, false, t0);
+                cat.havePut(name, "10.0.0.1", 18080, &.{1}, 0, t0);
             }
-            cat.havePut("spill.bin", "10.0.0.1", 18080, &.{1}, 0, false, t0);
+            cat.havePut("spill.bin", "10.0.0.1", 18080, &.{1}, 0, t0);
         }
     };
 
@@ -1546,12 +1448,12 @@ test "collectCachedCands answers from the have cache and skips incomplete cluste
     try std.testing.expect(cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf) == null);
 
     // One peer answered; the other is still unknown.
-    cat.havePut("m.bin", "10.0.0.1", 1, &.{0b0000_0001}, 4096, false, t0);
+    cat.havePut("m.bin", "10.0.0.1", 1, &.{0b0000_0001}, 4096, t0);
     try std.testing.expect(cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf) == null);
 
     // A healthy 404 is an empty bitmap: both peers have now answered, and
     // the miss peer's addresses all inherit that group's !have bit.
-    cat.havePut("m.bin", "10.1.0.1", 1, &.{}, 0, false, t0);
+    cat.havePut("m.bin", "10.1.0.1", 1, &.{}, 0, t0);
     const cands = cat.collectCachedCands("m.bin", 0, 4096, t0, &cand_buf, &ip_buf).?;
     try std.testing.expectEqual(@as(usize, 3), cands.len);
     try std.testing.expect(cands[0].have);
@@ -2830,95 +2732,6 @@ test "refresh snapshot order is membership, not readdir or lease addrs order" {
     try std.testing.expectEqualStrings("10.1.0.1", snap[2].ip);
     try std.testing.expectEqualStrings("zzz", snap[3].peer_id);
     try std.testing.expectEqualStrings("10.1.0.9", snap[3].ip);
-}
-
-test "stageDown tracks a failed staged fetch for the have TTL" {
-    const gpa = std.testing.allocator;
-    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
-    defer cat.deinit();
-    const t0: i64 = 1000;
-    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0));
-    try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, t0));
-    try std.testing.expect(cat.stageDown("10.0.0.9", 18080, t0));
-    // Same address, different port: not down.
-    try std.testing.expect(!cat.stageDown("10.0.0.9", 19090, t0));
-    // Different address: not down.
-    try std.testing.expect(!cat.stageDown("10.0.0.8", 18080, t0));
-    // Expiry: a recovered backend is retried after the TTL.
-    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms));
-    // A refresh while the entry is still live is not a first-failure log.
-    try std.testing.expect(!cat.noteStageDown("10.0.0.9", 18080, t0));
-    try std.testing.expect(!cat.noteStageDown("10.0.0.9", 18080, t0 + 100));
-    try std.testing.expect(cat.stageDown("10.0.0.9", 18080, t0 + 100));
-    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms + 100));
-    // After the TTL a new failure is a new outage and logs again.
-    try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, t0 + Catalog.have_ttl_ms + 100));
-}
-
-test "stageDown TTL from an attempt-start stamp is dead after a dial timeout" {
-    // fetchPieceStaged's connect budget is 15s; have_ttl_ms is 2s. A
-    // noteStageDown stamped at attempt start is expired by the time a
-    // blackholed /stage returns, so the next piece would retry /stage.
-    // fetchFromCands (src/peer.zig) stamps at the failure instant instead.
-    const gpa = std.testing.allocator;
-    var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
-    defer cat.deinit();
-    const attempt_start: i64 = 1000;
-    const after_dial: i64 = attempt_start + 15_000;
-    try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, attempt_start));
-    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, after_dial));
-    try std.testing.expect(cat.noteStageDown("10.0.0.9", 18080, after_dial));
-    try std.testing.expect(cat.stageDown("10.0.0.9", 18080, after_dial));
-    try std.testing.expect(cat.stageDown("10.0.0.9", 18080, after_dial + Catalog.have_ttl_ms - 1));
-    try std.testing.expect(!cat.stageDown("10.0.0.9", 18080, after_dial + Catalog.have_ttl_ms));
-}
-
-test "stageDown cap evicts expired by expiry then addr, never insert order" {
-    const gpa = std.testing.allocator;
-    const t0: i64 = 1000;
-    const Fill = struct {
-        fn toCap(cat: *Catalog, first: []const u16, at: i64) void {
-            for (first) |port| _ = cat.noteStageDown("10.0.0.1", port, at);
-            var port: u16 = @intCast(first.len + 1);
-            while (@as(usize, port) <= Catalog.stage_down_cap) : (port += 1)
-                _ = cat.noteStageDown("10.0.0.1", port, at);
-        }
-        fn hasPort(cat: *Catalog, port: u16) bool {
-            for (cat.stage_down.items) |e| {
-                if (e.port == port) return true;
-            }
-            return false;
-        }
-    };
-
-    // Live lines are not evicted to admit a new failure.
-    var cat_live = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
-    defer cat_live.deinit();
-    Fill.toCap(&cat_live, &.{1}, t0);
-    try std.testing.expectEqual(@as(usize, Catalog.stage_down_cap), cat_live.stage_down.items.len);
-    _ = cat_live.noteStageDown("10.0.0.1", 99, t0);
-    try std.testing.expectEqual(@as(usize, Catalog.stage_down_cap), cat_live.stage_down.items.len);
-    try std.testing.expect(!Fill.hasPort(&cat_live, 99));
-    try std.testing.expect(Fill.hasPort(&cat_live, 1));
-
-    // All expired, equal TTL: smallest port is the casualty in both insert
-    // orders. Array-order eviction would drop slot 0 instead.
-    const dead_at = t0 + Catalog.have_ttl_ms;
-    var cat_hi = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
-    defer cat_hi.deinit();
-    Fill.toCap(&cat_hi, &.{ 3, 2, 1 }, t0);
-    _ = cat_hi.noteStageDown("10.0.0.1", 99, dead_at);
-    try std.testing.expect(!Fill.hasPort(&cat_hi, 1));
-    try std.testing.expect(Fill.hasPort(&cat_hi, 3));
-    try std.testing.expect(Fill.hasPort(&cat_hi, 99));
-
-    var cat_lo = Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
-    defer cat_lo.deinit();
-    Fill.toCap(&cat_lo, &.{ 1, 2, 3 }, t0);
-    _ = cat_lo.noteStageDown("10.0.0.1", 99, dead_at);
-    try std.testing.expect(!Fill.hasPort(&cat_lo, 1));
-    try std.testing.expect(Fill.hasPort(&cat_lo, 3));
-    try std.testing.expect(Fill.hasPort(&cat_lo, 99));
 }
 
 fn expectEdgeTriggeredDown(

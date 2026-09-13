@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-13
+
+Peer HTTP drops `/stage` and the unused RDMA seam. Mixed fleets with `0.12.0`
+peers keep filling over `/have` and `/data`; a node that still probes `/stage`
+gets 404 and must use `/data`.
+
+### Drop the staged/RDMA data plane - 2026-09-13
+- **`GET /stage` is gone.** Peer HTTP is `/ping`, `/have`, and `/data`. `src/rdma.zig`, `X-Stage`, `Catalog.stage_down`/`haveStage`, and the staged fetch ladder are deleted. `/have` no longer advertises a second data plane.
+- **`http_5xx` counts every 5xx.** There is no 501 capability answer to exclude.
+
+### Shrink wrappers and historical docs - 2026-09-13
+- **Handover knobs JSON uses `std.json.Stringify`.** UTF-8 is still refused at encode (`NonUtf8Knob`); the PSK trailer stays raw after the JSON newline.
+- **`Bitfield.encode` is gone.** Sidecar writes go through `encodeTo`.
+- **`docs/design.md`, `docs/audits.md`, and the simd / Zig 0.16 review guides are deleted.** `architecture.md` is the shipped-behavior reference.
+
 ## [0.12.0] - 2026-09-12
 
 Child-dataset coverage in the offsite and restore-drill checks, fuzz
@@ -1079,7 +1094,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/maci0/modelfs/releases/tag/v0.13.0
 [0.12.0]: https://github.com/maci0/modelfs/releases/tag/v0.12.0
 [0.11.0]: https://github.com/maci0/modelfs/releases/tag/v0.11.0
 [0.10.0]: https://github.com/maci0/modelfs/releases/tag/v0.10.0

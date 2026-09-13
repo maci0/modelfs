@@ -3,8 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Shipped-behavior reference; kept current against `src/` |
-| Date | 2026-09-12 (re-verified against `src/`) |
-| Design history | [design.md](design.md): original architecture, goals G1-G10 with ship status, key decisions and what did not ship |
+| Date | 2026-09-13 (re-verified against `src/`) |
 
 Shipped in `modelfs` (Zig, libfuse3). A process on a spark only opens `/models/...`.
 
@@ -15,7 +14,7 @@ Source: [read-path.drawio](figures/read-path.drawio). One piece, one source. Mis
 If the local cache cannot land the fill (full or broken cache disk), that one read is served
 from the origin rather than failing EIO over a healthy origin (`serveHydrated` in
 src/fuse_fs.zig); the piece stays unmarked and the next miss retries the cache. Peer `/data`
-and `/stage` still answer 500 when this node's cache layer fails, so the fetching peer tries
+still answers 500 when this node's cache layer fails, so the fetching peer tries
 its next path. There is no full-file background stripe: it OOMed UMA.
 
 Setup and the CLI are in the [top-level README](../README.md). This document is what the
@@ -66,13 +65,12 @@ New code goes in the module that already owns that concern.
 |---|---|
 | `c.h`, `c.zig` | Sole door to libfuse3 and libc |
 | `sys.zig` | Syscall wrappers: EINTR retry, CLOEXEC, nofollow/owner-only writes; IPv4 `bind`/`accept`/`connect`/`listen`/`getsockname` and socket options through `std.c` |
-| `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`), the persisted bitfield codec, and piece-hash manifest overlap (`manifestOverlap` / `manifestOverlapPrepared`) |
+| `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`), the persisted bitfield codec, and piece-hash manifest overlap (`manifestOverlapPrepared`) |
 | `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`) |
 | `cull.zig` | Free-space watermark policy |
 | `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
 | `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`) |
 | `discover.zig` | Cluster leases (`walkLeases`, Catalog), `/have` probe cache, path scoring |
-| `rdma.zig` | RDMA data-plane transport seam: `/stage` window codec and the backend interface (null until the verbs tail; see design.md section 15) |
 | `peer.zig` | Peer HTTP server and fetch client |
 | `fuse_fs.zig` | FUSE handlers, daemon `State` (`init`/`spawnWorkers`/`deinit`/`run`/`attach`), discovery/cull loops, process-image handover |
 | `handover.zig` | Sealed-memfd knobs+PSK codec and `update` request/ack for `modelfs update` |
@@ -80,7 +78,7 @@ New code goes in the module that already owns that concern.
 | `main.zig` | CLI and mount wiring into `State.init` / `State.deinit`; mount-time `disableCoreDumps` / `scrubPskEnv` |
 | `root.zig` | Test aggregator for `zig build test` |
 
-`main` → `fuse_fs` → `peer` → (`store`, `discover`, `rdma`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
+`main` → `fuse_fs` → `peer` → (`store`, `discover`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
 `handover` and `hf` sit beside `fuse_fs`/`main`: neither speaks FUSE, and `hf` is the one place
 that reaches a host outside the cluster (HTTPS through `std.http.Client`, CLI only).
 
@@ -155,7 +153,7 @@ past the last slot falls back to the allocator rather than blocking a reader.
 
 `.cluster` is the cluster control plane and is not part of the filesystem the mount presents.
 It is hidden from FUSE `readdir`, answers `ENOENT` on lookup and `EPERM` on mutation, answers
-404 on peer `/have`/`/data`/`/stage`, and is refused by `modelfs pin`/`unpin`/`verify`/`dupes`
+404 on peer `/have`/`/data`, and is refused by `modelfs pin`/`unpin`/`verify`/`dupes`
 (`relIsCluster` in src/discover.zig).
 
 Names that fail `relOk` (C0/DEL, UTF-8 C1, Default_Ignorable) are omitted from FUSE `readdir`
@@ -236,7 +234,7 @@ winner. `Catalog.refresh` sorts the live path list by (peer id, ip, port) and
 `groupPathsByPeerId` sorts the outer probe-group list by peer id, so lease-directory readdir
 cannot decide snapshot or probe-todo order either.
 
-A `/stage` failure falls back to `/data` on the same peer; a failed `/data` falls to the next
+A failed `/data` falls to the next
 path, then NFS. Never two sources for one piece. A node that has written the path through the
 mount (`Store.wroteLocally`) hydrates further misses of that path from the origin, not from
 peers: a peer's cached piece can predate the write, and landing it would hide the writer's own
@@ -288,7 +286,6 @@ place (X-filled, key and value) so the
 ```
 GET /ping
 GET /have?path=<url-encoded rel>
-GET /stage?path=...&piece=N
 GET /data?path=...
 Range: bytes=start-end
 Authorization: Bearer <psk>
@@ -325,23 +322,6 @@ opening a cache entry, so a huge sparse origin file cannot drive a half-gigabyte
 bit, and FUSE and peer reads take them from the origin rather than treating an empty `cover` as
 a cache hit, which a sparse pread of the hole would otherwise answer with zeros.
 
-### `/stage`, the staged data plane
-
-`/stage` is the negotiated entry to the staged (RDMA) data plane. A node whose backend can
-stage advertises `X-Stage: 1` on `/have`, and a fetching node then stages one piece at a time:
-hydrate, at-rest verify, register the bytes, and reply with a 52-byte window (`len`/`rkey`/`addr`
-plus the piece digest, advisory) that its backend reads.
-
-Any `/stage` failure (501 because this node cannot stage, a malformed reply, a backend read
-error, a dial or head timeout) falls back to `/data` on the same peer and marks the address
-down for 2 s from the failure instant (`Catalog.noteStageDown` in src/discover.zig, stamped in
-`fetchFromCands` after `fetchPieceStaged` returns), so a sequential fill does not retry the
-extra round trip on every piece. A fleet without verbs never pays the probe, because the
-capability rides the have-cache line.
-
-The shipped backend is null, so this plane is protocol-and-pipeline only until the verbs tail
-lands (design.md section 15).
-
 ### Status codes
 
 Framing is identical on every endpoint: `Content-Length` always present, `Connection: close`,
@@ -349,22 +329,21 @@ empty body on errors.
 
 | Status | When |
 |---|---|
-| 200 | `/ping` (`text/plain`, body `ok`), `/have` (`application/octet-stream` bitmap + `X-Piece-Size`), or `/stage` (52-byte window body, see design.md section 15) |
+| 200 | `/ping` (`text/plain`, body `ok`) or `/have` (`application/octet-stream` bitmap + `X-Piece-Size`) |
 | 206 | `/data` partial content (`Content-Range`, `application/octet-stream`) |
-| 400 | Missing, empty, undecodable, or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; missing, malformed, or inverted (`end < start`) `Range` on `/data`; missing, malformed, or past-EOF `piece` on `/stage` |
+| 400 | Missing, empty, undecodable, or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
 | 401 | Missing or wrong bearer token (`WWW-Authenticate: Bearer`), including on non-GET |
 | 404 | Unknown path, a `.cluster` control path, or the origin has no regular file at `path` |
 | 405 | Authenticated request whose method is not GET (`Allow: GET`) |
 | 416 | `/data` range start at/after EOF, with `Content-Range: bytes */<size>` naming the complete length (an over-long end clamps to EOF instead) |
-| 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write, staging verify failure), or a `/have` bitmap that would exceed the 16 MiB fetch bound |
-| 501 | `/stage` only: this node has no data-plane backend (its `/have` does not advertise `X-Stage`); the fetching peer falls back to `/data`. Capability, not a 5xx for the `http_5xx` health gauge |
+| 500 | This node's cache layer failed (entry open, bitfield snapshot, hydration write, serve verify failure), or a `/have` bitmap that would exceed the 16 MiB fetch bound |
 | 502 | The origin is unreachable or failed (stat/pread error, or a size that does not fit `off_t`), i.e. retry another peer |
 
 ### Wire parsing
 
 A `/data` end past EOF clamps to it, and `bytes=N-` means through EOF (RFC 9110); suffix ranges
 (`bytes=-N`) are rejected. Wire integers (`Range`, `Content-Range`, `Content-Length`,
-`X-Piece-Size`, `/stage` `piece`) are unsigned decimal digits only: a leading sign or interior
+`X-Piece-Size`) are unsigned decimal digits only: a leading sign or interior
 underscore is malformed, the same rule RFC 9110 uses for Content-Length. Status lines are
 `HTTP/1.1` plus a 3-digit code, so `2000` is not 200 and `4040` is not a healthy miss.
 
@@ -391,10 +370,10 @@ root-reserved `f_bfree`.
 Culling punches piece-sized holes (default 8 MiB, `FALLOC_FL_PUNCH_HOLE`), clears that bit,
 and leaves the sparse file. The next read hydrates that piece again.
 
-Live entries are LRU by last access: FUSE reads, fills, and peer `/data`/`/stage` transfers
+Live entries are LRU by last access: FUSE reads, fills, and peer `/data` transfers
 stamp `last_access`. The cull skips `pin`, files accessed in the last 10 s, pieces this node is
 still filling, and entries with a cache-fd transfer in flight (`Cached.xfer`: peer
-`/data`/`/stage` and the FUSE read from the bit sample through pread). Punching mid-send would
+`/data` and the FUSE read from the bit sample through pread). Punching mid-send would
 ship hole zeros the fetching peer cannot tell from real data.
 
 Each round samples the 32 oldest idle live entries (`considerIdle` in src/store.zig) instead of
@@ -437,8 +416,8 @@ Verification happens twice:
 * **At admit.** A peer fill is only accepted when a trusted digest already exists to check it
   against (`hydratePiece` in src/fuse_fs.zig, `expectedHash` in src/store.zig). Bytes that fail
   are discarded unmarked and the piece refills from the origin (`fill_err_verify`).
-* **Before every `/data` and `/stage` serve.** Cached bytes are rehashed
-  (`verifyRange`/`serveStage` in src/peer.zig). A mismatch drops the transfer with a 500, counts
+* **Before every `/data` serve.** Cached bytes are rehashed
+  (`verifyRange` in src/peer.zig). A mismatch drops the transfer with a 500, counts
   `serve_verify_fail`, and **self-heals**: `Store.healPiece` clears the piece's mark so the next
   fill re-hydrates from the origin instead of failing every serve of that piece.
 
@@ -603,7 +582,7 @@ green. Artifacts from older builds fall back to wall-clock `now_s`.
 | Topology | `peers`, `piece`, `inflight` (HTTP handlers) |
 | Saturation | `cache_free_pct`, the same sample culling runs on; `-1` when statfs fails, i.e. culling suspended |
 | Origin health | `origin_down`, 1 while an EIO/ESTALE/ETIMEDOUT getattr/open/stat, write, origin pread, lease publish, or `.cluster` walk has not yet recovered |
-| Lifetime counters (`stats`) | reads/writes with errors, warm-cache reads (`reads_warm`), cumulative read/write/peer-HTTP durations in ns (`http_nanos` covers `/have` `/data` `/stage`, not `/ping`), piece fills by source with byte totals including `bytes_to_peer`, per-tier fill failures (including origin hydrations done to serve a peer), `probe_err`, `lease_err`, `meta_err`, pieces culled, `http_ok`, rejected auths, `http_405`, 5xx replies, malformed request heads, connections dropped at the inflight cap, and `serve_verify_fail` |
+| Lifetime counters (`stats`) | reads/writes with errors, warm-cache reads (`reads_warm`), cumulative read/write/peer-HTTP durations in ns (`http_nanos` covers `/have` `/data`, not `/ping`), piece fills by source with byte totals including `bytes_to_peer`, per-tier fill failures (including origin hydrations done to serve a peer), `probe_err`, `lease_err`, `meta_err`, pieces culled, `http_ok`, rejected auths, `http_405`, 5xx replies, malformed request heads, connections dropped at the inflight cap, and `serve_verify_fail` |
 
 ### `peers`
 
@@ -777,7 +756,7 @@ The tick line carries the only latency signal there is:
 | Field | Meaning |
 |---|---|
 | `rd_us` / `wr_us` | average wall time of a FUSE read/write over the interval |
-| `http_us` | average `/have`+`/data`+`/stage` handler time, over `httpok`+`http5xx`. `/ping` is liveness: neither timed nor counted, so a health-check poll cannot fire an idle tick |
+| `http_us` | average `/have`+`/data` handler time, over `httpok`+`http5xx`. `/ping` is liveness: neither timed nor counted, so a health-check poll cannot fire an idle tick |
 | `fill_ms peer/nfs` | average per-piece hydration stall by tier. A miss blocks the reader for one whole piece, so this is how "reads got slow" is diagnosed from the journal |
 | `md_us` | interval **total** (these handlers count wall time, not calls) of the getattr/open/statfs latency counters, so a metadata storm is visible in a window where no data read moved. The three publish separately in status.json |
 
@@ -787,7 +766,7 @@ And the counters worth knowing by name:
 |---|---|
 | `reads_warm` | fully cached FUSE reads. Hit rate is `reads_warm / reads_ok` |
 | `probe_err` | `/have` probes that failed for a reason other than a healthy 404: a dead peer, PSK drift, a malformed reply. The signature of a cluster silently degraded to NFS-only |
-| `httpok` / `serve_mib` | accepted `/have` 200, `/data` 206, and `/stage` 200 replies and the bytes they served (`/have`/`/data` Content-Length; `/stage` the window's piece `len`, not the 52-byte HTTP body), so a node serving pieces is distinguishable from an idle one |
+| `httpok` / `serve_mib` | accepted `/have` 200 and `/data` 206 replies and the bytes they served (`Content-Length`), so a node serving pieces is distinguishable from an idle one |
 | `httpbad` | connections whose request head never completed |
 | `httpdrop` | connections closed because all inflight slots were taken: the server refusing work under saturation |
 | `http405` | requests refused for method. The journal line is deduplicated on the same window as the 401 warn and echoes the method through `discover.displayName`, since a PSK holder picks that token |
@@ -798,12 +777,9 @@ And the counters worth knowing by name:
 
 ## What did not ship
 
-Canonical status is [design.md](design.md) sections 2.1 (G1-G10) and 13 (key decisions). Do not
-treat this list as a second copy of those rows.
-
 - Origin-less two-node (no shared dir)
-- Content-addressed dedup (Level 2) and CDC (Level 3): **shelved/dormant**, not merely unbuilt;
-  see design.md section 14. Level 1 integrity shipped ([Piece integrity](#piece-integrity-blake3-level-1))
+- Content-addressed dedup (Level 2) and CDC (Level 3): **shelved/dormant**, not merely unbuilt.
+  Level 1 integrity shipped ([Piece integrity](#piece-integrity-blake3-level-1))
 - Full-file background stripe
 - Sparse-file hydrate / FUSE passthrough (the agent stays in the I/O path; `direct_io` is the
   default)
