@@ -1719,7 +1719,7 @@ pub const Store = struct {
     }
 
     /// Clears a piece's mark after its cached bytes failed at-rest
-    /// verification (verifyRange/serveStage), so the next fill re-hydrates
+    /// verification (verifyRange), so the next fill re-hydrates
     /// from origin -- the serving node self-heals instead of failing every
     /// serve of the piece until a cull or `modelfs verify`. The bytes are
     /// left in place (no punch): the trusted digest is kept as the refill's

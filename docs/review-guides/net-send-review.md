@@ -41,7 +41,7 @@ Search recipes, each needing the surrounding function read before judging:
 
 ```
 rg -n 'fetchFromCands|fetchPieceStaged|fetchRangeInto|sendRequest' src/peer.zig
-rg -n 'probeTryClaim|noteStageDown|havePut|haveHas|pickBest|pathTieLess' src/discover.zig src/peer.zig
+rg -n 'probeTryClaim|havePut|haveHas|pickBest|pathTieLess' src/discover.zig src/peer.zig
 rg -n 'deadline|_ms\b' src/peer.zig
 rg -n 'sendfileAll|preadAll|pwriteAll|writeAll' src/
 rg -n 'fetchAdd' src/peer.zig            # counter coverage per failure branch
@@ -62,7 +62,7 @@ rg -n 'SO_REUSE' src/
 | Sev | Meaning |
 |---|---|
 | **P0** | Torn or unverified bytes admitted, two sources for one piece, a short reply accepted as complete, a punch during a send, a split listen port |
-| **P1** | Fleet-visible degradation: a lost stage-down stamp, a missing deadline, an uncounted failure branch, a cached connection failure, nondeterministic source choice |
+| **P1** | Fleet-visible degradation: a missing deadline, an uncounted failure branch, a cached connection failure, nondeterministic source choice |
 | **P2** | Contract drift with no current failure: a fallback rung reachable twice, a counter incremented in the wrong branch |
 | **P3** | Comment drift on the ladder, the deadlines, or the counters |
 
