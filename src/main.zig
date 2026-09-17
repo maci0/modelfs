@@ -1198,9 +1198,9 @@ fn checkCachePieceSize(piece_size: u32, block_size: u64) !void {
         return error.BadCachePieceSize;
 }
 
-fn validateCachePieceSize(cache: []const u8, piece_size: u32) !void {
+fn validateCachePieceSize(store: *const store_mod.Store, piece_size: u32) !void {
     var buf: [sys.c.PATH_MAX]u8 = undefined;
-    const path = try sys.joinZ(&buf, cache, "data");
+    const path = try store.cacheDataPath(&buf, "");
     var fs: sys.c.struct_statfs = undefined;
     const rc = sys.statfsNoFollow(path, &fs);
     if (rc != 0) {
@@ -1229,20 +1229,20 @@ test "cache piece size validation probes the data filesystem" {
     var buf: [128]u8 = undefined;
     const cache = try sys.scratchDir(&buf, "modelfs-cache-geometry");
     defer sys.deleteTree(std.testing.io, cache);
-    try std.testing.expectError(error.CacheStatfs, validateCachePieceSize(cache, piece.default_size));
-
     var store = store_mod.Store.init(std.testing.allocator, std.testing.io, "/unused", cache, piece.default_size);
     defer store.deinit();
+    try std.testing.expectError(error.CacheStatfs, validateCachePieceSize(&store, piece.default_size));
+
     try std.testing.expectEqual(@as(i32, 0), store.ensureLayout());
     var path_buf: [sys.c.PATH_MAX]u8 = undefined;
-    const data = try sys.joinZ(&path_buf, cache, "data");
+    const data = try store.cacheDataPath(&path_buf, "");
     var fs: sys.c.struct_statfs = undefined;
     try std.testing.expectEqual(@as(i32, 0), sys.statfsNoFollow(data, &fs));
     const block_size = std.math.cast(u32, fs.f_bsize) orelse return error.TestUnexpectedResult;
     try std.testing.expect(block_size > 1);
-    try validateCachePieceSize(cache, block_size);
-    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(cache, block_size - 1));
-    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(cache, block_size + 1));
+    try validateCachePieceSize(&store, block_size);
+    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(&store, block_size - 1));
+    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(&store, block_size + 1));
 }
 
 fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
@@ -1354,7 +1354,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         teardownMount(st);
         return 1;
     }
-    validateCachePieceSize(cache, opts.piece) catch {
+    validateCachePieceSize(&st.store, opts.piece) catch {
         teardownMount(st);
         return 1;
     };
@@ -1751,7 +1751,7 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
         teardownMount(st);
         return 1;
     }
-    validateCachePieceSize(owned.cache, owned.piece) catch {
+    validateCachePieceSize(&st.store, owned.piece) catch {
         teardownMount(st);
         return 1;
     };
