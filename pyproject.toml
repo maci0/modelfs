@@ -109,8 +109,7 @@ strict_equality_for_none = true
 # forward so a bytes/str mixup cannot hide behind implicit coercions.
 strict_bytes = true
 warn_unreachable = true
-# Not part of --strict: a dead or mistyped key in this very file must fail
-# the check instead of silently doing nothing.
+incremental = false
 warn_unused_configs = true
 enable_error_code = [
     "redundant-expr",
