@@ -657,6 +657,10 @@ fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
         replyStatus(self, fd, "500 Internal Server Error");
         return;
     };
+    var sent_complete = false;
+    defer if (!sent_complete) {
+        _ = self.store.stats.http_send_err.fetchAdd(1, .monotonic);
+    };
     const hw = sys.writeAll(fd, h);
     if (hw < 0) {
         std.log.warn("have header send failed for {s} (errno {d}); dropping peer transfer", .{ rel, -hw });
@@ -694,6 +698,7 @@ fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
         }
         done += take;
     }
+    sent_complete = true;
 }
 
 /// Hydrates every piece the range touches before streaming; unhydrated
@@ -822,6 +827,10 @@ fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: p
 /// per-chunk clamp to its remainder is what keeps a dribbling receiver from
 /// holding an inflight slot forever.
 fn streamRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64, deadline_ms: i64) void {
+    var sent_complete = false;
+    defer if (!sent_complete) {
+        _ = self.store.stats.http_send_err.fetchAdd(1, .monotonic);
+    };
     // Sendfile copies the cache fd, including sparse holes. A range the
     // bitfield cannot name would ship those zeros as a 206 body and the
     // fetching peer would mark them filled. file_size is the origin sample
@@ -861,7 +870,10 @@ fn streamRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: pi
             }
             done += take;
         }
-        if (done == want) return;
+        if (done == want) {
+            sent_complete = true;
+            return;
+        }
     }
 
     const chunk_cap: usize = 4 * 1024 * 1024;
@@ -902,6 +914,7 @@ fn streamRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: pi
         off += take;
         remaining -= take;
     }
+    sent_complete = true;
 }
 
 /// At-rest integrity pass before a /data reply: every covered piece with a
@@ -1008,6 +1021,7 @@ fn serveData(self: *Server, fd: c_int, rel: []const u8, rg: proto.Range) void {
     };
     const hw = sys.writeAll(fd, h);
     if (hw < 0) {
+        _ = self.store.stats.http_send_err.fetchAdd(1, .monotonic);
         std.log.warn("data header send failed for {s} (errno {d}); dropping peer transfer", .{ rel, -hw });
         return;
     }
@@ -2148,6 +2162,7 @@ test "streamRange honors the response body budget in both directions" {
         const t0 = sys.monoMs(std.testing.io);
         streamRange(&srv.server, pair[1], f, .{ .off = 0, .len = pattern.len }, pattern.len, t0 - 1);
         try std.testing.expect(sys.monoMs(std.testing.io) - t0 <= 2000);
+        try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_send_err.load(.monotonic));
         var probe: [1]u8 = undefined;
         try std.testing.expect(c.recv(pair[0], &probe, probe.len, c.MSG_PEEK | c.MSG_DONTWAIT) < 0);
     }
@@ -2161,6 +2176,17 @@ test "streamRange honors the response body budget in both directions" {
         const n = sys.readOnce(pair[0], &got) catch 0;
         try std.testing.expectEqual(@as(usize, got.len), n);
         try std.testing.expectEqualSlices(u8, &pattern, &got);
+        try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_send_err.load(.monotonic));
+    }
+    {
+        const prev_log_level = std.testing.log_level;
+        std.testing.log_level = .err;
+        defer std.testing.log_level = prev_log_level;
+        serveHave(&srv.server, -1, "budget.bin");
+        try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_send_err.load(.monotonic));
+        serveData(&srv.server, -1, "budget.bin", .{ .start = 0, .end = 31 });
+        try std.testing.expectEqual(@as(u64, 3), srv.store.stats.http_send_err.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
     }
 }
 

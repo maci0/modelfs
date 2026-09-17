@@ -135,6 +135,7 @@ pub const Stats = struct {
     http_ok: std.atomic.Value(u64) = .init(0),
     http_unauthorized: std.atomic.Value(u64) = .init(0),
     http_5xx: std.atomic.Value(u64) = .init(0),
+    http_send_err: std.atomic.Value(u64) = .init(0),
     /// Connections whose head never became a routable request: scanners
     /// that connect-and-drop, dribbled heads past the deadline, oversized
     /// heads, request lines without a target. Counted rather than logged;
@@ -195,6 +196,7 @@ pub const Stats = struct {
         http_ok: u64 = 0,
         http_unauthorized: u64 = 0,
         http_5xx: u64 = 0,
+        http_send_err: u64 = 0,
         http_malformed: u64 = 0,
         http_dropped: u64 = 0,
         http_405: u64 = 0,

@@ -1779,7 +1779,7 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
         },
     ) catch return;
     w.print(
-        " probe_err={d} lease_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http405={d} http_completed={d} http_us={d} md_us={d} meta_err={d}",
+        " probe_err={d} lease_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} http_send_err={d} httpbad={d} httpdrop={d} http405={d} http_completed={d} http_us={d} md_us={d} meta_err={d}",
         .{
             d.probe_err,
             d.lease_err,
@@ -1791,6 +1791,7 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.http_ok,
             d.http_unauthorized,
             d.http_5xx,
+            d.http_send_err,
             d.http_malformed,
             d.http_dropped,
             d.http_405,
@@ -3469,6 +3470,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     _ = st.store.stats.bytes_from_peer.fetchAdd(4096, .monotonic);
     _ = st.store.stats.http_405.fetchAdd(3, .monotonic);
     _ = st.store.stats.http_completed.fetchAdd(7, .monotonic);
+    _ = st.store.stats.http_send_err.fetchAdd(2, .monotonic);
     _ = st.store.stats.getattr_nanos.fetchAdd(2000, .monotonic);
     _ = st.store.stats.open_nanos.fetchAdd(4000, .monotonic);
     _ = st.store.stats.statfs_nanos.fetchAdd(8000, .monotonic);
@@ -3486,6 +3488,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // The four keys 0.5.0 added must actually be in the published document.
     try std.testing.expectEqual(@as(u64, 3), doc2.value.stats.http_405);
     try std.testing.expectEqual(@as(u64, 7), doc2.value.stats.http_completed);
+    try std.testing.expectEqual(@as(u64, 2), doc2.value.stats.http_send_err);
     try std.testing.expectEqual(@as(u64, 2000), doc2.value.stats.getattr_nanos);
     try std.testing.expectEqual(@as(u64, 4000), doc2.value.stats.open_nanos);
     try std.testing.expectEqual(@as(u64, 8000), doc2.value.stats.statfs_nanos);
