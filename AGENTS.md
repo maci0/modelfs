@@ -10,7 +10,7 @@ respects this tree's layout, gates, and constraints.
 | Path | Contents |
 |---|---|
 | `src/*.zig` | The daemon. Tests live beside the code they cover; a new file is invisible to `zig build test` until `root.zig` imports it. `-Dtest-filter=` matches test names, not files |
-| `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once; import via `c.zig` / `sys.zig`, never `@cImport` |
+| `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once (through `src/c_musl.h` for musl). Change the maintained headers or `build.zig`, never the generated bindings; `src/c.zig` is a maintained re-export. Import via `c.zig` / `sys.zig`, never `@cImport` |
 | `scripts/` | Gates and harnesses. `lib.sh` defines `ROOT_DIR`/`SCRATCH_DIR`/`SCRIPTS_DIR`; shell scripts source it before using those variables; scripts using none of them are exempt |
 | `docs/` | `README.md` indexes them. `architecture.md` is shipped behavior |
 | `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files, `SHA256SUMS`, NOTICE, and copyright. `build.zig` and `scripts/extract_fuse3_arm64.sh` verify the digests; extract writes under `.scratch/fuse3-arm64/`; `check.sh` checks them too |
