@@ -2208,25 +2208,24 @@ pub const Store = struct {
         // buffer against the recorded digests. Unchanged keeps the fast
         // path (including when xfer blocked the pwrite: the cache already
         // holds these bytes); changed falls through so the writes bump.
-        if (cov.start < cov.end) {
+        var hash_start = cov.start;
+        var first_hash: ?[piece.digest_len]u8 = null;
+        if (cov.start < cov.end and
+            piece.offset(cov.start, self.piece_size) == off and
+            piece.offset(cov.end, self.piece_size) - off == data.len)
+        {
             if (file.bits.allSet(cov.start, cov.end)) {
-                var changed = false;
-                var i = cov.start;
-                while (i < cov.end) : (i += 1) {
-                    const in_data = piece.offset(i, self.piece_size) - off;
+                while (hash_start < cov.end) : (hash_start += 1) {
+                    const in_data = piece.offset(hash_start, self.piece_size) - off;
                     var h: [piece.digest_len]u8 = undefined;
                     piece.digest(data[@intCast(in_data)..][0..self.piece_size], &h);
-                    if (file.hashes.get(i)) |old| {
-                        if (!std.mem.eql(u8, &h, &old)) {
-                            changed = true;
-                            break;
-                        }
-                    } else {
-                        changed = true;
-                        break;
+                    if (file.hashes.get(hash_start)) |old| {
+                        if (std.mem.eql(u8, &h, &old)) continue;
                     }
+                    first_hash = h;
+                    break;
                 }
-                if (!changed) return true;
+                if (hash_start == cov.end) return true;
             }
         }
         if (copied) {
@@ -2238,12 +2237,17 @@ pub const Store = struct {
             // a mix of old and new bytes, so their previous digest no longer
             // describes them and must not gate a refill.
             const span = piece.cover(.{ .off = off, .len = data.len }, file.size, self.piece_size);
-            var i = cov.start;
+            var i = hash_start;
             while (i < cov.end) : (i += 1) {
                 file.bits.set(i);
-                const in_data = piece.offset(i, self.piece_size) - off;
                 var h: [piece.digest_len]u8 = undefined;
-                piece.digest(data[@intCast(in_data)..][0..self.piece_size], &h);
+                if (first_hash) |saved| {
+                    h = saved;
+                    first_hash = null;
+                } else {
+                    const in_data = piece.offset(i, self.piece_size) - off;
+                    piece.digest(data[@intCast(in_data)..][0..self.piece_size], &h);
+                }
                 file.hashes.put(i, h) catch |err| {
                     std.log.warn("cannot record trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, i, err });
                 };
@@ -6657,6 +6661,90 @@ test "copyIntoCache records fully covered piece digests and drops boundary ones"
     piece.digest("0123456789abcdef", &h0);
     try std.testing.expectEqualSlices(u8, &h0, &st.expectedHash(f, 0, 0).?);
     try std.testing.expect(st.expectedHash(f, 1, 0) == null);
+}
+
+test "copyIntoCache preserves matching prefixes and updates changed or missing hashes" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-wprefix");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-wprefix");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+    const f = try st.get("prefix.bin", 80, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    const initial = [_]u8{'a'} ** 80;
+    try std.testing.expect(st.copyIntoCache(f, 0, &initial));
+    for ([_]bool{ false, true }) |missing| {
+        for (0..3) |first_changed| {
+            try std.testing.expect(st.copyIntoCache(f, 0, &initial));
+            var patch = [_]u8{'a'} ** 48;
+            if (missing) {
+                try std.testing.expect(f.hashes.remove(@intCast(first_changed + 1)));
+            } else {
+                @memset(patch[first_changed * 16 ..], 'b');
+            }
+            const generation = f.writes;
+            try std.testing.expect(st.copyIntoCache(f, 16, &patch));
+            try std.testing.expectEqual(generation + 1, f.writes);
+            try std.testing.expect(st.copyIntoCache(f, 16, &patch));
+            try std.testing.expectEqual(generation + 1, f.writes);
+            var actual: [80]u8 = undefined;
+            try std.testing.expectEqual(@as(isize, actual.len), st.readCache(f, &actual, 0, sys.monoSec(std.testing.io)));
+            try std.testing.expectEqualSlices(u8, initial[0..16], actual[0..16]);
+            try std.testing.expectEqualSlices(u8, &patch, actual[16..64]);
+            try std.testing.expectEqualSlices(u8, initial[64..], actual[64..]);
+            for (0..5) |i| {
+                var h: [piece.digest_len]u8 = undefined;
+                piece.digest(actual[i * 16 ..][0..16], &h);
+                try std.testing.expectEqualSlices(u8, &h, &st.expectedHash(f, @intCast(i), 0).?);
+                try std.testing.expect(st.hasPiece(f, @intCast(i), sys.monoSec(std.testing.io)));
+            }
+        }
+    }
+}
+
+test "copyIntoCache does not treat matching middle pieces as a partial-write retry" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-wpartial");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-wpartial");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const initial = [_]u8{'a'} ** 48;
+    const patch = "BBBBBBBB" ++ "a" ** 16 ++ "CCCCCCCC";
+    for ([_]bool{ false, true }) |busy| {
+        const f = try st.get(if (busy) "busy.bin" else "idle.bin", initial.len, sys.monoSec(std.testing.io));
+        defer st.releaseFile(f);
+        try std.testing.expect(st.copyIntoCache(f, 0, &initial));
+        if (busy) f.xfer.store(1, .monotonic);
+        defer f.xfer.store(0, .monotonic);
+        try std.testing.expectEqual(!busy, st.copyIntoCache(f, 8, patch));
+        try std.testing.expectEqual(@as(u64, 2), f.writes);
+        try std.testing.expect(st.expectedHash(f, 0, 0) == null);
+        try std.testing.expect(st.expectedHash(f, 2, 0) == null);
+        for (0..3) |i| try std.testing.expectEqual(!busy, st.hasPiece(f, @intCast(i), sys.monoSec(std.testing.io)));
+        if (busy) {
+            try std.testing.expect(st.expectedHash(f, 1, 0) == null);
+        } else {
+            var h: [piece.digest_len]u8 = undefined;
+            piece.digest(patch[8..24], &h);
+            try std.testing.expectEqualSlices(u8, &h, &st.expectedHash(f, 1, 0).?);
+            var actual: [48]u8 = undefined;
+            try std.testing.expectEqual(@as(isize, actual.len), st.readCache(f, &actual, 0, sys.monoSec(std.testing.io)));
+            try std.testing.expectEqualStrings("a" ** 8 ++ patch ++ "a" ** 8, &actual);
+        }
+    }
 }
 
 test "manifest publish then load: a fresh store verifies peer expectations from origin" {
