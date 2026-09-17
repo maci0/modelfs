@@ -310,9 +310,9 @@ pub fn decodeAck(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Ack)
 /// Hex handshake nonce matching one `update.req` to its `update.ack`. Fails
 /// rather than falling back to anything derivable: a pid-shaped token would
 /// let a same-uid racer ack an update it did not request.
-pub fn randomToken(out: *[token_bytes * 2]u8) !void {
+pub fn randomToken(io: std.Io, out: *[token_bytes * 2]u8) !void {
     var raw: [token_bytes]u8 = undefined;
-    if (sys.randomBytes(&raw) != 0) return error.NoRandom;
+    io.randomSecure(&raw) catch return error.NoRandom;
     const hex = std.fmt.bytesToHex(raw, .lower);
     @memcpy(out, &hex);
 }
@@ -510,11 +510,11 @@ test "parseHandoffArgs takes only the form execArgvZ writes" {
 test "update req/ack carry a token the client can match" {
     const gpa = std.testing.allocator;
     var tok: [token_bytes * 2]u8 = undefined;
-    try randomToken(&tok);
+    try randomToken(std.testing.io, &tok);
     // Two tokens in a row must differ, or a stale ack would match the next
     // request; a constant fallback used to make that possible.
     var again: [token_bytes * 2]u8 = undefined;
-    try randomToken(&again);
+    try randomToken(std.testing.io, &again);
     try std.testing.expect(!std.mem.eql(u8, &tok, &again));
     const req = try encodeReq(gpa, "/bin/modelfs", &tok);
     defer gpa.free(req);
@@ -533,6 +533,61 @@ test "update req/ack carry a token the client can match" {
     const got_special = try decodeAck(gpa, ack_special);
     defer got_special.deinit();
     try std.testing.expectEqualStrings("tok\"0\\", got_special.value.token);
+}
+
+test "update tokens and request bytes replay from injected entropy" {
+    const Entropy = struct {
+        fn fill(userdata: ?*anyopaque, buf: []u8) std.Io.RandomSecureError!void {
+            const prng: *std.Random.DefaultPrng = @ptrCast(@alignCast(userdata));
+            prng.random().bytes(buf);
+        }
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.randomSecure = Entropy.fill;
+    const seed = 20260917;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const io: std.Io = .{ .userdata = &prng, .vtable = &vtable };
+    var tokens: [4][token_bytes * 2]u8 = undefined;
+    for (&tokens) |*token| try randomToken(io, token);
+    prng = std.Random.DefaultPrng.init(seed);
+    for (tokens, 0..) |token, i| {
+        var replay: [token_bytes * 2]u8 = undefined;
+        try randomToken(io, &replay);
+        try std.testing.expectEqualSlices(u8, &token, &replay);
+        if (i > 0) try std.testing.expect(!std.mem.eql(u8, &token, &tokens[i - 1]));
+        const req = try encodeReq(std.testing.allocator, "/bin/modelfs", &token);
+        defer std.testing.allocator.free(req);
+        const replay_req = try encodeReq(std.testing.allocator, "/bin/modelfs", &replay);
+        defer std.testing.allocator.free(replay_req);
+        try std.testing.expectEqualStrings(req, replay_req);
+        const ack = try encodeAck(std.testing.allocator, &token);
+        defer std.testing.allocator.free(ack);
+        const replay_ack = try encodeAck(std.testing.allocator, &replay);
+        defer std.testing.allocator.free(replay_ack);
+        try std.testing.expectEqualStrings(ack, replay_ack);
+    }
+}
+
+test "update token entropy failures leave output unchanged" {
+    const Entropy = struct {
+        fn fill(userdata: ?*anyopaque, buf: []u8) std.Io.RandomSecureError!void {
+            const err: *std.Io.RandomSecureError = @ptrCast(@alignCast(userdata));
+            @memset(buf[0 .. buf.len / 2], 0xab);
+            return err.*;
+        }
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.randomSecure = Entropy.fill;
+    const original = [_]u8{'!'} ** (token_bytes * 2);
+    var token = original;
+    try std.testing.expectError(error.NoRandom, randomToken(std.Io.failing, &token));
+    try std.testing.expectEqualSlices(u8, &original, &token);
+    for ([_]std.Io.RandomSecureError{ error.EntropyUnavailable, error.Canceled }) |err| {
+        var failure = err;
+        const io: std.Io = .{ .userdata = &failure, .vtable = &vtable };
+        try std.testing.expectError(error.NoRandom, randomToken(io, &token));
+        try std.testing.expectEqualSlices(u8, &original, &token);
+    }
 }
 
 test "handover encode and decode refuse PSK with line breaks" {

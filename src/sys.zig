@@ -13,8 +13,6 @@
 //! memfds, socket options (`SO_SNDTIMEO` drives every deadline here), and
 //! `poll` have no `std` coverage; `fcntl` CLOEXEC toggling, libc `environ`
 //! mutation, and `errno` have no native equivalent either.
-//! `std.crypto.random` does not exist in 0.16, so `randomBytes` keeps the
-//! raw getrandom loop.
 const std = @import("std");
 pub const c = @import("c.zig").c;
 
@@ -278,29 +276,6 @@ pub fn setCloexec(fd: c_int, on: bool) i32 {
     else
         flags & ~@as(c_int, c.FD_CLOEXEC);
     if (std.c.fcntl(fd, c.F_SETFD, next) < 0) return negErrno();
-    return 0;
-}
-
-/// Fills `buf` from the kernel CSPRNG. 0 on success, -errno on failure.
-/// `std.crypto.random` and `std.posix.getrandom` are both gone in 0.16, so
-/// the raw syscall is the available primitive and it lives behind this layer
-/// like every other. Short reads are looped and EINTR retried; callers must
-/// fail rather than substitute a guessable value.
-pub fn randomBytes(buf: []u8) i32 {
-    var off: usize = 0;
-    while (off < buf.len) {
-        const n = std.os.linux.getrandom(buf[off..].ptr, buf.len - off, 0);
-        const signed: isize = @bitCast(n);
-        if (signed < 0) {
-            const err: i32 = @intCast(-signed);
-            if (err == c.EINTR) continue;
-            return -err;
-        }
-        // A zero-length read cannot make progress; treat it as a failure
-        // rather than spinning on a kernel that will not fill the buffer.
-        if (signed == 0) return -c.EIO;
-        off += @intCast(signed);
-    }
     return 0;
 }
 

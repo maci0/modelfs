@@ -1489,7 +1489,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         return 1;
     };
     var tok: [handover.token_bytes * 2]u8 = undefined;
-    handover.randomToken(&tok) catch {
+    handover.randomToken(io, &tok) catch {
         printErr("modelfs: cannot read random bytes for the update handshake token\n", .{});
         return 1;
     };
