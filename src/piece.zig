@@ -19,12 +19,9 @@ pub fn sidecarPieceSize(blob: []const u8) ?u32 {
     return if (ps != 0) ps else null;
 }
 
-/// Saturating ceil(n / d). `d` must be nonzero. The add saturates so a
-/// maxInt(u64) numerator cannot wrap before the divide (which would
-/// under-count pieces and leave a tail the bitfield cannot name).
-fn divCeilSat(n: u64, d: u64) u64 {
+fn divCeil(n: u64, d: u64) u64 {
     std.debug.assert(d != 0);
-    return @divFloor(n +| (d - 1), d);
+    return @divFloor(n, d) + @intFromBool(n % d != 0);
 }
 
 /// Piece count for a file, clamped at u32 max. piece_size 0 or an empty
@@ -36,7 +33,7 @@ pub fn count(file_size: u64, piece_size: u32) u32 {
     // so the quotient can exceed u32: clamp like indexAt instead of letting
     // the cast panic (safe builds) or wrap (release builds) into a bitfield
     // too small for the file, whose bits then persist via saveBits.
-    return @intCast(@min(divCeilSat(file_size, @as(u64, piece_size)), @as(u64, std.math.maxInt(u32))));
+    return @intCast(@min(divCeil(file_size, @as(u64, piece_size)), @as(u64, std.math.maxInt(u32))));
 }
 
 /// The pwrite address of piece `idx`. A u64 product of two u32 values cannot
@@ -132,7 +129,7 @@ pub fn cover(span: Span, file_size: u64, piece_size: u32) struct { start: u32, e
 pub fn fullCover(span: Span, piece_size: u32) struct { start: u32, end: u32 } {
     if (span.len == 0 or piece_size == 0) return .{ .start = 0, .end = 0 };
     const ps: u64 = piece_size;
-    const first = divCeilSat(span.off, ps);
+    const first = divCeil(span.off, ps);
     const stop = @divFloor(span.off +| span.len, ps);
     if (first >= stop) return .{ .start = 0, .end = 0 };
     return .{
@@ -901,6 +898,18 @@ test "tailValidBits survives the max-clamped final word" {
     try std.testing.expectEqual(@as(?u6, 60), tailValidBits(0, 64, 60));
     try std.testing.expectEqual(@as(?u6, 6), tailValidBits(64, 8, 70));
     try std.testing.expectEqual(@as(?u6, null), tailValidBits(64, 64, 128));
+}
+
+test "ceil division stays exact at u64 limits" {
+    const max = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(u64, 0), divCeil(0, 2));
+    try std.testing.expectEqual(@as(u64, 1), divCeil(1, 2));
+    try std.testing.expectEqual(@as(u64, 1), divCeil(2, 2));
+    try std.testing.expectEqual(@as(u64, 2), divCeil(3, 2));
+    try std.testing.expectEqual(max, divCeil(max, 1));
+    try std.testing.expectEqual(@as(u64, 1) << 63, divCeil(max, 2));
+    try std.testing.expectEqual(@as(u64, 1), divCeil(max, max));
+    try std.testing.expectEqual(@as(u64, 2), divCeil(max, max - 1));
 }
 
 test "count clamps instead of overflowing u32" {
