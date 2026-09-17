@@ -89,3 +89,14 @@ output="$(cat "${fixture}/missing-manifest.log")"
 [[ "${output}" == *"cannot read .deps/libfuse3-3.16.2/SHA256SUMS: FileNotFound"* ]] || fail "static build did not reject the missing manifest: ${output}"
 
 echo "=== static libfuse3 manifest required ==="
+
+pin="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "${fixture}/build.zig.zon")"
+[[ -n "${pin}" ]] || fail "missing Zig version pin"
+sed 's/^\([[:space:]]*\.minimum_zig_version *= *\)"[^"]*"/\1"0.0.0"/' "${ROOT_DIR}/build.zig.zon" >"${fixture}/build.zig.zon"
+rc=0
+zig build test --build-file "${fixture}/build.zig" -Dfuse-static >"${fixture}/wrong-toolchain.log" 2>&1 || rc=$?
+[[ "${rc}" -ne 0 ]] || fail "build accepted a compiler other than the pinned version"
+output="$(cat "${fixture}/wrong-toolchain.log")"
+[[ "${output}" == *"use the Zig version pinned by minimum_zig_version in build.zig.zon"* ]] || fail "build did not reject the wrong compiler: ${output}"
+
+echo "=== exact Zig toolchain required ==="

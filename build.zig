@@ -1,5 +1,10 @@
 const std = @import("std");
 
+comptime {
+    if (!std.mem.eql(u8, @import("builtin").zig_version_string, @import("build.zig.zon").minimum_zig_version))
+        @compileError("use the Zig version pinned by minimum_zig_version in build.zig.zon");
+}
+
 fn allocPrint(b: *std.Build, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(b.allocator, fmt, args) catch @panic("out of memory");
 }

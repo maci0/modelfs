@@ -11,7 +11,7 @@ both at once:
 
 | Tool | Floor | Pinned in |
 |---|---|---|
-| Zig | 0.16.0 | `minimum_zig_version` in [build.zig.zon](build.zig.zon) (setup-zig reads it) |
+| Zig | exactly 0.16.0 | `minimum_zig_version` in [build.zig.zon](build.zig.zon) (setup-zig reads it; the build rejects other versions) |
 | Python | 3.12 | [.python-version](.python-version) (setup-uv reads it) |
 | uv | see manifest | `[tool.uv] required-version` in [pyproject.toml](pyproject.toml) |
 | ruff, mypy | exact | [requirements-dev.lock.txt](requirements-dev.lock.txt) |
