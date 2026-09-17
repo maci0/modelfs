@@ -418,7 +418,7 @@ while :; do
         # Authorization: Bearer $(cat …psk) into -H used to leak it through
         # /proc/<pid>/cmdline (world-readable on the guest, as the ssh
         # command string is on this host).
-        have_cmd="printf \"Authorization: Bearer %s\\n\" \"\$(cat /home/ubuntu/modelfs.psk)\" > /home/ubuntu/have.hdr && chmod 600 /home/ubuntu/have.hdr && curl -s -D - -o /dev/null -H @/home/ubuntu/have.hdr \"http://127.0.0.1:18080/have?path=big.gguf\" | head -8; echo; curl -s -H @/home/ubuntu/have.hdr \"http://127.0.0.1:18080/have?path=big.gguf\" | xxd | head -5; rm -f /home/ubuntu/have.hdr"
+        have_cmd="umask 077; printf \"Authorization: Bearer %s\\n\" \"\$(cat /home/ubuntu/modelfs.psk)\" > /home/ubuntu/have.hdr && chmod 600 /home/ubuntu/have.hdr && curl -s -D - -o /dev/null -H @/home/ubuntu/have.hdr \"http://127.0.0.1:18080/have?path=big.gguf\" | head -8; echo; curl -s -H @/home/ubuntu/have.hdr \"http://127.0.0.1:18080/have?path=big.gguf\" | xxd | head -5; rm -f /home/ubuntu/have.hdr"
         ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${C1_IP}" "${have_cmd}" >&2
         exit 1
     fi
