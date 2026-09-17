@@ -24,7 +24,6 @@ fail() {
 
 command -v timeout >/dev/null 2>&1 || fail "timeout not found on PATH (coreutils)"
 
-# version_ge is the floor compare require_zig / require_python / check.sh share.
 expect_version_ge() {
     local rc=0
     # shellcheck disable=SC2310 # version_ge is a pure awk compare; it never relies on set -e
@@ -38,6 +37,34 @@ expect_version_ge 3.12.0 3.12 0
 expect_version_ge 3.14.7 3.12 0
 expect_version_ge 0.15.99 0.16.0 1
 expect_version_ge 3.11.9 3.12 1
+
+expect_zig_version() {
+    local version="$1" want="$2" output rc=0
+    set +e
+    output="$(
+        set -e
+        zig() {
+            [[ "$#" -eq 1 && "$1" == version ]] || exit 99
+            printf '%s\n' "${version}"
+        }
+        require_zig 2>&1
+    )"
+    rc=$?
+    set -e
+    [[ "${rc}" -eq "${want}" ]] || fail "require_zig ${version} exited ${rc}, want ${want}"
+    if [[ "${want}" -eq 0 ]]; then
+        [[ -z "${output}" ]] || fail "require_zig wrote output for the pinned compiler"
+    else
+        [[ "${output}" == *"does not match minimum_zig_version"* ]] || fail "require_zig omitted the exact pin diagnostic"
+    fi
+}
+zig_pin="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' build.zig.zon)"
+[[ -n "${zig_pin}" ]] || fail "missing Zig pin"
+expect_zig_version "${zig_pin}" 0
+expect_zig_version 0.0.0 1
+expect_zig_version 999.0.0 1
+expect_zig_version "${zig_pin}-dev.1" 1
+expect_zig_version "" 1
 
 expect_fuse_helper() {
     local helper="$1" output rc=0 bin

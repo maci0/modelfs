@@ -73,7 +73,7 @@ fail() {
     exit 1
 }
 
-command -v zig >/dev/null || fail "zig not on PATH (minimum_zig_version in build.zig.zon is the toolchain pin)"
+require_zig
 
 flags=(-Dtarget="${target}" -Doptimize=ReleaseFast -Dfuse-static)
 if [[ -n "${prefix}" ]]; then

@@ -65,8 +65,6 @@ version_ge() {
 
 # Named preflight for scripts that invoke `zig build`: a missing toolchain
 # otherwise dies as bash "command not found" with no pointer at setup.
-# The version floor is minimum_zig_version in build.zig.zon, the same pin
-# CI installs; an older zig used to fail later as a compile error.
 require_zig() {
     if ! command -v zig >/dev/null 2>&1; then
         echo "cannot run: zig not found on PATH -- see CONTRIBUTING.md (setup section)" >&2
@@ -79,11 +77,8 @@ require_zig() {
         exit 1
     fi
     zig_ver="$(zig version)"
-    local ge_rc=0
-    # shellcheck disable=SC2310 # version_ge is a pure awk compare; it never relies on set -e
-    version_ge "${zig_ver}" "${min_zig}" && ge_rc=0 || ge_rc=$?
-    if [[ "${ge_rc}" -ne 0 ]]; then
-        echo "cannot run: zig ${zig_ver} is older than minimum_zig_version ${min_zig} in build.zig.zon" >&2
+    if [[ "${zig_ver}" != "${min_zig}" ]]; then
+        echo "cannot run: zig ${zig_ver} does not match minimum_zig_version ${min_zig} in build.zig.zon" >&2
         exit 1
     fi
 }

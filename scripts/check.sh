@@ -132,15 +132,7 @@ fi
 
 # zig fmt does not consult build.zig.zon; catch an old toolchain here
 # rather than as a later, less obvious compile failure.
-min_zig="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
-[[ -n "${min_zig}" ]] || fail "cannot read minimum_zig_version from build.zig.zon"
-zig_ver="$(zig version)"
-ge_rc=0
-# shellcheck disable=SC2310 # version_ge is a pure awk compare; it never relies on set -e
-version_ge "${zig_ver}" "${min_zig}" && ge_rc=0 || ge_rc=$?
-if [[ "${ge_rc}" -ne 0 ]]; then
-    fail "zig ${zig_ver} is older than minimum_zig_version ${min_zig} in build.zig.zon"
-fi
+require_zig
 
 # Instant, and must run before any suite: a missing --help handler used to
 # start e2e / FUSE / ReleaseFast work. timeout is the safety net if a handler
