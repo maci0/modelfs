@@ -82,6 +82,7 @@ pub const Owned = struct {
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Owned) void {
+        std.crypto.secureZero(u8, self.psk);
         self.arena.deinit();
     }
 };
@@ -144,6 +145,9 @@ pub fn encode(gpa: std.mem.Allocator, k: Knobs) ![]u8 {
     for (k.seeds) |a| _ = try utf8Knob(a.ip);
     for (k.nodes) |n| _ = try utf8Knob(n.path);
     for (k.opens) |o| _ = try utf8Knob(o.path);
+    for (k.psk) |ch| {
+        if (ch == '\r' or ch == '\n') return error.BadPsk;
+    }
     const doc = JsonDoc{
         .origin = k.origin,
         .cache = k.cache,
@@ -189,6 +193,9 @@ pub fn decode(gpa: std.mem.Allocator, blob: []const u8) !Owned {
     const d = parsed.value;
     if (d.psk_len != psk_bytes.len) return error.PskLen;
     if (d.psk_len > proto.max_psk_bytes) return error.PskTooLarge;
+    for (psk_bytes) |ch| {
+        if (ch == '\r' or ch == '\n') return error.BadPsk;
+    }
     if (d.init.len % 2 != 0 or d.init.len / 2 > init_max) return error.BadInit;
     if (!cull.ordered(.{ .brun = d.brun, .bcull = d.bcull, .bstop = d.bstop })) return error.BadWatermarks;
 
@@ -291,7 +298,10 @@ pub fn decodeReq(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Req)
 }
 
 pub fn encodeAck(gpa: std.mem.Allocator, token: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{{\"token\":\"{s}\"}}\n", .{token});
+    _ = try utf8Knob(token);
+    const json = try std.json.Stringify.valueAlloc(gpa, Ack{ .token = token }, .{});
+    defer gpa.free(json);
+    return std.fmt.allocPrint(gpa, "{s}\n", .{json});
 }
 
 pub fn decodeAck(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Ack) {
@@ -518,6 +528,40 @@ test "update req/ack carry a token the client can match" {
     const got = try decodeAck(gpa, ack);
     defer got.deinit();
     try std.testing.expectEqualStrings(&tok, got.value.token);
+
+    const ack_special = try encodeAck(gpa, "tok\"0\\");
+    defer gpa.free(ack_special);
+    const got_special = try decodeAck(gpa, ack_special);
+    defer got_special.deinit();
+    try std.testing.expectEqualStrings("tok\"0\\", got_special.value.token);
+}
+
+test "handover encode and decode refuse PSK with line breaks" {
+    const gpa = std.testing.allocator;
+    var knobs = Knobs{
+        .origin = "/o",
+        .cache = "/c",
+        .id = "n",
+        .mount = "/m",
+        .piece = 4096,
+        .listen = 1,
+        .water = .{},
+        .direct_io = true,
+        .allow_other = false,
+        .fuse_fd = 3,
+        .listen_fds = &.{3},
+        .advertise = &.{},
+        .seeds = &.{},
+        .psk = "secret\nbreak",
+    };
+    try std.testing.expectError(error.BadPsk, encode(gpa, knobs));
+    knobs.psk = "secret";
+    const blob = try encode(gpa, knobs);
+    defer gpa.free(blob);
+    var tampered = try gpa.dupe(u8, blob);
+    defer gpa.free(tampered);
+    tampered[tampered.len - 1] = '\n';
+    try std.testing.expectError(error.BadPsk, decode(gpa, tampered));
 }
 
 const seed_handover_ok = fuzzcorpus.entry(

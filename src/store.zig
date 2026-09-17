@@ -619,7 +619,7 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cachePinPath(&buf, rel) catch return false;
         var st: c.struct_stat = undefined;
-        return sys.statPath(p, &st) == 0;
+        return sys.lstatPath(p, &st) == 0;
     }
 
     pub fn setPin(self: *const Store, rel: []const u8, on: bool) i32 {

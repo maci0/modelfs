@@ -1016,7 +1016,10 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
             return error.PskUnreadable;
         },
     };
-    defer gpa.free(raw);
+    defer {
+        std.crypto.secureZero(u8, raw);
+        gpa.free(raw);
+    }
     // Mode of the fd we just read, not a later path-stat: swapping the
     // file between read and chmod-check would otherwise let a world-readable
     // secret through. Other bits mean any local user can steal the cluster
@@ -1523,6 +1526,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         };
         defer ack.deinit();
         if (std.mem.eql(u8, ack.value.token, &tok)) {
+            _ = sys.unlink(ack_path);
             if (!printOut(io, gpa, "updated pid {d}\n", .{pid})) return 1;
             return 0;
         }
@@ -1533,6 +1537,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // read: a leftover req would let a later SIGUSR2 re-exec to the stale
     // binary path and ack a token nobody waits on.
     _ = sys.unlink(req_path);
+    _ = sys.unlink(ack_path);
     return 1;
 }
 
@@ -1571,6 +1576,10 @@ fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Envir
         error.OutOfMemory => return error.OutOfMemory,
         error.TokenTooLarge => {
             printErr("modelfs: {s} is longer than {d} bytes; that is not a token\n", .{ hf.token_env, hf.max_token_bytes });
+            return 1;
+        },
+        error.TokenNotHeaderSafe => {
+            printErr("modelfs: token contains a line break; refusing header-unsafe token\n", .{});
             return 1;
         },
     };

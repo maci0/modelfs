@@ -1035,7 +1035,7 @@ pub const Catalog = struct {
             var fbuf: [sys.c.PATH_MAX]u8 = undefined;
             const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
             var st: c.struct_stat = undefined;
-            if (sys.statPath(fp, &st) != 0) continue;
+            if (sys.lstatPath(fp, &st) != 0) continue;
             if (st.st_mtim.tv_sec > cutoff) continue;
             // Every node runs this sweep each discovery tick, so a stale
             // claim usually has several removers racing: losing the race is
@@ -1065,7 +1065,7 @@ pub const Catalog = struct {
             var ebuf: [sys.c.PATH_MAX]u8 = undefined;
             const zown = sys.appendExt(&ebuf, ipath, ".json") catch break :blk now_sec;
             var ost: c.struct_stat = undefined;
-            if (sys.statPath(zown, &ost) != 0) break :blk now_sec;
+            if (sys.lstatPath(zown, &ost) != 0) break :blk now_sec;
             break :blk ost.st_mtim.tv_sec;
         };
         return ref_sec -| sweep_min_age_secs;

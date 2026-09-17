@@ -186,6 +186,9 @@ pub fn loadToken(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map
             // Same wrong-file rule as the token file: past the cap it is not
             // a token, and the bearer buffer below cannot name it anyway.
             if (trimmed.len > max_token_bytes) return error.TokenTooLarge;
+            for (trimmed) |ch| {
+                if (ch == '\r' or ch == '\n') return error.TokenNotHeaderSafe;
+            }
             return try gpa.dupe(u8, trimmed);
         }
     }
@@ -199,9 +202,15 @@ pub fn loadToken(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map
         break :blk sys.joinZ(&path_buf, home, token_under_cache) catch return null;
     };
     const blob = sys.readFileAlloc(gpa, path, max_token_bytes) catch return null;
-    defer gpa.free(blob);
+    defer {
+        std.crypto.secureZero(u8, blob);
+        gpa.free(blob);
+    }
     const trimmed = std.mem.trim(u8, blob, " \t\r\n");
     if (trimmed.len == 0) return null;
+    for (trimmed) |ch| {
+        if (ch == '\r' or ch == '\n') return error.TokenNotHeaderSafe;
+    }
     return try gpa.dupe(u8, trimmed);
 }
 
@@ -231,6 +240,7 @@ pub fn pull(
     report: *Report,
 ) !void {
     var auth_buf: [max_token_bytes + "Bearer ".len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &auth_buf);
     var auth_store: [1]std.http.Header = undefined;
     // The privileged set, not extra_headers: a `resolve` URL redirects to a
     // signed CDN host, and the token must not follow it there.
@@ -509,6 +519,14 @@ test "loadToken prefers the environment and never needs a flag" {
     const from_file = (try loadToken(gpa, &env)).?;
     defer gpa.free(from_file);
     try std.testing.expectEqualStrings("hf_fromfile", from_file);
+
+    // Line breaks inside the token would split HTTP request headers; refuse them.
+    try env.put(token_env, "hf_\nfromenv");
+    try std.testing.expectError(error.TokenNotHeaderSafe, loadToken(gpa, &env));
+
+    try env.put(token_env, "   ");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(path, "hf_\r\nfromfile\n"));
+    try std.testing.expectError(error.TokenNotHeaderSafe, loadToken(gpa, &env));
 }
 
 const seed_tree_ok = fuzzcorpus.entry(
