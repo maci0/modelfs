@@ -194,10 +194,12 @@ pub fn loadToken(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map
     }
     var path_buf: [sys.c.PATH_MAX]u8 = undefined;
     const path = blk: {
-        if (environ.get(home_env)) |hf_home| {
+        if (environ.get(home_env)) |raw_home| {
+            const hf_home = std.mem.trim(u8, raw_home, " \t\r\n");
             if (hf_home.len != 0) break :blk sys.joinZ(&path_buf, hf_home, token_under_home) catch return null;
         }
-        const home = environ.get("HOME") orelse return null;
+        const raw_home = environ.get("HOME") orelse return null;
+        const home = std.mem.trim(u8, raw_home, " \t\r\n");
         if (home.len == 0) return null;
         break :blk sys.joinZ(&path_buf, home, token_under_cache) catch return null;
     };
@@ -519,6 +521,20 @@ test "loadToken prefers the environment and never needs a flag" {
     const from_file = (try loadToken(gpa, &env)).?;
     defer gpa.free(from_file);
     try std.testing.expectEqualStrings("hf_fromfile", from_file);
+
+    // A whitespace-only HF_HOME counts as unset and falls through to HOME.
+    var cache_home_buf: [256]u8 = undefined;
+    const cache_path = try sys.joinZ(&cache_home_buf, home, token_under_cache);
+    const cache_dir = std.fs.path.dirname(std.mem.span(cache_path)) orelse return error.TestUnexpectedValue;
+    _ = sys.mkdirAll(cache_dir, 0o755);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(cache_path, "hf_from_home_cache\n"));
+    try env.put(home_env, "   ");
+    try env.put("HOME", home);
+    const from_home = (try loadToken(gpa, &env)).?;
+    defer gpa.free(from_home);
+    try std.testing.expectEqualStrings("hf_from_home_cache", from_home);
+    _ = env.orderedRemove("HOME");
+    try env.put(home_env, home);
 
     // Line breaks inside the token would split HTTP request headers; refuse them.
     try env.put(token_env, "hf_\nfromenv");

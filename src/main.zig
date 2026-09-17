@@ -502,7 +502,7 @@ fn parseLogLevel(s: []const u8) ?std.log.Level {
 fn takeLogLevel(source: []const u8, raw: []const u8) !std.log.Level {
     return parseLogLevel(raw) orelse {
         if (!builtin.is_test)
-            std.debug.print("{s} {s}: want err, warn, info, or debug\n", .{ source, raw });
+            std.debug.print("{s} {s}: want err, warn, info, or debug\n", .{ source, discover.displayName(raw) });
         return error.BadLogLevel;
     };
 }
@@ -1262,6 +1262,9 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         },
     };
     defer seed_list.deinit(gpa);
+    for (seed_list.addrs.items) |s| {
+        std.log.info("seed {s}:{d}", .{ s.ip, s.port });
+    }
 
     const st = try gpa.create(fuse_fs.State);
     st.init(gpa, init.io, origin, cache, opts.piece, opts.water, id, addrs.items, local_ips, seed_list.addrs.items, psk, opts.direct_io);
@@ -3744,6 +3747,7 @@ test "parseArgs --log wins over MODELFS_LOG on every command" {
     }
     try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{ "status", "--log", "verbose" }));
     try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{ "peers", "--log", "" }));
+    try std.testing.expectError(error.BadLogLevel, takeLogLevel("--log", "err\x1b[31m"));
     try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "unpin", "--log" }));
 }
 
