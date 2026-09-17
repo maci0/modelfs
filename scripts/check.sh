@@ -62,7 +62,7 @@ fail() {
 # the existence check and then pick up the OS ruff/mypy/python3.
 venv_bin="${ROOT_DIR}/.venv/bin"
 if [[ ! -d "${venv_bin}" ]]; then
-    fail "pinned .venv not found; install it with: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+    fail "pinned .venv not found; install it with: uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
 fi
 export PATH="${venv_bin}:${PATH}"
 for tool in python3 ruff mypy; do
@@ -70,7 +70,7 @@ for tool in python3 ruff mypy; do
     case "${resolved}" in
         "${venv_bin}"/*) ;;
         *)
-            fail "pinned .venv is missing ${tool}; install it with: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+            fail "pinned .venv is missing ${tool}; install it with: uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
             ;;
     esac
 done
@@ -85,7 +85,7 @@ py_need="$(awk -v v="${py_want}" 'BEGIN { n = split(v, a, /[^0-9]+/); if (n < 2)
 py_got="$(python3 -c 'import sys; print("%d.%d" % (sys.version_info[0], sys.version_info[1]))')" \
     || fail "venv python3 is not a working interpreter"
 if [[ "${py_got}" != "${py_need}" ]]; then
-    fail "venv python is ${py_got}, want ${py_need} from .python-version; recreate with: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+    fail "venv python is ${py_got}, want ${py_need} from .python-version; recreate with: uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
 fi
 
 # Name every missing tool at once instead of dying mid-gate on a bare

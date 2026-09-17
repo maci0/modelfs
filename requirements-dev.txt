@@ -3,7 +3,7 @@
 # are SVG written with the stdlib (scripts/run_benchmarks_and_plots.py).
 # check.sh additionally requires the system tools zig (0.16) and shellcheck,
 # which are not pip-installable and are intentionally not listed here.
-# Install: uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
+# Install: uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt
 #
 # Exact pins matching requirements-dev.lock.txt. A range here would let
 # `uv pip compile` float a newer ruff/mypy without a bounds-file diff.

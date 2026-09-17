@@ -91,7 +91,7 @@ jobs:
 
       - name: Install pinned Python tooling
         # check.sh invokes ruff/mypy by name from the activated venv.
-        run: uv pip install --require-hashes -r requirements-dev.lock.txt
+        run: uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt
 
       # shellcheck is preinstalled on ubuntu-24.04 runners.
       - name: Static analysis gate
@@ -129,7 +129,7 @@ jobs:
             requirements*.txt
             .python-version
       - name: Install pinned Python tooling
-        run: uv pip install --require-hashes -r requirements-dev.lock.txt
+        run: uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt
       - name: Static analysis gate
         run: ./scripts/check.sh
 

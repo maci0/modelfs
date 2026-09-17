@@ -23,8 +23,11 @@ packages on every host: install `dpkg-deb` (the `dpkg` package), or `binutils`
 `zstd` executable. Then:
 
 ```bash
-uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt
+uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt
 ```
+
+The explicit `--python` keeps the install in this clone even when another
+virtual environment is active.
 
 If uv cannot find an interpreter, run `uv python install 3.12` first.
 `scripts/check.sh` puts `.venv/bin` on PATH itself, so you never activate it,
