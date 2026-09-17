@@ -807,10 +807,7 @@ fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, e
     if (got == size) return buf;
     // Short read (concurrent truncate, flaky NFS): shrink so callers free a
     // slice whose length matches its allocation.
-    return gpa.realloc(buf, got) catch {
-        gpa.free(buf);
-        return error.OutOfMemory;
-    };
+    return try gpa.realloc(buf, got);
 }
 
 pub fn readFileBuf(buf: []u8, path: [*:0]const u8) ![]u8 {
@@ -988,6 +985,47 @@ pub fn scratchDir(buf: []u8, name: []const u8) ![]const u8 {
     const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSecRaw(), pidSelf() });
     if (mkdirAll(p, 0o755) != 0) return error.MkdirFailed;
     return p;
+}
+
+test "readFileAlloc frees a short-read buffer once when shrinking fails" {
+    const ShrinkFailure = struct {
+        fd: c_int,
+        buffer: [8]u8 = undefined,
+        allocations: usize = 0,
+        frees: usize = 0,
+
+        fn alloc(ctx: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.allocations += 1;
+            if (self.allocations != 1 or len != self.buffer.len) return null;
+            if (ftruncate(self.fd, 1) != 0) return null;
+            return &self.buffer;
+        }
+
+        fn free(ctx: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.frees += 1;
+        }
+    };
+    var dir_buf: [128]u8 = undefined;
+    const scratch = try scratchDir(&dir_buf, "modelfs-short-read-oom");
+    defer deleteTree(std.testing.io, scratch);
+    var path_buf: [192]u8 = undefined;
+    const path = try joinZ(&path_buf, scratch, "data");
+    try std.testing.expectEqual(@as(i32, 0), writeFile(path, "12345678"));
+    const fd = open(path, c.O_RDWR, 0);
+    try std.testing.expect(fd >= 0);
+    defer close(fd);
+    var state: ShrinkFailure = .{ .fd = fd };
+    const allocator: std.mem.Allocator = .{ .ptr = &state, .vtable = &.{
+        .alloc = ShrinkFailure.alloc,
+        .resize = std.mem.Allocator.noResize,
+        .remap = std.mem.Allocator.noRemap,
+        .free = ShrinkFailure.free,
+    } };
+    try std.testing.expectError(error.OutOfMemory, readFileAlloc(allocator, path, 8));
+    try std.testing.expectEqual(@as(usize, 2), state.allocations);
+    try std.testing.expectEqual(@as(usize, 1), state.frees);
 }
 
 test "mkdirAll twice converges and refuses a file or symlink at the name" {
