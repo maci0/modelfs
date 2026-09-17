@@ -279,7 +279,7 @@ load; group-readable warns.
 
 On mount the daemon zeros `RLIMIT_CORE` so a crash cannot dump the secret (the mount exits if
 that limit cannot be set), overwrites `MODELFS_PSK_VALUE` in the process environment in
-place (X-filled, key and value) so the
+place (X-filled value, preserving `MODELFS_PSK_VALUE=`) so the
 `auto_unmount` helper cannot inherit it, and wipes the in-memory copy on teardown
 (`disableCoreDumps` / `scrubPskEnv` in src/main.zig).
 

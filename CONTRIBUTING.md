@@ -59,9 +59,9 @@ Formatting, CHANGELOG headings and tag links versus `build.zig.zon`, unit tests,
 restore-drill stub suite, vendored libfuse3 digest and extract checks,
 contributor-script `--help` handlers, shellcheck, `ruff check`,
 `ruff format --check`, mypy, and the CycloneDX inventory: exactly what
-the `check` CI job runs. The CI jobs (that gate, the native aarch64
-gate, the aarch64 cross-compile, the static musl smoke build, and the
-reproducibility rebuild -- the first three also as one local step):
+the `check` CI job runs. CI also runs the native aarch64 gate, the aarch64
+cross-compile, both static musl smoke builds, and the reproducibility rebuild.
+Run the host gate, cross-compile, and reproducibility rebuild as one local step:
 
 ```bash
 ./scripts/ci.sh
@@ -87,7 +87,8 @@ DT_RPATH/DT_RUNPATH.
 
 ## End-to-end suites
 
-Not in the gate: each needs hardware or a daemon CI does not have. Every one
+Not in the gate. The FUSE suites need hardware CI does not have, and fault-tolerance
+checks need a live peer; the CLI/protocol suite needs neither. Every one
 answers `--help` without starting work.
 
 ```bash
