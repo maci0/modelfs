@@ -4133,13 +4133,11 @@ test "store get file size update and pin" {
     try std.testing.expectEqual(@as(u64, 32), f1.size);
     try std.testing.expectEqual(@as(u32, 2), f1.bits.nbits);
 
-    // Resizing file
     const f2 = try st.get("bar.bin", 64, sys.monoSec(std.testing.io));
     try std.testing.expectEqual(f1, f2);
     try std.testing.expectEqual(@as(u64, 64), f2.size);
     try std.testing.expectEqual(@as(u32, 4), f2.bits.nbits);
 
-    // Pinning
     try std.testing.expectEqual(@as(i32, 0), st.setPin("bar.bin", true));
     try std.testing.expect(st.pinExists("bar.bin"));
     try std.testing.expectEqual(@as(i32, 0), st.setPin("bar.bin", false));
