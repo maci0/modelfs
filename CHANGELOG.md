@@ -5,10 +5,10 @@
 ### Upgrade from 0.14.1 - 2026-09-17
 
 These changes are not in `v0.14.1`. The next release needs a minor bump under
-CONTRIBUTING's `0.y.z` policy because token lookup and accepted cache piece sizes
-change for existing configurations. The peer HTTP response and persisted cache
-formats are unchanged; malformed peer request paths are now rejected as described
-below.
+CONTRIBUTING's `0.y.z` policy because token lookup, accepted cache piece sizes,
+and cluster ID limits change for existing configurations. The peer HTTP response
+and persisted cache formats are unchanged; malformed peer requests are now rejected
+as described below.
 
 - **Mount and handover startup reject piece sizes not aligned to the cache filesystem.** `0.14.1` accepted positive `--piece` values smaller than, or not divisible by, the cache `data/` filesystem's `statfs.f_bsize`; these now exit 1 because partial-block hole punches cannot reclaim those blocks. For example, `--piece 4K` no longer works on a 64-KiB-block filesystem; use `--piece 64K` or another positive multiple. The default `8M` is unchanged and aligns to both 4-KiB and 64-KiB blocks. Check custom grids before `modelfs update`: the replacement validates the inherited size after exec, so a rejected size terminates the mount rather than leaving the old image running. Stop and remount with a valid `--piece` (or `MODELFS_PIECE`); `update` cannot change the grid. Changing it makes old sidecar marks unusable and the cache refills, without migrating origin data. Use the same grid across the fleet to retain peer sharing; differing grids ignore each other's `/have` bits, and manifests on the old grid are not used for verification.
 - **`modelfs pull` trims surrounding spaces, tabs, CR, and LF from `HF_HOME` and `HOME`.** Previously those bytes were part of the token directory name. A whitespace-only `HF_HOME` now falls back to `HOME` instead of looking in a whitespace-named directory. Remove surrounding whitespace from these environment values; if it is intentional in a directory name, supply the token through `HF_TOKEN` instead (never argv).
@@ -18,6 +18,13 @@ below.
 - **`reads_warm` no longer counts origin fallbacks as cache hits.** In `0.14.1`, a read whose pieces were marked cached could count as warm even when the cache read failed and the origin served it. The hit-rate formula remains `reads_warm / reads_ok`, but reported hit rates may decrease after upgrading without any change in the workload.
 - **`fill_err_peer` now includes peer-candidate setup failures**, such as allocation failure before probing. `0.14.1` omitted these failures. A rising count does not necessarily mean a remote peer failed; `probe_err` still counts failed `/have` probes, not local setup errors.
 - **Peer `/have` and `/data` reject incomplete percent escapes with HTTP 400.** `0.14.1` treated a trailing `%` or `%2` as literal filename bytes. Custom clients must percent-encode literal `%` as `%25`; filenames containing percent signs remain supported. Existing modelfs clients already encode these paths correctly, so mixed fleets need no change.
+
+### Upgrade from 0.14.1 - 2026-09-18
+
+- **Cluster IDs are limited to 246 bytes.** `0.14.1` accepted longer `--id` and `MODELFS_ID` values even though `<id>.json.tmp` could exceed Linux's 255-byte filename limit and prevent lease publication. These configurations now fail argument validation; discovery also ignores incoming leases with longer IDs. Shorten an oversized ID to a unique printable-ASCII name of at most 246 bytes before remounting. Ordinary hostname IDs are unaffected.
+- **Authenticated peer GETs require a complete HTTP/1.0 or HTTP/1.1 request line and a valid `Content-Length`, if supplied.** `0.14.1` could serve requests with a missing or invalid version, extra request-line tokens, or a malformed length. These now receive HTTP 400, including on `/ping`. Custom clients and health checks must send a target and supported version with no extra tokens; omit `Content-Length` for a bodyless GET or use `0`. Lengths must be unsigned decimal digits fitting in a u64. Existing modelfs clients already comply; authentication and method rejection still take precedence.
+- **`reads_ok` now includes successful reads at or beyond EOF.** `0.14.1` timed these responses without counting them as successes. They still add neither bytes nor warm-cache hits, so `reads_warm / reads_ok` can decrease for the same workload after upgrading. Monitoring based on read counts or average latency must account for this denominator change.
+- **`probe_err` now counts `/have` piece-grid mismatches.** `0.14.1` ignored the incompatible bitmap without counting a failed probe. New nodes log the mismatch and try another path; mixed grids still cannot share pieces. Check that fleet `--piece` settings agree before treating this increase as a network outage.
 
 ### Security - 2026-09-17
 
@@ -44,6 +51,14 @@ below.
 - **Permission changes on unreadable files work on older kernels** through the `/proc/self/fd` fallback when `fchmodat2` is unavailable.
 - **Re-running `scripts/install_nas_backup.sh --install` preserves an existing `sanoid.conf`.** Previously it overwrote host-specific dataset and retention settings. Units and wrappers still refresh; apply intended configuration changes to the host's existing file. Failed copies no longer truncate installed files, so the installer can be retried.
 - **A failed restore-drill cleanup no longer appends a success log line.** `scripts/dr_restore_drill.sh` removes the clone before appending the log entry and exits nonzero when `zfs destroy` fails; previously a busy clone left the drill reporting success while the next run refused the mounted leftover. Verify and unmount the leftover `tank/drill` before rerunning.
+
+### Fixed - 2026-09-18
+
+- **Opening an existing regular file with `O_TRUNC` truncates the origin and invalidates its cached contents.** `0.14.1` ignored the flag in the open handler. Applications must omit `O_TRUNC` when they intend to preserve existing data.
+- **Truncation invalidates cached bytes even if closing the origin file reports an error.** The error still reaches the caller, but an already-completed origin truncation no longer leaves the old cached tail readable. Cache shrink allocation failures also clear cached marks and hashes rather than retaining stale content; affected pieces refill.
+- **Malformed piece sidecars are discarded and refilled.** Truncated bitmap bodies, incomplete identity trailers, extra trailing bytes, and zero piece sizes are now rejected instead of partially decoded. Valid `MFS1` sidecars, both with and without the optional 24-byte identity trailer, remain readable; no data migration is required.
+- **Peer range units are case-insensitive.** `/data` accepts `Bytes=` as well as `bytes=`, and fetchers accept mixed-case `Content-Range` units. Use lowercase when talking to `0.14.1` peers, which still require it.
+- **Discovery drops a lease at its `until` timestamp**, rather than keeping it for that extra second. Lease publishers and the on-disk JSON format are unchanged.
 
 ### Performance - 2026-09-17
 
