@@ -796,7 +796,7 @@ The tick line carries the only latency signal there is:
 
 | Field | Meaning |
 |---|---|
-| `rd_us` / `wr_us` | average wall time of a FUSE read/write over the interval |
+| `rd_us` / `wr_us` | average wall time of a FUSE read/write over the interval, using `reads_completed` / `writes_completed`. These count every timed handler, including caller errors excluded from the service-health outcome counters. Null-buffer requests are neither timed nor counted |
 | `http_us` | average `/have`+`/data` handler time, over `http_completed`. Includes misses, invalid ranges, failures, and interrupted sends. `/ping` and requests rejected before entering a handler are neither timed nor counted |
 | `fill_ms peer/nfs` | average per-piece hydration stall by tier. A miss blocks the reader for one whole piece, so this is how "reads got slow" is diagnosed from the journal |
 | `md_us` | interval **total** (these handlers count wall time, not calls) of the getattr/open/statfs latency counters, so a metadata storm is visible in a window where no data read moved. The three publish separately in status.json |

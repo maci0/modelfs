@@ -377,10 +377,13 @@ test "mf_open honors O_TRUNC for cold and cached files" {
         try std.testing.expectEqual(@as(c_int, 0), mf_read(rel.ptr, &rb, rb.len, 0, null));
         const after_eof = st.store.stats.snap();
         try std.testing.expectEqual(before_eof.reads_ok + 1, after_eof.reads_ok);
+        try std.testing.expectEqual(before_eof.reads_completed + 1, after_eof.reads_completed);
         try std.testing.expectEqual(before_eof.reads_err, after_eof.reads_err);
         try std.testing.expectEqual(before_eof.reads_warm, after_eof.reads_warm);
         try std.testing.expectEqual(before_eof.bytes_read, after_eof.bytes_read);
+        const before_write = st.store.stats.snap();
         try std.testing.expectEqual(@as(c_int, 3), mf_write(rel.ptr, "new", 3, 0, fi));
+        try std.testing.expectEqual(before_write.writes_completed + 1, st.store.stats.snap().writes_completed);
         try std.testing.expectEqualStrings("new", try sys.readFileBuf(&rb, origin_z));
         try std.testing.expectEqual(@as(c_int, 3), mf_read(rel.ptr, &rb, rb.len, 0, null));
         try std.testing.expectEqualStrings("new", rb[0..3]);
@@ -1173,7 +1176,10 @@ fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*
     // Latency covers the whole handler: warm reads too, so the tick line's
     // average tracks real reader-perceived latency, not just miss stalls.
     const rd_t0 = sys.monoNs(st.io);
-    defer _ = st.store.stats.read_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - rd_t0, 0)), .monotonic);
+    defer {
+        _ = st.store.stats.read_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - rd_t0, 0)), .monotonic);
+        _ = st.store.stats.reads_completed.fetchAdd(1, .monotonic);
+    }
     var rel: []const u8 = "";
     const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
     if (rerr != 0) return rerr;
@@ -1230,7 +1236,10 @@ fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse.off_t,
     // Same whole-handler coverage as mf_read: origin pwrite is the stall,
     // and wr_us on the tick line is the only way to see writes got slow.
     const wr_t0 = sys.monoNs(st.io);
-    defer _ = st.store.stats.write_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - wr_t0, 0)), .monotonic);
+    defer {
+        _ = st.store.stats.write_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - wr_t0, 0)), .monotonic);
+        _ = st.store.stats.writes_completed.fetchAdd(1, .monotonic);
+    }
     var rel: []const u8 = "";
     // Lookup-shaped denial: open on /.cluster already fails with ENOENT, so
     // write must agree instead of leaking that the control dir exists.
@@ -1736,11 +1745,15 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
         @field(d, f.name) = @field(cur, f.name) -| @field(prev.*, f.name);
     }
     if (std.meta.eql(d, store_mod.Stats.Snap{})) return;
+    var line_buf: [1536]u8 = undefined;
+    const line = formatStatsTick(d, &line_buf) catch return;
+    std.log.info("{s}", .{line});
+}
+
+fn formatStatsTick(d: store_mod.Stats.Snap, buf: []u8) ![]const u8 {
     const mib = 1024 * 1024;
-    const reads_attempted = d.reads_ok + d.reads_err;
-    const rd_us = meanPerOp(d.read_nanos, reads_attempted, std.time.ns_per_us);
-    const writes_attempted = d.writes_ok + d.writes_err;
-    const wr_us = meanPerOp(d.write_nanos, writes_attempted, std.time.ns_per_us);
+    const rd_us = meanPerOp(d.read_nanos, d.reads_completed, std.time.ns_per_us);
+    const wr_us = meanPerOp(d.write_nanos, d.writes_completed, std.time.ns_per_us);
     const fill_peer_ms = meanPerOp(d.fill_peer_nanos, d.fills_peer, std.time.ns_per_ms);
     const fill_origin_ms = meanPerOp(d.fill_origin_nanos, d.fills_origin, std.time.ns_per_ms);
     const http_us = meanPerOp(d.http_nanos, d.http_completed, std.time.ns_per_us);
@@ -1750,12 +1763,11 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     const md_us = @divTrunc(d.getattr_nanos + d.open_nanos + d.statfs_nanos, std.time.ns_per_us);
     // Format into a buffer then log one string: std.log.info is capped at
     // 32 format args, and the tick already named more Snap fields than that.
-    var line_buf: [1536]u8 = undefined;
-    var w = std.Io.Writer.fixed(&line_buf);
+    var w = std.Io.Writer.fixed(buf);
     // Field names mirror Stats.Snap's (what status.json publishes), so
     // the journal line and the machine artifact share one vocabulary and
     // no key collides ("err" used to name both read and write failures).
-    w.print(
+    try w.print(
         "tick: reads_ok={d} reads_err={d} reads_warm={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d} wr_us={d}" ++
             " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache/verify={d}/{d}/{d}/{d}",
         .{
@@ -1777,8 +1789,8 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.fill_err_cache,
             d.fill_err_verify,
         },
-    ) catch return;
-    w.print(
+    );
+    try w.print(
         " probe_err={d} lease_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} http_send_err={d} httpbad={d} httpdrop={d} http405={d} http_completed={d} http_us={d} md_us={d} meta_err={d}",
         .{
             d.probe_err,
@@ -1800,8 +1812,9 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             md_us,
             d.meta_err,
         },
-    ) catch return;
-    std.log.info("{s}", .{w.buffered()});
+    );
+    try w.print(" reads_completed={d} writes_completed={d}", .{ d.reads_completed, d.writes_completed });
+    return w.buffered();
 }
 
 fn writeStatus(st: *State) void {
@@ -3470,6 +3483,8 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     _ = st.store.stats.bytes_from_peer.fetchAdd(4096, .monotonic);
     _ = st.store.stats.http_405.fetchAdd(3, .monotonic);
     _ = st.store.stats.http_completed.fetchAdd(7, .monotonic);
+    _ = st.store.stats.reads_completed.fetchAdd(11, .monotonic);
+    _ = st.store.stats.writes_completed.fetchAdd(5, .monotonic);
     _ = st.store.stats.http_send_err.fetchAdd(2, .monotonic);
     _ = st.store.stats.getattr_nanos.fetchAdd(2000, .monotonic);
     _ = st.store.stats.open_nanos.fetchAdd(4000, .monotonic);
@@ -3488,6 +3503,8 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // The four keys 0.5.0 added must actually be in the published document.
     try std.testing.expectEqual(@as(u64, 3), doc2.value.stats.http_405);
     try std.testing.expectEqual(@as(u64, 7), doc2.value.stats.http_completed);
+    try std.testing.expectEqual(@as(u64, 11), doc2.value.stats.reads_completed);
+    try std.testing.expectEqual(@as(u64, 5), doc2.value.stats.writes_completed);
     try std.testing.expectEqual(@as(u64, 2), doc2.value.stats.http_send_err);
     try std.testing.expectEqual(@as(u64, 2000), doc2.value.stats.getattr_nanos);
     try std.testing.expectEqual(@as(u64, 4000), doc2.value.stats.open_nanos);
@@ -3525,6 +3542,45 @@ test "statusJson unlinks the staging file when rename fails" {
     const tmp_fp = try sys.appendExt(&zbuf, fp, ".tmp");
     var stbuf: sys.c.struct_stat = undefined;
     try std.testing.expect(sys.statPath(tmp_fp, &stbuf) != 0);
+}
+
+test "FUSE completion counters include timed caller errors without changing health outcomes" {
+    var st: State = undefined;
+    st.init(std.testing.allocator, std.testing.io, "/unused", "/unused", 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    const previous_state = tls_state;
+    tls_state = &st;
+    defer tls_state = previous_state;
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_read("/.cluster/lease", &buf, buf.len, 0, null));
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_write("/.cluster/lease", "x", 1, 0, null));
+    try std.testing.expectEqual(@as(c_int, -sys.c.EINVAL), mf_write("/model.bin", "x", 1, -1, null));
+    const timed = st.store.stats.snap();
+    try std.testing.expectEqual(@as(u64, 1), timed.reads_completed);
+    try std.testing.expectEqual(@as(u64, 2), timed.writes_completed);
+    try std.testing.expectEqual(@as(u64, 0), timed.reads_ok);
+    try std.testing.expectEqual(@as(u64, 0), timed.reads_err);
+    try std.testing.expectEqual(@as(u64, 0), timed.writes_ok);
+    try std.testing.expectEqual(@as(u64, 0), timed.writes_err);
+
+    try std.testing.expectEqual(@as(c_int, -sys.c.EFAULT), mf_read("/model.bin", null, 1, 0, null));
+    try std.testing.expectEqual(@as(c_int, -sys.c.EFAULT), mf_write("/model.bin", null, 1, 0, null));
+    try std.testing.expectEqualDeep(timed, st.store.stats.snap());
+}
+
+test "formatStatsTick divides latency by all timed completions" {
+    var buf: [1536]u8 = undefined;
+    const line = try formatStatsTick(.{
+        .reads_ok = 1,
+        .reads_completed = 4,
+        .read_nanos = 8000,
+        .writes_completed = 3,
+        .write_nanos = 9000,
+    }, &buf);
+    try std.testing.expect(std.mem.find(u8, line, " rd_us=2 ") != null);
+    try std.testing.expect(std.mem.find(u8, line, " wr_us=3 ") != null);
+    try std.testing.expect(std.mem.find(u8, line, " reads_completed=4 writes_completed=3") != null);
 }
 
 test "meanPerOp does not overflow the per-op divisor" {

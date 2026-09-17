@@ -71,6 +71,7 @@ pub const Stats = struct {
     /// read latency the tick line publishes; nothing else in this daemon
     /// answers "reads got slow".
     read_nanos: std.atomic.Value(u64) = .init(0),
+    reads_completed: std.atomic.Value(u64) = .init(0),
     writes_ok: std.atomic.Value(u64) = .init(0),
     writes_err: std.atomic.Value(u64) = .init(0),
     bytes_written: std.atomic.Value(u64) = .init(0),
@@ -78,6 +79,7 @@ pub const Stats = struct {
     /// only signal that origin writes stalled (NFS), the write-side twin of
     /// read_nanos.
     write_nanos: std.atomic.Value(u64) = .init(0),
+    writes_completed: std.atomic.Value(u64) = .init(0),
     /// Metadata operation latencies: getattr, open, statfs (ns).
     /// Every FUSE request traverses getattr; without these the tick line
     /// only answers "data reads got slow" while metadata storms stay invisible.
@@ -169,10 +171,12 @@ pub const Stats = struct {
         reads_warm: u64 = 0,
         bytes_read: u64 = 0,
         read_nanos: u64 = 0,
+        reads_completed: u64 = 0,
         writes_ok: u64 = 0,
         writes_err: u64 = 0,
         bytes_written: u64 = 0,
         write_nanos: u64 = 0,
+        writes_completed: u64 = 0,
         getattr_nanos: u64 = 0,
         open_nanos: u64 = 0,
         statfs_nanos: u64 = 0,
