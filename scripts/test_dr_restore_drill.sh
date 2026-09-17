@@ -1218,6 +1218,11 @@ OVERRIDE_DIR="${INSTALL_DEST}/etc/systemd/system/syncoid-models.service.d"
 mkdir -p "${OVERRIDE_DIR}"
 printf '%s\n' '[Service]' 'Environment=MF_SYNCOID_SRC=replica@nas:tank/models' \
     >"${OVERRIDE_DIR}/override.conf"
+SANOID_EXPECTED="${TEMP}/sanoid.expected"
+printf '%s\n' '[tank/site-models]' 'recursive = yes' 'daily = 90' \
+    >"${SANOID_EXPECTED}"
+cp "${SANOID_EXPECTED}" "${INSTALL_DEST}/etc/sanoid/sanoid.conf"
+rm "${INSTALL_DEST}/usr/local/sbin/modelfs-check-offsite"
 REINSTALL_OUT=""
 REINSTALL_RC=0
 REINSTALL_OUT="$(MF_NAS_DEST="${INSTALL_DEST}" "${INSTALLER}" --install 2>&1)" || REINSTALL_RC=$?
@@ -1233,6 +1238,13 @@ elif ! grep -q "BatchMode=yes" \
     fail "installer second --install lost syncoid BatchMode"
 else
     pass "installer --install leaves a syncoid drop-in override in place"
+fi
+if ! cmp -s "${SANOID_EXPECTED}" "${INSTALL_DEST}/etc/sanoid/sanoid.conf"; then
+    fail "installer second --install clobbered the site snapshot policy"
+elif ! cmp -s "${SCRIPTS_DIR}/check_offsite.sh" "${INSTALL_DEST}/usr/local/sbin/modelfs-check-offsite"; then
+    fail "installer second --install did not restore the missing wrapper"
+else
+    pass "installer --install preserves the snapshot policy and repairs missing files"
 fi
 
 # --- check_offsite.sh: site-loss copy freshness

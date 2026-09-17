@@ -18,8 +18,10 @@ Copy sanoid.conf, OnFailure drop-ins, the replica pull timer, the
 hourly snapshot-age alarm, the restore-drill timers, the pool-loss
 restore wrapper, and the offsite-age alarm from scripts/nas/ into
 MF_NAS_DEST (default /). Without --install, print the plan and exit
-0. Does not enable or start any unit; run the printed systemctl
-lines on the NAS and replica host.
+0. An existing sanoid.conf is preserved; edit its dataset and retention
+settings on the host. Units and wrappers are refreshed on each install.
+Does not enable or start any unit; run the printed systemctl lines on
+the NAS and replica host.
 EOF
 }
 
@@ -55,6 +57,10 @@ copy_one() {
     fi
     if [[ "${INSTALL}" -eq 0 ]]; then
         echo "would copy ${src} -> ${dest_path}"
+        return 0
+    fi
+    if [[ "${rel}" == "etc/sanoid/sanoid.conf" && -f "${dest_path}" ]]; then
+        echo "kept ${dest_path}"
         return 0
     fi
     mkdir -p "$(dirname "${dest_path}")"

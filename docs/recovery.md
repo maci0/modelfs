@@ -65,7 +65,8 @@ systemctl enable --now modelfs-drill.timer modelfs-drill-log.timer modelfs-snap-
 
 `scripts/nas/sanoid.conf` is the autosnap and autoprune policy: 36 hourly, 30 daily, 3 monthly,
 `recursive = yes`. Weights are near-immutable and lz4-compressed, so snapshots cost almost
-nothing; tune the counts to spare capacity, then re-copy the file.
+nothing; tune the counts to spare capacity. The installer preserves an existing
+`/etc/sanoid/sanoid.conf`, so edits made on the host survive a re-run.
 
 Recursive is a no-op while `tank/models` has only directories underneath
 ([operations.md](operations.md)). It is there so a later `zfs create tank/models/gguf` is
