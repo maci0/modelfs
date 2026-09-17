@@ -68,7 +68,7 @@ zig build test --summary all           # full unit suite
 zig build test -Dtest-filter=relOk     # only tests whose names contain this substring
 zig build test --watch                 # rebuild and re-run on change
 zig build fmt                          # apply zig fmt (check.sh only --checks)
-ruff format                            # apply ruff format (check.sh only --checks)
+.venv/bin/ruff format                  # apply pinned ruff format (check.sh only --checks)
 ```
 
 Unit tests live next to the code they cover in `src/*.zig`. A new module's

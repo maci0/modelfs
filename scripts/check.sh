@@ -24,7 +24,7 @@ Contributor commands (also listed by `zig build --help`; each script
 answers --help):
   zig build                                 build the binary
   zig build fmt                             apply zig fmt
-  ruff format                               apply ruff format
+  .venv/bin/ruff format                     apply pinned ruff format
   zig build test                            unit tests
   zig build test -Dtest-filter=relOk        tests whose names contain this substring
   zig build test --watch                    rebuild and re-run on change
@@ -342,7 +342,7 @@ echo "=== ruff ==="
 ruff check || fail "ruff check reported violations"
 
 echo "=== ruff format --check ==="
-ruff format --check || fail "ruff format --check reported unformatted files; fix with: ruff format"
+ruff format --check || fail "ruff format --check reported unformatted files; fix with: .venv/bin/ruff format"
 
 echo "=== mypy ==="
 # files = ["scripts"] in pyproject.toml, so a bare `mypy` matches this gate.
