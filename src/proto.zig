@@ -130,7 +130,7 @@ pub fn httpStatusIs(status_line: []const u8, code: u16) bool {
 pub fn parseRange(h: []const u8) ?Range {
     const p = "bytes=";
     const s = std.mem.trim(u8, h, " \t");
-    if (!std.mem.startsWith(u8, s, p)) return null;
+    if (!std.ascii.startsWithIgnoreCase(s, p)) return null;
     const body = s[p.len..];
     const dash = std.mem.findScalar(u8, body, '-') orelse return null;
     const a = parseU64Fast(body[0..dash]) orelse return null;
@@ -152,7 +152,7 @@ const ContentRange = struct { start: u64, end: u64, complete: u64 };
 pub fn parseContentRange(h: []const u8) ?ContentRange {
     const p = "bytes ";
     const s = std.mem.trim(u8, h, " \t");
-    if (!std.mem.startsWith(u8, s, p)) return null;
+    if (!std.ascii.startsWithIgnoreCase(s, p)) return null;
     const body = s[p.len..];
     const dash = std.mem.findScalar(u8, body, '-') orelse return null;
     const rest = body[dash + 1 ..];
@@ -1137,7 +1137,10 @@ fn refDigitsU64(s: []const u8) ?u64 {
 fn refParseRange(h: []const u8) ?Range {
     const s = std.mem.trim(u8, h, " \t");
     const prefix = "bytes=";
-    if (!std.mem.startsWith(u8, s, prefix)) return null;
+    if (s.len < prefix.len) return null;
+    for (prefix, s[0..prefix.len]) |expected, actual| {
+        if (std.ascii.toLower(actual) != expected) return null;
+    }
     const body = s[prefix.len..];
     const dash = std.mem.findScalar(u8, body, '-') orelse return null;
     const start = refDigitsU64(body[0..dash]) orelse return null;
@@ -1150,7 +1153,10 @@ fn refParseRange(h: []const u8) ?Range {
 fn refParseContentRange(h: []const u8) ?ContentRange {
     const s = std.mem.trim(u8, h, " \t");
     const prefix = "bytes ";
-    if (!std.mem.startsWith(u8, s, prefix)) return null;
+    if (s.len < prefix.len) return null;
+    for (prefix, s[0..prefix.len]) |expected, actual| {
+        if (std.ascii.toLower(actual) != expected) return null;
+    }
     const body = s[prefix.len..];
     const dash = std.mem.findScalar(u8, body, '-') orelse return null;
     const rest = body[dash + 1 ..];

@@ -346,7 +346,8 @@ invalid or incomplete escapes return 400 on both `/have` and `/data`. Encode a
 literal `%` as `%25`. A literal `+` stays `+`; encode spaces as `%20`.
 
 A `/data` end past EOF clamps to it, and `bytes=N-` means through EOF (RFC 9110); suffix ranges
-(`bytes=-N`) are rejected. Wire integers (`Range`, `Content-Range`, `Content-Length`,
+(`bytes=-N`) are rejected. The `bytes` unit is case-insensitive in both `Range` and
+`Content-Range`; responses use lowercase. Wire integers (`Range`, `Content-Range`, `Content-Length`,
 `X-Piece-Size`) are unsigned decimal digits only: a leading sign or interior
 underscore is malformed, the same rule RFC 9110 uses for Content-Length. Status lines are
 `HTTP/1.1` plus a 3-digit code, so `2000` is not 200 and `4040` is not a healthy miss.

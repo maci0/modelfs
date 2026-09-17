@@ -3999,7 +3999,10 @@ fn refCheckRangeReply(head: []const u8, start: u64, end: u64) !void {
     };
     const s = std.mem.trim(u8, cr, " \t");
     const prefix = "bytes ";
-    if (!std.mem.startsWith(u8, s, prefix)) return error.BadContentRange;
+    if (s.len < prefix.len) return error.BadContentRange;
+    for (prefix, s[0..prefix.len]) |expected, actual| {
+        if (std.ascii.toLower(actual) != expected) return error.BadContentRange;
+    }
     const body = s[prefix.len..];
     const dash = std.mem.findScalar(u8, body, '-') orelse return error.BadContentRange;
     const rest = body[dash + 1 ..];
@@ -4854,6 +4857,29 @@ test "fuzz data path contract holds for mutated corpus heads" {
             }
         }
         try serveDataCheck(fixture, buf[0..take]);
+    }
+}
+
+test "peer range units are case-insensitive in requests and replies" {
+    const gpa = std.testing.allocator;
+    const fixture = try DataFixture.create(gpa);
+    defer fixture.destroy();
+
+    for ([_][]const u8{ "bytes", "BYTES", "Bytes", "bYtEs" }) |unit| {
+        var req_buf: [256]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET /data?path=m.bin HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nRange: {s}=0-15\r\n\r\n", .{unit});
+        try std.testing.expectEqual(@as(i32, 0), try serveDataCheckOk(&fixture.srv, req));
+    }
+
+    for ([_][]const u8{ "bytes", "BYTES", "Bytes", "bYtEs" }) |unit| {
+        var reply_buf: [256]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&reply_buf, "HTTP/1.1 206 Partial Content\r\nContent-Range: {s} 16-23/32\r\nContent-Length: 8\r\nConnection: close\r\n\r\nABCDEFGH", .{unit});
+        const pair = try responsePair(wire);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        var out: [8]u8 = undefined;
+        const body = try readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 16, 23, &out, null);
+        try std.testing.expectEqualStrings("ABCDEFGH", body);
     }
 }
 
