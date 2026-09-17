@@ -3229,7 +3229,8 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var skipped: usize = 0;
     while (sys.readdir(dir)) |ent| {
         const name = sys.dirName(ent);
-        if (name.len == 0 or name[0] == '.') continue;
+        if (name.len != 2 * piece.digest_len or
+            std.mem.findNone(u8, name, "0123456789abcdef") != null) continue;
         // Names come off shared NFS storage. Skip-warns go through
         // displayName so a planted CR/LF or terminal escape cannot forge
         // journal lines; lease walks already apply the same gate.
@@ -3568,6 +3569,37 @@ test "cmdDupesAll scans the manifest store and --all is dupes-only" {
     try std.testing.expect(parsed_ok.opts.all);
     try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &env, &.{ "peers", "--all", "--origin", origin_d }));
     try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &env, &.{ "verify", "--all", "--origin", origin_d, "m.bin" }));
+}
+
+test "cmdDupesAll ignores unpublished manifest temporaries" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-dupes-tmp");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    const entries = [_]piece.ManifestEntry{.{ .idx = 0, .hash = [_]u8{0x11} ** piece.digest_len }};
+    try writeManifestForTest(gpa, origin_d, "a.bin", 16, 16, &entries);
+    var blob: [piece.manifestLen(entries.len)]u8 = undefined;
+    const enc = try piece.manifestEncode(16, 16, &entries, &blob);
+    var nb: [2 * piece.digest_len]u8 = undefined;
+    const name = piece.manifestName("a.bin", &nb);
+    var pb: [256]u8 = undefined;
+    var zb: [256]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&pb, "{s}/.cluster/manifests/{s}.tmp.1", .{ origin_d, name });
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(try sys.toZ(&zb, tmp), enc));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, .{ .origin = origin_d }));
+    const expected = "scanned 1 manifest(s), 1 piece(s) total\nbyte-identical pairs: 0\npairs sharing any digest: 0\n";
+    try std.testing.expectEqualStrings(expected, out.items);
+
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(try sys.toZ(&zb, tmp), enc[0 .. enc.len - 1]));
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupesAll(std.testing.io, gpa, .{ .origin = origin_d }));
+    try std.testing.expectEqualStrings(expected, out.items);
 }
 
 test "cmdDupesAll skips a control-byte manifest name and still scans the rest" {
