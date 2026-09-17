@@ -45,11 +45,13 @@ ignore = [
     "repeated-append",
     "too-many-locals",
     "compare-to-empty-string",
-    # Preview: import of subprocess is the documented spawn path
-    # (subprocess-without-shell-equals-true still flags each call; those
-    # are noqa'd with a reason).
-    "suspicious-subprocess-import",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Preview: import of subprocess is the documented spawn path
+# (subprocess-without-shell-equals-true still flags each call; those
+# are noqa'd with a reason).
+"scripts/run_benchmarks_and_plots.py" = ["suspicious-subprocess-import"]
 
 # Flag typing-only imports even when a runtime sibling from the same
 # module exists; the scripts already pass this.
