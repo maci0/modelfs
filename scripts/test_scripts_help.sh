@@ -51,7 +51,16 @@ expect_fuse_helper() {
     )"
     rc=$?
     set -e
-    rm -rf "${bin}"
+    if [[ "${helper}" == fusermount ]]; then
+        local python benchmark_output benchmark_rc=0
+        python="$(command -v python3)"
+        benchmark_output="$(timeout 2 env PATH="${bin}" "${python}" "${SCRIPTS_DIR}/run_benchmarks_and_plots.py" 2>&1)" || benchmark_rc=$?
+        rm -rf "${bin}"
+        [[ "${benchmark_rc}" -eq 1 ]] || fail "benchmark preflight accepted legacy fusermount"
+        [[ "${benchmark_output}" == *"no fusermount3 helper on PATH"* ]] || fail "benchmark preflight omitted fusermount3 install hint"
+    else
+        rm -rf "${bin}"
+    fi
     if [[ "${helper}" == fusermount ]]; then
         [[ "${rc}" -eq 1 ]] || fail "require_fuse accepted legacy fusermount"
         [[ "${output}" == *"no fusermount3 helper on PATH"* ]] || fail "require_fuse omitted fusermount3 install hint"

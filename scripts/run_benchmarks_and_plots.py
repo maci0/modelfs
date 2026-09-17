@@ -73,8 +73,8 @@ def require_fuse() -> None:
     problems: list[str] = []
     if not Path("/dev/fuse").exists():
         problems.append("/dev/fuse is missing")
-    if shutil.which("fusermount3") is None and shutil.which("fusermount") is None:
-        problems.append("no fusermount3/fusermount helper on PATH")
+    if shutil.which("fusermount3") is None:
+        problems.append("no fusermount3 helper on PATH")
     if problems:
         sys.exit(
             "cannot run benchmarks: "
