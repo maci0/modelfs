@@ -2108,7 +2108,7 @@ export fn ll_lookup(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]con
     var e: fuse.fuse_entry_param = undefined;
     const rc = fillEntry(st, child, &e);
     if (rc != 0) return replyErr(req, rc);
-    _ = fuse.fuse_reply_entry(req, &e);
+    if (fuse.fuse_reply_entry(req, &e) == -sys.c.ENOENT) dropLookup(st, e.ino, 1);
 }
 
 export fn ll_forget(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, nlookup: u64) callconv(.c) void {
@@ -2178,7 +2178,10 @@ export fn ll_open(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, fi: ?*fuse.fuse_fi
     if (rc != 0) return replyErr(req, rc);
     setFiFh(fi, rememberOpen(st, p));
     setFiCaching(st, fi);
-    _ = fuse.fuse_reply_open(req, fi);
+    // -ENOENT means the request was interrupted and the reply discarded: no
+    // release will come for this handle (fuse_lowlevel.h), so the record
+    // just taken is rolled back here, like libfuse's own open path.
+    if (fuse.fuse_reply_open(req, fi) == -sys.c.ENOENT) forgetOpen(st, fiFh(fi));
 }
 
 export fn ll_create(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) callconv(.c) void {
@@ -2196,7 +2199,14 @@ export fn ll_create(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]con
     if (erc != 0) return replyErr(req, erc);
     setFiFh(fi, rememberOpen(st, child));
     setFiCaching(st, fi);
-    _ = fuse.fuse_reply_create(req, &e, fi);
+    // -ENOENT means the request was interrupted and the reply discarded: the
+    // kernel will neither send FORGET for this entry nor release the handle
+    // (fuse_lowlevel.h), so both acquisitions are rolled back here, like
+    // libfuse's own create path.
+    if (fuse.fuse_reply_create(req, &e, fi) == -sys.c.ENOENT) {
+        forgetOpen(st, fiFh(fi));
+        dropLookup(st, e.ino, 1);
+    }
 }
 
 /// One FUSE read reply buffer. The kernel asks for at most
@@ -2345,7 +2355,7 @@ export fn ll_mkdir(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]cons
     var e: fuse.fuse_entry_param = undefined;
     const erc = fillEntry(st, child, &e);
     if (erc != 0) return replyErr(req, erc);
-    _ = fuse.fuse_reply_entry(req, &e);
+    if (fuse.fuse_reply_entry(req, &e) == -sys.c.ENOENT) dropLookup(st, e.ino, 1);
 }
 
 export fn ll_rmdir(req: fuse.fuse_req_t, parent: fuse.fuse_ino_t, name: [*c]const u8) callconv(.c) void {
