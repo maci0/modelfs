@@ -100,7 +100,7 @@ def _pep503(name: str) -> str:
 def parse_lock(text: str) -> list[LockedPackage]:
     packages: list[LockedPackage] = []
     current: LockedPackage | None = None
-    for raw in text.splitlines():
+    for raw in text.removeprefix("\ufeff").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -121,7 +121,7 @@ def parse_lock(text: str) -> list[LockedPackage]:
 
 def parse_bounds(text: str) -> list[str]:
     names: list[str] = []
-    for raw in text.splitlines():
+    for raw in text.removeprefix("\ufeff").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -149,7 +149,7 @@ def require_exact_pins(text: str, packages: list[LockedPackage]) -> None:
         sys.exit(f"{_LOCK_REL} lists no packages")
     locked = {_pep503(pkg.name): pkg.version for pkg in packages}
     saw = False
-    for raw in text.splitlines():
+    for raw in text.removeprefix("\ufeff").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -429,6 +429,18 @@ def _self_test_bounds() -> None:
         "missing from the lock",
     )
     _must_exit(lambda: require_exact_pins("# none\n", [pkg]), "lists no packages")
+    for prefix in ("", "# café\n"):
+        text = "\ufeff" + prefix + "mypy==2.3.1\n"
+        if parse_bounds(text) != ["mypy"]:
+            sys.exit("self-test failed: parse_bounds dropped a BOM-prefixed pin")
+        if parse_lock(text) != [LockedPackage(name="mypy", version="2.3.1")]:
+            sys.exit("self-test failed: parse_lock dropped a BOM-prefixed pin")
+        require_exact_pins(text, [pkg])
+    _must_exit(lambda: parse_bounds("# comment\n\ufeffmypy==2.3.1\n"), "unrecognized bounds line")
+    _must_exit(lambda: parse_lock("# comment\n\ufeffmypy==2.3.1\n"), "unrecognized lock line")
+    _must_exit(
+        lambda: require_exact_pins("# comment\n\ufeffmypy==2.3.1\n", [pkg]), "must pin exactly"
+    )
 
 
 def _self_test_zon() -> None:
