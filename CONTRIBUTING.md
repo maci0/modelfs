@@ -1,8 +1,8 @@
 # Contributing
 
-Everything here is the runnable path from a fresh clone; CI
-([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same gate, so
-what passes locally is what passes on push.
+Everything here is the runnable path from a fresh clone. CI
+([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the same gate,
+plus the architecture and release checks listed below.
 
 ## Setup, once per clone
 
@@ -101,6 +101,22 @@ answers `--help` without starting work.
 
 ## Build and release checks
 
+`./scripts/ci.sh` does not run CI's `static-linux` jobs. Reproduce that job's
+test and ELF checks on an x86_64 Linux host with:
+
+```bash
+zig build test -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast -Dfuse-static
+./scripts/build_static.sh x86_64-linux-musl --prefix .scratch/static
+```
+
+On an aarch64 Linux host, use `aarch64-linux-musl` in both commands.
+The tests execute the target binary, so use the host's architecture;
+`build_static.sh` alone can cross-compile but does not run the unit tests.
+The separate prefix preserves the native development binary in `zig-out/`.
+These builds compile the vendored libfuse3 and do not need distro headers.
+
+Other build checks:
+
 ```bash
 ./scripts/cross_aarch64.sh             # aarch64 ReleaseFast against the vendored libfuse3
 ./scripts/repro_check.sh               # two ReleaseFast builds from different paths, byte-compared
@@ -132,10 +148,11 @@ is the runbook they belong to.
 ## PR expectations
 
 The only blocking requirement is green CI: `./scripts/check.sh`, the
-`cross-aarch64` compile job, the two `static-linux` musl builds, and the
-`reproducibility` job. `./scripts/ci.sh` runs the gate, the cross-compile,
-and the reproducibility rebuild locally; the native aarch64 gate and the
-static smoke build run only on GitHub's runners. There is no sign-off gate.
+`cross-aarch64` compile job, the two `static-linux` musl builds (test recipe
+above), and the `reproducibility` job. `./scripts/ci.sh` runs the gate, the
+cross-compile, and the reproducibility rebuild locally. Run the static checks
+separately as shown above; the native aarch64 gate requires an aarch64 host.
+There is no sign-off gate.
 
 **Behavior changes belong in [CHANGELOG.md](CHANGELOG.md)**, as a dated `###`
 section under `[Unreleased]`. Adding one is not itself gated, but the file's
