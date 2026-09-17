@@ -2626,7 +2626,11 @@ fn serve(st: *State, inherit_fd: ?c_int) c_int {
         st.wakeup_w = p[1];
     }
     if (inherit_fd == null) {
-        _ = fuse.fuse_daemonize(@intFromBool(!st.detach));
+        if (fuse.fuse_daemonize(@intFromBool(!st.detach)) != 0) {
+            std.log.err("fuse_daemonize failed; refusing to serve", .{});
+            fuse.fuse_session_unmount(se);
+            return 1;
+        }
     } else {
         if (!replayInit(st, se)) return 1;
         // Back on for the image that is serving: a later auto_unmount

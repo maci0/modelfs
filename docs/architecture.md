@@ -761,7 +761,10 @@ and drill scripts keep their knobs outside this namespace (`MF_TEST_*`, `MF_DRIL
 
 ## Logging
 
-The daemon runs in the foreground under systemd `Type=simple`. Journal output has two shapes.
+The daemon runs in the foreground under systemd `Type=simple`. With `--detach`,
+`serve` in src/fuse_fs.zig refuses to serve if `fuse_daemonize` fails, unmounts the
+new session, and returns nonzero. An inherited session does not daemonize again.
+Journal output has two shapes.
 
 ### Per-event lines, failure-only and edge-triggered
 
