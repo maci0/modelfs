@@ -136,10 +136,9 @@ pub const Stats = struct {
     http_unauthorized: std.atomic.Value(u64) = .init(0),
     http_5xx: std.atomic.Value(u64) = .init(0),
     http_send_err: std.atomic.Value(u64) = .init(0),
-    /// Connections whose head never became a routable request: scanners
-    /// that connect-and-drop, dribbled heads past the deadline, oversized
-    /// heads, request lines without a target. Counted rather than logged;
-    /// the accept cap bounds the rate anyway.
+    /// Connections dropped for incomplete or unroutable request heads, plus
+    /// requests answered with HTTP 400. Counts each rejection once without
+    /// a per-rejection warning; the inflight cap does not bound their rate.
     http_malformed: std.atomic.Value(u64) = .init(0),
     /// Connections closed unaccepted because every inflight slot was taken:
     /// work this node actively refused while it looked up from the outside.

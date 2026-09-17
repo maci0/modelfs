@@ -810,7 +810,7 @@ And the counters worth knowing by name:
 | `httpok` / `serve_mib` | accepted `/have` 200 and `/data` 206 headers and their advertised bytes (`Content-Length`), not confirmation of complete body delivery |
 | `http_send_err` | `/have` and `/data` responses interrupted during header or body sending, counted once per transfer, including deadline expiry and cache-read or allocation failures after the success header. Published under the same name in status.json; investigate the matching `dropping peer transfer` / `dropping connection` warnings for the path, offset, and failure. These are not 5xx replies and may overlap `httpok` |
 | `http_completed` | completed timed `/have` and `/data` handlers, regardless of reply status or send outcome; paired with `http_nanos` in status.json and used as the `http_us` denominator |
-| `httpbad` | connections whose request head never completed |
+| `httpbad` | connections dropped for incomplete or unroutable request heads, plus requests answered with HTTP 400; published as `http_malformed` in status.json |
 | `httpdrop` | connections closed because all inflight slots were taken: the server refusing work under saturation |
 | `http405` | requests refused for method. The journal line is deduplicated on the same window as the 401 warn and echoes the method through `proto.displayName`, since a PSK holder picks that token |
 | `meta_err` | getattr/open/readdir origin-infrastructure failures (EIO/ESTALE/ETIMEDOUT), so an `ls` during an NFS outage does not look like a slow-but-healthy `md_us` interval |
