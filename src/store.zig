@@ -4252,15 +4252,27 @@ test "forget drops bits, fd, and disk artifacts for the path" {
     f1.bits.set(0);
     f1.bits.set(3);
     f1.mu.unlock(std.testing.io);
-    _ = st.saveBits(f1, false);
+    try std.testing.expect(st.saveBits(f1, false));
     try std.testing.expect(st.openCache(f1) >= 0);
 
     // No live entry: artifacts from an earlier process must still be purged.
+    try writeFilledSidecar(&st, "never-known.bin", 64, &.{ 0, 3 });
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const stale_data = try st.cacheDataPath(&db, "never-known.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(stale_data, "0123456789abcdef" ** 4));
     var mb: [sys.c.PATH_MAX]u8 = undefined;
-    st.forget("never-known.bin");
     const stale_meta = try st.cacheMetaPath(&mb, "never-known.bin");
+    var pb: [sys.c.PATH_MAX]u8 = undefined;
+    const stale_pin = try st.cachePinPath(&pb, "never-known.bin");
+    try std.testing.expectEqual(@as(i32, 0), st.setPin("never-known.bin", true));
     var st_buf: c.struct_stat = undefined;
-    try std.testing.expect(sys.statPath(stale_meta, &st_buf) != 0);
+    for ([_][*:0]const u8{ stale_meta, stale_data, stale_pin }) |path| {
+        try std.testing.expectEqual(@as(i32, 0), sys.statPath(path, &st_buf));
+    }
+    st.forget("never-known.bin");
+    for ([_][*:0]const u8{ stale_meta, stale_data, stale_pin }) |path| {
+        try std.testing.expectEqual(-@as(i32, c.ENOENT), sys.statPath(path, &st_buf));
+    }
 
     st.forget("gone.bin");
     // The entry is evicted from the map: a later get() builds a fresh one.
@@ -4277,7 +4289,6 @@ test "forget drops bits, fd, and disk artifacts for the path" {
     try std.testing.expectEqual(@as(u32, 0), f2.bits.filled());
     const meta = try st.cacheMetaPath(&mb, "gone.bin");
     try std.testing.expect(sys.statPath(meta, &st_buf) != 0);
-    var db: [sys.c.PATH_MAX]u8 = undefined;
     const data = try st.cacheDataPath(&db, "gone.bin");
     try std.testing.expect(sys.statPath(data, &st_buf) != 0);
     st.releaseFile(f1);
