@@ -36,7 +36,7 @@ main -> fuse_fs -> peer -> (store, discover) -> (piece, proto, cull, sys) -> c
 
 **F. No magic numbers.** Every threshold and tuning constant is a named module-level constant with a doc comment: `max_have_body_bytes`, `have_ttl_ms`, `manifest_retry_ms`, `max_inflight`, `max_status_age_secs`, `cache_data_mode`. A bare literal on a policy decision is P2; a bare literal on a security bound is P1. Protocol constants, external specs, and ABI offsets stay fixed and carry the comment naming the spec they come from.
 
-**G. Comptime discipline.** Comptime for closed sets known at build time (`inline for` over the command list in `knownCommand`, the seed-corpus framing in `fuzzcorpus.zig`) is correct. Comptime that only ever sees one value, or that makes a compile error name a synthetic type, is over-use. Runtime dispatch where the set is closed and small is under-use. Both are P2 unless a hot path pays for it.
+**G. Comptime discipline.** A closed set known at build time does not by itself justify replacing runtime dispatch with `inline for`. Before changing either direction, trace callers and show a required compile-time operation, a reproduced diagnostic problem, or a measured runtime cost; preserve behavior and testability. Keep existing comptime uses that meet those needs (`knownCommand`, the seed-corpus framing in `fuzzcorpus.zig`). Generic parameters with one instantiation belong to `abstractions-review.md`; a count alone is not a finding.
 
 **H. `@builtin` selection.** The choice must be provable from the value's range:
 
@@ -79,7 +79,7 @@ rg -n '^(//!|/// )' src/ | wc -l
 |---|---|
 | **P0** | Structure break that is a live footgun: an upward import, a new `@cImport` |
 | **P1** | Real cost: a second copy of an owned concern, a name that reads as its opposite, a bare literal on a security bound |
-| **P2** | Practice drift with no current failure: comptime over- or under-use, magic number on a policy knob, `pub` sprawl |
+| **P2** | Practice drift with no current failure: a reproduced comptime diagnostic problem, magic number on a policy knob, `pub` sprawl |
 | **P3** | Missing `//!`/`///`, comment wording, import order |
 
 ## Output format

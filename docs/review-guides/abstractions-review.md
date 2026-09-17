@@ -54,7 +54,7 @@ Report these as missing-abstraction findings, with the duplicate sites named:
 - **Repeated policy with a name.** The same gate, ordering, or retry written out at three call sites wants one function. `relOk`/`relIsCluster` are the model.
 - **Illegal states that a type could forbid.** Parallel booleans, a sentinel that means "unset", or two fields that must agree. Prefer `?T`, a tagged union, or one struct that cannot be built wrong.
 - **A pure core behind an impure shell**, so the core is testable without `/dev/fuse`, a socket, or an NFS mount. `readdirResume` and `piece.zig` are the models.
-- **A closed set known at build time**, where an `inline for` beats a runtime table.
+- **A closed set known at build time** is not by itself a missing abstraction. Comptime-versus-runtime dispatch belongs to `zig-best-practices-review.md` item G and requires the evidence specified there; do not introduce a helper or unroll a loop solely because the set is closed.
 
 ## Search recipes
 
