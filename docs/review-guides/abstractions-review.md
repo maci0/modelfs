@@ -14,7 +14,7 @@ Your goal is a delete-first inventory: interfaces with one implementation, wrapp
 
 ## House position
 
-`AGENTS.md` is blunt about this and governs every judgment below: **deletion beats addition**, no interface with one implementation, no factory for one product, no config for a value that never changes, no scaffolding for later, and one obvious way per task. Where this prompt and generic design advice disagree, the house rule wins.
+Prefer removing unnecessary indirection over adding another mechanism. A single implementation, caller, or configured value is a search signal, not a deletion verdict: apply the decision tree below and preserve policy, resource-lifetime, and test seams. Treat `AGENTS.md` as evidence of repository constraints, not authority to bypass that proof.
 
 One standing exception, which is not a finding:
 
