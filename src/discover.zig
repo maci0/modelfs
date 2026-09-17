@@ -974,17 +974,17 @@ pub const Catalog = struct {
     /// lease mtime on that filesystem (a live node rewrites its lease every
     /// publish tick) and abandoned .tmp staging files from crashed publishes.
     /// Our own lease is never swept even when our own writes are failing;
-    /// that state must stay visible in the log, not vanish quietly. `now_sec`
-    /// is the fallback cutoff clock when we have no lease file yet (tests,
-    /// or a tick whose publish never landed).
-    pub fn sweepLeases(self: *Catalog, now_sec: i64) void {
+    /// that state must stay visible in the log, not vanish quietly. Without
+    /// an own lease file there is no origin-clock reference and the sweep
+    /// skips the tick (see sweepCutoff).
+    pub fn sweepLeases(self: *Catalog) void {
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
         const dirz = self.clusterDir(&dbuf) catch return;
         // Same O_NOFOLLOW directory open as walkLeases: following a planted
         // `.cluster` symlink would unlink names under the target.
         const dir = sys.opendirNoFollow(dirz) orelse return;
         defer sys.closedir(dir);
-        const cutoff = self.sweepCutoff(dirz, now_sec);
+        const cutoff = self.sweepCutoff(dirz) orelse return;
 
         // Collect then sort: NFS readdir order must not decide which stale
         // claim is unlinked first. A crash mid-sweep would otherwise leave
@@ -1042,19 +1042,18 @@ pub const Catalog = struct {
 
     /// Cutoff instant for sweepLeases: this node's own lease mtime on the
     /// origin filesystem minus sweep_min_age_secs, so NAS/spark clock skew
-    /// cannot make live peers look idle. `now_sec` is used only when that
-    /// file is missing.
-    fn sweepCutoff(self: *const Catalog, dirz: [*:0]const u8, now_sec: i64) i64 {
-        const ref_sec = blk: {
-            var ibuf: [sys.c.PATH_MAX]u8 = undefined;
-            const ipath = sys.joinZ(&ibuf, std.mem.span(dirz), self.self_id) catch break :blk now_sec;
-            var ebuf: [sys.c.PATH_MAX]u8 = undefined;
-            const zown = sys.appendExt(&ebuf, ipath, ".json") catch break :blk now_sec;
-            var ost: c.struct_stat = undefined;
-            if (sys.lstatPath(zown, &ost) != 0) break :blk now_sec;
-            break :blk ost.st_mtim.tv_sec;
-        };
-        return ref_sec -| sweep_min_age_secs;
+    /// cannot make live peers look idle. No cutoff when that file is
+    /// missing: its mtime is the only clock on this shared filesystem we
+    /// can compare mtimes against, and a wall-clock fallback would let a
+    /// skewed NAS clock or a reboot clock step unlink live peers instead.
+    fn sweepCutoff(self: *const Catalog, dirz: [*:0]const u8) ?i64 {
+        var ibuf: [sys.c.PATH_MAX]u8 = undefined;
+        const ipath = sys.joinZ(&ibuf, std.mem.span(dirz), self.self_id) catch return null;
+        var ebuf: [sys.c.PATH_MAX]u8 = undefined;
+        const zown = sys.appendExt(&ebuf, ipath, ".json") catch return null;
+        var ost: c.struct_stat = undefined;
+        if (sys.lstatPath(zown, &ost) != 0) return null;
+        return ost.st_mtim.tv_sec -| sweep_min_age_secs;
     }
 
     pub fn snapshot(self: *Catalog, gpa: std.mem.Allocator) ![]Path {
@@ -1729,7 +1728,7 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
             // must not start deleting survivors.
             try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, me_fp, past_sec));
         }
-        cat.sweepLeases(sweep_now);
+        cat.sweepLeases();
         try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
         try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
         try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
@@ -1771,7 +1770,7 @@ test "sweepLeases unlinks stale names as a set, not readdir arrival order" {
 
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
     defer cat.deinit();
-    cat.sweepLeases(sweep_now);
+    cat.sweepLeases();
 
     var stbuf: c.struct_stat = undefined;
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, zzz_fp), &stbuf) != 0);
@@ -1817,12 +1816,52 @@ test "sweepLeases ages origin mtimes against our own lease, not CLOCK_REALTIME" 
     const addrs = [_]proto.LeaseAddr{};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
     defer cat.deinit();
-    cat.sweepLeases(sweep_now);
+    cat.sweepLeases();
 
     var stbuf: c.struct_stat = undefined;
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
     try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
+}
+
+test "sweepLeases skips cleanup without an origin clock reference" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-sweep-no-clock");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    const nas_now: i64 = 1_700_000_000;
+    const names = [_][]const u8{ "alive.json", "dead.json", "crashed.json.tmp" };
+    var path_buf: [192]u8 = undefined;
+    var zbuf: [192]u8 = undefined;
+    for (names, 0..) |name, i| {
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ cluster_d, name });
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, path), "{}"));
+        const stamp = if (i == 0) nas_now else nas_now - 2 * Catalog.sweep_min_age_secs;
+        try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, path, stamp));
+    }
+
+    cat.sweepLeases();
+    var st: c.struct_stat = undefined;
+    for (names) |name| {
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ cluster_d, name });
+        try std.testing.expectEqual(@as(i32, 0), sys.statPath(try sys.toZ(&zbuf, path), &st));
+    }
+
+    cat.publish(nas_now);
+    const own_path = try std.fmt.bufPrint(&path_buf, "{s}/me.json", .{cluster_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, own_path, nas_now));
+    cat.sweepLeases();
+    for (names, 0..) |name, i| {
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ cluster_d, name });
+        const rc = sys.statPath(try sys.toZ(&zbuf, path), &st);
+        if (i == 0) try std.testing.expectEqual(@as(i32, 0), rc) else try std.testing.expect(rc != 0);
+    }
 }
 
 test "hostname copies into buf" {
@@ -2630,7 +2669,7 @@ test "lease walk and sweep refuse a planted .cluster symlink" {
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
     cat.refresh(sys.nowSec(std.testing.io));
-    cat.sweepLeases(sys.nowSec(std.testing.io));
+    cat.sweepLeases();
 
     const snap = try cat.snapshot(gpa);
     defer Catalog.freeSnapshot(gpa, snap);

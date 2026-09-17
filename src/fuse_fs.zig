@@ -1694,12 +1694,10 @@ fn discLoop(st: *State) void {
     while (st.running.load(.acquire)) {
         // One wall-clock instant per tick: publish and refresh's expiry
         // filter decide against the same sample instead of two reads
-        // drifting across the tick. Sweep prefers this node's own lease
-        // mtime on the origin (NAS clock) and uses `now` only when that
-        // file is missing.
+        // drifting across the tick.
         const now = sys.nowSec(st.io);
         tickCluster(st, now);
-        st.catalog.sweepLeases(now);
+        st.catalog.sweepLeases();
         // Membership is a gauge, not a counter, so it never moves the tick
         // line. An idle node that loses every peer would otherwise stay
         // silent until the next fill fell through to NFS.

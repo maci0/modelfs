@@ -193,6 +193,7 @@ Every node also sweeps the directory each tick, unlinking lease files older than
 abandoned `<id>.json.tmp` files from crashed publishes, never its own lease. Age is measured
 against **this node's own lease mtime on the origin** (the NAS clock): comparing NAS mtimes to
 the spark's `CLOCK_REALTIME` would unlink live peers whenever the NAS ran minutes behind.
+If the own lease cannot be statted, cleanup skips the tick rather than using the node's clock.
 Stale names are collected and then unlinked in filename order (`sweepLeases` in
 src/discover.zig), so NFS readdir order cannot decide which claim disappears first if the
 sweeper crashes mid-tick.
