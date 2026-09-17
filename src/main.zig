@@ -1516,7 +1516,8 @@ fn liveDaemon(io: std.Io, gpa: std.mem.Allocator, cache: []const u8, blob_out: *
         return error.NotLive;
     }
     if (statusAgeSecs(io, doc.value)) |age| {
-        if (age > max_status_age_secs) {
+        const future_mono = if (doc.value.mono_s) |stamp| stamp > sys.monoSec(io) else false;
+        if (age > max_status_age_secs or future_mono) {
             printErr("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ cache, store_mod.status_file, age });
             gpa.free(blob);
             return error.NotLive;
@@ -2483,6 +2484,31 @@ test "unknownEnvLine renders refused names through the displayName echo gate" {
     // line: the refusal stays unconditional either way.
     const long = unknownEnvLine(buf[0..64], "MODELFS_" ** 20);
     try std.testing.expectEqualStrings("unknown environment variable (see 'modelfs help')\n", long);
+}
+
+test "cmdStatus rejects a future monotonic stamp inside the heartbeat grace period" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-status-future");
+    defer sys.deleteTree(io, cache_d);
+
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const path = try store_mod.Store.cacheStatusPath(cache_d, &zbuf);
+    var doc_buf: [192]u8 = undefined;
+    const doc = try std.fmt.bufPrint(&doc_buf, "{{\"pid\":{d},\"now_s\":{d},\"mono_s\":{d}}}\n", .{
+        sys.pidSelf(),
+        sys.nowSec(io),
+        sys.monoSec(io) + @divTrunc(max_status_age_secs, 2),
+    });
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(path, doc));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 1), try cmdStatus(io, gpa, .{ .cache = cache_d }));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "cmdStatus retires a crashed daemon's status.json as not running" {
