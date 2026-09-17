@@ -302,7 +302,7 @@ echo "=== vendored fuse3 hashes ==="
 echo "=== vendored libfuse3 static-source hashes ==="
 (
     cd "${ROOT_DIR}/.deps/libfuse3-3.16.2"
-    sha256sum -c SHA256SUMS
+    sha256sum -c SHA256SUMS || exit 1
     # Two-way coverage: build.zig's digest check only validates files the
     # sums LIST; this catches a file added to the tree but omitted from the
     # sums (it would otherwise compile into the release binary unchecked).
