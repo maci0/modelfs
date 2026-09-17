@@ -1426,16 +1426,14 @@ fn probeSlots(
     // same sample (see ProbeCtx.now_ms).
     const now_ms = sys.monoMs(cat.io);
     for (groups, 0..) |g, gi| {
-        var answered = false;
         for (g) |pi| {
             const p = paths[pi];
             if (cat.haveHas(rel, p.ip, p.port, idx, local_piece_size, now_ms)) |has| {
                 slots[gi] = has;
-                answered = true;
                 break;
             }
         }
-        if (!answered) try todo.append(gpa, gi);
+        if (slots[gi] == null) try todo.append(gpa, gi);
     }
     if (todo.items.len == 0) return;
 
@@ -1453,13 +1451,6 @@ fn probeSlots(
         .stats = stats,
         .now_ms = now_ms,
     };
-    // One remaining peer: run the walk here. Spawning a thread to do a
-    // single connect would cost more than the probe itself on loopback
-    // and still serialize behind the join.
-    if (todo.items.len == 1) {
-        probeWorker(&ctx);
-        return;
-    }
     // Cap at the server's own inflight limit: probing harder than a peer
     // accepts would only buy rejections. Run one worker on this thread so
     // a spawn is not paid for the last slot.
@@ -1578,10 +1569,7 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
         cands.deinit(gpa);
     }
     for (paths) |p| {
-        var has = false;
-        if (group_of.get(p.peer_id)) |gi| {
-            if (slots[gi]) |has_piece| has = has_piece;
-        }
+        const has = if (group_of.get(p.peer_id)) |gi| slots[gi] orelse false else false;
         const ip_copy = try gpa.dupe(u8, p.ip);
         errdefer gpa.free(ip_copy);
         try cands.append(gpa, .{
