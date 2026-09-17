@@ -221,6 +221,10 @@ recv, the property set, and the monthly hold. It is dry-run by default; `--execu
   DEST the same way the replica's `ExecStartPost` does.
 * It refuses a mounted DEST unless `--force`, so it cannot `--force-delete` the live export by
   accident.
+* A local replica cannot be an ancestor or descendant of DEST, even with `--force`. Receiving
+  recursively into an ancestor could destroy the backup; receiving into a descendant would
+  modify the backup tree. Use separate dataset trees, such as `tank/models-backup` and
+  `tank/models`.
 * It does **not** create the pool, because vdev layout is site-specific, and does not wipe node
   caches, which live on other hosts.
 

@@ -1791,6 +1791,19 @@ write_restore_env tank/models 0 no /export/models tank/models tank/models@snap "
 expect_restore "pool restore --local-from DEST is an alarm" 1 "is DEST" \
     "${RESTORE}" --local-from tank/models
 
+for RESTORE_SOURCE in tank/models/backup tank; do
+    write_restore_env tank/models 0 no /export/models \
+        "${RESTORE_SOURCE}" "${RESTORE_SOURCE}@autosnap_ok" "${FRESH}"
+    OVERLAP_LOG="${TEMP}/overlap-restore.log"
+    expect_restore "pool restore refuses overlapping source ${RESTORE_SOURCE} even with --force" 1 "overlaps destination" \
+        MF_RESTORE_LOG="${OVERLAP_LOG}" "${RESTORE}" --execute --force --local-from "${RESTORE_SOURCE}"
+    if [[ -e "${RESTORE_STATE}/commands.log" || -e "${RESTORE_STATE}/syncoid.args" || -e "${OVERLAP_LOG}" ]]; then
+        fail "overlapping restore touched ZFS or the restore log"
+    else
+        pass "overlapping restore leaves the backup and destination untouched"
+    fi
+done
+
 RLOG="${TEMP}/pool-restore.log"
 write_restore_env tank/models 0 no /export/models
 expect_restore "pool restore --execute --from pulls and sets properties" 0 "pool-restore OK" \

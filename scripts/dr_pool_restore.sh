@@ -125,6 +125,10 @@ case "${MOUNTPOINT}" in
         ;;
 esac
 
+if [[ -n "${LOCAL_FROM}" && ( "${LOCAL_FROM}" == "${DEST}/"* || "${DEST}" == "${LOCAL_FROM}/"* ) ]]; then
+    die "local replica ${LOCAL_FROM} overlaps destination ${DEST}; restore into a separate dataset tree"
+fi
+
 command -v zfs >/dev/null 2>&1 || die "zfs not found; this restore runs on the replacement NAS"
 
 # A recv onto a mounted dest is --force-delete of the live export.
