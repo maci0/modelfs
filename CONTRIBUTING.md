@@ -17,7 +17,10 @@ both at once:
 | ruff, mypy | exact | [requirements-dev.lock.txt](requirements-dev.lock.txt) |
 
 Also needed from the package manager: libfuse3 headers (`libfuse3-dev` /
-`fuse3-devel`) and shellcheck. Then:
+`fuse3-devel`) and shellcheck. The gate also extracts the vendored arm64
+packages on every host: install `dpkg-deb` (the `dpkg` package), or `binutils`
+(for `ar`), `tar`, and `zstd`. GNU tar's `--zstd` flag still requires the
+`zstd` executable. Then:
 
 ```bash
 uv venv .venv && uv pip install --require-hashes -r requirements-dev.lock.txt

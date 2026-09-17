@@ -38,6 +38,24 @@ echo stale >"${OUT}/root/leftover-from-previous-extract/STALE"
 [[ -e "${OUT}/lib/libfuse3.so" ]] || fail "dangling libfuse3.so linker symlink"
 [[ -e "${OUT}/lib/libfuse3.so.3" ]] || fail "dangling libfuse3.so.3 soname symlink"
 
+tool_path="${OUT}/tools-without-zstd"
+missing_out="${OUT}/missing-tools"
+mkdir -p "${tool_path}" "${missing_out}/root"
+for tool in bash dirname sha256sum mkdir rm mktemp tar awk; do
+    tool_bin="$(command -v "${tool}")"
+    ln -s "${tool_bin}" "${tool_path}/${tool}"
+done
+tool_bin="$(type -P true)"
+ln -s "${tool_bin}" "${tool_path}/ar"
+printf 'preserve previous extract\n' >"${missing_out}/root/KEEP"
+rc=0
+PATH="${tool_path}" "${SCRIPTS_DIR}/extract_fuse3_arm64.sh" --out "${missing_out}" >"${OUT}/missing-tools.log" 2>&1 || rc=$?
+[[ "${rc}" -eq 1 ]] || fail "missing zstd exited ${rc}, want 1"
+output="$(cat "${OUT}/missing-tools.log")"
+[[ "${output}" == *"need dpkg-deb, or binutils ar plus tar and zstd"* ]] || fail "missing zstd did not name the required tools: ${output}"
+[[ -f "${missing_out}/root/KEEP" ]] || fail "missing tools destroyed the previous extract"
+rm -rf "${tool_path}" "${missing_out}" "${OUT}/missing-tools.log"
+
 echo "=== extract_fuse3_arm64 hermetic extract ok ==="
 
 # Same ELF-machine gate scripts/cross_aarch64.sh runs after the link, so a

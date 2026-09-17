@@ -7,7 +7,7 @@
 #
 # The extractor prefers dpkg-deb (Debian-family). Other distros: a .deb is
 # an ar archive whose data.tar.zst holds the filesystem, unpacked with
-# binutils ar plus zstd (or tar --zstd).
+# binutils ar plus tar and zstd.
 set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
@@ -54,6 +54,11 @@ DEB_DIR="${ROOT_DIR}/.deps/fuse3-arm64"
 SUMS="${DEB_DIR}/SHA256SUMS"
 
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum not found on PATH"
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+    for tool in ar tar zstd; do
+        command -v "${tool}" >/dev/null 2>&1 || fail "need dpkg-deb, or binutils ar plus tar and zstd; ${tool} not found on PATH (see CONTRIBUTING.md setup)"
+    done
+fi
 
 [[ -f "${SUMS}" ]] || fail "${SUMS} missing; it is the digest list for the vendored .deb files"
 
@@ -80,26 +85,15 @@ extract_one() {
         if ! (
             cd "${tmp}"
             ar x "${deb_path}" "${data_tar}"
-            # Prefer the zstd binary; GNU tar 1.31+ also understands --zstd
-            # on hosts that ship the flag but not a zstd executable on PATH.
-            if command -v zstd >/dev/null 2>&1; then
-                zstd -dc "${data_tar}" | tar -xf - -C "${OUT}/root/"
-            else
-                tar_help="$(tar --help 2>/dev/null || true)"
-                if [[ "${tar_help}" == *--zstd* ]]; then
-                    tar --zstd -xf "${data_tar}" -C "${OUT}/root/"
-                else
-                    exit 1
-                fi
-            fi
+            zstd -dc "${data_tar}" | tar -xf - -C "${OUT}/root/"
         ); then
             rm -rf "${tmp}"
-            fail "failed to extract $1 via ar/tar (need zstd or tar --zstd)"
+            fail "failed to extract $1 via ar and zstd"
         fi
         rm -rf "${tmp}"
         return 0
     fi
-    fail "need dpkg-deb, or binutils ar plus zstd (or tar --zstd), to extract $1"
+    fail "need dpkg-deb, or binutils ar plus tar and zstd, to extract $1"
 }
 
 # Wipe first: overlaying a new extract onto a previous tree would keep

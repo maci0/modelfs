@@ -42,7 +42,7 @@ The aarch64 build needs an arm64 libfuse3, which ships here as `.deb` files only
 `cross_aarch64.sh` extracts them into `.scratch/fuse3-arm64/`, hash-checked against
 [.deps/fuse3-arm64/SHA256SUMS](.deps/fuse3-arm64/SHA256SUMS) (provenance:
 [.deps/fuse3-arm64/README.md](.deps/fuse3-arm64/README.md)); without `dpkg` it falls
-back to `ar` plus `zstd` or `tar --zstd`. For any other libfuse3 location, point
+back to `ar`, `tar`, and the `zstd` executable. For any other libfuse3 location, point
 `-Dfuse-include=` / `-Dfuse-lib=` at it.
 
 ## Quickstart
