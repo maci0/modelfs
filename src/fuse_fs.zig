@@ -1679,14 +1679,7 @@ fn writeStatus(st: *State) void {
 
 fn statusJson(st: *State) !void {
     var buf: [4096]u8 = undefined;
-    const paths = try st.catalog.snapshot(st.gpa);
-    defer discover.Catalog.freeSnapshot(st.gpa, paths);
-    const npeers = blk: {
-        var seen = std.StringHashMap(void).init(st.gpa);
-        defer seen.deinit();
-        for (paths) |p| _ = try seen.put(p.peer_id, {});
-        break :blk seen.count();
-    };
+    const npeers = st.catalog.peerCount();
     const s = st.store.stats.snap();
     // Saturation signal for monitors: the same sample culling runs on.
     // -1 means the cache filesystem could not be stat'ed (culling suspended).

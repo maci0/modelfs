@@ -1834,7 +1834,6 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     }
 
     const now = sys.nowSec(io);
-    var any = false;
     for (rows.items) |r| {
         const live = r.until >= now;
         const status_str = if (live) "live" else "expired";
@@ -1847,9 +1846,8 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             const ip_shown = if (!proto.containsControl(a.ip)) a.ip else "<ip withheld>";
             if (!printOut(io, gpa, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps })) return 1;
         }
-        any = true;
     }
-    if (!any) return if (printOut(io, gpa, "no leases\n", .{})) 0 else 1;
+    if (rows.items.len == 0) return if (printOut(io, gpa, "no leases\n", .{})) 0 else 1;
     return 0;
 }
 
