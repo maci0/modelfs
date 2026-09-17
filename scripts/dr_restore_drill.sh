@@ -332,7 +332,10 @@ cleanup() {
     fi
     if zfs list -H -o name "${CLONE}" >/dev/null 2>&1; then
         zfs unmount "${CLONE}" >/dev/null 2>&1 || true
-        zfs destroy "${CLONE}" >/dev/null 2>&1 || true
+        if ! zfs destroy "${CLONE}"; then
+            echo "drill FAIL: cannot destroy drill clone ${CLONE}; inspect and clean it up before rerunning" >&2
+            return 1
+        fi
     fi
 }
 trap cleanup EXIT
@@ -460,6 +463,9 @@ HASH_LIVE="$(sha256sum "${LIVE}${SAMPLE_REL}" | awk '{print $1}')"
 if [[ "${HASH_CLONE}" != "${HASH_LIVE}" ]]; then
     die "restored ${SAMPLE_REL} hashes ${HASH_CLONE} but the live copy hashes ${HASH_LIVE}: the snapshot did not faithfully capture this file"
 fi
+
+cleanup
+trap - EXIT
 
 # UTC, second precision, trailing Z: lexicographically sortable and the
 # same on every host, unlike `date -Is` which is local time with a DST

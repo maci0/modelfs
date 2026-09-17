@@ -247,6 +247,7 @@ case "${sub}" in
         ;;
     destroy)
         read_state
+        [[ "${MF_STUB_DESTROY_FAIL:-0}" -eq 0 ]] || exit 1
         dataset="${1-}"
         if [[ -f "${STATE}/clone" ]]; then
             # shellcheck source=/dev/null
@@ -260,6 +261,7 @@ case "${sub}" in
         ;;
     unmount)
         read_state
+        [[ "${MF_STUB_UNMOUNT_FAIL:-0}" -eq 0 ]] || exit 1
         dataset="${1-}"
         if [[ -f "${STATE}/clone" ]]; then
             # shellcheck source=/dev/null
@@ -386,6 +388,48 @@ if [[ -f "${STUB_STATE}/clone" ]]; then
 else
     pass "happy path destroyed the clone"
 fi
+
+expect_ok "second drill succeeds without resetting clone state" "${LIVE1}" "${LOG1}"
+LOG_LINES="$(wc -l <"${LOG1}")"
+if [[ ! -f "${STUB_STATE}/clone" && "${LOG_LINES}" -eq 2 ]]; then
+    pass "repeated drill leaves no clone and records both completed runs"
+else
+    fail "repeated drill left a clone or failed to record both runs"
+fi
+
+LOG_CLEANUP="${TEMP}/cleanup.log"
+expect_fail "failed cleanup is an alarm" "cannot destroy drill clone" "${LIVE1}" "${LOG_CLEANUP}" \
+    MF_STUB_UNMOUNT_FAIL=1 MF_STUB_DESTROY_FAIL=1
+if [[ -f "${STUB_STATE}/clone" && ! -s "${LOG_CLEANUP}" ]]; then
+    pass "failed cleanup retains the clone without publishing success"
+else
+    fail "failed cleanup lost the clone or published success"
+fi
+expect_fail "retry after failed cleanup preserves the mounted clone" "already exists and is mounted" \
+    "${LIVE1}" "${LOG_CLEANUP}"
+zfs unmount tank/drill
+expect_ok "retry recovers after the leftover clone is unmounted" "${LIVE1}" "${LOG_CLEANUP}"
+LOG_LINES="$(wc -l <"${LOG_CLEANUP}")"
+if [[ ! -f "${STUB_STATE}/clone" && "${LOG_LINES}" -eq 1 ]]; then
+    pass "cleanup recovery publishes only the completed retry"
+else
+    fail "cleanup recovery left a clone or published failed attempts"
+fi
+
+expect_ok "destroy completes cleanup when explicit unmount fails" "${LIVE1}" "${TEMP}/unmount.log" \
+    MF_STUB_UNMOUNT_FAIL=1
+if [[ -f "${STUB_STATE}/clone" ]]; then
+    fail "destroy after failed unmount left the clone behind"
+fi
+
+expect_ok "keep mode preserves the verified clone" "${LIVE1}" "${TEMP}/keep.log" MF_DRILL_KEEP=1
+if [[ -f "${STUB_STATE}/clone" ]]; then
+    pass "keep mode leaves the clone for inspection"
+else
+    fail "keep mode destroyed the clone"
+fi
+zfs unmount tank/drill
+zfs destroy tank/drill
 
 # --- 2. no snapshots
 LIVE2="${TEMP}/live2"

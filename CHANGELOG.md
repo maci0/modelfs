@@ -41,6 +41,7 @@ below.
 - **Peer range reads reject a numeric `Content-Range` total at or below the inclusive range end.** Unknown totals (`*`) remain accepted, and existing modelfs servers already send valid totals. Partial `sendfile` progress is retained on a later send failure so a fallback does not resend bytes already transferred.
 - **Permission changes on unreadable files work on older kernels** through the `/proc/self/fd` fallback when `fchmodat2` is unavailable.
 - **Re-running `scripts/install_nas_backup.sh --install` preserves an existing `sanoid.conf`.** Previously it overwrote host-specific dataset and retention settings. Units and wrappers still refresh; apply intended configuration changes to the host's existing file. Failed copies no longer truncate installed files, so the installer can be retried.
+- **A failed restore-drill cleanup no longer appends a success log line.** `scripts/dr_restore_drill.sh` removes the clone before appending the log entry and exits nonzero when `zfs destroy` fails; previously a busy clone left the drill reporting success while the next run refused the mounted leftover. Verify and unmount the leftover `tank/drill` before rerunning.
 
 ### Performance - 2026-09-17
 
