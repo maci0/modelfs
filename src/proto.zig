@@ -115,7 +115,6 @@ pub fn httpStatusCode(status_line: []const u8) ?u16 {
     if (rest.len < 3) return null;
     if (rest.len > 3 and rest[3] != ' ') return null;
     const n = parseU64Fast(rest[0..3]) orelse return null;
-    if (n > 999) return null;
     return @intCast(n);
 }
 
