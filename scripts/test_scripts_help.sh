@@ -39,6 +39,32 @@ expect_version_ge 3.14.7 3.12 0
 expect_version_ge 0.15.99 0.16.0 1
 expect_version_ge 3.11.9 3.12 1
 
+expect_fuse_helper() {
+    local helper="$1" output rc=0 bin
+    mkdir -p "${SCRATCH_DIR}"
+    bin="$(mktemp -d "${SCRATCH_DIR}/fuse-preflight.XXXXXX")"
+    ln -s "${BASH}" "${bin}/${helper}"
+    set +e
+    output="$(
+        export PATH="${bin}"
+        require_fuse 2>&1
+    )"
+    rc=$?
+    set -e
+    rm -rf "${bin}"
+    if [[ "${helper}" == fusermount ]]; then
+        [[ "${rc}" -eq 1 ]] || fail "require_fuse accepted legacy fusermount"
+        [[ "${output}" == *"no fusermount3 helper on PATH"* ]] || fail "require_fuse omitted fusermount3 install hint"
+    elif [[ -e /dev/fuse ]]; then
+        [[ "${rc}" -eq 0 && -z "${output}" ]] || fail "require_fuse rejected fusermount3"
+    else
+        [[ "${rc}" -eq 1 && "${output}" == *"/dev/fuse is missing"* ]] || fail "require_fuse omitted missing device"
+        [[ "${output}" != *"no fusermount3 helper"* ]] || fail "require_fuse missed fusermount3"
+    fi
+}
+expect_fuse_helper fusermount
+expect_fuse_helper fusermount3
+
 # Every top-level scripts/*.sh and scripts/*.py is a contributor command
 # and must answer --help. Discovered by glob so a new script is covered the
 # moment it lands instead of needing its name added to a list that can be

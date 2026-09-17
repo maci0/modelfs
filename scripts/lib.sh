@@ -141,10 +141,8 @@ require_fuse() {
     if [[ ! -e /dev/fuse ]]; then
         problems+=("/dev/fuse is missing")
     fi
-    if command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1; then
-        :
-    else
-        problems+=("no fusermount3/fusermount helper on PATH")
+    if ! command -v fusermount3 >/dev/null 2>&1; then
+        problems+=("no fusermount3 helper on PATH")
     fi
     if ((${#problems[@]} > 0)); then
         local joined
