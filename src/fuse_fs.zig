@@ -2694,17 +2694,7 @@ fn onUsr2(_: c_int) callconv(.c) void {
 fn installHandoverSignal(st: *State, se: *fuse.fuse_session) void {
     live_state = st;
     live_session = se;
-    var sa = std.mem.zeroes(sys.c.struct_sigaction);
-    // Same union, two libc spellings: glibc nests the handler behind a named
-    // __sigaction_handler union, musl names it __sa_handler.
-    if (comptime @import("builtin").target.abi == .musl) {
-        sa.__sa_handler.sa_handler = onUsr2;
-    } else {
-        sa.__sigaction_handler.sa_handler = onUsr2;
-    }
-    _ = sys.c.sigemptyset(&sa.sa_mask);
-    sa.sa_flags = sys.c.SA_RESTART;
-    _ = sys.c.sigaction(sys.c.SIGUSR2, &sa, null);
+    _ = sys.setSignalHandler(sys.c.SIGUSR2, onUsr2, sys.c.SA_RESTART);
 }
 
 /// Inverse of installHandoverSignal: drop live_* and restore SIGUSR2 to
@@ -2714,15 +2704,7 @@ fn installHandoverSignal(st: *State, se: *fuse.fuse_session) void {
 fn removeHandoverSignal() void {
     live_state = null;
     live_session = null;
-    var sa = std.mem.zeroes(sys.c.struct_sigaction);
-    if (comptime @import("builtin").target.abi == .musl) {
-        sa.__sa_handler.sa_handler = null;
-    } else {
-        sa.__sigaction_handler.sa_handler = null;
-    }
-    _ = sys.c.sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    _ = sys.c.sigaction(sys.c.SIGUSR2, &sa, null);
+    _ = sys.setSignalHandler(sys.c.SIGUSR2, null, 0);
 }
 
 test "removeHandoverSignal clears live_* and restores SIGUSR2 to SIG_DFL" {
@@ -2735,6 +2717,14 @@ test "removeHandoverSignal clears live_* and restores SIGUSR2 to SIG_DFL" {
     installHandoverSignal(&st, se);
     try std.testing.expect(live_state == &st);
     try std.testing.expect(live_session == se);
+    var installed = std.mem.zeroes(sys.c.struct_sigaction);
+    try std.testing.expectEqual(@as(c_int, 0), sys.c.sigaction(sys.c.SIGUSR2, null, &installed));
+    const installed_handler = if (comptime @import("builtin").target.abi == .musl)
+        installed.__sa_handler.sa_handler
+    else
+        installed.__sigaction_handler.sa_handler;
+    try std.testing.expect(installed_handler == onUsr2);
+    try std.testing.expect(installed.sa_flags & sys.c.SA_RESTART != 0);
 
     removeHandoverSignal();
     try std.testing.expect(live_state == null);

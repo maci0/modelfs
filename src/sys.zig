@@ -36,6 +36,18 @@ pub fn negErrno() i32 {
     return if (e == 0) -1 else -e;
 }
 
+pub fn setSignalHandler(signal: c_int, handler: ?*const fn (c_int) callconv(.c) void, flags: @FieldType(c.struct_sigaction, "sa_flags")) c_int {
+    var sa = std.mem.zeroes(c.struct_sigaction);
+    if (comptime @import("builtin").target.abi == .musl) {
+        sa.__sa_handler.sa_handler = handler;
+    } else {
+        sa.__sigaction_handler.sa_handler = handler;
+    }
+    _ = c.sigemptyset(&sa.sa_mask);
+    sa.sa_flags = flags;
+    return c.sigaction(signal, &sa, null);
+}
+
 /// Wall-clock epoch seconds: for instants shared across processes and
 /// machines (cluster lease expiry). Never for elapsed-time math; that is
 /// monoSec's job. Sampled through `io` so a simulator substitutes a virtual
