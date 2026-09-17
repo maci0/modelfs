@@ -1480,9 +1480,9 @@ export fn ll_destroy(ud: ?*anyopaque) callconv(.c) void {
 /// first FUSE op.
 pub fn tickCluster(st: *State, now: i64) void {
     st.catalog.publish(now);
-    if (st.catalog.publish_rc != 0)
-        _ = st.store.stats.lease_err.fetchAdd(1, .monotonic);
     st.catalog.refresh(now);
+    if (st.catalog.originErrno() != 0)
+        _ = st.store.stats.lease_err.fetchAdd(1, .monotonic);
     st.store.noteOriginIo(discover.cluster_dir, st.catalog.originErrno(), "lease");
 }
 
@@ -3384,6 +3384,46 @@ test "tickCluster counts lease_err on publish failure and meta_err on origin out
     try std.testing.expectEqual(@as(u64, 1), st.store.stats.meta_err.load(.monotonic));
     countMetaErr(&st, -sys.c.ESTALE);
     try std.testing.expectEqual(@as(u64, 2), st.store.stats.meta_err.load(.monotonic));
+}
+
+test "tickCluster counts lease_err when refresh encounters an unreadable cluster walk" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-tick-ref-err");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-tick-ref-err");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const addrs = [_]proto.LeaseAddr{.{ .ip = "10.0.0.1", .port = 18080, .mbps = 0 }};
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 4096, .{}, "me", &addrs, &.{}, &.{}, "", true);
+    defer st.deinit();
+
+    // Healthy tick: publish and refresh both succeed.
+    tickCluster(&st, sys.nowSec(st.io));
+    try std.testing.expectEqual(@as(u64, 0), st.store.stats.lease_err.load(.monotonic));
+    try std.testing.expectEqual(@as(i32, 0), st.catalog.originErrno());
+
+    // Make .cluster write-and-search only (0o300, -wx------): file creation/rename
+    // (publish) succeeds, but directory readdir (refresh walk) fails EACCES (.io_err).
+    // tickCluster must increment lease_err.
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const cz = try sys.toZ(&zbuf, cluster_d);
+    try std.testing.expectEqual(@as(i32, 0), sys.c.chmod(cz, 0o300));
+    defer _ = sys.c.chmod(cz, 0o755);
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    tickCluster(&st, sys.nowSec(st.io));
+    try std.testing.expectEqual(@as(u64, 1), st.store.stats.lease_err.load(.monotonic));
+    try std.testing.expect(st.catalog.originErrno() != 0);
+    try std.testing.expectEqual(@as(i32, 0), st.catalog.publish_rc);
+    try std.testing.expectEqual(@as(i32, -sys.c.EACCES), st.catalog.refresh_rc);
 }
 
 test "hydratePiece fails closed when write generation keeps discarding fills" {
