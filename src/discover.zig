@@ -1230,8 +1230,7 @@ pub fn localIpv4(gpa: std.mem.Allocator) ![][]const u8 {
         if ((flags & @as(@TypeOf(flags), @intCast(c.IFF_UP))) == 0) continue;
         const sin: *c.struct_sockaddr_in = @ptrCast(@alignCast(addr));
         var buf: [c.INET_ADDRSTRLEN]u8 = undefined;
-        const s = c.inet_ntop(c.AF_INET, &sin.sin_addr, &buf, buf.len) orelse continue;
-        const span = std.mem.span(s);
+        const span = sys.dottedQuad(&buf, sin.sin_addr.s_addr) orelse continue;
         if (!shouldAdvertise(span)) continue;
         var dup = false;
         for (list.items) |have| {

@@ -367,12 +367,10 @@ fn readHeadFullDeadline(io: std.Io, fd: c_int, buf: []u8, out_head_len: *usize, 
 /// lines. Falls back to "unknown" rather than failing the caller: an
 /// unformattable address (never seen with AF_INET accepts) must still log.
 fn peerAddrText(peer: c.struct_sockaddr_in, buf: []u8) []const u8 {
-    const raw = std.mem.bigToNative(u32, peer.sin_addr.s_addr);
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
-        @as(u8, @truncate(raw >> 24)),
-        @as(u8, @truncate(raw >> 16)),
-        @as(u8, @truncate(raw >> 8)),
-        @as(u8, @truncate(raw)),
+    var ip_buf: [c.INET_ADDRSTRLEN]u8 = undefined;
+    const ip = sys.dottedQuad(&ip_buf, peer.sin_addr.s_addr) orelse return "unknown";
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{
+        ip,
         std.mem.bigToNative(u16, peer.sin_port),
     }) catch "unknown";
 }
@@ -1779,6 +1777,12 @@ test "peerAddrText formats the accepted peer address for security logs" {
     far.sin_port = std.mem.nativeToBig(u16, 65535);
     far.sin_addr.s_addr = std.mem.nativeToBig(u32, 0xC0A80064); // 192.168.0.100
     try std.testing.expectEqualStrings("192.168.0.100:65535", peerAddrText(far, &buf));
+
+    far.sin_addr.s_addr = std.mem.nativeToBig(u32, 0xFFFFFFFF);
+    const widest = "255.255.255.255:65535";
+    try std.testing.expectEqualStrings(widest, peerAddrText(far, buf[0..widest.len]));
+    try std.testing.expectEqualStrings("unknown", peerAddrText(far, buf[0 .. widest.len - 1]));
+    try std.testing.expectEqualStrings("unknown", peerAddrText(lo, buf[0..0]));
 }
 
 /// Connected socketpair with `response` already written into fds[0]: a

@@ -887,7 +887,7 @@ pub fn setSockBuffers(fd: c_int, size_bytes: c_int) void {
     setsockoptMem(fd, c.SOL_SOCKET, c.SO_SNDBUF, &n);
 }
 
-fn dottedQuad(out_ip: []u8, s_addr_be: u32) ?[]const u8 {
+pub fn dottedQuad(out_ip: []u8, s_addr_be: u32) ?[]const u8 {
     const raw = std.mem.bigToNative(u32, s_addr_be);
     return std.fmt.bufPrint(out_ip, "{d}.{d}.{d}.{d}", .{
         @as(u8, @truncate(raw >> 24)),
@@ -1243,6 +1243,25 @@ test "connectIn bounds a dead dial" {
     const fl = std.c.fcntl(fd, c.F_GETFL);
     try std.testing.expect(fl >= 0);
     try std.testing.expectEqual(@as(c_int, 0), fl & c.O_NONBLOCK);
+}
+
+test "dottedQuad formats network-order addresses within the supplied buffer" {
+    const cases = .{
+        .{ @as(u32, 0), "0.0.0.0" },
+        .{ @as(u32, 0x01020304), "1.2.3.4" },
+        .{ @as(u32, 0xC0A80064), "192.168.0.100" },
+        .{ @as(u32, 0xFFFFFFFF), "255.255.255.255" },
+    };
+    var out: [c.INET_ADDRSTRLEN]u8 = undefined;
+    inline for (cases) |case| {
+        const addr = std.mem.nativeToBig(u32, case[0]);
+        const expected = case[1];
+        const rendered = dottedQuad(out[0..expected.len], addr).?;
+        try std.testing.expectEqualStrings(expected, rendered);
+        try std.testing.expect(rendered.ptr == out[0..].ptr);
+        try std.testing.expect(dottedQuad(out[0 .. expected.len - 1], addr) == null);
+        try std.testing.expect(dottedQuad(out[0..0], addr) == null);
+    }
 }
 
 test "resolveIpv4 passes numeric quads and resolves localhost" {
