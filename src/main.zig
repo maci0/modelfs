@@ -1903,7 +1903,7 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 
     const now = sys.nowSec(io);
     for (rows.items) |r| {
-        const live = r.until >= now;
+        const live = r.until > now;
         const status_str = if (live) "live" else "expired";
         // Lease ids and addresses come off shared storage as other nodes'
         // JSON; echo them only when free of control bytes so `modelfs peers`

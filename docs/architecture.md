@@ -183,8 +183,9 @@ through FUSE):
 }
 ```
 
-Refresh every 10 s, `until` = now + 30 s. Expired leases are dropped and a node skips its own
-`id`. No PSK in the JSON. A failed write or rename of `<id>.json.tmp` unlinks the staging file
+Refresh every 10 s, `until` = now + 30 s in Unix epoch seconds. A lease expires at
+`now >= until`, both in discovery and `modelfs peers`. Expired leases are dropped and a node
+skips its own `id`. No PSK in the JSON. A failed write or rename of `<id>.json.tmp` unlinks the staging file
 in `Catalog.publish`, so a retrying tick cannot keep it alive by refreshing its mtime.
 
 Every node also sweeps the directory each tick, unlinking lease files older than 300 s and

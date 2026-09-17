@@ -874,7 +874,7 @@ pub const Catalog = struct {
             pub fn visit(acc: *@This(), name: []const u8, parsed: std.json.Parsed(proto.Lease)) void {
                 _ = name;
                 const lease = parsed.value;
-                if (lease.until < acc.now_sec) return;
+                if (lease.until <= acc.now_sec) return;
                 if (std.mem.eql(u8, lease.id, acc.cat.self_id)) return;
                 // Publish-side validId is ASCII without quote/slash/controls;
                 // incoming JSON is not. A planted document with
@@ -2323,6 +2323,30 @@ test "refresh skips self and expired leases" {
 
     try std.testing.expectEqual(@as(u32, 1), cat.inflight("10.0.0.1", 18080, 1));
     try std.testing.expectEqual(@as(u32, 0), cat.inflight("10.0.0.1", 18080, -1));
+}
+
+test "refresh expires a published lease at its deadline" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-expiry");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const addrs = [_]proto.LeaseAddr{
+        .{ .ip = "10.0.0.1", .port = 18080 },
+    };
+    var publisher = Catalog.init(gpa, std.testing.io, origin_d, "other", &addrs, &.{}, &.{});
+    defer publisher.deinit();
+    var reader = Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer reader.deinit();
+
+    const published_at: i64 = 1_709_251_170;
+    publisher.publish(published_at);
+    const expires_at = published_at + Catalog.lease_ttl_secs;
+    reader.refresh(expires_at - 1);
+    try std.testing.expectEqual(@as(u32, 1), reader.peerCount());
+    reader.refresh(expires_at);
+    try std.testing.expectEqual(@as(u32, 0), reader.peerCount());
+    reader.refresh(expires_at + 1);
+    try std.testing.expectEqual(@as(u32, 0), reader.peerCount());
 }
 
 test "refresh drops undialable lease addresses" {
