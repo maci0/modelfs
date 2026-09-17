@@ -60,9 +60,11 @@ Suites outside the gate (most need hardware CI lacks):
 - **`hf.zig` is the only outbound reach.** The daemon talks to peers and the
   origin; `modelfs pull` is the one path that contacts a host outside the
   cluster, from the CLI, never from the mount.
-- **Run artifacts in the repo go to `.scratch/`**, never `/tmp`: it is tmpfs here, and a
-  piece cache written there is charged to RAM. (The NAS drill's scratch is
-  `/var/tmp/modelfs-drill` via `MF_DRILL_SCRATCH` -- no checkout on that host.)
+- **Run artifacts go to the repo's `.scratch/`**, never `/tmp`: it is tmpfs here,
+  and a piece cache written there is charged to RAM. Shell `mktemp` templates
+  use `SCRATCH_DIR` from `scripts/lib.sh`; Python temporary caches, mounts,
+  origins, and logs set `dir=` to the repo's `.scratch/`, not the system default.
+  The NAS drill uses `/var/tmp/modelfs-drill` via `MF_DRILL_SCRATCH` without a checkout.
 - **Harness knobs use `MF_`, never `MODELFS_`.** The daemon refuses unknown
   `MODELFS_*` as typo'd knobs.
 - **Every external path is untrusted.** Request heads, lease JSON, and encoded
