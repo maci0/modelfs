@@ -3288,54 +3288,21 @@ test "handover snapshot bytes do not carry hash-map iteration order" {
         .advertise = &.{},
         .seeds = &.{},
         .psk = &.{},
+        .nodes = node_snaps,
+        .opens = open_snaps,
+        .next_ino = st.next_ino,
+        .next_fh = st.next_fh,
     };
     // Identical inputs to the real serialization: the churn advanced st2's
     // counters, but those are carried fields, not table state, so both
     // blobs take the same ones. Byte-equal blobs mean the encoded snapshot
     // is a function of the surviving tables alone.
-    const blob = try handover.encode(gpa, .{
-        .origin = knobs.origin,
-        .cache = knobs.cache,
-        .id = knobs.id,
-        .mount = knobs.mount,
-        .piece = knobs.piece,
-        .listen = knobs.listen,
-        .water = knobs.water,
-        .direct_io = knobs.direct_io,
-        .allow_other = knobs.allow_other,
-        .fuse_fd = knobs.fuse_fd,
-        .listen_fds = knobs.listen_fds,
-        .advertise = knobs.advertise,
-        .seeds = knobs.seeds,
-        .psk = knobs.psk,
-        .init = &.{},
-        .nodes = node_snaps,
-        .opens = open_snaps,
-        .next_ino = st.next_ino,
-        .next_fh = st.next_fh,
-    });
+    const blob = try handover.encode(gpa, knobs);
     defer gpa.free(blob);
-    const blob2 = try handover.encode(gpa, .{
-        .origin = knobs.origin,
-        .cache = knobs.cache,
-        .id = knobs.id,
-        .mount = knobs.mount,
-        .piece = knobs.piece,
-        .listen = knobs.listen,
-        .water = knobs.water,
-        .direct_io = knobs.direct_io,
-        .allow_other = knobs.allow_other,
-        .fuse_fd = knobs.fuse_fd,
-        .listen_fds = knobs.listen_fds,
-        .advertise = knobs.advertise,
-        .seeds = knobs.seeds,
-        .psk = knobs.psk,
-        .init = &.{},
-        .nodes = node_snaps2,
-        .opens = open_snaps2,
-        .next_ino = st.next_ino,
-        .next_fh = st.next_fh,
-    });
+    var knobs2 = knobs;
+    knobs2.nodes = node_snaps2;
+    knobs2.opens = open_snaps2;
+    const blob2 = try handover.encode(gpa, knobs2);
     defer gpa.free(blob2);
     try std.testing.expectEqualSlices(u8, blob, blob2);
     // Sorted order in the snapshot itself: a diff against a divergent replay
