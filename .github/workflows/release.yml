@@ -92,7 +92,7 @@ jobs:
           path: dist
       - name: bundle license texts and dependency provenance
         run: |
-          tar -czf dist/modelfs-licenses.tar.gz \
+          tar --format=gnu --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner --mode=0644 -czf dist/modelfs-licenses.tar.gz \
             LICENSE \
             .deps/libfuse3-3.16.2/LICENSE \
             .deps/libfuse3-3.16.2/LGPL2.txt \
