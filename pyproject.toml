@@ -40,18 +40,22 @@ ignore = [
     # Preview: prefer `ruff: ignore` over `noqa`. noqa stays so a comment
     # that also names a bandit code remains valid for both tools.
     "noqa-comments",
-    # Preview nits this tree does not pass: repeated list.append,
-    # too-many-locals, empty-string comparisons.
-    "repeated-append",
-    "too-many-locals",
-    "compare-to-empty-string",
 ]
 
 [tool.ruff.lint.per-file-ignores]
 # Preview: import of subprocess is the documented spawn path
 # (subprocess-without-shell-equals-true still flags each call; those
-# are noqa'd with a reason).
-"scripts/run_benchmarks_and_plots.py" = ["suspicious-subprocess-import"]
+# are noqa'd with a reason). The SVG writer also holds preview nits the
+# whole gate must not lose: repeated list.append pairs each element with
+# a next-line label, and the chart functions hold one locals frame per
+# figure layout.
+"scripts/run_benchmarks_and_plots.py" = [
+    "suspicious-subprocess-import",
+    "repeated-append",
+    "too-many-locals",
+]
+# The benchmark-CLI main() takes 16 arguments by design.
+"scripts/cluster_verify.py" = ["too-many-locals"]
 
 # Flag typing-only imports even when a runtime sibling from the same
 # module exists; the scripts already pass this.

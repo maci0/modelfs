@@ -175,7 +175,7 @@ def parse_sha256sums(text: str) -> list[tuple[str, str]]:
         if not line or line.startswith("#"):
             continue
         digest, sep, name = line.partition("  ")
-        if sep == "" or _HEX64.fullmatch(digest) is None or "/" in name or name in {".", ".."}:
+        if not sep or _HEX64.fullmatch(digest) is None or "/" in name or name in {".", ".."}:
             sys.exit(f"malformed SHA256SUMS line: {line}")
         if name in seen:
             sys.exit(f"duplicate SHA256SUMS entry: {name}")
@@ -455,6 +455,11 @@ def _self_test_sums() -> None:
         sys.exit(f"self-test failed: parse_sha256sums {got}")
     _must_exit(
         lambda: parse_sha256sums(("A" * _SHA256_HEX_LEN) + "  foo.deb\n"),
+        "malformed SHA256SUMS line",
+    )
+    _must_exit(lambda: parse_sha256sums("short  foo.deb\n"), "malformed SHA256SUMS line")
+    _must_exit(
+        lambda: parse_sha256sums(digest + " ../escape.deb\n"),
         "malformed SHA256SUMS line",
     )
     _must_exit(lambda: parse_sha256sums(line + line), "duplicate SHA256SUMS entry")
