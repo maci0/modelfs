@@ -81,12 +81,23 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
+      - name: bundle license texts and dependency provenance
+        run: |
+          tar -czf dist/modelfs-licenses.tar.gz \
+            LICENSE \
+            .deps/libfuse3-3.16.2/LICENSE \
+            .deps/libfuse3-3.16.2/LGPL2.txt \
+            .deps/libfuse3-3.16.2/GPL2.txt \
+            .deps/libfuse3-3.16.2/README.md \
+            .deps/fuse3-arm64/NOTICE \
+            .deps/fuse3-arm64/copyright \
+            .deps/fuse3-arm64/README.md
       - name: checksum and publish
         env:
           GH_TOKEN: ${{ github.token }}

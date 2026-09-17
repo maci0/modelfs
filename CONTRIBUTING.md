@@ -210,8 +210,10 @@ single-file binaries for `x86_64-linux-musl` and `aarch64-linux-musl`
 (`scripts/build_static.sh`: vendored libfuse3 compiled in, no interpreter,
 no shared libraries), refuses a tag that does not name `build.zig.zon`'s
 version, and attaches the two musl static binaries, the
-`aarch64-linux-gnu` spark build (from `scripts/cross_aarch64.sh`), and a
-`SHA256SUMS` to a GitHub release named after the tag. Re-tagging buys nothing: the workflow fires on
+`aarch64-linux-gnu` spark build (from `scripts/cross_aarch64.sh`), and
+`modelfs-licenses.tar.gz` containing the project license and both vendored
+libfuse variants' license texts and provenance. `SHA256SUMS` covers all four
+assets on the GitHub release named after the tag. Re-tagging buys nothing: the workflow fires on
 tag creation, and a mismatched tag fails the build. The repository itself
 stays the source of truth for package consumers (the Zig package tarball is
 whatever `.paths` lists) and for anyone building from the tagged commit.

@@ -27,6 +27,13 @@ The peer HTTP and persisted cache formats are unchanged.
 
 - **Read-buffer claiming, trusted-hash lookups, and peer candidate checks avoid redundant scans and hash lookups.** Piece selection and verification behavior are unchanged.
 
+### Release notices archive - 2026-09-17
+- **Releases attach `modelfs-licenses.tar.gz`.** The project license plus the
+  vendored libfuse3 3.16.2 source (LICENSE, LGPL2.txt, GPL2.txt, provenance
+  README) and arm64 deb (NOTICE, copyright, README) texts publish beside the
+  binaries, covered by `SHA256SUMS`, so binary downloads carry the license
+  and provenance grant for the embedded library.
+
 ## [0.14.1] - 2026-09-17
 
 Musl static release builds restore SIGUSR2 without `sys.c.SIG_DFL`
