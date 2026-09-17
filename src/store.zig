@@ -1314,6 +1314,10 @@ pub const Store = struct {
     pub fn beginFill(self: *Store, file: *Cached, idx: u32, now_sec: i64) !FillClaim {
         while (true) {
             file.mu.lockUncancelable(self.io);
+            if (file.dead.load(.acquire)) {
+                file.mu.unlock(self.io);
+                return .raced;
+            }
             if (file.bits.get(idx)) {
                 file.mu.unlock(self.io);
                 return .filled;
@@ -6099,6 +6103,11 @@ test "beginFill answers filled and raced without claiming or marking" {
     try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 5, sys.monoSec(std.testing.io))).len);
     try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 5, "0123456789abcdef", null, sys.monoSec(std.testing.io)));
     try std.testing.expect(st.hasPiece(f, 5, sys.monoSec(std.testing.io)));
+
+    // Dead entry (forget/purged): beginFill returns .raced rather than
+    // claiming a dead file.
+    f.dead.store(true, .release);
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .raced);
 }
 
 test "sidecar save and cache open recreate a deleted parent directory" {
