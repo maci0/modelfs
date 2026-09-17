@@ -42,14 +42,14 @@ main -> fuse_fs -> peer -> (store, discover) -> (piece, proto, cull, sys) -> c
 
 | Situation | Correct | Wrong |
 |---|---|---|
-| Wire, sidecar, or manifest integer narrowing | `std.math.cast` then handle null | `@intCast`, which panics in safe builds and wraps in ReleaseFast |
+| Wire, sidecar, or manifest integer narrowing | `std.math.cast` then handle null, or a proven range check before `@intCast` | Out-of-range `@intCast`: safety-checked illegal behavior, not guaranteed wrapping when safety checks are disabled |
 | A value an invariant bounds | `@intCast` plus a comment naming the invariant | a silent `@truncate` |
 | Deliberately dropping high bits | `@truncate` with a comment saying why | `@intCast` |
 | Reinterpreting a hostile length or pointer | do not | `@ptrCast` on untrusted input |
 | Counting or scanning bits | `@popCount`, `@clz`, `@ctz` | a bit-at-a-time loop |
 | Signed and unsigned mixing on wire values | explicit cast plus a range check | implicit coercion |
 
-`@ptrCast` on a length or offset derived from peer bytes, a lease, or a manifest is P0. `@intCast` on the same is P1.
+Before judging a cast, trace the source type, preceding range checks, and destination type; external provenance alone is not a finding. An `@ptrCast` that permits an invalid access is a defect for `zig-src-review.md`; so is an `@intCast` with a reachable out-of-range value. Verify cast semantics against the language reference for `minimum_zig_version` in `build.zig.zon`, not an observed ReleaseFast result.
 
 **I. Public surface.** `pub` only what another module calls. A `pub` on a file-private helper is P3 individually and P2 as a pattern, because it turns an internal into a contract. Every module carries a `//!` header saying what it owns; every `pub` declaration carries a `///` stating behavior, ownership, and any lock the caller must hold.
 
@@ -77,8 +77,8 @@ rg -n '^(//!|/// )' src/ | wc -l
 
 | Sev | Meaning |
 |---|---|
-| **P0** | Structure break that is a live footgun: an upward import, a new `@cImport`, `@ptrCast` on untrusted length |
-| **P1** | Real cost: a second copy of an owned concern, `@intCast` on wire values, a name that reads as its opposite, a bare literal on a security bound |
+| **P0** | Structure break that is a live footgun: an upward import, a new `@cImport` |
+| **P1** | Real cost: a second copy of an owned concern, a name that reads as its opposite, a bare literal on a security bound |
 | **P2** | Practice drift with no current failure: comptime over- or under-use, magic number on a policy knob, `pub` sprawl |
 | **P3** | Missing `//!`/`///`, comment wording, import order |
 

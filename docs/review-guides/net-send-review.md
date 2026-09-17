@@ -24,7 +24,7 @@ Read docs/architecture.md sections "Path score" and "Auth and HTTP" first. These
 
 ## Review the following
 
-1. **Source selection determinism.** `probeCandidates` walks one `/have` per peer, trying that peer's addresses best-first so a multi-homed node costs one round trip. `pickBest` takes the max score, and ties break by ip bytes then port (`pathTieLess`), never by lease-file or `getifaddrs` order. A new tiebreak that leaves the winner unspecified is P1: cold clusters start every path at the same prior, so environment enumeration would decide.
+1. **Source selection determinism.** `probeCandidates` walks one `/have` per peer, trying that peer's addresses best-first so a multi-homed node costs one round trip. `pickBest` takes the max score, and ties break by ip bytes then port (`candTieLess` in `src/discover.zig`), never by lease-file or `getifaddrs` order. A new tiebreak that leaves the winner unspecified is P1: cold clusters start every path at the same prior, so environment enumeration would decide.
 2. **Probe singleflight and the have cache.** Concurrent fills of one file share one probe walk through `Catalog.probeTryClaim`; waiters yield and retry the have cache rather than each probing every peer. Cache lines are per (path, file) for `have_ttl_ms` (2 s), capped at `have_cache_cap` (32) with a deterministic eviction victim. **Connection failures are never cached**, so a peer that comes back is retried on the next piece; caching them is P1. Hits and healthy 404 misses are cached, and both stale directions are bounded by the fallback ladder.
 3. **HTTP `/data` is the only peer data plane.** There is no staged/RDMA path. A failed `/data` falls to the next path, then the origin. Reintroducing a capability header that changes fetch routing without a documented wire break is P1.
 4. **Reply validation before use.** `checkRangeReply` requires 206, a `Content-Range` whose start matches the request and whose end is at most the request end, and a selected length equal to `Content-Length`. A shorter body under a matching window is refused, not cached. Accepting a reply on fewer conditions is P0: it admits a short piece as complete.
@@ -41,7 +41,7 @@ Search recipes, each needing the surrounding function read before judging:
 
 ```
 rg -n 'fetchFromCands|fetchPieceStaged|fetchRangeInto|sendRequest' src/peer.zig
-rg -n 'probeTryClaim|havePut|haveHas|pickBest|pathTieLess' src/discover.zig src/peer.zig
+rg -n 'probeTryClaim|havePut|haveHas|pickBest|candTieLess' src/discover.zig src/peer.zig
 rg -n 'deadline|_ms\b' src/peer.zig
 rg -n 'sendfileAll|preadAll|pwriteAll|writeAll' src/
 rg -n 'fetchAdd' src/peer.zig            # counter coverage per failure branch
