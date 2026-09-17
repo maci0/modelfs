@@ -18,6 +18,10 @@ Usage: ./scripts/test_dr_restore_drill.sh
 Restore-drill regressions against a stub zfs(8). Also run by check.sh.
 EOF
 
+unset MF_DRILL_LOG_MAX_AGE MF_NAS_DEST MF_OFFSITE_DATASET MF_OFFSITE_MAX_AGE \
+    MF_RESTORE_FROM MF_RESTORE_LOCAL_FROM MF_RESTORE_MOUNTPOINT \
+    MF_RESTORE_SHARENFS MF_RESTORE_LOG CHILD_DS CHILD_SNAP CHILD_CREATION
+
 mkdir -p "${SCRATCH_DIR}"
 
 FAILS=0
@@ -58,11 +62,24 @@ read_state() {
 write_clone() {
     printf 'CLONE_NAME=%q\nCLONE_MP=%q\nCLONE_MOUNTED=%q\n' "$1" "$2" "$3" >"${STATE}/clone"
 }
+require_fixture_path() {
+    local root path
+    root="$(realpath -e "${STATE}/..")"
+    path="$(realpath -m "$1")"
+    case "${path}" in
+        "${root}/"*) ;;
+        *)
+            echo "stub zfs: mountpoint outside fixture tree" >&2
+            exit 1
+            ;;
+    esac
+}
 clear_clone() {
-    rm -f "${STATE}/clone"
     if [[ -n "${CLONE_MP:-}" && -d "${CLONE_MP}" && "${CLONE_MP}" != "${ORIGIN_MP}" ]]; then
+        require_fixture_path "${CLONE_MP}"
         rm -rf "${CLONE_MP}"
     fi
+    rm -f "${STATE}/clone"
 }
 sub="$1"
 shift
@@ -239,6 +256,7 @@ case "${sub}" in
         clone="${2-}"
         [[ -n "${snap}" && -n "${clone}" ]] || exit 1
         [[ "${snap}" == "${SNAP_NAME}" ]] || exit 1
+        require_fixture_path "${mp}"
         mkdir -p "${mp}"
         if [[ -d "${SNAP_TREE}" ]]; then
             cp -a "${SNAP_TREE}/." "${mp}/"
@@ -314,6 +332,11 @@ expect_ok() {
         MF_DRILL_LIVE="${live}" \
         MF_DRILL_LOG="${log}" \
         MF_DRILL_KEEP="" \
+        MF_DRILL_CLONE_MP="" \
+        MF_DRILL_SCRATCH="${TEMP}/scratch" \
+        MF_DRILL_REPLICA="" \
+        MF_DRILL_MAX_SNAP_AGE="" \
+        MF_DRILL_MAX_REPLICA_AGE="" \
         "$@" \
         "${DRILL}" tank/models 2>&1)" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
@@ -339,6 +362,11 @@ expect_fail() {
         MF_DRILL_LIVE="${live}" \
         MF_DRILL_LOG="${log}" \
         MF_DRILL_KEEP="" \
+        MF_DRILL_CLONE_MP="" \
+        MF_DRILL_SCRATCH="${TEMP}/scratch" \
+        MF_DRILL_REPLICA="" \
+        MF_DRILL_MAX_SNAP_AGE="" \
+        MF_DRILL_MAX_REPLICA_AGE="" \
         "$@" \
         "${DRILL}" tank/models 2>&1)" || rc=$?
     if [[ "${rc}" -eq 0 ]]; then
@@ -372,6 +400,18 @@ echo 'only on live' >"${LIVE1}/gguf/new-after-snap.gguf"
 LOG1="${TEMP}/drill1.log"
 write_env tank/models "${LIVE1}" tank/models@autosnap_test "${FRESH}" "${SNAP1}"
 expect_ok "happy path restores off the live tree" "${LIVE1}" "${LOG1}"
+INHERITED_MP="${TEMP}/inherited-clone"
+mkdir -p "${INHERITED_MP}"
+printf 'preserve me\n' >"${INHERITED_MP}/sentinel"
+MF_DRILL_CLONE_MP="${INHERITED_MP}" \
+    expect_ok "inherited clone mountpoint is ignored" "${LIVE1}" "${TEMP}/inherited-clone.log"
+if [[ ! -f "${INHERITED_MP}/sentinel" || -e "${INHERITED_MP}/gguf" ]]; then
+    fail "inherited clone mountpoint was modified"
+else
+    pass "inherited clone mountpoint is untouched"
+fi
+MF_DRILL_REPLICA=tank/unconfigured MF_DRILL_MAX_SNAP_AGE=1 MF_DRILL_MAX_REPLICA_AGE=invalid \
+    expect_ok "inherited drill policy is ignored" "${LIVE1}" "${TEMP}/inherited-policy.log"
 if [[ -f "${LOG1}" ]] && grep -q "sample=/gguf/model.gguf" "${LOG1}" && grep -q "replica=unchecked" "${LOG1}"; then
     pass "log records weight sample and replica=unchecked"
 else
@@ -659,6 +699,11 @@ expect_age_ok() {
         MF_DRILL_LIVE="${live}" \
         MF_DRILL_LOG="${log}" \
         MF_DRILL_KEEP="" \
+        MF_DRILL_CLONE_MP="" \
+        MF_DRILL_SCRATCH="${TEMP}/scratch" \
+        MF_DRILL_REPLICA="" \
+        MF_DRILL_MAX_SNAP_AGE="" \
+        MF_DRILL_MAX_REPLICA_AGE="" \
         "$@" \
         "${DRILL}" --age-only tank/models 2>&1)" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
@@ -688,6 +733,11 @@ expect_age_fail() {
         MF_DRILL_LIVE="${live}" \
         MF_DRILL_LOG="${log}" \
         MF_DRILL_KEEP="" \
+        MF_DRILL_CLONE_MP="" \
+        MF_DRILL_SCRATCH="${TEMP}/scratch" \
+        MF_DRILL_REPLICA="" \
+        MF_DRILL_MAX_SNAP_AGE="" \
+        MF_DRILL_MAX_REPLICA_AGE="" \
         "$@" \
         "${DRILL}" --age-only tank/models 2>&1)" || rc=$?
     if [[ "${rc}" -eq 0 ]]; then

@@ -30,6 +30,7 @@ MNT="${W}/mnt"
 LOG="${W}/daemon.log"
 BIN="${W}/out/bin/modelfs"
 daemon_pid=""
+holder=""
 
 fail() {
     echo "FAIL: $1" >&2
@@ -37,6 +38,10 @@ fail() {
 }
 
 cleanup() {
+    if [[ -n "${holder}" ]] && kill -0 "${holder}" 2>/dev/null; then
+        kill -KILL "${holder}" 2>/dev/null || true
+        wait "${holder}" 2>/dev/null || true
+    fi
     if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
         kill -TERM "${daemon_pid}" 2>/dev/null || true
         for _ in $(seq 40); do
@@ -83,9 +88,16 @@ mount_is_up() {
     grep -q " ${MNT} " /proc/self/mounts
 }
 
+# A leftover daemon from a killed previous run would serve the port and the
+# old mountpoint here and fail this run with a confusing wrong-byte error
+# well after start; name the stale state instead.
 # shellcheck disable=SC2310 # port_open is a probe; its status is the answer
 if port_open; then
     fail "port ${PORT} is already in use (set MF_HOTRELOAD_PORT)"
+fi
+# shellcheck disable=SC2310 # mount_is_up is a probe; its status is the answer
+if mount_is_up; then
+    fail "a previous run left ${MNT} mounted; unmount it before rerunning"
 fi
 
 "${BIN}" mount "${MNT}" --origin "${W}/origin" --cache "${W}/cache" \
@@ -126,6 +138,9 @@ holder=$!
 for _ in $(seq 100); do
     if [[ -f "${W}/held.ready" ]]; then
         break
+    fi
+    if ! kill -0 "${holder}" 2>/dev/null; then
+        fail "held reader died before opening the held fd"
     fi
     sleep 0.1
 done
