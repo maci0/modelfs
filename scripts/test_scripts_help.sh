@@ -96,4 +96,30 @@ for s in "${scripts[@]}"; do
     esac
 done
 
+expect_static_usage() (
+    zig() { exit 99; }
+    set +e
+    (zig)
+    rc=$?
+    set -e
+    [[ "${rc}" -eq 99 ]] || fail "zig stub did not stop execution"
+    export -f zig
+    rc=0
+    timeout 2 "${SCRIPTS_DIR}/build_static.sh" "$@" >"${help_out}" 2>"${help_err}" || rc=$?
+    [[ "${rc}" -eq 2 ]] || fail "build_static.sh $* exited ${rc}, want 2"
+    [[ ! -s "${help_out}" ]] || fail "build_static.sh $* wrote to stdout"
+    err="$(cat "${help_err}")"
+    case "${err}" in
+        Usage:*) ;;
+        *) fail "build_static.sh $* did not print Usage: on stderr" ;;
+    esac
+)
+expect_static_usage x86_64-linux-musl --prefx .scratch/static
+expect_static_usage aarch64-linux-musl unexpected
+expect_static_usage x86_64-linux-musl --prefix
+expect_static_usage x86_64-linux-musl --prefix ""
+expect_static_usage x86_64-linux-musl --prefix --bad
+expect_static_usage x86_64-linux-musl --prefix .scratch/static unexpected
+expect_static_usage x86_64-linux-musl --prefix .scratch/static --prefix .scratch/other
+
 echo "=== script --help ok ==="

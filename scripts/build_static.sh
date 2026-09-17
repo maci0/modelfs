@@ -35,6 +35,10 @@ fi
 
 target="${1:-}"
 prefix=""
+if [[ $# -gt 1 && ( $# -ne 3 || "${2}" != "--prefix" ) ]]; then
+    usage >&2
+    exit 2
+fi
 if [[ "${2:-}" == "--prefix" ]]; then
     if [[ -z "${3:-}" || "${3:0:1}" == "-" ]]; then
         usage >&2
