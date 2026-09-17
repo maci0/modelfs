@@ -332,6 +332,56 @@ test "mf_create honors O_EXCL at the origin and keeps the legacy truncate" {
     try std.testing.expectEqual(@as(u64, 0), @as(u64, @intCast(sb.st_size)));
 }
 
+test "mf_open honors O_TRUNC for cold and cached files" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-open-trunc");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-open-trunc");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    const previous_state = tls_state;
+    tls_state = &st;
+    defer tls_state = previous_state;
+    const previous_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_level;
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+
+    var fi_buf: [64]u8 align(8) = @splat(0);
+    const fi: *fuse.fuse_file_info = @ptrCast(&fi_buf);
+    const pattern = "0123456789abcdef";
+    var rb: [16]u8 = undefined;
+    for ([_][:0]const u8{ "cold.bin", "warm.bin" }, 0..) |rel, i| {
+        var pb: [sys.c.PATH_MAX]u8 = undefined;
+        const origin_z = try st.store.originPath(&pb, rel);
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, pattern));
+        if (i != 0) {
+            std.mem.writeInt(i32, fi_buf[0..4], sys.c.O_WRONLY, .little);
+            try std.testing.expectEqual(@as(c_int, 0), mf_open(rel.ptr, fi));
+            try std.testing.expectEqualStrings(pattern, try sys.readFileBuf(&rb, origin_z));
+            try std.testing.expectEqual(@as(c_int, 16), mf_read(rel.ptr, &rb, rb.len, 0, null));
+            try std.testing.expectEqualStrings(pattern, &rb);
+        }
+
+        std.mem.writeInt(i32, fi_buf[0..4], sys.c.O_WRONLY | sys.c.O_TRUNC, .little);
+        try std.testing.expectEqual(@as(c_int, 0), mf_open(rel.ptr, fi));
+        var ost: sys.c.struct_stat = undefined;
+        try std.testing.expectEqual(@as(i32, 0), sys.statPath(origin_z, &ost));
+        try std.testing.expectEqual(@as(i64, 0), ost.st_size);
+        try std.testing.expectEqual(@as(c_int, 0), mf_read(rel.ptr, &rb, rb.len, 0, null));
+        try std.testing.expectEqual(@as(c_int, 3), mf_write(rel.ptr, "new", 3, 0, fi));
+        try std.testing.expectEqualStrings("new", try sys.readFileBuf(&rb, origin_z));
+        try std.testing.expectEqual(@as(c_int, 3), mf_read(rel.ptr, &rb, rb.len, 0, null));
+        try std.testing.expectEqualStrings("new", rb[0..3]);
+    }
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_open("missing.bin", fi));
+}
+
 test "clientCreateMode strips setuid, setgid, and sticky bits" {
     try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o4755));
     try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o2755));
@@ -693,7 +743,6 @@ fn cachedFor(st: *State, rel: []const u8) ?*store_mod.Store.Cached {
 }
 
 fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
-    _ = fi;
     const st = statePtr();
     const open_t0 = sys.monoNs(st.io);
     defer _ = st.store.stats.open_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - open_t0, 0)), .monotonic);
@@ -711,6 +760,7 @@ fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     }
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFLNK) return -sys.c.ELOOP;
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
+        if ((fiFlags(fi) & sys.c.O_TRUNC) != 0) return mf_truncate(path, 0, fi);
         const size = sys.sizeFromStat(ost.st_size) orelse {
             std.log.warn("origin size unusable for {s}; failing open", .{rel});
             return -sys.c.EIO;
