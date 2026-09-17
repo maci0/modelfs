@@ -3257,14 +3257,13 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
             const ov = piece.manifestOverlapPrepared(a.manifest, b.manifest, a.by_digest, b.by_digest);
             // Shifted = digests shared outside the aligned positions: the
             // only overlap CDC (Level 3) could recover.
-            const shifted = ov.shifted;
             if (!printOut(io, gpa, "overlap {s} vs {s}: {d}/{d} aligned, {d} shared digest(s), {d} shifted{s}\n", .{
                 a.rel,
                 b.rel,
                 ov.aligned,
                 @min(a.manifest.entries.len, b.manifest.entries.len),
                 ov.shared,
-                shifted,
+                ov.shifted,
                 if (ov.identical) " -- byte-identical" else "",
             })) return 1;
         }

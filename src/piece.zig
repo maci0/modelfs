@@ -674,6 +674,32 @@ test "manifestOverlapPrepared counts aligned, shared, and identical content" {
     try std.testing.expect(!mixed.identical);
     try std.testing.expectEqual(@as(u64, 0), mixed.aligned);
     try std.testing.expectEqual(@as(u64, 2), mixed.shared);
+    try std.testing.expectEqual(@as(u64, 2), mixed.shifted);
+    try std.testing.expectEqual(@as(u64, 0), ab.shifted);
+    try std.testing.expectEqual(@as(u64, 2), ac.shifted);
+    try std.testing.expectEqual(@as(u64, 0), ad.shifted);
+    try std.testing.expectEqual(@as(u64, 0), de.shifted);
+    try std.testing.expectEqual(@as(u64, 0), (try overlap.of(empty, empty)).shifted);
+
+    var repeated_a = [_]ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h1 },
+        .{ .idx = 2, .hash = h0 },
+        .{ .idx = 3, .hash = h2 },
+    };
+    var repeated_b = [_]ManifestEntry{
+        .{ .idx = 0, .hash = h1 },
+        .{ .idx = 1, .hash = h0 },
+        .{ .idx = 2, .hash = h0 },
+        .{ .idx = 3, .hash = h0 },
+    };
+    const repeated = try overlap.of(
+        .{ .piece_size = 16, .file_size = 64, .entries = &repeated_a },
+        .{ .piece_size = 16, .file_size = 64, .entries = &repeated_b },
+    );
+    try std.testing.expectEqual(@as(u64, 1), repeated.aligned);
+    try std.testing.expectEqual(@as(u64, 2), repeated.shared);
+    try std.testing.expectEqual(@as(u64, 1), repeated.shifted);
 }
 
 test "sidecarPieceSize reads the header and refuses a zero or foreign blob" {

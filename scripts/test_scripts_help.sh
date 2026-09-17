@@ -96,21 +96,24 @@ for s in "${scripts[@]}"; do
     esac
 done
 
+zig() { exit 99; }
+
 expect_static_args() {
-    local want="$1" rc=0
+    local want="$1" rc=0 output
     shift
     (
-        zig() { exit 99; }
         export -f zig
         timeout 2 "${SCRIPTS_DIR}/build_static.sh" "$@"
     ) >"${help_out}" 2>"${help_err}" || rc=$?
     [[ "${rc}" -eq "${want}" ]] || fail "build_static.sh $* exited ${rc}, want ${want}"
     if [[ "${want}" -eq 0 ]]; then
         [[ ! -s "${help_err}" ]] || fail "build_static.sh $* wrote to stderr"
-        [[ "$(cat "${help_out}")" == Usage:* ]] || fail "build_static.sh $* omitted stdout usage"
+        output="$(cat "${help_out}")"
+        [[ "${output}" == Usage:* ]] || fail "build_static.sh $* omitted stdout usage"
     else
         [[ ! -s "${help_out}" ]] || fail "build_static.sh $* wrote to stdout"
-        [[ "$(cat "${help_err}")" == Usage:* ]] || fail "build_static.sh $* omitted stderr usage"
+        output="$(cat "${help_err}")"
+        [[ "${output}" == Usage:* ]] || fail "build_static.sh $* omitted stderr usage"
     fi
 }
 

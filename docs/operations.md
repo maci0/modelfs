@@ -264,6 +264,10 @@ Dedup decisions are measured, not guessed: `modelfs dupes <rel>... --origin
 overlap, and `modelfs dupes --all --origin <origin>` scans the whole
 manifest store for byte-identical and digest-sharing pairs. Run either
 before deciding whether duplicate models cost disk worth engineering for.
+`piece.manifestOverlapPrepared` in `src/piece.zig` counts aligned positions
+separately from distinct shared digests. Shifted counts shared digests with
+no same-index match on the same piece grid; repeated aligned pieces do not
+reduce that count.
 
 ### Durability caveat, kept as-is on purpose
 
