@@ -612,7 +612,10 @@ dropped on the redirect to the signed CDN host. There is no token flag because a
 world-readable, and core dumps are disabled for the run when a token is in play.
 `HF_HOME` and `HOME` are trimmed of surrounding spaces, tabs, CR, and LF; an empty
 `HF_HOME` falls back to `HOME`. Tokens are trimmed the same way, but embedded CR or LF
-is refused with exit 1 before downloading (`loadToken` src/hf.zig).
+is refused with exit 1 before downloading (`loadToken` src/hf.zig). A missing or empty token
+file permits anonymous pulls; unreadable files, files over 4096 bytes, and overlong token
+paths fail before any network request. Allocation failures propagate rather than silently
+selecting anonymous access. A nonempty `HF_TOKEN` takes precedence over the token file.
 
 Everything the endpoint returns is untrusted: repo ids and refs are held to a URL-safe charset
 with no `.`/`..` segments, file names are percent-encoded into the download URL, and every

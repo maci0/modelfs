@@ -1578,7 +1578,15 @@ fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Envir
     const token: ?[]u8 = hf.loadToken(gpa, environ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.TokenTooLarge => {
-            printErr("modelfs: {s} is longer than {d} bytes; that is not a token\n", .{ hf.token_env, hf.max_token_bytes });
+            printErr("modelfs: Hugging Face token exceeds {d} bytes; check HF_TOKEN or the token file\n", .{hf.max_token_bytes});
+            return 1;
+        },
+        error.TokenPathTooLong => {
+            printErr("modelfs: Hugging Face token path is too long; check HF_HOME or HOME\n", .{});
+            return 1;
+        },
+        error.TokenFileUnreadable => {
+            printErr("modelfs: cannot read Hugging Face token file; check HF_HOME/token or HOME/.cache/huggingface/token and its permissions\n", .{});
             return 1;
         },
         error.TokenNotHeaderSafe => {

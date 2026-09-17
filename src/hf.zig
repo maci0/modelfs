@@ -182,8 +182,7 @@ pub fn joinRel(buf: []u8, dest: []const u8, path: []const u8) ![]const u8 {
 }
 
 /// The access token, or null when the host has none configured. Caller
-/// frees. A read failure on the token file is not an error: an anonymous
-/// pull of a public repo is the common case.
+/// frees.
 pub fn loadToken(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map) !?[]u8 {
     if (environ.get(token_env)) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
@@ -203,14 +202,20 @@ pub fn loadToken(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map
     const path = blk: {
         if (environ.get(home_env)) |raw_home| {
             const hf_home = std.mem.trim(u8, raw_home, " \t\r\n");
-            if (hf_home.len != 0) break :blk sys.joinZ(&path_buf, hf_home, token_under_home) catch return null;
+            if (hf_home.len != 0) break :blk sys.joinZ(&path_buf, hf_home, token_under_home) catch return error.TokenPathTooLong;
         }
         const raw_home = environ.get("HOME") orelse return null;
         const home = std.mem.trim(u8, raw_home, " \t\r\n");
         if (home.len == 0) return null;
-        break :blk sys.joinZ(&path_buf, home, token_under_cache) catch return null;
+        break :blk sys.joinZ(&path_buf, home, token_under_cache) catch return error.TokenPathTooLong;
     };
-    const blob = sys.readFileAlloc(gpa, path, max_token_bytes) catch return null;
+    var open_errno: i32 = 0;
+    const blob = sys.readFileAllocOpenErrno(gpa, path, max_token_bytes, &open_errno, null) catch |err| switch (err) {
+        error.OpenFailed => if (open_errno == sys.c.ENOENT) return null else return error.TokenFileUnreadable,
+        error.FileTooBig => return error.TokenTooLarge,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.TokenFileUnreadable,
+    };
     defer {
         std.crypto.secureZero(u8, blob);
         gpa.free(blob);
@@ -561,6 +566,63 @@ test "loadToken prefers the environment and never needs a flag" {
     try env.put(token_env, "   ");
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(path, "hf_\r\nfromfile\n"));
     try std.testing.expectError(error.TokenNotHeaderSafe, loadToken(gpa, &env));
+}
+
+test "loadToken distinguishes missing files from invalid token configuration" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var dir_buf: [128]u8 = undefined;
+    const home = try sys.scratchDir(&dir_buf, "modelfs-hf-token-errors");
+    defer sys.deleteTree(std.testing.io, home);
+    try env.put(home_env, home);
+    try std.testing.expectEqual(@as(?[]u8, null), try loadToken(gpa, &env));
+
+    var path_buf: [256]u8 = undefined;
+    const path = try sys.joinZ(&path_buf, home, token_under_home);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(path, "x" ** (max_token_bytes + 1)));
+    try std.testing.expectError(error.TokenTooLarge, loadToken(gpa, &env));
+
+    try env.put(token_env, "hf_override");
+    const override = (try loadToken(gpa, &env)).?;
+    defer gpa.free(override);
+    try std.testing.expectEqualStrings("hf_override", override);
+    _ = env.orderedRemove(token_env);
+
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(path, "x" ** max_token_bytes));
+    const maximum = (try loadToken(gpa, &env)).?;
+    defer gpa.free(maximum);
+    try std.testing.expectEqualStrings("x" ** max_token_bytes, maximum);
+
+    try env.put(home_env, std.mem.span(path));
+    try std.testing.expectError(error.TokenFileUnreadable, loadToken(gpa, &env));
+    try env.put(home_env, "x" ** sys.c.PATH_MAX);
+    try std.testing.expectError(error.TokenPathTooLong, loadToken(gpa, &env));
+    _ = env.orderedRemove(home_env);
+    try env.put("HOME", "x" ** sys.c.PATH_MAX);
+    try std.testing.expectError(error.TokenPathTooLong, loadToken(gpa, &env));
+}
+
+test "loadToken propagates token file allocation failures" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var dir_buf: [128]u8 = undefined;
+    const home = try sys.scratchDir(&dir_buf, "modelfs-hf-token-oom");
+    defer sys.deleteTree(std.testing.io, home);
+    var path_buf: [256]u8 = undefined;
+    const path = try sys.joinZ(&path_buf, home, token_under_home);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(path, "hf_fromfile\n"));
+    try env.put(home_env, home);
+
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map) !void {
+            const token = (try loadToken(allocator, environ)) orelse return error.TestUnexpectedResult;
+            defer allocator.free(token);
+            try std.testing.expectEqualStrings("hf_fromfile", token);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(gpa, Runner.run, .{&env});
 }
 
 const seed_tree_ok = fuzzcorpus.entry(
