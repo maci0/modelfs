@@ -75,9 +75,11 @@ Suites outside the gate (most need hardware CI lacks):
   CLI model paths require `store.relOk` to return true and
   `discover.relIsCluster` to return false before origin or cache access.
   Peer `/have` and `/data` paths first pass `decodePath` in `src/peer.zig`.
-- **No hot-path allocation.** Piece hydration and request parsing use stack
-  buffers or one reusable piece-sized buffer; allocating functions take an
-  explicit `gpa`.
+- **No hot-path allocation beyond the reusable hydration buffer.** Piece
+  hydration and peer request parsing use stack buffers or one reusable
+  piece-sized buffer; the per-request allocation in `hydrateRange`
+  (`src/peer.zig`) is that permitted buffer, not an allocation per piece.
+  Request parsing must not allocate; allocating functions take an explicit `gpa`.
 - **`zig fmt` decides formatting.** `minimum_zig_version` in `build.zig.zon` is
   the single source of truth for the toolchain, including in CI.
 - **Docs point at symbols, not line numbers.** Line references rot within a
