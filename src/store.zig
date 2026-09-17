@@ -512,6 +512,7 @@ pub const Store = struct {
             // drain wait gave up on. Destroying them would hand those threads
             // freed memory; leaking them is bounded by the stuck-handler cap
             // and strictly safer.
+            // cordis-boundary: stuck handler refs outside restore; compensate by leaking entry until process exit.
             if (f.refs.load(.acquire) != 0) {
                 std.log.warn("store shutdown: {s} still referenced; leaking entry", .{f.rel});
                 continue;
@@ -1405,6 +1406,18 @@ pub const Store = struct {
         return file.bits.get(idx);
     }
 
+    /// Stamp recency once and report whether every covered piece is filled.
+    /// Callers that already hold `xfer` (FUSE `ensureRange`, peer
+    /// `hydrateRange`) use this instead of per-piece `hasPiece`: punchPiece
+    /// refuses while xfer is nonzero, so one stamp covers the whole span,
+    /// and the unlocked bit walk that follows cannot race a hole.
+    pub fn touchRangeFilled(self: *Store, file: *Cached, span: piece.Span, file_size: u64, now_sec: i64) bool {
+        file.mu.lockUncancelable(self.io);
+        defer file.mu.unlock(self.io);
+        file.last_access.store(now_sec, .monotonic);
+        return rangeFilled(file, span, file_size, self.piece_size);
+    }
+
     /// Origin-side manifest directory: `<origin>/.cluster/manifests/`. Flat
     /// hex names (piece.manifestName), so no nested directories and no
     /// traversal risk; lease walks and sweeps skip it (no .json/.tmp names,
@@ -2000,17 +2013,6 @@ pub const Store = struct {
         return rc;
     }
 
-    /// Copies bytes this node just wrote through the mount into the local
-    /// cache and marks the pieces they fully span. The entry is grown with
-    /// its piece marks preserved: an append is our own write, not an external
-    /// rewrite, so reconcileSize's wipe-on-size-change reset must not fire
-    /// here (it would discard every earlier chunk's cached pieces on a
-    /// sequential ingest). Call only when the observed origin size equals
-    /// `end`; any other size goes through get()'s conservative reset.
-    pub fn cacheFill(self: *Store, rel: []const u8, end: u64, off: u64, data: []const u8, now_sec: i64) void {
-        self.cacheFillIdentified(rel, end, off, data, OriginId{}, now_sec);
-    }
-
     /// Growth past a size that was not piece-aligned widens the short last
     /// piece: a set mark there described only the bytes the old size held,
     /// so carrying it across the grow would claim a full piece the cache fd
@@ -2041,9 +2043,12 @@ pub const Store = struct {
         if (cleared) _ = self.saveBits(file, false);
     }
 
-    /// Like cacheFill(), recording the post-write origin identity so a later
-    /// getIdentified does not treat this node's own write as a foreign
-    /// rewrite (NFS mtime lag is ignored: an older stamp is not adopted).
+    /// Copies bytes this node just wrote through the mount into the local
+    /// cache and marks the pieces they fully span, recording the post-write
+    /// origin identity so a later getIdentified does not treat this node's
+    /// own write as a foreign rewrite (NFS mtime lag is ignored: an older
+    /// stamp is not adopted). Call only when the observed origin size equals
+    /// `end`; any other size goes through get()'s conservative reset.
     pub fn cacheFillIdentified(self: *Store, rel: []const u8, end: u64, off: u64, data: []const u8, origin_id: OriginId, now_sec: i64) void {
         const file = blk: {
             if (self.lookupRef(rel)) |f| break :blk f;
@@ -2904,7 +2909,7 @@ test "cacheFill grows entry preserving earlier piece marks" {
     var fbuf2: [160]u8 = undefined;
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&fbuf2, fp), ""));
     try std.testing.expectEqual(@as(isize, 16), st.originPwrite("app.bin", &w1, 0));
-    st.cacheFill("app.bin", 16, 0, &w1, sys.monoSec(std.testing.io));
+    st.cacheFillIdentified("app.bin", 16, 0, &w1, OriginId{}, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("app.bin").?;
@@ -2919,7 +2924,7 @@ test "cacheFill grows entry preserving earlier piece marks" {
     var w2: [24]u8 = undefined;
     @memset(&w2, 0xBB);
     try std.testing.expectEqual(@as(isize, 24), st.originPwrite("app.bin", &w2, 16));
-    st.cacheFill("app.bin", 40, 16, &w2, sys.monoSec(std.testing.io));
+    st.cacheFillIdentified("app.bin", 40, 16, &w2, OriginId{}, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("app.bin").?;
@@ -2938,7 +2943,7 @@ test "cacheFill grows entry preserving earlier piece marks" {
     var w3: [8]u8 = undefined;
     @memset(&w3, 0xCC);
     try std.testing.expectEqual(@as(isize, 8), st.originPwrite("app.bin", &w3, 40));
-    st.cacheFill("app.bin", 48, 40, &w3, sys.monoSec(std.testing.io));
+    st.cacheFillIdentified("app.bin", 48, 40, &w3, OriginId{}, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("app.bin").?;
@@ -3006,7 +3011,7 @@ test "a fill claimed at the old short geometry cannot mark the widened piece" {
     var tail: [8]u8 = undefined;
     @memset(&tail, 0xBB);
     try std.testing.expectEqual(@as(isize, 8), st.originPwrite("race.bin", &tail, 40));
-    st.cacheFill("race.bin", 48, 40, &tail, now);
+    st.cacheFillIdentified("race.bin", 48, 40, &tail, OriginId{}, now);
 
     // The stale 8-byte completion must be dropped without even touching the
     // cache fd, and the mark instant itself refuses a mismatched length.
@@ -3058,7 +3063,7 @@ test "cacheFill grow drops a hydrated short tail's mark instead of widening it" 
     var w1: [40]u8 = undefined;
     @memset(&w1, 0xAA);
     try std.testing.expectEqual(@as(isize, 40), st.originPwrite("grow.bin", &w1, 0));
-    st.cacheFill("grow.bin", 40, 0, &w1, sys.monoSec(std.testing.io));
+    st.cacheFillIdentified("grow.bin", 40, 0, &w1, OriginId{}, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("grow.bin").?;
@@ -3081,7 +3086,7 @@ test "cacheFill grow drops a hydrated short tail's mark instead of widening it" 
     var w2: [4]u8 = undefined;
     @memset(&w2, 0xBB);
     try std.testing.expectEqual(@as(isize, 4), st.originPwrite("grow.bin", &w2, 44));
-    st.cacheFill("grow.bin", 48, 44, &w2, sys.monoSec(std.testing.io));
+    st.cacheFillIdentified("grow.bin", 48, 44, &w2, OriginId{}, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("grow.bin").?;
@@ -3124,7 +3129,7 @@ test "cacheFill resets every mark when an external truncate shrinks the file" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zz0, fp), ""));
     for ([_]u64{ 0, 16, 32 }) |off| {
         try std.testing.expectEqual(@as(isize, 16), st.originPwrite("ext.bin", &chunk, off));
-        st.cacheFill("ext.bin", off + 16, off, &chunk, sys.monoSec(std.testing.io));
+        st.cacheFillIdentified("ext.bin", off + 16, off, &chunk, OriginId{}, sys.monoSec(std.testing.io));
     }
     {
         const f = st.lookupRef("ext.bin").?;
@@ -3148,7 +3153,7 @@ test "cacheFill resets every mark when an external truncate shrinks the file" {
         try std.testing.expectEqual(@as(i32, 0), sys.ftruncate(fd, 32));
         try std.testing.expectEqual(@as(isize, 16), sys.pwriteAll(fd, &chunk, 16));
     }
-    st.cacheFill("ext.bin", 32, 16, &chunk, sys.monoSec(std.testing.io));
+    st.cacheFillIdentified("ext.bin", 32, 16, &chunk, OriginId{}, sys.monoSec(std.testing.io));
 
     {
         const f = st.lookupRef("ext.bin").?;
@@ -3306,7 +3311,7 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
 
         var chunk: [32]u8 = undefined;
         @memset(&chunk, 0x5A);
-        st.cacheFill("rc.bin", 32, 0, &chunk, sys.monoSec(std.testing.io));
+        st.cacheFillIdentified("rc.bin", 32, 0, &chunk, OriginId{}, sys.monoSec(std.testing.io));
 
         const blob = try sys.readFileAlloc(gpa, mp, 4096);
         defer gpa.free(blob);
@@ -3405,8 +3410,8 @@ test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
     var w2: [24]u8 = undefined;
     @memset(&w2, 0xBB);
 
-    st.cacheFill("app.bin", 16, 0, &w1, sys.monoSec(std.testing.io));
-    st.cacheFill("app.bin", 40, 16, &w2, sys.monoSec(std.testing.io));
+    st.cacheFillIdentified("app.bin", 16, 0, &w1, OriginId{}, sys.monoSec(std.testing.io));
+    st.cacheFillIdentified("app.bin", 40, 16, &w2, OriginId{}, sys.monoSec(std.testing.io));
     {
         const f = st.lookupRef("app.bin").?;
         defer st.releaseFile(f);
@@ -3583,7 +3588,7 @@ test "cacheFill shrink drops an in-flight fill of a surviving piece" {
 
         while (!claimed.load(.acquire))
             std.Thread.yield() catch {};
-        st.cacheFill("race.bin", 32, 16, &fresh, sys.monoSec(std.testing.io));
+        st.cacheFillIdentified("race.bin", 32, 16, &fresh, OriginId{}, sys.monoSec(std.testing.io));
         filler.join();
 
         f.mu.lockUncancelable(std.testing.io);

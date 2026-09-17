@@ -61,7 +61,7 @@ jobs:
       # uv itself: [tool.uv] required-version in pyproject.toml, the field
       # setup-uv already reads when `version` is empty.
       - name: Read Python version pin
-        id: py
+        id: py-x86
         run: |
           version="$(tr -d '[:space:]' < .python-version)"
           if [[ -z "${version}" ]]; then
@@ -84,7 +84,7 @@ jobs:
         with:
           activate-environment: true
           venv-path: .venv
-          python-version: ${{ steps.py.outputs.version }}
+          python-version: ${{ steps.py-x86.outputs.version }}
           cache-dependency-glob: |
             requirements*.txt
             .python-version
@@ -112,7 +112,7 @@ jobs:
       - name: Install libfuse3 development files
         run: ./scripts/install_libfuse3_dev.sh
       - name: Read Python version pin
-        id: py
+        id: py-arm
         run: |
           version="$(tr -d '[:space:]' < .python-version)"
           if [[ -z "${version}" ]]; then
@@ -124,7 +124,7 @@ jobs:
         with:
           activate-environment: true
           venv-path: .venv
-          python-version: ${{ steps.py.outputs.version }}
+          python-version: ${{ steps.py-arm.outputs.version }}
           cache-dependency-glob: |
             requirements*.txt
             .python-version

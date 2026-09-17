@@ -455,7 +455,10 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
     // Before any reply path, so the status line survives the close even for
     // a client that sent a body with its (broken) request.
     drainDeclaredBody(self.io, fd, head, n, total_read);
-    const auth = proto.headerGet(head, "Authorization") orelse "";
+    // Auth runs before the method gate; /data also needs Range. One pass
+    // for both names so a valid /data request does not rescan the head.
+    const auth_h, const range_h = proto.headerGet2(head, "Authorization", "Range");
+    const auth = auth_h orelse "";
     if (!proto.bearerOk(auth, self.psk)) {
         // Security-relevant event: without this line a wrong-PSK node or an
         // unauthenticated prober is invisible to the operator, and without
@@ -538,7 +541,7 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
         return;
     }
     {
-        const rh = proto.headerGet(head, "Range") orelse {
+        const rh = range_h orelse {
             replyStatus(self, fd, "400 Bad Request");
             return;
         };
@@ -684,12 +687,16 @@ fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
 fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
     const cov = piece.cover(span, file_size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
+    // Caller (serveData) already holds xfer: one stamp + allSet covers the
+    // span, then unlocked bit walks are safe because punchPiece refuses
+    // while xfer is nonzero.
+    if (self.store.touchRangeFilled(file, span, file_size, sys.monoSec(self.io))) return true;
     const piece_size = self.store.piece_size;
     var pbuf: ?[]u8 = null;
     defer if (pbuf) |b| self.gpa.free(b);
     var pi = cov.start;
     while (pi < cov.end) : (pi += 1) {
-        if (!self.store.hasPiece(file, pi, sys.monoSec(self.io))) {
+        if (!file.bits.get(pi)) {
             // Allocate before claiming: nothing but finishPiece removes a
             // filling entry, so an allocation failure after the claim would
             // leave the piece claimed forever and wedge every later filler
@@ -764,10 +771,11 @@ fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: p
                 },
             }
             // Only pieces that entered a fill claim need revalidation: a piece
-            // already cached above skips this entirely, halving the per-piece
-            // lock traffic on fully-warm transfers. Punches cannot land under
-            // us either way -- serveData holds xfer across the whole response.
-            if (!self.store.hasPiece(file, pi, sys.monoSec(self.io))) {
+            // already cached above skips this entirely. Punches cannot land
+            // under us -- serveData holds xfer across the whole response --
+            // and touchRangeFilled already stamped the span, so the bit
+            // probe needs no lock (same contract as the warm walk above).
+            if (!file.bits.get(pi)) {
                 // completeFill returns 0 on a skipped claim (local write
                 // generation mismatch, forget) as well as a landed fill.
                 // Treating that as 404 tells the fetching peer the path is
@@ -1058,19 +1066,23 @@ fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: c_int, head_buf:
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
-    if (!proto.httpStatusIs(status_line, 200)) {
+    // Null parse matches the old double-httpStatusIs miss path: HttpStatus,
+    // not BadHttp, so fuzz and callers keep the same error contract.
+    const status = proto.httpStatusCode(status_line) orelse return error.HttpStatus;
+    if (status != 200) {
         // A 404 is a healthy peer answering "not cached here" -- the normal
         // shape of a fleet where replicas differ. It gets its own error so
         // the probe-failure counter can exclude it and stay meaningful;
         // everything else (auth rejected, peer broken, malformed reply)
         // means this node cannot actually talk to the cluster.
-        if (proto.httpStatusIs(status_line, 404)) return error.PeerMiss;
+        if (status == 404) return error.PeerMiss;
         return error.HttpStatus;
     }
     // Absent X-Piece-Size (an older peer) is unknown (0) and assumed
     // aligned. An advertised 0 is not absence: no legal --piece is zero,
     // so it is malformed like any other bad grid.
-    const piece_size: u32 = if (proto.headerGet(head, "X-Piece-Size")) |ps_str| blk: {
+    const ps_h, const cl_h = proto.headerGet2(head, "X-Piece-Size", "Content-Length");
+    const piece_size: u32 = if (ps_h) |ps_str| blk: {
         const piece_size_n = proto.parseU64Fast(ps_str) orelse return error.BadPieceSize;
         const ps = std.math.cast(u32, piece_size_n) orelse return error.BadPieceSize;
         if (ps == 0) return error.BadPieceSize;
@@ -1081,7 +1093,7 @@ fn haveFromHeadDeadline(gpa: std.mem.Allocator, io: std.Io, fd: c_int, head_buf:
     // max_have_body_bytes). A missing header reads as length 0, matching the
     // zero-length success below. The same 1*DIGIT parser Range uses: a
     // "+16" or "16_0" length is malformed, not a size.
-    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
+    const cl_str = cl_h orelse "0";
     const declared = proto.parseU64Fast(cl_str) orelse return error.BadContentLength;
     if (declared > max_have_body_bytes) return error.BodyTooLarge;
     const bits = try finishBodyAlloc(gpa, io, fd, head_buf, head_len, total_read, null, deadline_ms);
@@ -1136,14 +1148,15 @@ fn checkRangeReply(head: []const u8, start: u64, end: u64) !void {
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
     if (!proto.httpStatusIs(status_line, 206)) return error.HttpStatus;
-    const cr = proto.headerGet(head, "Content-Range") orelse return error.MissingContentRange;
+    const cr_h, const cl_h = proto.headerGet2(head, "Content-Range", "Content-Length");
+    const cr = cr_h orelse return error.MissingContentRange;
     const r = proto.parseContentRange(cr) orelse return error.BadContentRange;
     if (r.start != start or r.end < start or r.end > end) return error.RangeMismatch;
     // Content-Length is the body the caller will accept; Content-Range is
     // the window those bytes claim to cover. A mismatch would mark a
     // shorter (or longer) body filled under the requested piece bounds.
     // Absent length keeps the same 0 reading finishBodyAlloc uses.
-    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
+    const cl_str = cl_h orelse "0";
     const cl = proto.parseU64Fast(cl_str) orelse return error.BadContentLength;
     const want = r.end -| r.start +| 1;
     if (cl != want) return error.LengthMismatch;
@@ -1244,9 +1257,9 @@ fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: c_int, head_buf: []co
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;
     const status_line = head[0..status_end];
-    if (!proto.httpStatusIs(status_line, 200) and !proto.httpStatusIs(status_line, 206)) {
-        return error.HttpStatus;
-    }
+    // Null parse matches the old double-httpStatusIs miss path: HttpStatus.
+    const status = proto.httpStatusCode(status_line) orelse return error.HttpStatus;
+    if (status != 200 and status != 206) return error.HttpStatus;
 
     const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
     // A malformed or overflowing length is a broken reply, not a zero-byte
@@ -1459,7 +1472,7 @@ fn probeSlots(
 
 /// Total order for the probe walk inside one peer-id group: higher lease
 /// prior first (pathScore with inflight fixed at 0, the pre-probe state),
-/// then pathTieLess (ip bytes, then port). The tie-break is
+/// then addrTieLess (ip bytes, then port). The tie-break is
 /// what keeps the walk a function of the address set alone: on a cold
 /// cluster every path carries the same prior, so without it the first-tried
 /// address would be decided by the publisher's getifaddrs order riding in
@@ -1469,7 +1482,7 @@ fn probeOrderLess(a: discover.Path, b: discover.Path) bool {
     const sa = discover.pathScore(a.ewma_bps, a.hops, 0);
     const sb = discover.pathScore(b.ewma_bps, b.hops, 0);
     if (sa != sb) return sa > sb;
-    return discover.pathTieLess(a, b);
+    return discover.addrTieLess(a.ip, a.port, b.ip, b.port);
 }
 
 /// Groups snapshot indexes by unique peer id, each group sorted best-first
@@ -3944,13 +3957,13 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                     try std.testing.expect(refHttpStatusIs(head[0..status_end], 200));
                     try std.testing.expect(!refHttpStatusIs(head[0..status_end], 206));
                     try std.testing.expect(!refHttpStatusIs(head[0..status_end], 404));
-                    const cl_str = proto.headerGet(head, "Content-Length") orelse "0";
-                    const want_len = std.math.cast(usize, proto.parseU64Fast(cl_str) orelse 0) orelse 0;
+                    const cl_str, const ps_str = proto.headerGet2(head, "Content-Length", "X-Piece-Size");
+                    const want_len = std.math.cast(usize, proto.parseU64Fast(cl_str orelse "0") orelse 0) orelse 0;
                     try std.testing.expectEqual(want_len, rep.bits.len);
                     try std.testing.expect(total_read >= head_len + rep.bits.len);
                     try std.testing.expectEqualSlices(u8, wire[head_len..][0..rep.bits.len], rep.bits);
-                    const ps_str = proto.headerGet(head, "X-Piece-Size") orelse "0";
-                    const ps_n = proto.parseU64Fast(ps_str) orelse return error.TestUnexpectedResult;
+                    const ps = ps_str orelse "0";
+                    const ps_n = proto.parseU64Fast(ps) orelse return error.TestUnexpectedResult;
                     try std.testing.expectEqual(std.math.cast(u32, ps_n) orelse return error.TestUnexpectedResult, rep.piece_size);
                     // hasPiece is the fill-routing trust boundary: a
                     // misaligned advertised grid cannot look like a hit,
@@ -4010,8 +4023,8 @@ fn fuzzHaveReplyOne(_: void, smith: *std.testing.Smith) anyerror!void {
                     refHttpStatusIs(dest_head[0..status_end], 404),
                     proto.httpStatusIs(dest_head[0..status_end], 404),
                 );
-                const status_ok = proto.httpStatusIs(dest_head[0..status_end], 200) or
-                    proto.httpStatusIs(dest_head[0..status_end], 206);
+                const dest_status = proto.httpStatusCode(dest_head[0..status_end]);
+                const status_ok = dest_status == 200 or dest_status == 206;
                 const dest_cl_str = proto.headerGet(dest_head, "Content-Length") orelse "0";
                 const dest_want: ?usize = if (proto.parseU64Fast(dest_cl_str)) |n| std.math.cast(usize, n) else null;
 
@@ -4137,7 +4150,8 @@ fn fuzzRequestHeadOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const method = it.next() orelse return;
     const target = it.next() orelse return;
     if (!std.mem.eql(u8, method, "GET")) return;
-    const auth = proto.headerGet(head, "Authorization") orelse return;
+    const auth_h, const range_h = proto.headerGet2(head, "Authorization", "Range");
+    const auth = auth_h orelse return;
     const authed = proto.bearerOk(auth, fuzz_request_psk);
     try std.testing.expectEqual(refBearerOk(auth, fuzz_request_psk), authed);
     if (!authed) return;
@@ -4160,7 +4174,7 @@ fn fuzzRequestHeadOne(_: void, smith: *std.testing.Smith) anyerror!void {
     try std.testing.expectEqual(refRelOk(rel), routed_ok);
     if (!routed_ok) return;
     if (path[1] != 'd') return;
-    const rh = proto.headerGet(head, "Range") orelse return;
+    const rh = range_h orelse return;
     const rg = proto.parseRange(rh) orelse return;
     try std.testing.expect(rg.start <= rg.end);
     var canon: [64]u8 = undefined;
@@ -4239,7 +4253,8 @@ fn classifyServedHead(head: []const u8) ServeClass {
     var it = std.mem.splitScalar(u8, served[0..line_end], ' ');
     const method = it.next() orelse return .dropped;
     const target = it.next() orelse return .dropped;
-    const auth = proto.headerGet(served, "Authorization") orelse "";
+    const auth_h, const range_h = proto.headerGet2(served, "Authorization", "Range");
+    const auth = auth_h orelse "";
     if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
     if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
     const path = proto.pathOnly(target);
@@ -4253,7 +4268,7 @@ fn classifyServedHead(head: []const u8) ServeClass {
     if (!store_mod.relOk(rel)) return .bad_path;
     if (discover.relIsCluster(rel)) return .miss;
     if (is_data) {
-        const rh = proto.headerGet(served, "Range") orelse return .bad_range;
+        const rh = range_h orelse return .bad_range;
         _ = proto.parseRange(rh) orelse return .bad_range;
     }
     // Routed requests stop at statOrigin's ENOENT in the fixture below
@@ -4451,7 +4466,8 @@ fn classifyDataHead(head: []const u8) DataClass {
     var it = std.mem.splitScalar(u8, served[0..line_end], ' ');
     const method = it.next().?;
     const target = it.next() orelse return .dropped;
-    const auth = proto.headerGet(served, "Authorization") orelse "";
+    const auth_h, const range_h = proto.headerGet2(served, "Authorization", "Range");
+    const auth = auth_h orelse "";
     if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
     if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
     const path = proto.pathOnly(target);
@@ -4465,7 +4481,7 @@ fn classifyDataHead(head: []const u8) DataClass {
     if (!store_mod.relOk(rel)) return .bad_path;
     if (discover.relIsCluster(rel)) return .not_found;
     if (is_data) {
-        const rh = proto.headerGet(served, "Range") orelse return .bad_range;
+        const rh = range_h orelse return .bad_range;
         const rg = proto.parseRange(rh) orelse return .bad_range;
         return switch (dataKindOf(rel)) {
             .dir, .absent => .not_found,
@@ -4628,16 +4644,18 @@ fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
             try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 206 Partial Content\r\n"));
             var crbuf: [96]u8 = undefined;
             const cr = try std.fmt.bufPrint(&crbuf, "bytes {d}-{d}/{d}", .{ pr.start, pr.end, data_file_size });
-            try std.testing.expectEqualStrings(cr, proto.headerGet(rep_head, "Content-Range") orelse return error.NoContentRange);
-            const cl_str = proto.headerGet(rep_head, "Content-Length") orelse return error.NoContentLength;
+            const cr_h, const cl_h = proto.headerGet2(rep_head, "Content-Range", "Content-Length");
+            try std.testing.expectEqualStrings(cr, cr_h orelse return error.NoContentRange);
+            const cl_str = cl_h orelse return error.NoContentLength;
             try std.testing.expectEqual(want_len, proto.parseU64Fast(cl_str) orelse return error.BadContentLength);
             try std.testing.expectEqual(want_len, @as(u64, body.len));
             try std.testing.expectEqualSlices(u8, data_pattern[pr.start..][0..want_len], body);
         },
         .have_bits => |hb| {
             try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
-            try std.testing.expectEqualStrings("16", proto.headerGet(rep_head, "X-Piece-Size") orelse return error.NoPieceSize);
-            const cl_str = proto.headerGet(rep_head, "Content-Length") orelse return error.NoContentLength;
+            const ps_h, const cl_h = proto.headerGet2(rep_head, "X-Piece-Size", "Content-Length");
+            try std.testing.expectEqualStrings("16", ps_h orelse return error.NoPieceSize);
+            const cl_str = cl_h orelse return error.NoContentLength;
             try std.testing.expectEqual(hb.bits_bytes, std.math.cast(usize, proto.parseU64Fast(cl_str) orelse return error.BadContentLength) orelse return error.BadContentLength);
             try std.testing.expectEqual(hb.bits_bytes, body.len);
             const mask = havePadMask(hb.nbits);

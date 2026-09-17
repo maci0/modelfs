@@ -106,20 +106,11 @@ fn pathListLess(_: void, a: Path, b: Path) bool {
     switch (std.mem.order(u8, a.peer_id, b.peer_id)) {
         .lt => return true,
         .gt => return false,
-        .eq => return pathTieLess(a, b),
+        .eq => return addrTieLess(a.ip, a.port, b.ip, b.port),
     }
 }
 
 fn candTieLess(a: PathCand, b: PathCand) bool {
-    return addrTieLess(a.ip, a.port, b.ip, b.port);
-}
-
-/// The same tie-break over live catalog Paths: score descending, then ip
-/// bytes, then port. The peer probe walk sorts each multi-homed group with
-/// it so equal priors resolve by address bytes alone -- never by the lease
-/// document's address order, which is the publisher's getifaddrs
-/// enumeration and varies across reboots and machines.
-pub fn pathTieLess(a: Path, b: Path) bool {
     return addrTieLess(a.ip, a.port, b.ip, b.port);
 }
 
@@ -182,7 +173,7 @@ pub fn printable(s: []const u8) bool {
 /// so every site that logs one of those goes through here rather than
 /// re-deciding the printable gate inline.
 pub fn displayName(name: []const u8) []const u8 {
-    return if (printable(name)) name else "<name withheld: control bytes>";
+    return if (!proto.containsControl(name)) name else "<name withheld: control bytes>";
 }
 
 /// True when s is safe to publish as this node's cluster id. The id names
@@ -2063,19 +2054,14 @@ test "pickBest breaks score ties by ip and port, never by list order" {
     try std.testing.expectEqual(@as(usize, 0), pickBest(&.{ lo, a }).?);
 }
 
-test "pathTieLess orders by ip then port" {
+test "addrTieLess orders by ip then port" {
     // Same total order candTieLess gives candidates: the probe walk must
     // resolve equal priors by address bytes, never by lease arrival order.
-    const mk = struct {
-        fn p(ip: []const u8, port: u16) Path {
-            return .{ .peer_id = "x", .ip = ip, .port = port, .ewma_bps = 1e8, .hops = 0 };
-        }
-    }.p;
-    try std.testing.expect(pathTieLess(mk("10.0.0.5", 18080), mk("10.0.0.9", 18080)));
-    try std.testing.expect(!pathTieLess(mk("10.0.0.9", 18080), mk("10.0.0.5", 18080)));
-    try std.testing.expect(pathTieLess(mk("10.0.0.5", 18079), mk("10.0.0.5", 18081)));
-    // Reflexivity: identical paths compare false both ways.
-    try std.testing.expect(!pathTieLess(mk("10.0.0.5", 18080), mk("10.0.0.5", 18080)));
+    try std.testing.expect(addrTieLess("10.0.0.5", 18080, "10.0.0.9", 18080));
+    try std.testing.expect(!addrTieLess("10.0.0.9", 18080, "10.0.0.5", 18080));
+    try std.testing.expect(addrTieLess("10.0.0.5", 18079, "10.0.0.5", 18081));
+    // Reflexivity: identical addresses compare false both ways.
+    try std.testing.expect(!addrTieLess("10.0.0.5", 18080, "10.0.0.5", 18080));
 }
 
 test "same /24 is zero hops" {

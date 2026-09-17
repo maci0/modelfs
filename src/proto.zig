@@ -103,19 +103,25 @@ pub fn parseU64Fast(s: []const u8) ?u64 {
     return n;
 }
 
-/// True when `status_line` is HTTP/1.1 with this 3-digit status code.
+/// Parses the 3-digit status code from an HTTP/1.1 status line.
 /// RFC 9110 `status-code` is `3DIGIT`; a prefix match on `"HTTP/1.1 200"`
 /// would also accept `2000` and `200OK`. A missing reason-phrase is allowed
 /// (`HTTP/1.1 200`); anything other than end-of-line or SP after the code
-/// is not.
-pub fn httpStatusIs(status_line: []const u8, code: u16) bool {
+/// is not. Prefer this when one head may match several codes.
+pub fn httpStatusCode(status_line: []const u8) ?u16 {
     const p = "HTTP/1.1 ";
-    if (!std.mem.startsWith(u8, status_line, p)) return false;
+    if (!std.mem.startsWith(u8, status_line, p)) return null;
     const rest = status_line[p.len..];
-    if (rest.len < 3) return false;
-    if (rest.len > 3 and rest[3] != ' ') return false;
-    const n = parseU64Fast(rest[0..3]) orelse return false;
-    return n == @as(u64, code);
+    if (rest.len < 3) return null;
+    if (rest.len > 3 and rest[3] != ' ') return null;
+    const n = parseU64Fast(rest[0..3]) orelse return null;
+    if (n > 999) return null;
+    return @intCast(n);
+}
+
+/// True when `status_line` is HTTP/1.1 with this 3-digit status code.
+pub fn httpStatusIs(status_line: []const u8, code: u16) bool {
+    return httpStatusCode(status_line) == code;
 }
 
 /// Parses an HTTP Range header value ("bytes=start-end"). End is inclusive.
@@ -174,6 +180,27 @@ pub fn headerGet(head: []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// One-pass twin of `headerGet` for two names. Same case-insensitive match
+/// and value trim; first occurrence of each name wins. Prefer this over two
+/// `headerGet` calls on the same head: peer request/reply heads are scanned
+/// for Authorization+Range, X-Piece-Size+Content-Length, or Content-Range+
+/// Content-Length on every connection and every piece body.
+pub fn headerGet2(head: []const u8, name_a: []const u8, name_b: []const u8) struct { ?[]const u8, ?[]const u8 } {
+    var a: ?[]const u8 = null;
+    var b: ?[]const u8 = null;
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    _ = it.next(); // status / request line
+    while (it.next()) |line| {
+        if (line.len == 0) break;
+        if (a != null and b != null) break;
+        const col = std.mem.findScalar(u8, line, ':') orelse continue;
+        const name = line[0..col];
+        const val = std.mem.trim(u8, line[col + 1 ..], " \t");
+        if (a == null and col == name_a.len and std.ascii.eqlIgnoreCase(name, name_a)) a = val else if (b == null and col == name_b.len and std.ascii.eqlIgnoreCase(name, name_b)) b = val;
+    }
+    return .{ a, b };
 }
 
 /// Timing-safe bearer check. Tokens are hashed with SHA-256 first so a
@@ -681,16 +708,18 @@ test "range and query" {
     try std.testing.expect(parseU64Fast("-1") == null);
     try std.testing.expect(parseU64Fast(" 16") == null);
 
+    try std.testing.expectEqual(@as(?u16, 200), httpStatusCode("HTTP/1.1 200 OK"));
+    try std.testing.expectEqual(@as(?u16, 206), httpStatusCode("HTTP/1.1 206 Partial Content"));
+    try std.testing.expectEqual(@as(?u16, 404), httpStatusCode("HTTP/1.1 404 Not Found"));
+    try std.testing.expectEqual(@as(?u16, 200), httpStatusCode("HTTP/1.1 200"));
+    try std.testing.expectEqual(@as(?u16, 200), httpStatusCode("HTTP/1.1 200 "));
+    try std.testing.expect(httpStatusCode("HTTP/1.1 2000") == null);
+    try std.testing.expect(httpStatusCode("HTTP/1.1 200OK") == null);
+    try std.testing.expect(httpStatusCode("HTTP/1.1 4040") == null);
+    try std.testing.expect(httpStatusCode("HTTP/1.0 200 OK") == null);
+    try std.testing.expect(httpStatusCode("HTTP/1.1 20") == null);
     try std.testing.expect(httpStatusIs("HTTP/1.1 200 OK", 200));
     try std.testing.expect(httpStatusIs("HTTP/1.1 206 Partial Content", 206));
-    try std.testing.expect(httpStatusIs("HTTP/1.1 404 Not Found", 404));
-    try std.testing.expect(httpStatusIs("HTTP/1.1 200", 200));
-    try std.testing.expect(httpStatusIs("HTTP/1.1 200 ", 200));
-    try std.testing.expect(!httpStatusIs("HTTP/1.1 2000", 200));
-    try std.testing.expect(!httpStatusIs("HTTP/1.1 200OK", 200));
-    try std.testing.expect(!httpStatusIs("HTTP/1.1 4040", 404));
-    try std.testing.expect(!httpStatusIs("HTTP/1.0 200 OK", 200));
-    try std.testing.expect(!httpStatusIs("HTTP/1.1 20", 200));
     try std.testing.expect(!httpStatusIs("HTTP/1.1 206", 200));
 
     const cr = parseContentRange("bytes 16-31/48").?;
@@ -724,6 +753,24 @@ test "headerGet is case-insensitive and trims" {
     try std.testing.expectEqualStrings("node1:18080", headerGet(head, "Host").?);
     try std.testing.expectEqualStrings("bytes=0-9", headerGet(head, "range").?);
     try std.testing.expect(headerGet(head, "Content-Length") == null);
+}
+
+test "headerGet2 matches two headerGet calls in one pass" {
+    const head = "GET /data HTTP/1.1\r\nAuthorization: Bearer  tok123 \r\nRange: bytes=0-9\r\nX-Piece-Size: 4096\r\nContent-Length: 16\r\n\r\n";
+    const auth, const rh = headerGet2(head, "Authorization", "Range");
+    try std.testing.expectEqualStrings("Bearer  tok123", auth.?);
+    try std.testing.expectEqualStrings("bytes=0-9", rh.?);
+    const ps, const cl = headerGet2(head, "X-Piece-Size", "Content-Length");
+    try std.testing.expectEqualStrings("4096", ps.?);
+    try std.testing.expectEqualStrings("16", cl.?);
+    const missing, const host = headerGet2(head, "Content-Range", "Host");
+    try std.testing.expect(missing == null);
+    try std.testing.expect(host == null);
+    // Case-insensitive names; first occurrence wins.
+    const dup = "HTTP/1.1 206\r\ncontent-length: 1\r\nContent-Length: 99\r\nContent-Range: bytes 0-0/1\r\n\r\n";
+    const cr, const cl2 = headerGet2(dup, "Content-Range", "Content-Length");
+    try std.testing.expectEqualStrings("bytes 0-0/1", cr.?);
+    try std.testing.expectEqualStrings("1", cl2.?);
 }
 
 test "HaveBits.hasPiece respects advertised grid" {

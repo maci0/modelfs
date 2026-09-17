@@ -173,6 +173,7 @@ pub const State = struct {
             // thread freed memory the moment its current syscall unwinds.
             // Leak the whole tree instead, mirroring Store.deinit's
             // stuck-handler policy; process exit reclaims it.
+            // cordis-boundary: stuck peer handler is outside restore; compensate by leaking State until process exit.
             std.log.warn("shutdown: peer handler still inflight after drain; leaking mount state", .{});
             return;
         }
@@ -893,7 +894,10 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
             std.log.warn("cache write refused {s} piece {d} (errno {d}); piece unmarked", .{ file.rel, idx, -rc });
             return rc;
         }
-        if (st.store.hasPiece(file, idx, sys.monoSec(st.io))) break;
+        // Caller (ensureRange via mf_read) holds xfer; punchPiece refuses while
+        // xfer is nonzero, and touchRangeFilled already stamped the span, so
+        // the bit probe needs no lock (same contract as hydrateRange).
+        if (file.bits.get(idx)) break;
         // A local write-through discarded this fill (peer bytes would have
         // overwritten it). One origin retry is the intended recovery; looping
         // past that would stall this FUSE worker for as long as writers keep
@@ -934,6 +938,11 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
 fn ensureRange(st: *State, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) i32 {
     const cov = piece.cover(span, file_size, st.store.piece_size);
     if (cov.start >= cov.end) return 0;
+    // Caller (mf_read) already holds xfer: one stamp + allSet covers the
+    // span, then unlocked bit walks are safe because punchPiece refuses
+    // while xfer is nonzero. Warm paths that reached serveHydrated with
+    // ready=false still short-circuit here without per-piece hasPiece.
+    if (st.store.touchRangeFilled(file, span, file_size, sys.monoSec(st.io))) return 0;
     // One reusable buffer for every hydrated piece in the range, allocated
     // only when some covered piece actually lacks its bit: warm reads (every
     // piece cached) previously paid a piece-sized alloc/free per call.
@@ -941,7 +950,7 @@ fn ensureRange(st: *State, file: *store_mod.Store.Cached, span: piece.Span, file
     defer if (scratch) |s| st.gpa.free(s);
     var i = cov.start;
     while (i < cov.end) : (i += 1) {
-        if (st.store.hasPiece(file, i, sys.monoSec(st.io))) continue;
+        if (file.bits.get(i)) continue;
         if (scratch == null)
             scratch = st.gpa.alloc(u8, st.store.piece_size) catch {
                 // Same operator-trace contract as hydratePiece's claim OOM
@@ -1458,6 +1467,9 @@ export fn ll_destroy(ud: ?*anyopaque) callconv(.c) void {
     const st: *State = @ptrCast(@alignCast(ud));
     st.running.store(false, .release);
     st.server.stop();
+    // Inverse of ll_init / llEnter: drop this thread's State pointer so a
+    // late path handler cannot read freed mount state via tls_state.
+    tls_state = null;
 }
 
 /// One discovery-tick origin sample: publish then refresh, then feed the
@@ -2470,8 +2482,9 @@ fn serve(st: *State, inherit_fd: ?c_int) c_int {
     if (st.update_token) |tok| writeAck(st, tok);
     const rc = fuse.fuse_session_loop_mt_31(se, 0);
     fuse.fuse_remove_signal_handlers(se);
-    live_state = null;
-    live_session = null;
+    // fuse_remove_signal_handlers only resets HUP/INT/TERM/PIPE. SIGUSR2 is
+    // ours; clearing live_* without restoring SIG_DFL leaves onUsr2 armed.
+    removeHandoverSignal();
 
     if (st.handover_asked.load(.acquire)) {
         // Neither unmount nor destroy: destroy closes the FUSE fd, and the
@@ -2636,6 +2649,51 @@ fn installHandoverSignal(st: *State, se: *fuse.fuse_session) void {
     _ = sys.c.sigemptyset(&sa.sa_mask);
     sa.sa_flags = sys.c.SA_RESTART;
     _ = sys.c.sigaction(sys.c.SIGUSR2, &sa, null);
+}
+
+/// Inverse of installHandoverSignal: drop live_* and restore SIGUSR2 to
+/// SIG_DFL. Idempotent — a second call is a no-op on an already-cleared slot.
+fn removeHandoverSignal() void {
+    live_state = null;
+    live_session = null;
+    var sa = std.mem.zeroes(sys.c.struct_sigaction);
+    if (comptime @import("builtin").target.abi == .musl) {
+        sa.__sa_handler.sa_handler = sys.c.SIG_DFL;
+    } else {
+        sa.__sigaction_handler.sa_handler = sys.c.SIG_DFL;
+    }
+    _ = sys.c.sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    _ = sys.c.sigaction(sys.c.SIGUSR2, &sa, null);
+}
+
+test "removeHandoverSignal clears live_* and restores SIGUSR2 to SIG_DFL" {
+    // Dispose-the-registration: installHandoverSignal is the effect;
+    // removeHandoverSignal is its inverse. A fake session pointer is enough —
+    // install only stores it; onUsr2 is never invoked here.
+    var st: State = undefined;
+    var se_slot: usize = 0;
+    const se: *fuse.fuse_session = @ptrCast(@alignCast(&se_slot));
+    installHandoverSignal(&st, se);
+    try std.testing.expect(live_state == &st);
+    try std.testing.expect(live_session == se);
+
+    removeHandoverSignal();
+    try std.testing.expect(live_state == null);
+    try std.testing.expect(live_session == null);
+
+    // Idempotent inverse.
+    removeHandoverSignal();
+    try std.testing.expect(live_state == null);
+    try std.testing.expect(live_session == null);
+
+    var cur = std.mem.zeroes(sys.c.struct_sigaction);
+    _ = sys.c.sigaction(sys.c.SIGUSR2, null, &cur);
+    const handler = if (comptime @import("builtin").target.abi == .musl)
+        cur.__sa_handler.sa_handler
+    else
+        cur.__sigaction_handler.sa_handler;
+    try std.testing.expectEqual(sys.c.SIG_DFL, handler);
 }
 
 fn snapNodes(st: *State, gpa: std.mem.Allocator) ![]handover.NodeSnap {

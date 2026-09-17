@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-17
+
+Hot-path peer/FUSE scans cost less lock and header work. Dead helpers drop.
+Handover teardown matches the SIGUSR2 install. CI Python pin step ids no
+longer collide across jobs.
+
+### Hot-path header and miss-span scans - 2026-09-17
+- **`proto.headerGet2` scans one head for two names.** `handleConn`, `haveFromHeadDeadline`, `checkRangeReply`, and peer test helpers use it instead of two `headerGet` walks.
+- **`Store.touchRangeFilled` cuts miss-path lock churn.** Under an existing `xfer` hold, `ensureRange` and `hydrateRange` stamp once and walk `file.bits` unlocked; `punchPiece` still refuses while `xfer` is nonzero.
+- **`proto.httpStatusCode` parses once.** `haveFromHeadDeadline` and `finishBodyAlloc` compare the code instead of two `httpStatusIs` walks; `httpStatusIs` delegates to it.
+- **`hydrateRange` / `hydratePiece` post-fill recheck uses `file.bits.get`.** Under the existing `xfer` hold the stamp already landed via `touchRangeFilled`, so the locked `hasPiece` path is redundant.
+
+### Drop dead helpers and one-line wrappers - 2026-09-17
+- **`manifestsIdentical` / `manifestsShareAny` deleted.** Zero callers; `manifestOverlapPrepared` covers `modelfs dupes`.
+- **`cacheFill` deleted.** Tests call `cacheFillIdentified` with `OriginId{}`; production already did.
+- **`pieceBit` / `pathTieLess` inlined.** Call sites use `file.bits.get` and `addrTieLess`.
+- **`displayName` / `modelfs peers` gate on `proto.containsControl` directly.** `printable` remains for its unit tests.
+
+### Temporal teardown for SIGUSR2 - 2026-09-17
+- **`removeHandoverSignal` restores SIGUSR2 to SIG_DFL.** `fuse_remove_signal_handlers` only resets HUP/INT/TERM/PIPE; the handover install now has a matching inverse that also clears `live_*`.
+- **`ll_destroy` clears `tls_state`.** Inverse of `ll_init` / `llEnter` so a late path handler cannot read freed mount state.
+- **CI Python pin step ids are unique across jobs.** `py-x86` / `py-arm` replace the duplicated `py` id.
+
 ## [0.13.0] - 2026-09-13
 
 Peer HTTP drops `/stage` and the unused RDMA seam. Mixed fleets with `0.12.0`
@@ -1094,7 +1117,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/maci0/modelfs/releases/tag/v0.14.0
 [0.13.0]: https://github.com/maci0/modelfs/releases/tag/v0.13.0
 [0.12.0]: https://github.com/maci0/modelfs/releases/tag/v0.12.0
 [0.11.0]: https://github.com/maci0/modelfs/releases/tag/v0.11.0

@@ -517,33 +517,6 @@ pub fn digestSorted(gpa: std.mem.Allocator, entries: []const ManifestEntry) ![]M
     return copy;
 }
 
-/// True when two manifests are byte-identical (same file size, same piece count,
-/// all piece indices and digests matching). Fast-fails in O(1) on size or count
-/// mismatch without scanning entries.
-pub fn manifestsIdentical(a: Manifest, b: Manifest) bool {
-    if (a.file_size != b.file_size or a.entries.len != b.entries.len) return false;
-    for (a.entries, b.entries) |ae, be| {
-        if (ae.idx != be.idx or !digestEql(&ae.hash, &be.hash)) return false;
-    }
-    return true;
-}
-
-/// True when two digest-sorted manifest entry lists share at least one digest.
-/// Early-returns on the first common digest rather than computing the full
-/// intersection count.
-pub fn manifestsShareAny(a_dig: []const ManifestEntry, b_dig: []const ManifestEntry) bool {
-    var i: usize = 0;
-    var j: usize = 0;
-    while (i < a_dig.len and j < b_dig.len) {
-        switch (digestOrder(&a_dig[i].hash, &b_dig[j].hash)) {
-            .lt => i += 1,
-            .gt => j += 1,
-            .eq => return true,
-        }
-    }
-    return false;
-}
-
 /// Compares two manifests' entries (both sorted by idx, as decode
 /// guarantees). Aligned counts same-index same-digest pairs; shared counts
 /// distinct digests in both (a merge over the caller's digest-sorted copies

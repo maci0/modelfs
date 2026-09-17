@@ -1106,7 +1106,7 @@ fn leaseAddrs(gpa: std.mem.Allocator, opts: Opts, local_ips: []const []const u8,
     }
     // Canonicalize so the published lease JSON is a function of the
     // address set, never of getifaddrs or --advertise enumeration order.
-    // Probe walks already ignore that order (pathTieLess); this keeps the
+    // Probe walks already ignore that order (addrTieLess); this keeps the
     // document itself replayable from the NIC set.
     std.mem.sort(proto.LeaseAddr, addrs.items, {}, struct {
         fn lessThan(_: void, a: proto.LeaseAddr, b: proto.LeaseAddr) bool {
@@ -1821,10 +1821,10 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         // Lease ids and addresses come off shared storage as other nodes'
         // JSON; echo them only when free of control bytes so `modelfs peers`
         // cannot be turned into a terminal-injection vector.
-        const id_shown = if (discover.printable(r.id)) r.id else "<id withheld: control bytes>";
+        const id_shown = if (!proto.containsControl(r.id)) r.id else "<id withheld: control bytes>";
         if (!printOut(io, gpa, "{s} (until={d}, {s})\n", .{ id_shown, r.until, status_str })) return 1;
         for (r.addrs) |a| {
-            const ip_shown = if (discover.printable(a.ip)) a.ip else "<ip withheld>";
+            const ip_shown = if (!proto.containsControl(a.ip)) a.ip else "<ip withheld>";
             if (!printOut(io, gpa, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps })) return 1;
         }
         any = true;
