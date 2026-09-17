@@ -148,7 +148,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Extra arguments are refused unless they are themselves those global
     // flags: `modelfs version --help` must match the documented "every
     // command also accepts -h/--help" instead of dying as a positional error.
-    if (argv.items.len >= 1 and std.mem.eql(u8, argv.items[0], handover.internal_cmd)) {
+    if (std.mem.eql(u8, argv.items[0], handover.internal_cmd)) {
         return cmdHandover(init, argv.items);
     }
     switch (classifyMeta(argv.items)) {
