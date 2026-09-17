@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -77,16 +81,34 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
       - name: checksum and publish
         env:
           GH_TOKEN: ${{ github.token }}
-          # No checkout in this job, so gh cannot learn the repo from git.
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
+          zon="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
+          test "${TAG}" = "v${zon}"
+          awk -v heading="## [${zon}] - " '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > dist/release-notes.md
+          if ! grep -q '[^[:space:]]' dist/release-notes.md; then
+            echo "missing changelog notes for ${TAG}" >&2
+            exit 1
+          fi
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists; refusing to replace it" >&2
+            exit 1
+          fi
           # The rel-* prefix keeps the artifact directories from colliding
           # with the binaries' own names; after the flatten, the SHA256SUMS
           # lines name exactly the assets a downloader sees. The sparks
@@ -100,7 +122,11 @@ jobs:
           rm -f SHA256SUMS
           sha256sum modelfs-* > SHA256SUMS
           cat SHA256SUMS
-          gh release view "${TAG}" >/dev/null 2>&1 \
-            || gh release create "${TAG}" --verify-tag --title "modelfs ${TAG}" --generate-notes
-          gh release upload "${TAG}" --clobber \
-            modelfs-* SHA256SUMS
+          chmod +x modelfs-x86_64-linux-musl
+          test "$(./modelfs-x86_64-linux-musl version)" = "${zon}"
+          ./modelfs-x86_64-linux-musl help >/dev/null
+          gh release create "${TAG}" --verify-tag --draft \
+            --title "modelfs ${TAG}" --notes-file release-notes.md \
+            modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl \
+            modelfs-aarch64-linux-gnu SHA256SUMS
+          gh release edit "${TAG}" --draft=false

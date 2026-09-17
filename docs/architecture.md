@@ -610,6 +610,9 @@ origin the files land (default: the repo id). The token comes from `HF_TOKEN`, e
 `$HF_HOME/token`, else `~/.cache/huggingface/token`, and travels as a privileged header so it is
 dropped on the redirect to the signed CDN host. There is no token flag because argv is
 world-readable, and core dumps are disabled for the run when a token is in play.
+`HF_HOME` and `HOME` are trimmed of surrounding spaces, tabs, CR, and LF; an empty
+`HF_HOME` falls back to `HOME`. Tokens are trimmed the same way, but embedded CR or LF
+is refused with exit 1 before downloading (`loadToken` src/hf.zig).
 
 Everything the endpoint returns is untrusted: repo ids and refs are held to a URL-safe charset
 with no `.`/`..` segments, file names are percent-encoded into the download URL, and every
@@ -771,7 +774,7 @@ And the counters worth knowing by name:
 | `httpdrop` | connections closed because all inflight slots were taken: the server refusing work under saturation |
 | `http405` | requests refused for method. The journal line is deduplicated on the same window as the 401 warn and echoes the method through `discover.displayName`, since a PSK holder picks that token |
 | `meta_err` | getattr/open/readdir origin-infrastructure failures (EIO/ESTALE/ETIMEDOUT), so an `ls` during an NFS outage does not look like a slow-but-healthy `md_us` interval |
-| `lease_err` | failed lease publishes: the heartbeat of an idle node whose origin is down |
+| `lease_err` | discovery ticks with a failed lease publish or cluster refresh; increments once even when both fail (`tickCluster` src/fuse_fs.zig) |
 
 ---
 

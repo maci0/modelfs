@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Upgrade from 0.14.1 - 2026-09-17
+
+These changes are not in `v0.14.1`. The next release needs a minor bump under
+CONTRIBUTING's `0.y.z` policy because token lookup changes for existing configurations.
+The peer HTTP and persisted cache formats are unchanged.
+
+- **`modelfs pull` trims surrounding spaces, tabs, CR, and LF from `HF_HOME` and `HOME`.** Previously those bytes were part of the token directory name. A whitespace-only `HF_HOME` now falls back to `HOME` instead of looking in a whitespace-named directory. Remove surrounding whitespace from these environment values; if it is intentional in a directory name, supply the token through `HF_TOKEN` instead (never argv).
+- **`lease_err` counts discovery ticks with either a publish or refresh failure.** In `0.14.1` it counted only failed publishes. Monitors must interpret it as failed lease maintenance, not a count of failed writes; a tick with both failures still increments once.
+
+### Security - 2026-09-17
+
+- **`modelfs pull` refuses tokens containing embedded CR or LF**, from `HF_TOKEN` or the token file, with exit 1 before downloading. `0.14.1` passed these values to the HTTP client without this check. Replace malformed values with a single-line token; surrounding whitespace is still trimmed. Fixed in the unreleased tree, not yet in a tagged release.
+- **Temporary PSK and Hugging Face token buffers are wiped before release**, including decoded handover PSKs and the pull authorization buffer. `0.14.1` freed these copies without wiping them.
+- **Handover encoding and decoding reject PSKs containing CR or LF**, and update acknowledgements escape JSON token bytes. Normal CLI-generated hexadecimal update tokens are unchanged.
+- **Lease cleanup and pin checks use the link's metadata rather than following symlinks**, and invalid log-level diagnostics suppress control bytes.
+
+### Fixed - 2026-09-17
+
+- **A read racing cache-entry removal no longer claims a fill on a dead entry.** `Store.beginFill` returns `.raced` so callers retry or use the origin rather than filling an entry that cannot be marked.
+- **`modelfs update` removes its acknowledgement after success or timeout.** Mount startup also logs resolved seed addresses for diagnosing discovery configuration.
+
+### Performance - 2026-09-17
+
+- **Read-buffer claiming, trusted-hash lookups, and peer candidate checks avoid redundant scans and hash lookups.** Piece selection and verification behavior are unchanged.
+
 ## [0.14.1] - 2026-09-17
 
 Musl static release builds restore SIGUSR2 without `sys.c.SIG_DFL`
