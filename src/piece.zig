@@ -463,7 +463,11 @@ pub const Overlap = struct {
     /// shared somewhere in the file.
     shared: u64 = 0,
     /// True when the files have the same size and every piece matches:
-    /// an outright duplicate (same bytes, possibly different path).
+    /// an outright duplicate (same bytes, possibly different path). Both
+    /// manifests must run the same grid and cover every piece the size
+    /// implies; a partial manifest (a crash cut hashing short) compares
+    /// as not-identical against anything, itself included, because two
+    /// matching partial views do not prove the tails match.
     identical: bool = false,
 };
 
@@ -530,7 +534,7 @@ pub fn manifestOverlapPrepared(
 ) Overlap {
     var ov = Overlap{};
     // Aligned pass: both entry lists are ascending by idx.
-    {
+    if (a.piece_size == b.piece_size) {
         var i: usize = 0;
         var j: usize = 0;
         while (i < a.entries.len and j < b.entries.len) {
@@ -545,7 +549,10 @@ pub fn manifestOverlapPrepared(
             }
         }
     }
-    ov.identical = a.file_size == b.file_size and
+    ov.identical = a.piece_size == b.piece_size and
+        a.file_size == b.file_size and
+        trackedEnd(a.file_size, a.piece_size) == a.file_size and
+        a.entries.len == count(a.file_size, a.piece_size) and
         a.entries.len == b.entries.len and
         ov.aligned == a.entries.len;
     // Shared pass: merge-intersect the digest-sorted copies.
@@ -633,6 +640,18 @@ test "manifestOverlapPrepared counts aligned, shared, and identical content" {
     try std.testing.expectEqual(@as(u64, 2), de.aligned);
     try std.testing.expectEqual(@as(u64, 1), de.shared);
     try std.testing.expect(!de.identical);
+
+    const partial = Manifest{ .piece_size = 16, .file_size = 48, .entries = &a_entries };
+    try std.testing.expect(!(try overlap.of(partial, partial)).identical);
+    const unknown = Manifest{ .piece_size = 16, .file_size = 48, .entries = &.{} };
+    try std.testing.expect(!(try overlap.of(unknown, unknown)).identical);
+    const empty = Manifest{ .piece_size = 16, .file_size = 0, .entries = &.{} };
+    try std.testing.expect((try overlap.of(empty, empty)).identical);
+    const other_grid = Manifest{ .piece_size = 17, .file_size = 32, .entries = &a_entries };
+    const mixed = try overlap.of(A, other_grid);
+    try std.testing.expect(!mixed.identical);
+    try std.testing.expectEqual(@as(u64, 0), mixed.aligned);
+    try std.testing.expectEqual(@as(u64, 2), mixed.shared);
 }
 
 test "sidecarPieceSize reads the header and refuses a zero or foreign blob" {
