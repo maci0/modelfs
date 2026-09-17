@@ -53,7 +53,12 @@ dnf install -y epel-release && dnf install -y sanoid   # sanoid ships syncoid
 sudo ./scripts/install_nas_backup.sh --install
 ```
 
-The installer does not start units. On the NAS, after `dnf install sanoid`:
+The installer does not start units. Files installed with `sudo` belong to
+`root:root`, not the checkout owner: wrappers use mode `0755`; units, the
+initial snapshot policy, and documentation use `0644`. Unprivileged
+`MF_NAS_DEST` previews belong to the installing user.
+
+On the NAS, after `dnf install sanoid`:
 
 ```bash
 systemctl daemon-reload

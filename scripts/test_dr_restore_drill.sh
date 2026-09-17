@@ -1201,10 +1201,21 @@ else
     pass "installer dry-run lists the NAS units"
 fi
 
+INSTALL_SOURCE="${TEMP}/nas-source"
+mkdir -p "${INSTALL_SOURCE}/scripts" "${INSTALL_SOURCE}/docs"
+cp "${ROOT_DIR}/build.zig.zon" "${INSTALL_SOURCE}/"
+cp "${ROOT_DIR}/docs/recovery.md" "${INSTALL_SOURCE}/docs/"
+cp -R "${SCRIPTS_DIR}/nas" "${INSTALL_SOURCE}/scripts/"
+cp "${INSTALLER}" "${SCRIPTS_DIR}/lib.sh" \
+    "${SCRIPTS_DIR}/dr_restore_drill.sh" "${SCRIPTS_DIR}/check_drill_log.sh" \
+    "${SCRIPTS_DIR}/hold_monthlies.sh" "${SCRIPTS_DIR}/dr_pool_restore.sh" \
+    "${SCRIPTS_DIR}/check_offsite.sh" "${INSTALL_SOURCE}/scripts/"
+chmod -R 0777 "${INSTALL_SOURCE}"
 INSTALL_DEST="${TEMP}/nas-root"
 INSTALL_OUT=""
 INSTALL_RC=0
-INSTALL_OUT="$(MF_NAS_DEST="${INSTALL_DEST}" "${INSTALLER}" --install 2>&1)" || INSTALL_RC=$?
+INSTALL_OUT="$(umask 0077; MF_NAS_DEST="${INSTALL_DEST}" \
+    "${INSTALL_SOURCE}/scripts/install_nas_backup.sh" --install 2>&1)" || INSTALL_RC=$?
 if [[ "${INSTALL_RC}" -ne 0 ]]; then
     fail "installer --install: expected success, rc=${INSTALL_RC}: ${INSTALL_OUT}"
 else
@@ -1232,6 +1243,19 @@ else
         usr/local/share/doc/modelfs/recovery.md; do
         if [[ ! -f "${INSTALL_DEST}/${rel}" ]]; then
             missing="${missing} ${rel}"
+        else
+            expected_mode=644
+            if [[ "${rel}" == usr/local/sbin/* ]]; then
+                expected_mode=755
+            fi
+            expected_group="$(id -g)"
+            if [[ "${EUID}" -eq 0 ]]; then
+                expected_group=0
+            fi
+            metadata="$(stat -c '%u:%g:%a' "${INSTALL_DEST}/${rel}")"
+            if [[ "${metadata}" != "${EUID}:${expected_group}:${expected_mode}" ]]; then
+                fail "installer unsafe ownership or mode for ${rel}: ${metadata}"
+            fi
         fi
     done
     if [[ -n "${missing}" ]]; then
@@ -1402,13 +1426,13 @@ fi
 INTERRUPTED_DEST="${TEMP}/interrupted-root"
 COPY_FAIL_BIN="${TEMP}/copy-fail-bin"
 mkdir -p "${COPY_FAIL_BIN}"
-cat >"${COPY_FAIL_BIN}/cp" <<'COPYFAIL'
+cat >"${COPY_FAIL_BIN}/install" <<'COPYFAIL'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' '[tank/models]' >"${@: -1}"
 exit 1
 COPYFAIL
-chmod +x "${COPY_FAIL_BIN}/cp"
+chmod +x "${COPY_FAIL_BIN}/install"
 INTERRUPTED_RC=0
 INTERRUPTED_OUT="$(PATH="${COPY_FAIL_BIN}:${PATH}" MF_NAS_DEST="${INTERRUPTED_DEST}" \
     "${INSTALLER}" --install 2>&1)" || INTERRUPTED_RC=$?

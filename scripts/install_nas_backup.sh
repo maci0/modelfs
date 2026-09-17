@@ -20,6 +20,8 @@ restore wrapper, and the offsite-age alarm from scripts/nas/ into
 MF_NAS_DEST (default /). Without --install, print the plan and exit
 0. An existing sanoid.conf is preserved; edit its dataset and retention
 settings on the host. Units and wrappers are refreshed on each install.
+Installed files belong to the installing user (root:root under sudo),
+with mode 0755 for wrappers and 0644 for units, policy, and documentation.
 Does not enable or start any unit; run the printed systemctl lines on
 the NAS and replica host.
 EOF
@@ -68,7 +70,14 @@ copy_one() (
     temporary="$(mktemp "${dest_path}.tmp.XXXXXX")"
     trap 'rm -f -- "${temporary}"' EXIT
     trap 'exit 1' HUP INT TERM
-    cp -a -- "${src}" "${temporary}"
+    local mode=0644 group=0
+    if [[ "${rel}" == usr/local/sbin/* ]]; then
+        mode=0755
+    fi
+    if [[ "${EUID}" -ne 0 ]]; then
+        group="$(id -g)"
+    fi
+    install --owner="${EUID}" --group="${group}" --mode="${mode}" -- "${src}" "${temporary}"
     if [[ "${rel}" == "etc/sanoid/sanoid.conf" ]]; then
         mv -nT -- "${temporary}" "${dest_path}"
     else
