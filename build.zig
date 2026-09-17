@@ -17,11 +17,8 @@ fn isLowerHex(s: []const u8) bool {
 /// covers the vendored static-build source). Verified before any compile so
 /// vendored inputs cannot silently drift. Entries are paths relative to the
 /// vendored directory (`./name` for flat lists, `lib/fuse.c` for nested
-/// ones); `..`, absolute paths, and empty names are rejected. Absent
-/// SHA256SUMS (Zig package consumers: `.deps` is not in `build.zig.zon`
-/// `.paths`) skips the check; a present file with no entries, a missing
-/// listed file, or a digest mismatch fails the build.
-fn vendoredMismatch(b: *std.Build, dir_rel: []const u8) ?[]const u8 {
+/// ones); `..`, absolute paths, and empty names are rejected.
+fn vendoredMismatch(b: *std.Build, dir_rel: []const u8, required: bool) ?[]const u8 {
     const sums_rel = allocPrint(b, "{s}/SHA256SUMS", .{dir_rel});
     const sums = std.Io.Dir.cwd().readFileAlloc(
         b.graph.io,
@@ -29,7 +26,10 @@ fn vendoredMismatch(b: *std.Build, dir_rel: []const u8) ?[]const u8 {
         b.allocator,
         .limited(256 << 10),
     ) catch |err| switch (err) {
-        error.FileNotFound => return null,
+        error.FileNotFound => return if (required)
+            allocPrint(b, "cannot read {s}: {t}", .{ sums_rel, err })
+        else
+            null,
         else => return allocPrint(b, "cannot read {s}: {t}", .{ sums_rel, err }),
     };
 
@@ -248,7 +248,7 @@ pub fn build(b: *std.Build) void {
     const fuse_lib = if (fuse_static) null else fuse_lib_opt;
 
     for ([_][]const u8{ ".deps/fuse3-arm64", ".deps/libfuse3-3.16.2" }) |dir| {
-        if (vendoredMismatch(b, dir)) |msg| {
+        if (vendoredMismatch(b, dir, fuse_static and std.mem.eql(u8, dir, fuse_static_root))) |msg| {
             fail_step(b, test_step, msg);
             return;
         }

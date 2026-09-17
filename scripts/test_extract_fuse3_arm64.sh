@@ -78,3 +78,14 @@ assert_aarch64_elf "${elf_x86}" 2>/dev/null && x86_rc=0 || x86_rc=$?
 assert_aarch64_elf "${elf_be}" 2>/dev/null && be_rc=0 || be_rc=$?
 [[ "${be_rc}" -ne 0 ]] || fail "assert_aarch64_elf accepted a big-endian ELF ident"
 echo "=== aarch64 ELF header check ok ==="
+
+fixture="$(mktemp -d "${SCRATCH_DIR}/fuse-manifest-test.XXXXXX")"
+trap 'rm -rf "${fixture}"' EXIT
+cp "${ROOT_DIR}/build.zig" "${ROOT_DIR}/build.zig.zon" "${fixture}/"
+rc=0
+zig build test --build-file "${fixture}/build.zig" -Dfuse-static >"${fixture}/missing-manifest.log" 2>&1 || rc=$?
+[[ "${rc}" -ne 0 ]] || fail "static build accepted a missing manifest"
+output="$(cat "${fixture}/missing-manifest.log")"
+[[ "${output}" == *"cannot read .deps/libfuse3-3.16.2/SHA256SUMS: FileNotFound"* ]] || fail "static build did not reject the missing manifest: ${output}"
+
+echo "=== static libfuse3 manifest required ==="
