@@ -644,6 +644,10 @@ The kernel FUSE connection and the peer listen fds stay open across the exec, an
 identity (origin, cache, piece size, node id, listen port, advertise/seeds, watermarks, io mode,
 cluster PSK) is reconstituted from a sealed memfd, so the PSK never appears on argv
 (`cmdUpdate` src/main.zig; `execHandover` / `attach` src/fuse_fs.zig; codec src/handover.zig).
+Filesystem paths retain their exact bytes: the JSON codec writes valid UTF-8 as strings and
+non-UTF-8 paths as byte arrays, and accepts both on decode. This covers origin/cache/mount,
+cached inode and open-handle paths, and the replacement binary path in `update.req`.
+NFC and NFD spellings remain distinct.
 
 Two things make that possible:
 

@@ -112,10 +112,6 @@ const JsonDoc = struct {
 };
 
 fn utf8Knob(s: []const u8) !void {
-    // Anything the decoder's UTF-8 validator rejects (a stray 0x80-0xFF byte
-    // in a path argv carried verbatim) must fail HERE, at the encode, with a
-    // named error -- never after the exec, where a decode failure silently
-    // times out every future update of the mount.
     if (!std.unicode.utf8ValidateSlice(s)) return error.NonUtf8Knob;
 }
 
@@ -136,14 +132,9 @@ pub fn encode(gpa: std.mem.Allocator, k: Knobs) ![]u8 {
     if (!cull.ordered(k.water)) return error.BadWatermarks;
     const init_hex = try hexInit(gpa, k.init);
     defer gpa.free(init_hex);
-    try utf8Knob(k.origin);
-    try utf8Knob(k.cache);
     try utf8Knob(k.id);
-    try utf8Knob(k.mount);
     for (k.advertise) |a| try utf8Knob(a.ip);
     for (k.seeds) |a| try utf8Knob(a.ip);
-    for (k.nodes) |n| try utf8Knob(n.path);
-    for (k.opens) |o| try utf8Knob(o.path);
     for (k.psk) |ch| {
         if (ch == '\r' or ch == '\n') return error.BadPsk;
     }
@@ -286,7 +277,6 @@ pub const Req = struct { bin: []const u8, token: []const u8 };
 pub const Ack = struct { token: []const u8 };
 
 pub fn encodeReq(gpa: std.mem.Allocator, bin: []const u8, token: []const u8) ![]u8 {
-    try utf8Knob(bin);
     try utf8Knob(token);
     const json = try std.json.Stringify.valueAlloc(gpa, Req{ .bin = bin, .token = token }, .{});
     defer gpa.free(json);
@@ -455,19 +445,40 @@ test "handover JSON escapes control bytes so odd argv paths still round-trip" {
     try std.testing.expectEqualStrings("/opt/bi\nnary", parsed.value.bin);
     try std.testing.expectEqualStrings("tok\"0\\", parsed.value.token);
 
-    // A byte std.json's UTF-8 validator rejects must fail the ENCODE with a
-    // named error, not the decode after the exec (the silent-timeout bug
-    // this gate replaces). Valid multi-byte UTF-8 still round-trips.
-    var bad = knobs;
-    bad.origin = "/nas/\xff\xfe";
-    try std.testing.expectError(error.NonUtf8Knob, encode(gpa, bad));
-    var good = knobs;
-    good.mount = "/models/überutf8";
-    const blob2 = try encode(gpa, good);
-    defer gpa.free(blob2);
-    var got2 = try decode(gpa, blob2);
-    defer got2.deinit();
-    try std.testing.expectEqualStrings(good.mount, got2.mount);
+    const paths = [_][]const u8{ "/models/überutf8", "/models/caf\u{e9}", "/models/cafe\u{301}", "/models/\u{1f600}", "/nas/\xff\xfe", "/models/\xc3", "/models/\xed\xa0\x80" };
+    for (paths) |path| {
+        var raw = knobs;
+        raw.origin = path;
+        raw.cache = path;
+        raw.mount = path;
+        raw.nodes = &.{.{ .ino = 5, .path = path, .nlookup = 3 }};
+        raw.opens = &.{.{ .fh = 9, .path = path }};
+        const blob2 = try encode(gpa, raw);
+        defer gpa.free(blob2);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(blob2));
+        var got2 = try decode(gpa, blob2);
+        defer got2.deinit();
+        try std.testing.expectEqualStrings(path, got2.origin);
+        try std.testing.expectEqualStrings(path, got2.cache);
+        try std.testing.expectEqualStrings(path, got2.mount);
+        try std.testing.expectEqualStrings(path, got2.nodes[0].path);
+        try std.testing.expectEqualStrings(path, got2.opens[0].path);
+        const argv = try execArgvZ(gpa, "/bin/modelfs", 9, got2.mount);
+        defer freeExecArgvZ(gpa, argv);
+        try std.testing.expectEqualStrings(path, std.mem.span(argv[4].?));
+    }
+}
+
+test "handover request preserves non-UTF-8 binary paths" {
+    const gpa = std.testing.allocator;
+    const bin = "/opt/\xff/modelfs";
+    const req = try encodeReq(gpa, bin, "token");
+    defer gpa.free(req);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(req));
+    const parsed = try decodeReq(gpa, req);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(bin, parsed.value.bin);
+    try std.testing.expectEqualStrings("token", parsed.value.token);
 }
 
 test "handover decode refuses a truncated or mismatched PSK trailer" {
