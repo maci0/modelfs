@@ -3063,7 +3063,8 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     // reapIdle consult it. This roundtrip is what makes an operator's pin
     // actually protect a file from culling.
     try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "/models/gguf/big.gguf", true));
-    const pin_fp = try std.fmt.bufPrint(&pbuf, "{s}/pin/gguf/big.gguf", .{cache_d});
+    var pin_buf: [192]u8 = undefined;
+    const pin_fp = try std.fmt.bufPrint(&pin_buf, "{s}/pin/gguf/big.gguf", .{cache_d});
     try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf) == 0);
 
     // A ".." component would write outside cache/pin: refused with exit 1,
@@ -3099,8 +3100,11 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     }
 
     // Unpin removes the artifact so the file becomes cullable again.
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf));
     try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "gguf/big.gguf", false));
-    try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf) != 0);
+    try std.testing.expectEqual(@as(i32, -sys.c.ENOENT), sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf));
+    const remaining_pin = try std.fmt.bufPrint(&pbuf, "{s}/pin/.clusterfoo", .{cache_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.statPath(try sys.toZ(&zb, remaining_pin), &stbuf));
 }
 
 test "cmdVerify checks cached pieces against the origin manifest and clears mismatches" {
