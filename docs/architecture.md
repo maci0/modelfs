@@ -800,6 +800,7 @@ The tick line carries the only latency signal there is:
 | Field | Meaning |
 |---|---|
 | `rd_us` / `wr_us` | average wall time of a FUSE read/write over the interval, using `reads_completed` / `writes_completed`. These count every timed handler, including caller errors excluded from the service-health outcome counters. Null-buffer requests are neither timed nor counted |
+| `fsync_us` | average origin fsync/fdatasync time for FUSE requests, including failed attempts, over `fsync_completed`. Published cumulatively as `fsync_nanos` and `fsync_completed` in status.json. Path-policy rejections are neither timed nor counted |
 | `http_us` | average `/have`+`/data` handler time, over `http_completed`. Includes misses, invalid ranges, failures, and interrupted sends. `/ping` and requests rejected before entering a handler are neither timed nor counted |
 | `fill_ms peer/nfs` | average per-piece hydration stall by tier. A miss blocks the reader for one whole piece, so this is how "reads got slow" is diagnosed from the journal |
 | `md_us` | interval **total** (these handlers count wall time, not calls) of the getattr/open/statfs latency counters, so a metadata storm is visible in a window where no data read moved. The three publish separately in status.json |
@@ -809,6 +810,7 @@ And the counters worth knowing by name:
 | Counter | What it says |
 |---|---|
 | `reads_warm` | fully cached FUSE reads. Hit rate is `reads_warm / reads_ok` |
+| `fsync_ok` / `fsync_err` | successful/failed origin fsync/fdatasync attempts through FUSE, separate from write outcomes. Errors include origin open failures such as ENOENT; infrastructure failures also feed `origin_down` and its path/errno log through `Store.noteOriginIo` in src/store.zig |
 | `probe_err` | `/have` probes that failed for a reason other than a healthy 404: a dead peer, PSK drift, a malformed reply. The signature of a cluster silently degraded to NFS-only |
 | `httpok` / `serve_mib` | accepted `/have` 200 and `/data` 206 headers and their advertised bytes (`Content-Length`), not confirmation of complete body delivery |
 | `http_send_err` | `/have` and `/data` responses interrupted during header or body sending, counted once per transfer, including deadline expiry and cache-read or allocation failures after the success header. Published under the same name in status.json; investigate the matching `dropping peer transfer` / `dropping connection` warnings for the path, offset, and failure. These are not 5xx replies and may overlap `httpok` |

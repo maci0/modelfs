@@ -1332,7 +1332,18 @@ fn mf_fsync(path: [*c]const u8, datasync: c_int, fi: ?*fuse.fuse_file_info) call
     // COMMIT lease files a FUSE client cannot see.
     const rerr = resolveRel(cPath(path), -sys.c.ENOENT, &rel);
     if (rerr != 0) return rerr;
-    return st.store.originFsync(rel, datasync != 0);
+    const t0 = sys.monoNs(st.io);
+    defer {
+        _ = st.store.stats.fsync_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - t0, 0)), .monotonic);
+        _ = st.store.stats.fsync_completed.fetchAdd(1, .monotonic);
+    }
+    const rc = st.store.originFsync(rel, datasync != 0);
+    if (rc == 0) {
+        _ = st.store.stats.fsync_ok.fetchAdd(1, .monotonic);
+    } else {
+        _ = st.store.stats.fsync_err.fetchAdd(1, .monotonic);
+    }
+    return rc;
 }
 
 fn mf_release(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
@@ -1814,6 +1825,12 @@ fn formatStatsTick(d: store_mod.Stats.Snap, buf: []u8) ![]const u8 {
         },
     );
     try w.print(" reads_completed={d} writes_completed={d}", .{ d.reads_completed, d.writes_completed });
+    try w.print(" fsync_ok={d} fsync_err={d} fsync_completed={d} fsync_us={d}", .{
+        d.fsync_ok,
+        d.fsync_err,
+        d.fsync_completed,
+        meanPerOp(d.fsync_nanos, d.fsync_completed, std.time.ns_per_us),
+    });
     return w.buffered();
 }
 
@@ -3573,6 +3590,48 @@ test "FUSE completion counters include timed caller errors without changing heal
     try std.testing.expectEqualDeep(timed, st.store.stats.snap());
 }
 
+test "FUSE fsync publishes origin outcomes and latency without counting rejected paths" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-fsync-stats");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-fsync-stats");
+    defer sys.deleteTree(std.testing.io, cache_d);
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    const previous_state = tls_state;
+    tls_state = &st;
+    defer tls_state = previous_state;
+
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_fsync("/.cluster/lease", 0, null));
+    try std.testing.expectEqualDeep(store_mod.Stats.Snap{}, st.store.stats.snap());
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_fsync("/missing.bin", 0, null));
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const origin_z = try st.store.originPath(&pbuf, "model.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, "data"));
+    try std.testing.expectEqual(@as(c_int, 0), mf_fsync("/model.bin", 0, null));
+    try std.testing.expectEqual(@as(c_int, 0), mf_fsync("/model.bin", 1, null));
+    const stats = st.store.stats.snap();
+    try std.testing.expectEqual(@as(u64, 2), stats.fsync_ok);
+    try std.testing.expectEqual(@as(u64, 1), stats.fsync_err);
+    try std.testing.expectEqual(@as(u64, 3), stats.fsync_completed);
+    try std.testing.expect(stats.fsync_nanos > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.writes_completed);
+
+    try statusJson(&st);
+    const status_z = try store_mod.Store.cacheStatusPath(cache_d, &pbuf);
+    const blob = try sys.readFileAlloc(gpa, status_z, 4096);
+    defer gpa.free(blob);
+    const doc = try std.json.parseFromSlice(struct { stats: store_mod.Stats.Snap }, gpa, blob, .{ .ignore_unknown_fields = true });
+    defer doc.deinit();
+    try std.testing.expectEqualDeep(stats, doc.value.stats);
+    var line_buf: [1536]u8 = undefined;
+    const line = try formatStatsTick(stats, &line_buf);
+    try std.testing.expect(std.mem.find(u8, line, " fsync_ok=2 fsync_err=1 fsync_completed=3 fsync_us=") != null);
+}
+
 test "formatStatsTick divides latency by all timed completions" {
     var buf: [1536]u8 = undefined;
     const line = try formatStatsTick(.{
@@ -3581,10 +3640,13 @@ test "formatStatsTick divides latency by all timed completions" {
         .read_nanos = 8000,
         .writes_completed = 3,
         .write_nanos = 9000,
+        .fsync_completed = 2,
+        .fsync_nanos = 8000,
     }, &buf);
     try std.testing.expect(std.mem.find(u8, line, " rd_us=2 ") != null);
     try std.testing.expect(std.mem.find(u8, line, " wr_us=3 ") != null);
     try std.testing.expect(std.mem.find(u8, line, " reads_completed=4 writes_completed=3") != null);
+    try std.testing.expect(std.mem.endsWith(u8, line, " fsync_completed=2 fsync_us=4"));
 }
 
 test "meanPerOp does not overflow the per-op divisor" {
