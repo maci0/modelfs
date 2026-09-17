@@ -90,7 +90,9 @@ translate-c's musl timespec demotion, with `src/c-musl-shim/` first on the inclu
 The commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`, `pull`, `update`)
 import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and
 name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`,
-`manifestPath`, `manifestsDirPath`) rather than reconstructing those joins. Pin, verify, and
+`manifestPath`, `manifestsDirPath`) rather than reconstructing those joins. Status and update
+locate the heartbeat through `Store.cacheStatusPath`, which takes a cache root without
+requiring an initialized Store. Pin, verify, and
 dupes pass the process `std.Io` into Store so recency and retry instants stay on the injected
 clock. `dupes` compares manifests through `piece.manifestOverlapPrepared`; `update` is a thin
 client of `status.json` liveness and `pull` of `hf.pull`.

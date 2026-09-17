@@ -573,8 +573,8 @@ pub const Store = struct {
         return self.cacheSubPath(buf, "pin", rel);
     }
 
-    pub fn cacheStatusPath(self: *const Store, buf: []u8) ![*:0]u8 {
-        return sys.joinZ(buf, self.cache, status_file);
+    pub fn cacheStatusPath(cache: []const u8, buf: []u8) ![*:0]u8 {
+        return sys.joinZ(buf, cache, status_file);
     }
 
     pub fn ensureLayout(self: *const Store) i32 {
@@ -7243,4 +7243,19 @@ test "same-size rewrite does not resurrect hashes from a stale manifest" {
     try std.testing.expectEqual(f, f2);
     try std.testing.expect(!st.hasPiece(f2, 0, t0));
     try std.testing.expect(st.expectedHash(f2, 0, 0) == null);
+}
+
+test "cacheStatusPath joins the cache root and bounds the sentinel" {
+    var buf: [64]u8 = undefined;
+    for ([_][]const u8{ "/cache", "/cache/" }) |cache| {
+        const path = try Store.cacheStatusPath(cache, &buf);
+        try std.testing.expectEqualStrings("/cache/status.json", std.mem.span(path));
+    }
+    try std.testing.expectEqualStrings("/status.json", std.mem.span(try Store.cacheStatusPath("/", &buf)));
+    const expected = "/cache/status.json";
+    const exact = try Store.cacheStatusPath("/cache", buf[0 .. expected.len + 1]);
+    try std.testing.expectEqualStrings(expected, std.mem.span(exact));
+    try std.testing.expectEqual(@as(u8, 0), buf[expected.len]);
+    try std.testing.expectError(error.NameTooLong, Store.cacheStatusPath("/cache", buf[0..expected.len]));
+    try std.testing.expectError(error.NameTooLong, Store.cacheStatusPath("/cache", buf[0..0]));
 }

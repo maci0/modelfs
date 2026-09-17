@@ -1488,7 +1488,7 @@ fn statusAgeSecs(io: std.Io, doc: StatusLiveness) ?i64 {
 fn liveDaemon(io: std.Io, gpa: std.mem.Allocator, cache: []const u8, blob_out: *?[]u8) error{ NotLive, OutOfMemory }!i64 {
     blob_out.* = null;
     var z: [sys.c.PATH_MAX]u8 = undefined;
-    const p = sys.joinZ(&z, cache, store_mod.status_file) catch {
+    const p = store_mod.Store.cacheStatusPath(cache, &z) catch {
         printErr("modelfs: cache path too long to name {s}/{s}\n", .{ cache, store_mod.status_file });
         return error.NotLive;
     };

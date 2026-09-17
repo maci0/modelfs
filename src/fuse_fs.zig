@@ -1849,7 +1849,7 @@ fn statusJson(st: *State) !void {
     try w.writeAll("}}\n");
     const json = w.buffered();
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const p = try st.store.cacheStatusPath(&pbuf);
+    const p = try store_mod.Store.cacheStatusPath(st.store.cache, &pbuf);
     var tbuf: [sys.c.PATH_MAX]u8 = undefined;
     const tp = try sys.appendExt(&tbuf, p, ".tmp");
     // Atomic swap: a torn half-written status.json would make `modelfs status`
@@ -3406,7 +3406,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try statusJson(&st);
 
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const fp = try st.store.cacheStatusPath(&pbuf);
+    const fp = try store_mod.Store.cacheStatusPath(st.store.cache, &pbuf);
     var zbuf: [sys.c.PATH_MAX]u8 = undefined;
     const tmp_fp = try sys.appendExt(&zbuf, fp, ".tmp");
     var stbuf: sys.c.struct_stat = undefined;
@@ -3511,7 +3511,7 @@ test "statusJson unlinks the staging file when rename fails" {
     defer st.deinit();
 
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const fp = try st.store.cacheStatusPath(&pbuf);
+    const fp = try store_mod.Store.cacheStatusPath(st.store.cache, &pbuf);
     // Destination is a directory: rename(status.json.tmp, status.json) fails
     // and must not leave the staging file (a retry every tick would refresh
     // mtime with no sweeper to age it out).
@@ -3867,7 +3867,7 @@ test "mf_read counts warm hits only when the cache serves the bytes" {
 
     try statusJson(&st);
     var sb: [sys.c.PATH_MAX]u8 = undefined;
-    const status_z = try st.store.cacheStatusPath(&sb);
+    const status_z = try store_mod.Store.cacheStatusPath(st.store.cache, &sb);
     const blob = try sys.readFileAlloc(gpa, status_z, 4096);
     defer gpa.free(blob);
     const doc = try std.json.parseFromSlice(struct { stats: store_mod.Stats.Snap }, gpa, blob, .{ .ignore_unknown_fields = true });
