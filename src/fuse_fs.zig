@@ -2653,14 +2653,16 @@ fn installHandoverSignal(st: *State, se: *fuse.fuse_session) void {
 
 /// Inverse of installHandoverSignal: drop live_* and restore SIGUSR2 to
 /// SIG_DFL. Idempotent — a second call is a no-op on an already-cleared slot.
+/// musl's SIG_DFL macro is `((void (*)(int)) 0)` which zig translate-c cannot
+/// emit, so use null (same bits) instead of `sys.c.SIG_DFL`.
 fn removeHandoverSignal() void {
     live_state = null;
     live_session = null;
     var sa = std.mem.zeroes(sys.c.struct_sigaction);
     if (comptime @import("builtin").target.abi == .musl) {
-        sa.__sa_handler.sa_handler = sys.c.SIG_DFL;
+        sa.__sa_handler.sa_handler = null;
     } else {
-        sa.__sigaction_handler.sa_handler = sys.c.SIG_DFL;
+        sa.__sigaction_handler.sa_handler = null;
     }
     _ = sys.c.sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
@@ -2693,7 +2695,8 @@ test "removeHandoverSignal clears live_* and restores SIGUSR2 to SIG_DFL" {
         cur.__sa_handler.sa_handler
     else
         cur.__sigaction_handler.sa_handler;
-    try std.testing.expectEqual(sys.c.SIG_DFL, handler);
+    // null == SIG_DFL bits; avoid sys.c.SIG_DFL (musl translate-c @compileError).
+    try std.testing.expect(handler == null);
 }
 
 fn snapNodes(st: *State, gpa: std.mem.Allocator) ![]handover.NodeSnap {

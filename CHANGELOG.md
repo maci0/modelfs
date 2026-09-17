@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-17
+
+Musl static release builds restore SIGUSR2 without `sys.c.SIG_DFL`
+(translate-c cannot emit musl's `((void (*)(int)) 0)` macro).
+
+### Build
+- **`removeHandoverSignal` uses a null handler.** Same bits as SIG_DFL; avoids the musl translate-c `@compileError` that broke `scripts/build_static.sh` / release.yml.
+
 ## [0.14.0] - 2026-09-17
 
 Hot-path peer/FUSE scans cost less lock and header work. Dead helpers drop.
@@ -1117,7 +1125,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/maci0/modelfs/releases/tag/v0.14.1
 [0.14.0]: https://github.com/maci0/modelfs/releases/tag/v0.14.0
 [0.13.0]: https://github.com/maci0/modelfs/releases/tag/v0.13.0
 [0.12.0]: https://github.com/maci0/modelfs/releases/tag/v0.12.0
