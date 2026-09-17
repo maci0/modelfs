@@ -929,10 +929,6 @@ pub const Store = struct {
     /// marks as soon as the file was back at the last-saved length, serving
     /// old bytes or hole zeros as current. Must be called WITHOUT store.mu
     /// held (it takes content_mu then file.mu internally).
-    fn reconcileSize(self: *Store, f: *Cached, file_size: u64) !*Cached {
-        return self.reconcile(f, file_size, OriginId{});
-    }
-
     /// Brings a live entry in line with a freshly observed origin size and
     /// identity. Size mismatch is the existing wipe; a same-size rewrite
     /// (newer mtime or different ino) is the same wipe, because the bits
