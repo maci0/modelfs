@@ -56,6 +56,11 @@ const usage =
     \\  modelfs version
     \\  modelfs help
     \\
+    \\verify checks cached pieces against trusted hashes and clears mismatched
+    \\cache marks so later reads refill them. Mismatches exit 1, even after
+    \\clearing. Exit 0 can mean nothing was checked: inspect the piece count
+    \\in the summary. Pieces without trusted hashes are skipped.
+    \\
     \\mount options:
     \\  --origin PATH         Existing NFS/dir origin (required). Writes go here.
     \\  --cache PATH          Local piece cache (default /var/cache/modelfs)
