@@ -456,7 +456,7 @@ pub fn sendfileAll(out_fd: c_int, in_fd: c_int, off: u64, count: usize) isize {
             // full timeout window and loop forever against a stalled
             // receiver, so surface it like readOnce does.
             if (e == c.EINTR) continue;
-            return -e;
+            return if (sent > 0) @intCast(sent) else -e;
         }
         if (rc == 0) break;
         sent += @intCast(rc);
@@ -1323,6 +1323,37 @@ test "sendfileAll zero copy" {
     const read_n = c.read(fds[0], &buf, buf.len);
     try std.testing.expectEqual(@as(isize, @intCast(data.len)), read_n);
     try std.testing.expectEqualStrings(data, buf[0..@intCast(read_n)]);
+}
+
+test "sendfileAll preserves partial progress before a send error" {
+    var db: [128]u8 = undefined;
+    const scratch = try scratchDir(&db, "modelfs-sendfile-partial");
+    defer deleteTree(std.testing.io, scratch);
+    var pb: [192]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&pb, "{s}/data", .{scratch});
+
+    var fds: [2]c_int = undefined;
+    if (c.pipe(&fds) != 0) return error.Pipe;
+    defer close(fds[0]);
+    defer close(fds[1]);
+    try std.testing.expectEqual(@as(i32, 0), setNonblocking(fds[1], true));
+    const capacity = std.c.fcntl(fds[1], c.F_GETPIPE_SZ);
+    try std.testing.expect(capacity > 0);
+    const data = try std.testing.allocator.alloc(u8, @as(usize, @intCast(capacity)) + 1);
+    defer std.testing.allocator.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate(i);
+    try std.testing.expectEqual(@as(i32, 0), writeFile(path, data));
+    const in_fd = open(path, c.O_RDONLY, 0);
+    try std.testing.expect(in_fd >= 0);
+    defer close(in_fd);
+
+    const sent = sendfileAll(fds[1], in_fd, 0, data.len);
+    try std.testing.expectEqual(@as(isize, capacity), sent);
+    try std.testing.expectEqual(@as(isize, -c.EAGAIN), sendfileAll(fds[1], in_fd, @intCast(sent), 1));
+    const received = try std.testing.allocator.alloc(u8, @intCast(sent));
+    defer std.testing.allocator.free(received);
+    try std.testing.expectEqual(@as(usize, @intCast(sent)), try readOnce(fds[0], received));
+    try std.testing.expectEqualSlices(u8, data[0..@intCast(sent)], received);
 }
 
 test "readFile NoFollow refuses a planted symlink that the following form would ingest" {
