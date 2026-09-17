@@ -111,13 +111,12 @@ const JsonDoc = struct {
     next_fh: u64 = 1,
 };
 
-fn utf8Knob(s: []const u8) ![]const u8 {
+fn utf8Knob(s: []const u8) !void {
     // Anything the decoder's UTF-8 validator rejects (a stray 0x80-0xFF byte
     // in a path argv carried verbatim) must fail HERE, at the encode, with a
     // named error -- never after the exec, where a decode failure silently
     // times out every future update of the mount.
     if (!std.unicode.utf8ValidateSlice(s)) return error.NonUtf8Knob;
-    return s;
 }
 
 fn hexInit(gpa: std.mem.Allocator, init: []const u8) ![]u8 {
@@ -137,14 +136,14 @@ pub fn encode(gpa: std.mem.Allocator, k: Knobs) ![]u8 {
     if (!cull.ordered(k.water)) return error.BadWatermarks;
     const init_hex = try hexInit(gpa, k.init);
     defer gpa.free(init_hex);
-    _ = try utf8Knob(k.origin);
-    _ = try utf8Knob(k.cache);
-    _ = try utf8Knob(k.id);
-    _ = try utf8Knob(k.mount);
-    for (k.advertise) |a| _ = try utf8Knob(a.ip);
-    for (k.seeds) |a| _ = try utf8Knob(a.ip);
-    for (k.nodes) |n| _ = try utf8Knob(n.path);
-    for (k.opens) |o| _ = try utf8Knob(o.path);
+    try utf8Knob(k.origin);
+    try utf8Knob(k.cache);
+    try utf8Knob(k.id);
+    try utf8Knob(k.mount);
+    for (k.advertise) |a| try utf8Knob(a.ip);
+    for (k.seeds) |a| try utf8Knob(a.ip);
+    for (k.nodes) |n| try utf8Knob(n.path);
+    for (k.opens) |o| try utf8Knob(o.path);
     for (k.psk) |ch| {
         if (ch == '\r' or ch == '\n') return error.BadPsk;
     }
@@ -287,8 +286,8 @@ pub const Req = struct { bin: []const u8, token: []const u8 };
 pub const Ack = struct { token: []const u8 };
 
 pub fn encodeReq(gpa: std.mem.Allocator, bin: []const u8, token: []const u8) ![]u8 {
-    _ = try utf8Knob(bin);
-    _ = try utf8Knob(token);
+    try utf8Knob(bin);
+    try utf8Knob(token);
     const json = try std.json.Stringify.valueAlloc(gpa, Req{ .bin = bin, .token = token }, .{});
     defer gpa.free(json);
     return std.fmt.allocPrint(gpa, "{s}\n", .{json});
@@ -298,7 +297,7 @@ pub fn decodeReq(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Req)
 }
 
 pub fn encodeAck(gpa: std.mem.Allocator, token: []const u8) ![]u8 {
-    _ = try utf8Knob(token);
+    try utf8Knob(token);
     const json = try std.json.Stringify.valueAlloc(gpa, Ack{ .token = token }, .{});
     defer gpa.free(json);
     return std.fmt.allocPrint(gpa, "{s}\n", .{json});
