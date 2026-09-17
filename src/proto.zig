@@ -162,8 +162,11 @@ pub fn parseContentRange(h: []const u8) ?ContentRange {
     const complete_s = rest[slash + 1 ..];
     const complete = if (complete_s.len == 1 and complete_s[0] == '*')
         std.math.maxInt(u64)
-    else
-        parseU64Fast(complete_s) orelse return null;
+    else blk: {
+        const length = parseU64Fast(complete_s) orelse return null;
+        if (b >= length) return null;
+        break :blk length;
+    };
     return .{ .start = a, .end = b, .complete = complete };
 }
 
@@ -745,6 +748,27 @@ test "range and query" {
     try std.testing.expectEqualStrings("/data", pathOnly("/data"));
 }
 
+test "Content-Range requires a complete length beyond the inclusive end" {
+    for ([_][]const u8{
+        "bytes 0-0/0",
+        "bytes 0-7/7",
+        "bytes 0-7/6",
+        "bytes 18446744073709551615-18446744073709551615/18446744073709551615",
+    }) |value| {
+        try std.testing.expect(parseContentRange(value) == null);
+    }
+    for ([_][]const u8{
+        "bytes 0-0/1",
+        "bytes 0-7/8",
+        "bytes 0-7/32",
+        "bytes 0-7/*",
+        "bytes 18446744073709551614-18446744073709551614/18446744073709551615",
+        "bytes 18446744073709551615-18446744073709551615/*",
+    }) |value| {
+        try std.testing.expect(parseContentRange(value) != null);
+    }
+}
+
 test "headerGet is case-insensitive and trims" {
     const head = "GET /ping HTTP/1.1\r\nHost: node1:18080\r\nAuthorization: Bearer  tok123 \r\nRange: bytes=0-9\r\n\r\n";
     try std.testing.expectEqualStrings("Bearer  tok123", headerGet(head, "Authorization").?);
@@ -1135,8 +1159,11 @@ fn refParseContentRange(h: []const u8) ?ContentRange {
     const complete_s = rest[slash + 1 ..];
     const complete: u64 = if (complete_s.len == 1 and complete_s[0] == '*')
         std.math.maxInt(u64)
-    else
-        refDigitsU64(complete_s) orelse return null;
+    else blk: {
+        const length = refDigitsU64(complete_s) orelse return null;
+        if (length <= end) return null;
+        break :blk length;
+    };
     return .{ .start = start, .end = end, .complete = complete };
 }
 

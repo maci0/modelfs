@@ -1926,6 +1926,20 @@ test "range fetch binds the 206 body to the requested Content-Range" {
     }
 }
 
+test "range fetch rejects an end outside the complete representation" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "0", "7", "6" }) |complete| {
+        var response: [256]u8 = undefined;
+        const wire = try std.fmt.bufPrint(&response, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/{s}\r\nContent-Length: 8\r\nConnection: close\r\n\r\nABCDEFGH", .{complete});
+        const pair = try responsePair(wire);
+        defer sys.close(pair[0]);
+        defer sys.close(pair[1]);
+        var out = [_]u8{0} ** 8;
+        try std.testing.expectError(error.BadContentRange, readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 0, 7, &out, null));
+        try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 8), &out);
+    }
+}
+
 test "readFlexBodyAlloc rejects a malformed Content-Length instead of coercing to 0" {
     const gpa = std.testing.allocator;
     // Regression: an unparsable or overflowing length used to read as 0, so
@@ -3932,7 +3946,8 @@ fn refCheckRangeReply(head: []const u8, start: u64, end: u64) !void {
     if (b < a) return error.BadContentRange;
     const complete_s = rest[slash + 1 ..];
     if (!(complete_s.len == 1 and complete_s[0] == '*')) {
-        _ = refDigitsU64(complete_s) orelse return error.BadContentRange;
+        const complete = refDigitsU64(complete_s) orelse return error.BadContentRange;
+        if (complete <= b) return error.BadContentRange;
     }
     if (a != start or b < start or b > end) return error.RangeMismatch;
     const cl_str = blk: {

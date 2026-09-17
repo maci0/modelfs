@@ -349,7 +349,9 @@ underscore is malformed, the same rule RFC 9110 uses for Content-Length. Status 
 
 The fetching peer requires `206` plus a `Content-Range` whose start matches the request, whose
 end is at most the request end (EOF clamp), and whose selected length equals `Content-Length`;
-a shorter body under a matching window is refused rather than cached. `v0.1.0` servers already
+a shorter body under a matching window is refused rather than cached. A numeric complete
+length must exceed the inclusive range end; an unknown complete length (`*`) is accepted.
+`v0.1.0` servers already
 send that header on every 206, so a mixed fleet still fills. Errors carry no body: both peers
 of a conversation parse only the status line.
 
