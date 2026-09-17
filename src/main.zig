@@ -1170,7 +1170,12 @@ fn buildSeeds(gpa: std.mem.Allocator, specs: []const []const u8) !SeedList {
             return error.SeedUndialable;
         }
         const owned = try gpa.dupe(u8, rip);
+        errdefer gpa.free(owned);
+        // owned_ips is the ownership record; addrs borrows its bytes for the
+        // daemon's lifetime, so the record entry must exist before the
+        // borrow is published and be unwound if the borrow append fails.
         try out.owned_ips.append(gpa, owned);
+        errdefer _ = out.owned_ips.pop();
         try out.addrs.append(gpa, .{ .ip = owned, .port = hp.port, .mbps = 0 });
     }
     return out;
@@ -4451,6 +4456,23 @@ test "buildSeeds passes numeric ips through and resolves names" {
     // for a hostname that resolved to the unspecified address.
     try std.testing.expectError(error.SeedUndialable, buildSeeds(gpa, &.{"0.0.0.0"}));
     try std.testing.expectError(error.SeedUndialable, buildSeeds(gpa, &.{"255.255.255.255:19099"}));
+}
+
+test "buildSeeds releases resolved ips on allocation failure" {
+    const Runner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const specs = [_][]const u8{"127.0.0.1:19099"} ++ [_][]const u8{"localhost:19098"} ** 12;
+            var seeds = try buildSeeds(gpa, &specs);
+            defer seeds.deinit(gpa);
+            try std.testing.expectEqual(specs.len, seeds.addrs.items.len);
+            try std.testing.expectEqual(@as(usize, 12), seeds.owned_ips.items.len);
+            for (seeds.addrs.items, 0..) |addr, i| {
+                try std.testing.expectEqualStrings("127.0.0.1", addr.ip);
+                try std.testing.expectEqual(@as(u16, if (i == 0) 19099 else 19098), addr.port);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "leaseAddrs follows --listen and falls back to loopback" {
