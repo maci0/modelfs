@@ -167,20 +167,24 @@ jobs:
   # the release workflow; this job runs the exact same recipe on every push
   # and PR so a breakage (vendored-source drift, a link regression, an
   # assert_static_elf gap) fails CI weeks before a release depends on it.
-  # Compile/link/ELF-assert only: the runners have no /dev/fuse for a live
-  # mount, and the full test suite runs natively in the two check jobs.
   static-linux:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64-linux-musl, aarch64-linux-musl]
+        include:
+          - target: x86_64-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-linux-musl
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Test native static release build
+        run: zig build test -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dfuse-static
       - name: Build and verify the static single-file binary
         run: ./scripts/build_static.sh ${{ matrix.target }} --prefix .scratch/static
 
