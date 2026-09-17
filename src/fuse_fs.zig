@@ -373,7 +373,13 @@ test "mf_open honors O_TRUNC for cold and cached files" {
         var ost: sys.c.struct_stat = undefined;
         try std.testing.expectEqual(@as(i32, 0), sys.statPath(origin_z, &ost));
         try std.testing.expectEqual(@as(i64, 0), ost.st_size);
+        const before_eof = st.store.stats.snap();
         try std.testing.expectEqual(@as(c_int, 0), mf_read(rel.ptr, &rb, rb.len, 0, null));
+        const after_eof = st.store.stats.snap();
+        try std.testing.expectEqual(before_eof.reads_ok + 1, after_eof.reads_ok);
+        try std.testing.expectEqual(before_eof.reads_err, after_eof.reads_err);
+        try std.testing.expectEqual(before_eof.reads_warm, after_eof.reads_warm);
+        try std.testing.expectEqual(before_eof.bytes_read, after_eof.bytes_read);
         try std.testing.expectEqual(@as(c_int, 3), mf_write(rel.ptr, "new", 3, 0, fi));
         try std.testing.expectEqualStrings("new", try sys.readFileBuf(&rb, origin_z));
         try std.testing.expectEqual(@as(c_int, 3), mf_read(rel.ptr, &rb, rb.len, 0, null));
@@ -430,7 +436,15 @@ test "truncate invalidates cached bytes even when origin close fails" {
         try std.testing.expectEqual(@as(c_int, 4), mf_read("/model.bin", &out, out.len, 0, null));
         try std.testing.expectEqualStrings("0123", out[0..4]);
         try std.testing.expectEqual(@as(c_int, -sys.c.EIO), truncateWithClose("/model.bin", 4, null, Close.fail));
-        try std.testing.expectEqual(@as(c_int, 0), mf_read("/model.bin", &out, out.len, 4, null));
+        for ([_]fuse.off_t{ 4, 8 }) |off| {
+            const before_eof = st.store.stats.snap();
+            try std.testing.expectEqual(@as(c_int, 0), mf_read("/model.bin", &out, out.len, off, null));
+            const after_eof = st.store.stats.snap();
+            try std.testing.expectEqual(before_eof.reads_ok + 1, after_eof.reads_ok);
+            try std.testing.expectEqual(before_eof.reads_err, after_eof.reads_err);
+            try std.testing.expectEqual(before_eof.reads_warm, after_eof.reads_warm);
+            try std.testing.expectEqual(before_eof.bytes_read, after_eof.bytes_read);
+        }
         st.store.forget(rel);
     }
 }
@@ -1190,6 +1204,7 @@ fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*
     file.last_access.store(sys.monoSec(st.io), .monotonic);
     if (uoff >= fsize) {
         file.mu.unlock(st.io);
+        _ = st.store.stats.reads_ok.fetchAdd(1, .monotonic);
         return 0;
     }
     const n = @min(want, @as(usize, @intCast(fsize - uoff)));
