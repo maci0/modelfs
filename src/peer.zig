@@ -44,8 +44,8 @@ pub const Server = struct {
         var seen_port: std.AutoHashMap(u16, void) = std.AutoHashMap(u16, void).init(self.gpa);
         defer seen_port.deinit();
         for (specs) |a| {
-            if (seen_port.contains(a.port)) continue;
-            try seen_port.put(a.port, {});
+            const entry = try seen_port.getOrPut(a.port);
+            if (entry.found_existing) continue;
             try self.bindOne("0.0.0.0", a.port);
         }
     }

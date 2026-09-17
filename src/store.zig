@@ -1318,7 +1318,11 @@ pub const Store = struct {
                 file.mu.unlock(self.io);
                 return .filled;
             }
-            if (file.filling.contains(idx)) {
+            const gop = file.filling.getOrPut(idx) catch |err| {
+                file.mu.unlock(self.io);
+                return err;
+            };
+            if (gop.found_existing) {
                 file.mu.unlock(self.io);
                 // Yield through the injected Io, not nanosleep: a simulator
                 // can interleave the in-flight filler instead of blocking
@@ -1326,10 +1330,7 @@ pub const Store = struct {
                 sys.sleepMs(self.io, 2);
                 continue;
             }
-            file.filling.put(idx, file.writes) catch |err| {
-                file.mu.unlock(self.io);
-                return err;
-            };
+            gop.value_ptr.* = file.writes;
             // A fill in flight is access: it must keep punchPiece (which
             // rechecks recency under the same lock) from culling under it.
             file.last_access.store(now_sec, .monotonic);
@@ -1602,10 +1603,13 @@ pub const Store = struct {
         const extra: u32 = @intCast(@min(mf.entries.len, std.math.maxInt(u32)));
         file.hashes.ensureTotalCapacity(file.hashes.count() +| extra) catch {};
         for (mf.entries) |e| {
-            if (file.hashes.contains(e.idx)) continue;
-            file.hashes.put(e.idx, e.hash) catch |err| {
+            const entry = file.hashes.getOrPut(e.idx) catch |err| {
                 std.log.warn("cannot load trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, e.idx, err });
+                continue;
             };
+            if (!entry.found_existing) {
+                entry.value_ptr.* = e.hash;
+            }
         }
         file.manifest_size = file.size;
     }

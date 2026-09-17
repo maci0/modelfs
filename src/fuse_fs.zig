@@ -2136,12 +2136,20 @@ const ReadBuf = struct {
 /// Null only when the fallback allocation also fails.
 fn claimReadBuf(st: *State, want: usize) ?ReadBuf {
     if (want <= read_slot_bytes) {
-        for (0..read_slots) |i| {
+        var cur = st.read_taken.load(.monotonic);
+        while (true) {
+            const mask: u32 = (@as(u32, 1) << @intCast(read_slots)) - 1;
+            const free_bits: u32 = ~@as(u32, cur) & mask;
+            if (free_bits == 0) break;
+            const i: usize = @ctz(free_bits);
             const bit = @as(u16, 1) << @intCast(i);
-            // The fetchOr is the claim: the thread that observes the bit
+            // The CAS is the claim: the thread that observes the bit
             // clear owns the slot until it releases, so the lazy fill below
             // cannot race another handler.
-            if (st.read_taken.fetchOr(bit, .acq_rel) & bit != 0) continue;
+            if (st.read_taken.cmpxchgWeak(cur, cur | bit, .acq_rel, .monotonic)) |actual| {
+                cur = actual;
+                continue;
+            }
             if (st.read_bufs[i] == null) {
                 st.read_bufs[i] = st.gpa.alloc(u8, read_slot_bytes) catch {
                     _ = st.read_taken.fetchAnd(~bit, .release);

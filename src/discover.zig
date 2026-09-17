@@ -632,17 +632,28 @@ pub const Catalog = struct {
         const paths = self.paths.items;
         if (paths.len > out.len or paths.len > ip_buf.len) return null;
         var n: usize = 0;
+        var last_peer_id: ?[]const u8 = null;
+        var last_answered: ?bool = null;
         for (paths) |p| {
             if (p.ip.len > ip4_text_max) return null;
             var answered: ?bool = null;
-            for (paths) |q| {
-                if (!std.mem.eql(u8, q.peer_id, p.peer_id)) continue;
-                if (self.haveLookup(rel, q.ip, q.port, now_ms)) |e| {
-                    answered = (proto.HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
-                    break;
+            if (last_peer_id) |lpid| {
+                if (std.mem.eql(u8, lpid, p.peer_id)) {
+                    answered = last_answered;
                 }
             }
-            if (answered == null) return null;
+            if (answered == null) {
+                for (paths) |q| {
+                    if (!std.mem.eql(u8, q.peer_id, p.peer_id)) continue;
+                    if (self.haveLookup(rel, q.ip, q.port, now_ms)) |e| {
+                        answered = (proto.HaveBits{ .bits = e.bits, .piece_size = e.piece_size }).hasPiece(idx, local_piece_size);
+                        break;
+                    }
+                }
+                if (answered == null) return null;
+                last_peer_id = p.peer_id;
+                last_answered = answered;
+            }
             @memcpy(ip_buf[n][0..p.ip.len], p.ip);
             out[n] = .{
                 .ip = ip_buf[n][0..p.ip.len],
@@ -1108,6 +1119,7 @@ pub const Catalog = struct {
         defer self.mu.unlock(self.io);
         var n: u32 = 0;
         for (self.paths.items, 0..) |p, i| {
+            if (i > 0 and std.mem.eql(u8, self.paths.items[i - 1].peer_id, p.peer_id)) continue;
             var dup = false;
             for (self.paths.items[0..i]) |q| {
                 if (std.mem.eql(u8, q.peer_id, p.peer_id)) {
