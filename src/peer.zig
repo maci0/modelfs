@@ -1679,15 +1679,19 @@ pub fn fillFromPeers(
         if (cat.collectCachedCands(rel, idx, piece_size, now_ms, &cand_buf, &ip_buf)) |cached| {
             return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cached, stats);
         }
-        if (cat.probeTryClaim(rel)) {
-            defer cat.probeRelease(rel);
+        const claim = cat.probeTryClaim(rel);
+        if (claim != .busy) {
+            defer if (claim == .claimed) cat.probeRelease(rel);
             // The previous owner may have populated the cache while we
             // claimed; skip the wire if so.
             const now2 = sys.monoMs(cat.io);
             if (cat.collectCachedCands(rel, idx, piece_size, now2, &cand_buf, &ip_buf)) |cached| {
                 return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cached, stats);
             }
-            const cands = try probeCandidates(gpa, psk, cat, rel, idx, piece_size, stats);
+            const cands = probeCandidates(gpa, psk, cat, rel, idx, piece_size, stats) catch |err| {
+                if (stats) |s| _ = s.fill_err_peer.fetchAdd(1, .monotonic);
+                return err;
+            };
             defer {
                 for (cands) |cand| gpa.free(cand.ip);
                 gpa.free(cands);
@@ -3720,6 +3724,27 @@ test "fillFromPeers probes concurrently and streams piece into out" {
     try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "missing.bin", 0, 16, &out, &srv.store.stats));
     try std.testing.expectEqual(@as(u64, 0), srv.store.stats.probe_err.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), srv.store.stats.fill_err_peer.load(.monotonic));
+}
+
+test "fillFromPeers counts candidate allocation failure and releases the probe claim" {
+    const gpa = std.testing.allocator;
+    var cat = discover.Catalog.init(gpa, std.testing.io, "/unused", "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    try cat.paths.append(gpa, .{
+        .peer_id = "peer",
+        .ip = "127.0.0.1",
+        .port = 18080,
+        .ewma_bps = 1e9,
+        .hops = 0,
+    });
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var stats: store_mod.Stats = .{};
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.OutOfMemory, fillFromPeers(failing.allocator(), "secret", &cat, "x.bin", 0, 16, &out, &stats));
+    try std.testing.expectEqual(@as(u64, 1), stats.fill_err_peer.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), stats.probe_err.load(.monotonic));
+    try std.testing.expectEqual(discover.Catalog.ProbeClaim.claimed, cat.probeTryClaim("x.bin"));
+    cat.probeRelease("x.bin");
 }
 
 test "fillFromPeers counts failed /have probes but not healthy misses" {

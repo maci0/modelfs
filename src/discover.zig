@@ -567,30 +567,24 @@ pub const Catalog = struct {
         };
     }
 
-    /// True when this caller owns the in-flight /have probe for `rel` and
-    /// must run probeCandidates (then probeRelease). False when another
-    /// filler of this file is already walking the cluster: wait and retry
-    /// collectCachedCands. Cap or OOM returns true without recording so a
-    /// many-file cold start still probes (the pre-singleflight behavior)
-    /// instead of waiting on a slot that will never name this rel.
-    pub fn probeTryClaim(self: *Catalog, rel: []const u8) bool {
+    pub const ProbeClaim = enum { claimed, busy, overflow };
+
+    pub fn probeTryClaim(self: *Catalog, rel: []const u8) ProbeClaim {
         const gpa = self.gpa;
         self.have_mu.lockUncancelable(self.io);
         defer self.have_mu.unlock(self.io);
         for (self.probe_inflight.items) |e| {
-            if (std.mem.eql(u8, e.rel, rel)) return false;
+            if (std.mem.eql(u8, e.rel, rel)) return .busy;
         }
-        if (self.probe_inflight.items.len >= probe_inflight_cap) return true;
-        const rel_own = gpa.dupe(u8, rel) catch return true;
+        if (self.probe_inflight.items.len >= probe_inflight_cap) return .overflow;
+        const rel_own = gpa.dupe(u8, rel) catch return .overflow;
         self.probe_inflight.append(gpa, .{ .rel = rel_own }) catch {
             gpa.free(rel_own);
-            return true;
+            return .overflow;
         };
-        return true;
+        return .claimed;
     }
 
-    /// Drops the in-flight claim probeTryClaim recorded for `rel`. A no-op
-    /// when the claim was the cap/OOM overflow path (nothing recorded).
     pub fn probeRelease(self: *Catalog, rel: []const u8) void {
         const gpa = self.gpa;
         self.have_mu.lockUncancelable(self.io);
@@ -1476,19 +1470,17 @@ test "probeTryClaim singleflights one rel and isolates another" {
     var cat = Catalog.init(gpa, std.testing.io, "/unused", "me", &addrs, &.{}, &.{});
     defer cat.deinit();
 
-    try std.testing.expect(cat.probeTryClaim("a.bin"));
-    try std.testing.expect(!cat.probeTryClaim("a.bin"));
-    try std.testing.expect(cat.probeTryClaim("b.bin"));
-    try std.testing.expect(!cat.probeTryClaim("b.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.claimed, cat.probeTryClaim("a.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.busy, cat.probeTryClaim("a.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.claimed, cat.probeTryClaim("b.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.busy, cat.probeTryClaim("b.bin"));
     cat.probeRelease("a.bin");
-    try std.testing.expect(cat.probeTryClaim("a.bin"));
-    try std.testing.expect(!cat.probeTryClaim("b.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.claimed, cat.probeTryClaim("a.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.busy, cat.probeTryClaim("b.bin"));
     cat.probeRelease("a.bin");
     cat.probeRelease("b.bin");
-    // A release of a rel that was never recorded (cap/OOM overflow path)
-    // is a no-op, including a double release.
     cat.probeRelease("a.bin");
-    try std.testing.expect(cat.probeTryClaim("a.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.claimed, cat.probeTryClaim("a.bin"));
     cat.probeRelease("a.bin");
 }
 
@@ -1502,13 +1494,15 @@ test "probeTryClaim cap overflow still lets the caller probe" {
     while (i < Catalog.probe_inflight_cap) : (i += 1) {
         var name_buf: [16]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "f{d}.bin", .{i}) catch unreachable;
-        try std.testing.expect(cat.probeTryClaim(name));
+        try std.testing.expectEqual(Catalog.ProbeClaim.claimed, cat.probeTryClaim(name));
     }
-    // Past the cap the caller still probes (true) rather than waiting on a
-    // slot that will never name this rel. The overflow path records nothing,
-    // so a second claim of the same overflow rel also probes.
-    try std.testing.expect(cat.probeTryClaim("spill.bin"));
-    try std.testing.expect(cat.probeTryClaim("spill.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.overflow, cat.probeTryClaim("spill.bin"));
+    try std.testing.expectEqual(Catalog.ProbeClaim.overflow, cat.probeTryClaim("spill.bin"));
+    const overflow = cat.probeTryClaim("spill.bin");
+    cat.probeRelease("f0.bin");
+    try std.testing.expectEqual(Catalog.ProbeClaim.claimed, cat.probeTryClaim("spill.bin"));
+    if (overflow == .claimed) cat.probeRelease("spill.bin");
+    try std.testing.expectEqual(Catalog.ProbeClaim.busy, cat.probeTryClaim("spill.bin"));
     cat.probeRelease("spill.bin");
     i = 0;
     while (i < Catalog.probe_inflight_cap) : (i += 1) {
