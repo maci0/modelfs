@@ -759,7 +759,7 @@ The tick line carries the only latency signal there is:
 | Field | Meaning |
 |---|---|
 | `rd_us` / `wr_us` | average wall time of a FUSE read/write over the interval |
-| `http_us` | average `/have`+`/data` handler time, over `httpok`+`http5xx`. `/ping` is liveness: neither timed nor counted, so a health-check poll cannot fire an idle tick |
+| `http_us` | average `/have`+`/data` handler time, over `http_completed`. Includes misses, invalid ranges, failures, and interrupted sends. `/ping` and requests rejected before entering a handler are neither timed nor counted |
 | `fill_ms peer/nfs` | average per-piece hydration stall by tier. A miss blocks the reader for one whole piece, so this is how "reads got slow" is diagnosed from the journal |
 | `md_us` | interval **total** (these handlers count wall time, not calls) of the getattr/open/statfs latency counters, so a metadata storm is visible in a window where no data read moved. The three publish separately in status.json |
 
@@ -770,6 +770,7 @@ And the counters worth knowing by name:
 | `reads_warm` | fully cached FUSE reads. Hit rate is `reads_warm / reads_ok` |
 | `probe_err` | `/have` probes that failed for a reason other than a healthy 404: a dead peer, PSK drift, a malformed reply. The signature of a cluster silently degraded to NFS-only |
 | `httpok` / `serve_mib` | accepted `/have` 200 and `/data` 206 replies and the bytes they served (`Content-Length`), so a node serving pieces is distinguishable from an idle one |
+| `http_completed` | completed timed `/have` and `/data` handlers, regardless of reply status or send outcome; paired with `http_nanos` in status.json and used as the `http_us` denominator |
 | `httpbad` | connections whose request head never completed |
 | `httpdrop` | connections closed because all inflight slots were taken: the server refusing work under saturation |
 | `http405` | requests refused for method. The journal line is deduplicated on the same window as the 401 warn and echoes the method through `discover.displayName`, since a PSK holder picks that token |

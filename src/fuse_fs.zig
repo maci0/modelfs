@@ -1607,8 +1607,7 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     const wr_us = meanPerOp(d.write_nanos, writes_attempted, std.time.ns_per_us);
     const fill_peer_ms = meanPerOp(d.fill_peer_nanos, d.fills_peer, std.time.ns_per_ms);
     const fill_origin_ms = meanPerOp(d.fill_origin_nanos, d.fills_origin, std.time.ns_per_ms);
-    const http_attempted = d.http_ok + d.http_5xx;
-    const http_us = meanPerOp(d.http_nanos, http_attempted, std.time.ns_per_us);
+    const http_us = meanPerOp(d.http_nanos, d.http_completed, std.time.ns_per_us);
     // Total, not a mean: the metadata handlers count wall time but not calls,
     // and a tick fires on any counter moving. Without this field a
     // metadata-only interval logs a line of zeros.
@@ -1644,7 +1643,7 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
         },
     ) catch return;
     w.print(
-        " probe_err={d} lease_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http405={d} http_us={d} md_us={d} meta_err={d}",
+        " probe_err={d} lease_err={d} peer_mib={d} origin_mib={d} serve_mib={d} serve_verify_fail={d} culled={d} httpok={d} http401={d} http5xx={d} httpbad={d} httpdrop={d} http405={d} http_completed={d} http_us={d} md_us={d} meta_err={d}",
         .{
             d.probe_err,
             d.lease_err,
@@ -1659,6 +1658,7 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
             d.http_malformed,
             d.http_dropped,
             d.http_405,
+            d.http_completed,
             http_us,
             md_us,
             d.meta_err,
@@ -3224,6 +3224,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     _ = st.store.stats.fills_peer.fetchAdd(1, .monotonic);
     _ = st.store.stats.bytes_from_peer.fetchAdd(4096, .monotonic);
     _ = st.store.stats.http_405.fetchAdd(3, .monotonic);
+    _ = st.store.stats.http_completed.fetchAdd(7, .monotonic);
     _ = st.store.stats.getattr_nanos.fetchAdd(2000, .monotonic);
     _ = st.store.stats.open_nanos.fetchAdd(4000, .monotonic);
     _ = st.store.stats.statfs_nanos.fetchAdd(8000, .monotonic);
@@ -3240,6 +3241,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     // Snap fields default to 0, so a missing JSON key would still parse.
     // The four keys 0.5.0 added must actually be in the published document.
     try std.testing.expectEqual(@as(u64, 3), doc2.value.stats.http_405);
+    try std.testing.expectEqual(@as(u64, 7), doc2.value.stats.http_completed);
     try std.testing.expectEqual(@as(u64, 2000), doc2.value.stats.getattr_nanos);
     try std.testing.expectEqual(@as(u64, 4000), doc2.value.stats.open_nanos);
     try std.testing.expectEqual(@as(u64, 8000), doc2.value.stats.statfs_nanos);

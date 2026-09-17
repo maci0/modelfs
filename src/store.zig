@@ -155,6 +155,7 @@ pub const Stats = struct {
     /// stay untimed: /ping is liveness, and timing it would make a health
     /// check fire an otherwise-idle tick line of zeros.
     http_nanos: std.atomic.Value(u64) = .init(0),
+    http_completed: std.atomic.Value(u64) = .init(0),
 
     /// Consistent copy of every counter for diffing between discovery ticks
     /// and for status.json formatting. Snap's field list is the single
@@ -198,6 +199,7 @@ pub const Stats = struct {
         http_dropped: u64 = 0,
         http_405: u64 = 0,
         http_nanos: u64 = 0,
+        http_completed: u64 = 0,
     };
 
     // Every Stats counter must have a Snap counterpart, or it compiles fine

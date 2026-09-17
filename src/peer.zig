@@ -536,7 +536,10 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
     }
     if (std.mem.eql(u8, path, "/have")) {
         const t0 = sys.monoNs(self.io);
-        defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
+        defer {
+            _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
+            _ = self.store.stats.http_completed.fetchAdd(1, .monotonic);
+        }
         serveHave(self, fd, rel);
         return;
     }
@@ -550,7 +553,10 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
             return;
         };
         const t0 = sys.monoNs(self.io);
-        defer _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
+        defer {
+            _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
+            _ = self.store.stats.http_completed.fetchAdd(1, .monotonic);
+        }
         serveData(self, fd, rel, rg);
     }
 }
@@ -3048,6 +3054,7 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         // or http_nanos (a health-check poll must not fire an idle tick).
         try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
         try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_nanos.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_completed.load(.monotonic));
     }
     // A non-GET method is refused even with valid auth, and the refusal
     // names what the resource accepts (RFC 9110 §15.5.5).
@@ -3166,6 +3173,19 @@ test "peer http dispatch answers ping, wrong method, and unknown paths" {
         }
         // A miss must not look like a transfer: http_ok stays the 206 above.
         try std.testing.expectEqual(@as(u64, 1), srv.store.stats.http_ok.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 2), srv.store.stats.http_completed.load(.monotonic));
+        {
+            var res = try roundTrip(port, "GET /have?path=missing.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nConnection: close\r\n\r\n");
+            defer res.deinit(gpa);
+            try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 404 Not Found\r\n"));
+        }
+        try std.testing.expectEqual(@as(u64, 3), srv.store.stats.http_completed.load(.monotonic));
+        {
+            var res = try roundTrip(port, "GET /data?path=r.bin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=99-100\r\nConnection: close\r\n\r\n");
+            defer res.deinit(gpa);
+            try std.testing.expect(std.mem.startsWith(u8, res.items, "HTTP/1.1 416 "));
+        }
+        try std.testing.expectEqual(@as(u64, 4), srv.store.stats.http_completed.load(.monotonic));
     }
 }
 
