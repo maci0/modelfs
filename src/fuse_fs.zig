@@ -382,6 +382,59 @@ test "mf_open honors O_TRUNC for cold and cached files" {
     try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_open("missing.bin", fi));
 }
 
+test "truncate invalidates cached bytes even when origin close fails" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "truncate-close-origin");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "truncate-close-cache");
+    defer sys.deleteTree(std.testing.io, cache_d);
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+    tls_state = &st;
+    defer tls_state = null;
+    const Close = struct {
+        fn fail(fd: c_int) i32 {
+            sys.close(fd);
+            return -sys.c.EIO;
+        }
+    };
+    const rel = "model.bin";
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const origin_z = try st.store.originPath(&pbuf, rel);
+    for ([_]bool{ true, false }) |live| {
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, "0123456789abcdef"));
+        st.store.cacheFillIdentified(rel, 16, 0, "0123456789abcdef", .{}, 0);
+        if (!live) {
+            st.store.deinit();
+            st.store = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        }
+        const entry = st.store.lookupRef(rel);
+        if (entry) |file| st.store.releaseFile(file);
+        try std.testing.expectEqual(live, entry != null);
+        try std.testing.expectEqual(@as(c_int, -sys.c.EIO), truncateWithClose("/model.bin", 4, null, Close.fail));
+        if (st.store.lookupRef(rel)) |file| {
+            defer st.store.releaseFile(file);
+            try std.testing.expectEqual(@as(u64, 4), file.size);
+            try std.testing.expect(file.bits.lastSet() == null);
+            try std.testing.expectEqual(@as(u32, 0), file.hashes.count());
+        } else {
+            var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+            var sb: sys.c.struct_stat = undefined;
+            try std.testing.expectEqual(@as(i32, -sys.c.ENOENT), sys.statPath(try st.store.cacheMetaPath(&mbuf, rel), &sb));
+        }
+        var out: [16]u8 = undefined;
+        try std.testing.expectEqual(@as(c_int, 4), mf_read("/model.bin", &out, out.len, 0, null));
+        try std.testing.expectEqualStrings("0123", out[0..4]);
+        try std.testing.expectEqual(@as(c_int, -sys.c.EIO), truncateWithClose("/model.bin", 4, null, Close.fail));
+        try std.testing.expectEqual(@as(c_int, 0), mf_read("/model.bin", &out, out.len, 4, null));
+        st.store.forget(rel);
+    }
+}
+
 test "clientCreateMode strips setuid, setgid, and sticky bits" {
     try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o4755));
     try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o2755));
@@ -1267,6 +1320,10 @@ fn mf_release(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int 
 }
 
 fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
+    return truncateWithClose(path, size, fi, sys.closeWrite);
+}
+
+fn truncateWithClose(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_info, comptime closeWrite: anytype) c_int {
     _ = fi;
     const st = statePtr();
     var rel: []const u8 = "";
@@ -1284,9 +1341,8 @@ fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_info) 
     const fd = sys.open(op, sys.c.O_WRONLY | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK, 0);
     if (fd < 0) return sys.negErrno();
     const origin_tr = sys.ftruncate(fd, new_size);
-    const cr = sys.closeWrite(fd);
+    const cr = closeWrite(fd);
     if (origin_tr != 0) return origin_tr;
-    if (cr != 0) return cr;
     // Map lookup must take store.mu; lookupRef also pins the entry against
     // eviction for the duration of the truncate.
     const live = st.store.lookupRef(rel);
@@ -1305,7 +1361,7 @@ fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_info) 
             // truncate to the current size. Re-wiping bits would discard
             // pieces re-hydrated after the first truncate to this size.
             store_mod.Store.truncateCacheFd(file, new_size);
-            return 0;
+            return cr;
         }
         const nb = piece.Bitfield.init(st.gpa, piece.count(new_size, st.store.piece_size)) catch {
             // Origin is already the new length. Leaving filled bits at the
@@ -1346,7 +1402,7 @@ fn mf_truncate(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_info) 
         // marks, keep data/pins.
         st.store.distrust(rel);
     }
-    return 0;
+    return cr;
 }
 
 fn mf_unlink(path: [*c]const u8) callconv(.c) c_int {
