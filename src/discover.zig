@@ -906,15 +906,16 @@ pub const Catalog = struct {
                 return;
             },
             .missing_dir => {
-                new_paths.deinit(self.gpa);
-                new_arena.deinit();
-                // ENOENT: empty/fresh cluster, or .cluster was removed.
-                // Not an infrastructure outage; keep the previous list.
                 self.refresh_rc = 0;
-                if (!self.refresh_failing)
-                    std.log.warn("cluster leases unreadable at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
-                self.refresh_failing = true;
-                return;
+                if (self.peerCount() != 0) {
+                    new_paths.deinit(self.gpa);
+                    new_arena.deinit();
+                    if (!self.refresh_failing)
+                        std.log.warn("cluster leases unreadable at {s}/{s}; keeping previous peer list", .{ self.origin, cluster_dir });
+                    self.refresh_failing = true;
+                    return;
+                }
+                self.refresh_failing = false;
             },
             .io_err => |e| {
                 new_paths.deinit(self.gpa);
@@ -2685,7 +2686,6 @@ test "refresh uses seeds only while cluster is empty" {
     defer sys.deleteTree(std.testing.io, origin_d);
     var cbuf: [160]u8 = undefined;
     const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
-    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
 
     const seeds = [_]proto.LeaseAddr{
         .{ .ip = "10.0.0.9", .port = 19099, .mbps = 0 },
@@ -2706,6 +2706,18 @@ test "refresh uses seeds only while cluster is empty" {
     try std.testing.expectEqual(@as(f64, 1e8), snap[0].ewma_bps);
     // mbps seed prior converts Mbit/s to B/s: 200000 mbit/s -> 25 GB/s
     try std.testing.expectEqual(@as(f64, 25_000_000_000.0), snap[1].ewma_bps);
+    try std.testing.expectEqual(@as(i32, 0), cat.originErrno());
+
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+    cat.refresh(sys.nowSec(std.testing.io));
+    const empty_snap = try cat.snapshot(gpa);
+    defer Catalog.freeSnapshot(gpa, empty_snap);
+    try std.testing.expectEqual(snap.len, empty_snap.len);
+    for (snap, empty_snap) |before, after| {
+        try std.testing.expectEqualStrings(before.peer_id, after.peer_id);
+        try std.testing.expectEqualStrings(before.ip, after.ip);
+        try std.testing.expectEqual(before.port, after.port);
+    }
 
     // Once a live lease exists, seeds are dropped in favor of real peers.
     var zbuf: [192]u8 = undefined;
