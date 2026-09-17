@@ -3440,7 +3440,7 @@ test "cmdDupes reports manifest overlap and gates its paths" {
     // A corrupt manifest fails the command instead of undercounting the
     // overlap the report exists to measure.
     try writeManifestForTest(gpa, origin_d, "c.bin", 16, 32, &a_entries);
-    var mb: [256]u8 = undefined;
+    var mb: [2 * piece.digest_len]u8 = undefined;
     var zb: [256]u8 = undefined;
     const mname = piece.manifestName("c.bin", &mb);
     var pbuf: [256]u8 = undefined;
