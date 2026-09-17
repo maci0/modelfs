@@ -556,23 +556,15 @@ pub fn unlink(path: [*:0]const u8) i32 {
 pub fn chmod(path: [*:0]const u8, mode: c.mode_t) i32 {
     const fd = open(path, c.O_PATH | c.O_NOFOLLOW, 0);
     if (fd < 0) return negErrno();
+    defer close(fd);
     const lk = fstatNotLink(fd);
-    if (lk != 0) {
-        close(fd);
-        return lk;
-    }
+    if (lk != 0) return lk;
     const rc = c.fchmodat(fd, "", mode, c.AT_EMPTY_PATH);
     if (rc != 0) {
         const e0: i32 = negErrno();
-        if (e0 != -c.EINVAL and e0 != -c.ENOSYS) {
-            close(fd);
-            return e0;
-        }
-        const result = chmodViaProc(fd, mode);
-        close(fd);
-        return result;
+        if (e0 != -c.EINVAL and e0 != -c.ENOSYS) return e0;
+        return chmodViaProc(fd, mode);
     }
-    close(fd);
     return 0;
 }
 
