@@ -4644,13 +4644,19 @@ test "fill completion and piece probes refresh the cull recency window" {
     // Same guard on the probe itself: a warm read answers every bit check
     // without filling anything, so hasPiece must carry the stamp that keeps
     // a concurrent punch out of the check-to-readCache window.
-    _ = st.hasPiece(f, 1, t0 + 3600);
-    try std.testing.expect(!st.punchPiece(f, 0, t0 + 3600));
+    var probe_time = t0 + 3600;
+    for ([_]u32{ 0, 1 }) |idx| {
+        probe_time += Store.recency_secs;
+        try std.testing.expectEqual(idx == 0, st.hasPiece(f, idx, probe_time));
+        try std.testing.expect(!st.punchPiece(f, 0, probe_time));
+        try std.testing.expect(!st.punchPiece(f, 0, probe_time + Store.recency_secs - 1));
+    }
 
     // Once genuinely idle past the window, the same piece culls normally:
     // the stamps close race windows, they do not block culling.
-    try std.testing.expect(st.punchPiece(f, 0, t0 + 3600 + 11)); // 10s recency_secs + 1
-    try std.testing.expect(!st.hasPiece(f, 0, t0 + 3600));
+    const expired = probe_time + Store.recency_secs;
+    try std.testing.expect(st.punchPiece(f, 0, expired));
+    try std.testing.expect(!st.hasPiece(f, 0, expired));
 }
 
 // Re-execution is the normal consequence of retries and redeliveries, so
