@@ -5,10 +5,12 @@
 ### Upgrade from 0.14.1 - 2026-09-17
 
 These changes are not in `v0.14.1`. The next release needs a minor bump under
-CONTRIBUTING's `0.y.z` policy because token lookup changes for existing configurations.
-The peer HTTP response and persisted cache formats are unchanged; malformed
-peer request paths are now rejected as described below.
+CONTRIBUTING's `0.y.z` policy because token lookup and accepted cache piece sizes
+change for existing configurations. The peer HTTP response and persisted cache
+formats are unchanged; malformed peer request paths are now rejected as described
+below.
 
+- **Mount and handover startup reject piece sizes not aligned to the cache filesystem.** `0.14.1` accepted positive `--piece` values smaller than, or not divisible by, the cache `data/` filesystem's `statfs.f_bsize`; these now exit 1 because partial-block hole punches cannot reclaim those blocks. For example, `--piece 4K` no longer works on a 64-KiB-block filesystem; use `--piece 64K` or another positive multiple. The default `8M` is unchanged and aligns to both 4-KiB and 64-KiB blocks. Check custom grids before `modelfs update`: the replacement validates the inherited size after exec, so a rejected size terminates the mount rather than leaving the old image running. Stop and remount with a valid `--piece` (or `MODELFS_PIECE`); `update` cannot change the grid. Changing it makes old sidecar marks unusable and the cache refills, without migrating origin data. Use the same grid across the fleet to retain peer sharing; differing grids ignore each other's `/have` bits, and manifests on the old grid are not used for verification.
 - **`modelfs pull` trims surrounding spaces, tabs, CR, and LF from `HF_HOME` and `HOME`.** Previously those bytes were part of the token directory name. A whitespace-only `HF_HOME` now falls back to `HOME` instead of looking in a whitespace-named directory. Remove surrounding whitespace from these environment values; if it is intentional in a directory name, supply the token through `HF_TOKEN` instead (never argv).
 - **`modelfs pull` no longer falls back to anonymous access on token-file errors.** In `0.14.1`, an unreadable or oversized token file, or an overlong token path, was treated as no token. These now exit 1 before any network request; allocation failures also propagate. Check permissions on `$HF_HOME/token` or `$HOME/.cache/huggingface/token`, keep the file at most 4096 bytes (including whitespace), and shorten overlong home paths. A nonempty valid `HF_TOKEN` still overrides the file. For intentional anonymous pulls, leave the resolved token file absent or empty; merely unsetting `HF_TOKEN` still enables file lookup.
 - **`lease_err` counts discovery ticks with either a publish or refresh failure.** In `0.14.1` it counted only failed publishes. Monitors must interpret it as failed lease maintenance, not a count of failed writes; a tick with both failures still increments once.
@@ -27,6 +29,7 @@ peer request paths are now rejected as described below.
 ### Fixed - 2026-09-17
 
 - **An explicit `--log` overrides an invalid `MODELFS_LOG` value.** `0.14.1` rejected the environment value before reading the flag. Without `--log`, an invalid environment value still fails rather than silently choosing a default.
+- **`modelfs update` preserves the running daemon's effective log level.** `0.14.1` reset it to `info` during handover. The first live update from an older image still uses `info` because that image does not serialize the level; restart with the desired mount `--log` or `MODELFS_LOG` to restore it. The update command's `--log` controls that command, not the replacement daemon. Later live updates between new images retain the configured level.
 - **Restore-drill sampling preserves tabs in filenames.** `scripts/dr_restore_drill.sh` no longer strips trailing tabs when matching a snapshot sample to its live file, avoiding false failures or selection of the wrong live pathname.
 - **A read racing cache-entry removal no longer claims a fill on a dead entry.** `Store.beginFill` returns `.raced` so callers retry or use the origin rather than filling an entry that cannot be marked.
 - **`modelfs update` removes its acknowledgement after success or timeout.** Mount startup also logs resolved seed addresses for diagnosing discovery configuration.
