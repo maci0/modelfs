@@ -581,7 +581,8 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
             const p = self.cacheSubPath(&buf, sub, "") catch return -sys.c.ENAMETOOLONG;
-            if (sys.mkdirAll(std.mem.span(p), cache_dir_mode) != 0) return sys.negErrno();
+            const rc = sys.mkdirAll(std.mem.span(p), cache_dir_mode);
+            if (rc != 0) return rc;
             // mkdirAll leaves an existing dir's mode alone (EEXIST + is-dir).
             // A leftover 0755 `data/` from an older daemon is world-listable
             // even when the files inside are 0600; fchmod through an
@@ -6286,6 +6287,24 @@ test "openCache refuses a symlink planted at the data path" {
 
     var rb: [8]u8 = undefined;
     try std.testing.expectEqualStrings("keepme", try sys.readFileBuf(&rb, try sys.toZ(&zb, target)));
+}
+
+test "ensureLayout preserves mkdirAll errors for non-directory paths" {
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-layout-error");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(std.testing.allocator, std.testing.io, cache_d, cache_d, 16);
+    defer st.deinit();
+
+    var buf: [c.PATH_MAX]u8 = undefined;
+    for ([_][]const u8{ "data", "meta", "pin" }) |sub| {
+        const path = try st.cacheSubPath(&buf, sub, "");
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(path, ""));
+        try std.testing.expectEqual(@as(i32, -c.ENOTDIR), st.ensureLayout());
+        try std.testing.expectEqual(@as(i32, 0), sys.unlink(path));
+    }
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
 }
 
 test "openCache creates owner-only data files and tightens leftovers" {
