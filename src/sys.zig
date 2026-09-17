@@ -86,20 +86,16 @@ fn nowSecRaw() i64 {
 /// slash on `rel` is stripped so an origin-relative name can sit on either
 /// a trailing-slash or a bare root.
 pub fn joinZ(buf: []u8, root: []const u8, rel: []const u8) ![*:0]u8 {
-    if (root.len + rel.len + 2 > buf.len) return error.NameTooLong;
-    @memcpy(buf[0..root.len], root);
-    var n = root.len;
-    const rel_body: []const u8 = if (rel.len > 0 and rel[0] == '/') rel[1..] else rel;
-    if (rel_body.len > 0) {
-        if (n == 0 or buf[n - 1] != '/') {
-            buf[n] = '/';
-            n += 1;
-        }
-        @memcpy(buf[n..][0..rel_body.len], rel_body);
-        n += rel_body.len;
-    }
-    // collapse trailing slash except root
-    if (n > 1 and buf[n - 1] == '/') n -= 1;
+    const rel_body = if (rel.len > 0 and rel[0] == '/') rel[1..] else rel;
+    const separator = rel_body.len > 0 and (root.len == 0 or root[root.len - 1] != '/');
+    const root_len = if (rel_body.len == 0 and root.len > 1 and root[root.len - 1] == '/') root.len - 1 else root.len;
+    const rel_len = if (rel_body.len > 0 and rel_body[rel_body.len - 1] == '/') rel_body.len - 1 else rel_body.len;
+    const prefix_len = std.math.add(usize, root_len, @intFromBool(separator)) catch return error.NameTooLong;
+    const n = std.math.add(usize, prefix_len, rel_len) catch return error.NameTooLong;
+    if (n >= buf.len) return error.NameTooLong;
+    @memcpy(buf[0..root_len], root[0..root_len]);
+    if (separator) buf[root_len] = '/';
+    @memcpy(buf[prefix_len..n], rel_body[0..rel_len]);
     buf[n] = 0;
     return buf[0..n :0];
 }
@@ -1086,6 +1082,28 @@ test "joinZ" {
     // point sidecars and data files at the wrong keys.
     try std.testing.expectError(error.NameTooLong, joinZ(buf[0..16], "/mnt/nas/models", "gguf/foo.gguf"));
     try std.testing.expectError(error.NameTooLong, joinZ(buf[0..29], "/mnt/nas/models", "gguf/foo.gguf"));
+}
+
+test "joinZ uses the exact byte capacity for non-ASCII paths" {
+    const cases = [_]struct { root: []const u8, rel: []const u8, want: []const u8 }{
+        .{ .root = "/", .rel = "é", .want = "/é" },
+        .{ .root = "/模型/", .rel = "/cafe\u{301}", .want = "/模型/cafe\u{301}" },
+        .{ .root = "/模型", .rel = "😀/", .want = "/模型/😀" },
+        .{ .root = "/模型/", .rel = "", .want = "/模型" },
+        .{ .root = "/", .rel = "", .want = "/" },
+        .{ .root = "", .rel = "", .want = "" },
+        .{ .root = "", .rel = "//", .want = "/" },
+        .{ .root = "/nas/", .rel = "\xff\xfe", .want = "/nas/\xff\xfe" },
+    };
+    for (cases) |case| {
+        var buf: [64]u8 = @splat(0xaa);
+        const got = try joinZ(buf[0 .. case.want.len + 1], case.root, case.rel);
+        try std.testing.expectEqualStrings(case.want, std.mem.span(got));
+        try std.testing.expectEqual(@as(u8, 0xaa), buf[case.want.len + 1]);
+        @memset(&buf, 0xaa);
+        try std.testing.expectError(error.NameTooLong, joinZ(buf[0..case.want.len], case.root, case.rel));
+        for (buf) |byte| try std.testing.expectEqual(@as(u8, 0xaa), byte);
+    }
 }
 
 test "monoSec never goes backwards" {
