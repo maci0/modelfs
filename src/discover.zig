@@ -1734,32 +1734,20 @@ test "sweepLeases removes stale claims, keeps fresh and own" {
     const addrs = [_]proto.LeaseAddr{};
     var cat = Catalog.init(gpa, std.testing.io, origin_d, "me", &addrs, &.{}, &.{});
     defer cat.deinit();
-    cat.sweepLeases(sweep_now);
-
     var stbuf: c.struct_stat = undefined;
-    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
-    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
-    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
-    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
-
-    // Own lease with stale mtime: still kept (publish failures must stay
-    // visible). Cutoff then follows that stale stamp, so a second pass
-    // must not start deleting survivors.
-    {
-        const own_past = sweep_now - 2 * Catalog.sweep_min_age_secs;
-        try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, me_fp, own_past));
+    for (0..2) |pass| {
+        if (pass == 1) {
+            // Own lease with stale mtime: still kept (publish failures must stay
+            // visible). Cutoff then follows that stale stamp, so a second pass
+            // must not start deleting survivors.
+            try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, me_fp, past_sec));
+        }
+        cat.sweepLeases(sweep_now);
+        try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
+        try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
+        try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
+        try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
     }
-
-    // Re-execution is the sweep's normal shape: every node runs one per
-    // discovery tick, so the same stale directory is swept repeatedly and
-    // concurrently. A second pass over the already-swept tree must converge
-    // on exactly the first pass's outcome -- no further removals, survivors
-    // untouched -- instead of erroring or resurrecting anything.
-    cat.sweepLeases(sweep_now);
-    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, old_fp), &stbuf) != 0);
-    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, tmp_fp), &stbuf) != 0);
-    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, new_fp), &stbuf) == 0);
-    try std.testing.expect(sys.statPath(try sys.toZ(&zbuf, me_fp), &stbuf) == 0);
 }
 
 test "sweepLeases unlinks stale names as a set, not readdir arrival order" {
