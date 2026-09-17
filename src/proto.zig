@@ -49,7 +49,8 @@ pub fn urlDecode(out: []u8, s: []const u8) ![]u8 {
     var i: usize = 0;
     while (i < s.len) {
         if (n >= out.len) return error.NoSpaceLeft;
-        if (s[i] == '%' and i + 2 < s.len) {
+        if (s[i] == '%') {
+            if (s.len - i < 3) return error.BadUrl;
             const hi = hexVal(s[i + 1]) orelse return error.BadUrl;
             const lo = hexVal(s[i + 2]) orelse return error.BadUrl;
             out[n] = (hi << 4) | lo;
@@ -658,10 +659,11 @@ test "url codec rejects bad hex and undersized buffers" {
     // invalid escape digit after a syntactically complete %XX position
     try std.testing.expectError(error.BadUrl, urlDecode(&buf, "%zz"));
     try std.testing.expectError(error.BadUrl, urlDecode(&buf, "ok%2G"));
-    // a truncated trailing escape passes through verbatim (the caller's
-    // relOk gate still applies to the decoded result)
-    try std.testing.expectEqualStrings("100%", try urlDecode(&buf, "100%"));
-    try std.testing.expectEqualStrings("%2", try urlDecode(&buf, "%2"));
+    for ([_][]const u8{ "%", "%2", "100%", "ok%2", "%20%", "%25%2" }) |wire| {
+        try std.testing.expectError(error.BadUrl, urlDecode(&buf, wire));
+    }
+    try std.testing.expectEqualStrings("100%", try urlDecode(&buf, "100%25"));
+    try std.testing.expectEqualStrings("%2", try urlDecode(&buf, "%252"));
     // buffer too small for the decoded bytes
     try std.testing.expectError(error.NoSpaceLeft, urlDecode(buf[0..2], "abc"));
     // encode needs 3 bytes per escaped character

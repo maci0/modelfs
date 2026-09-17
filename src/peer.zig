@@ -2863,6 +2863,44 @@ test "handleConn counts a targetless request line as malformed" {
     try std.testing.expectEqual(before + 2, srv.store.stats.http_malformed.load(.monotonic));
 }
 
+test "peer paths reject incomplete percent escapes and preserve encoded percent names" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-srv-o-escape");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-srv-c-escape");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var fz: [192]u8 = undefined;
+    for ([_][]const u8{ "100%", "%2" }) |name| {
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.joinZ(&fz, origin_d, name), "weights"));
+    }
+    const srv = try TestServer.start(gpa, origin_d, cache_d, 16, "secret");
+    defer srv.stop();
+
+    for ([_][]const u8{ "have", "data" }) |route| {
+        for ([_][]const u8{ "%", "%2", "100%", "missing%2", "%20%", "%25%2" }) |path| {
+            var req_buf: [256]u8 = undefined;
+            const req = try std.fmt.bufPrint(&req_buf, "GET /{s}?path={s} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer secret\r\nRange: bytes=0-6\r\nConnection: close\r\n\r\n", .{ route, path });
+            var res = try roundTrip(srv.port(), req);
+            defer res.deinit(gpa);
+            try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", res.items);
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_ok.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), srv.store.stats.http_5xx.load(.monotonic));
+
+    for ([_][]const u8{ "100%", "%2" }) |name| {
+        const body = try fetchRange(gpa, std.testing.io, "secret", "127.0.0.1", srv.port(), name, 0, 6);
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("weights", body);
+        const have = try fetchHave(gpa, std.testing.io, "secret", "127.0.0.1", srv.port(), name);
+        defer gpa.free(have.bits);
+        try std.testing.expectEqualSlices(u8, &.{1}, have.bits);
+    }
+}
+
 test "serveHave answers with the exact cached bitfield blob" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;

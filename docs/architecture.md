@@ -341,6 +341,10 @@ empty body on errors.
 
 ### Wire parsing
 
+`path` is percent-decoded once. Every `%` must be followed by two hex digits;
+invalid or incomplete escapes return 400 on both `/have` and `/data`. Encode a
+literal `%` as `%25`. A literal `+` stays `+`; encode spaces as `%20`.
+
 A `/data` end past EOF clamps to it, and `bytes=N-` means through EOF (RFC 9110); suffix ranges
 (`bytes=-N`) are rejected. Wire integers (`Range`, `Content-Range`, `Content-Length`,
 `X-Piece-Size`) are unsigned decimal digits only: a leading sign or interior
