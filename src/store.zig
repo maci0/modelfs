@@ -2665,16 +2665,20 @@ pub const Store = struct {
         // Encode and path resolution stay outside the lock; both failures
         // bail before anything is mutated, so no hole can outlive its
         // unpersisted mark.
-        const need = loaded.bits.encodedLen();
+        const id_extra: usize = if (loaded.id.known) OriginId.encoded_len else 0;
+        const need = loaded.bits.encodedLen() + id_extra;
         const blob_mem = self.gpa.alloc(u8, need) catch {
             std.log.warn("bitfield encode failed for {s}; piece {d} stays cached", .{ rel, idx });
             return false;
         };
         defer self.gpa.free(blob_mem);
-        const blob = loaded.bits.encodeTo(self.piece_size, size, blob_mem) catch {
+        const bits_blob = loaded.bits.encodeTo(self.piece_size, size, blob_mem) catch {
             std.log.warn("bitfield encode failed for {s}; piece {d} stays cached", .{ rel, idx });
             return false;
         };
+        if (loaded.id.known)
+            loaded.id.write(blob_mem[bits_blob.len..][0..OriginId.encoded_len]);
+        const blob = blob_mem[0..need];
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
         const mp = self.cacheMetaPath(&mbuf, rel) catch {
             std.log.warn("bitfield save skipped for {s}; cache path does not fit; piece {d} stays cached", .{ rel, idx });
@@ -5361,6 +5365,51 @@ test "punchDisk punches an orphaned rel and publishes cleared bits" {
     const f = try st.get("orph.bin", pattern.len, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
     try std.testing.expect(!f.bits.get(0));
+}
+
+test "punchDisk preserves identity for surviving pieces across restart" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-pd-id");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-pd-id");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const t0: i64 = 1_000;
+    const id1 = OriginId{ .mtime_sec = 100, .mtime_nsec = 123, .ino = 7, .known = true };
+    const id2 = OriginId{ .mtime_sec = 100, .mtime_nsec = 124, .ino = 7, .known = true };
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+        const f = try st.getIdentified("kept.bin", 32, id1, t0);
+        defer st.releaseFile(f);
+        for (0..2) |i| {
+            const idx: u32 = @intCast(i);
+            try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, idx, t0)).len);
+            try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, idx, "0123456789abcdef", null, t0));
+        }
+    }
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        try std.testing.expect(st.punchDisk("kept.bin"));
+        var loaded = try st.loadBits("kept.bin", 32, id1);
+        defer loaded.bits.deinit(gpa);
+        try std.testing.expect(OriginId.eql(id1, loaded.id));
+        try std.testing.expect(!loaded.discarded);
+        try std.testing.expect(loaded.bits.get(0));
+        try std.testing.expect(!loaded.bits.get(1));
+    }
+    {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        const f = try st.getIdentified("kept.bin", 32, id2, t0);
+        defer st.releaseFile(f);
+        try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+        try std.testing.expect(OriginId.eql(id2, f.origin_id));
+    }
 }
 
 test "punchDisk reclaims a data file no sidecar vouches for" {
