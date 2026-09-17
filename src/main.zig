@@ -1449,15 +1449,6 @@ fn scrubPskEnv() void {
     }
 }
 
-/// True when the process named by pid still exists. kill(pid, 0) signals
-/// nothing; EPERM means the process exists but belongs to another user.
-/// Nonpositive or out-of-range ids name no process.
-fn pidAlive(pid: i64) bool {
-    if (pid <= 0 or pid > std.math.maxInt(i32)) return false;
-    std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |err| return err == error.PermissionDenied;
-    return true;
-}
-
 /// Only liveness fields matter here; every other status.json field is
 /// ignored (and validated by whoever consumes the full document). now_s and
 /// mono_s are optional so artifacts from older builds keep parsing: without
@@ -1515,7 +1506,7 @@ fn liveDaemon(io: std.Io, gpa: std.mem.Allocator, cache: []const u8, blob_out: *
         return error.NotLive;
     };
     defer doc.deinit();
-    if (!pidAlive(doc.value.pid)) {
+    if (!sys.pidAlive(doc.value.pid)) {
         printErr("modelfs: not running (stale status.json names exited pid {d})\n", .{doc.value.pid});
         gpa.free(blob);
         return error.NotLive;
@@ -2364,27 +2355,6 @@ fn fuzzFlagValuesOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
 test "fuzz cli flag value parsers fail loudly without wrapping or panicking" {
     try std.testing.fuzz({}, fuzzFlagValuesOne, .{ .corpus = &fuzz_argv_corpus });
-}
-
-test "pidAlive answers for live and exited processes" {
-    try std.testing.expect(pidAlive(@intCast(sys.pidSelf())));
-    // Nonpositive and out-of-range ids name no process.
-    try std.testing.expect(!pidAlive(0));
-    try std.testing.expect(!pidAlive(-5));
-    try std.testing.expect(!pidAlive(@as(i64, std.math.maxInt(i32)) + 1));
-    // A child that has been spawned AND waited on is deterministically dead:
-    // the liveness probe must answer for the process itself, not guess from
-    // the id's plausibility.
-    var child = try std.process.spawn(std.testing.io, .{
-        .argv = &.{"true"},
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .ignore,
-    });
-    const dead_pid: i64 = @intCast(child.id.?);
-    const term = try child.wait(std.testing.io);
-    try std.testing.expect(term == .exited);
-    try std.testing.expect(!pidAlive(dead_pid));
 }
 
 test "pathsOverlap matches equality and whole-component containment" {

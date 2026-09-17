@@ -119,6 +119,15 @@ pub fn pidSelf() i32 {
     return std.os.linux.getpid();
 }
 
+/// True when the process named by pid still exists. kill(pid, 0) signals
+/// nothing; EPERM means the process exists but belongs to another user.
+/// Nonpositive or out-of-range ids name no process.
+pub fn pidAlive(pid: i64) bool {
+    if (pid <= 0 or pid > std.math.maxInt(i32)) return false;
+    std.posix.kill(@intCast(pid), @enumFromInt(0)) catch |err| return err == error.PermissionDenied;
+    return true;
+}
+
 /// Sets a file's atime and mtime to `sec` (errno-style, -EIO on any
 /// failure). The sweep tests age lease artifacts past their cutoff with
 /// this instead of a raw utimensat: `Io.File.setTimestamps` is the same
@@ -1236,6 +1245,27 @@ test "connectIn succeeds against a local listener" {
     const fl = std.c.fcntl(cfd, c.F_GETFL);
     try std.testing.expect(fl >= 0);
     try std.testing.expectEqual(@as(c_int, 0), fl & c.O_NONBLOCK);
+}
+
+test "pidAlive answers for live and exited processes" {
+    try std.testing.expect(pidAlive(@intCast(pidSelf())));
+    // Nonpositive and out-of-range ids name no process.
+    try std.testing.expect(!pidAlive(0));
+    try std.testing.expect(!pidAlive(-5));
+    try std.testing.expect(!pidAlive(@as(i64, std.math.maxInt(i32)) + 1));
+    // A child that has been spawned AND waited on is deterministically dead:
+    // the liveness probe must answer for the process itself, not guess from
+    // the id's plausibility.
+    var child = try std.process.spawn(std.testing.io, .{
+        .argv = &.{"true"},
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const dead_pid: i64 = @intCast(child.id.?);
+    const term = try child.wait(std.testing.io);
+    try std.testing.expect(term == .exited);
+    try std.testing.expect(!pidAlive(dead_pid));
 }
 
 test "connectIn bounds a dead dial" {
