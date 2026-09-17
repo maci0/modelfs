@@ -212,7 +212,7 @@ pub fn decode(gpa: std.mem.Allocator, blob: []const u8) !Owned {
         .opens = try a.alloc(OpenSnap, d.opens.len),
         .next_ino = d.next_ino,
         .next_fh = d.next_fh,
-        .arena = arena,
+        .arena = undefined,
     };
     _ = std.fmt.hexToBytes(out.init, d.init) catch return error.BadInit;
     for (d.nodes, 0..) |n, i| {
@@ -227,6 +227,7 @@ pub fn decode(gpa: std.mem.Allocator, blob: []const u8) !Owned {
     for (d.seeds, 0..) |sd, i| {
         out.seeds[i] = .{ .ip = try a.dupe(u8, sd.ip), .port = sd.port, .mbps = sd.mbps };
     }
+    out.arena = arena;
     return out;
 }
 
@@ -405,6 +406,39 @@ test "handover encode/decode round-trips knobs and keeps the PSK off argv" {
     try std.testing.expectEqualStrings(psk, from_fd.psk);
     try std.testing.expectEqual(knobs.listen, from_fd.listen);
     try std.testing.expectEqual(knobs.piece, from_fd.piece);
+}
+
+test "handover decode owns arena blocks allocated for snapshot paths" {
+    const gpa = std.testing.allocator;
+    const path = [_]u8{'x'} ** 1024;
+    const nodes = [_]NodeSnap{.{ .ino = 5, .path = &path, .nlookup = 3 }} ** 32;
+    const opens = [_]OpenSnap{.{ .fh = 9, .path = &path }} ** 32;
+    const knobs = Knobs{
+        .origin = "/o",
+        .cache = "/c",
+        .id = "n",
+        .mount = "/m",
+        .piece = 4096,
+        .listen = 1,
+        .water = .{},
+        .direct_io = true,
+        .allow_other = false,
+        .fuse_fd = 3,
+        .listen_fds = &.{3},
+        .advertise = &.{},
+        .seeds = &.{},
+        .psk = "secret",
+        .nodes = &nodes,
+        .opens = &opens,
+    };
+    const blob = try encode(gpa, knobs);
+    defer gpa.free(blob);
+    var got = try decode(gpa, blob);
+    defer got.deinit();
+    try std.testing.expectEqual(nodes.len, got.nodes.len);
+    try std.testing.expectEqual(opens.len, got.opens.len);
+    for (got.nodes) |node| try std.testing.expectEqualStrings(&path, node.path);
+    for (got.opens) |open| try std.testing.expectEqualStrings(&path, open.path);
 }
 
 test "handover JSON escapes control bytes so odd argv paths still round-trip" {
