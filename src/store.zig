@@ -339,7 +339,7 @@ pub const Store = struct {
     /// silent in status.json.
     origin_io_down: std.atomic.Value(bool) = .init(false),
     mu: std.Io.Mutex = .init,
-    files: std.StringHashMap(*Cached),
+    files: std.StringHashMapUnmanaged(*Cached) = .empty,
     /// Bumped under mu after every mutation of on-disk cache artifacts
     /// (data/meta unlink or rewrite). get()'s builder loads the sidecar
     /// OUTSIDE mu; without this stamp a builder that started before a
@@ -365,7 +365,7 @@ pub const Store = struct {
         /// In-flight fill claims: piece index -> `writes` sampled at beginFill.
         /// completeFill drops a claim whose generation no longer matches, so a
         /// peer fill cannot land over bytes this node just wrote through.
-        filling: std.AutoHashMap(u32, u64),
+        filling: std.AutoHashMapUnmanaged(u32, u64) = .empty,
         cache_fd: c_int = -1,
         last_access: std.atomic.Value(i64) = .init(0),
         /// Serializes write-through pwrite+mark with completeFill pwrite+mark,
@@ -419,7 +419,7 @@ pub const Store = struct {
         /// written under file.mu; cleared on size change, forget, and
         /// distrust. Digests survive punchPiece (they are the expectation a
         /// refill must meet), so a culled piece refills verified.
-        hashes: std.AutoHashMap(u32, [piece.digest_len]u8),
+        hashes: std.AutoHashMapUnmanaged(u32, [piece.digest_len]u8) = .empty,
         /// file.size at the last manifest load attempt. null = never
         /// successfully loaded for the current size; a manifest whose
         /// recorded file_size differs from the entry's is stale and
@@ -446,8 +446,8 @@ pub const Store = struct {
         pub fn deinit(self: *Cached, gpa: std.mem.Allocator) void {
             if (self.cache_fd >= 0) sys.close(self.cache_fd);
             self.bits.deinit(gpa);
-            self.filling.deinit();
-            self.hashes.deinit();
+            self.filling.deinit(gpa);
+            self.hashes.deinit(gpa);
             gpa.free(self.rel);
             gpa.destroy(self);
         }
@@ -471,7 +471,6 @@ pub const Store = struct {
             .origin = origin,
             .cache = cache,
             .piece_size = piece_size,
-            .files = std.StringHashMap(*Cached).init(gpa),
         };
     }
 
@@ -524,7 +523,7 @@ pub const Store = struct {
             // double-freeing with it.
             if (!f.freed.swap(true, .acq_rel)) f.deinit(self.gpa);
         }
-        self.files.deinit();
+        self.files.deinit(self.gpa);
     }
 
     pub fn originPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
@@ -1059,8 +1058,6 @@ pub const Store = struct {
                     .rel = rel_own,
                     .size = file_size,
                     .bits = loaded.bits,
-                    .filling = std.AutoHashMap(u32, u64).init(self.gpa),
-                    .hashes = std.AutoHashMap(u32, [piece.digest_len]u8).init(self.gpa),
                     .last_access = .init(now_sec),
                     .origin_id = loaded.id,
                 };
@@ -1077,7 +1074,7 @@ pub const Store = struct {
                 f.deinit(self.gpa);
                 continue;
             }
-            self.files.put(f.rel, f) catch |err| {
+            self.files.put(self.gpa, f.rel, f) catch |err| {
                 self.mu.unlock(self.io);
                 f.deinit(self.gpa);
                 return err;
@@ -1279,7 +1276,7 @@ pub const Store = struct {
                     // reader's readCache gets its own stamp in.
                     file.last_access.store(now_sec, .monotonic);
                     if (hash) |h| {
-                        file.hashes.put(idx, h) catch |err| {
+                        file.hashes.put(self.gpa, idx, h) catch |err| {
                             std.log.warn("cannot record trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, idx, err });
                         };
                         file.manifest_dirty = true;
@@ -1324,7 +1321,7 @@ pub const Store = struct {
                 file.mu.unlock(self.io);
                 return .filled;
             }
-            const gop = file.filling.getOrPut(idx) catch |err| {
+            const gop = file.filling.getOrPut(self.gpa, idx) catch |err| {
                 file.mu.unlock(self.io);
                 return err;
             };
@@ -1607,9 +1604,9 @@ pub const Store = struct {
         // Reserve once: a 70 GiB file is thousands of puts, and each
         // grow would realloc the map under file.mu.
         const extra: u32 = @intCast(@min(mf.entries.len, std.math.maxInt(u32)));
-        file.hashes.ensureTotalCapacity(file.hashes.count() +| extra) catch {};
+        file.hashes.ensureTotalCapacity(self.gpa, file.hashes.count() +| extra) catch {};
         for (mf.entries) |e| {
-            const entry = file.hashes.getOrPut(e.idx) catch |err| {
+            const entry = file.hashes.getOrPut(self.gpa, e.idx) catch |err| {
                 std.log.warn("cannot load trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, e.idx, err });
                 continue;
             };
@@ -2248,7 +2245,7 @@ pub const Store = struct {
                     const in_data = piece.offset(i, self.piece_size) - off;
                     piece.digest(data[@intCast(in_data)..][0..self.piece_size], &h);
                 }
-                file.hashes.put(i, h) catch |err| {
+                file.hashes.put(self.gpa, i, h) catch |err| {
                     std.log.warn("cannot record trusted hash for {s} piece {d} ({t}); piece verifies by refill", .{ file.rel, i, err });
                 };
                 file.manifest_dirty = true;
@@ -2883,17 +2880,12 @@ test "rangeFilled is true only when every covered piece is marked" {
     defer bits.deinit(gpa);
     bits.set(0);
     bits.set(1);
-    var filling = std.AutoHashMap(u32, u64).init(gpa);
-    defer filling.deinit();
     var rel = [_]u8{ 't', '.', 'b', 'i', 'n' };
     var file = Store.Cached{
         .rel = &rel,
         .size = 64,
         .bits = bits,
-        .filling = filling,
-        .hashes = std.AutoHashMap(u32, [piece.digest_len]u8).init(gpa),
     };
-    defer file.hashes.deinit();
     const ps: u32 = 16;
     try std.testing.expect(Store.rangeFilled(&file, .{ .off = 0, .len = 16 }, 64, ps));
     try std.testing.expect(Store.rangeFilled(&file, .{ .off = 0, .len = 32 }, 64, ps));
@@ -3098,7 +3090,7 @@ test "cacheFill grow drops a hydrated short tail's mark instead of widening it" 
         f.bits.set(2);
         var h: [piece.digest_len]u8 = undefined;
         piece.digest(w1[32..40], &h);
-        try f.hashes.put(2, h);
+        try f.hashes.put(st.gpa, 2, h);
         f.mu.unlock(std.testing.io);
     }
 
@@ -5641,10 +5633,6 @@ test "considerIdle keeps a bounded oldest-first sample" {
     const gpa = std.testing.allocator;
     var dummy_bits = try piece.Bitfield.init(gpa, 1);
     defer dummy_bits.deinit(gpa);
-    var filling = std.AutoHashMap(u32, u64).init(gpa);
-    defer filling.deinit();
-    var hashes = std.AutoHashMap(u32, [piece.digest_len]u8).init(gpa);
-    defer hashes.deinit();
     var rels: [Store.idle_sample_cap + 1][8]u8 = undefined;
     var files: [Store.idle_sample_cap + 1]Store.Cached = undefined;
     var i: usize = 0;
@@ -5654,8 +5642,6 @@ test "considerIdle keeps a bounded oldest-first sample" {
             .rel = name,
             .size = 1,
             .bits = dummy_bits,
-            .filling = filling,
-            .hashes = hashes,
         };
         files[i].refs.store(1, .monotonic);
     }
@@ -6105,18 +6091,19 @@ test "disk cull refuses to cut the hole unless the cleared bits persist" {
 
 test "beginFill surfaces allocation failure instead of spinning" {
     const gpa = std.testing.allocator;
-    var st = Store.init(gpa, std.testing.io, "/unused", "/unused", 16);
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var st = Store.init(failing.allocator(), std.testing.io, "/unused", "/unused", 16);
     defer st.deinit();
     const f = try st.get("oom.bin", 64, sys.monoSec(std.testing.io));
     defer st.releaseFile(f);
 
-    // Rebind the entry's filling map to an allocator whose first allocation
-    // fails: beginFill must report the failure to its caller (which turns it
-    // into EIO/500) rather than retry forever and wedge the reader.
-    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
-    f.filling.deinit();
-    f.filling = std.AutoHashMap(u32, u64).init(failing.allocator());
+    failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, st.beginFill(f, 0, sys.monoSec(std.testing.io)));
+    try std.testing.expectEqual(@as(u32, 0), f.filling.count());
+
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(u32, 16), (try st.beginFill(f, 0, sys.monoSec(std.testing.io))).len);
+    try std.testing.expectEqual(@as(?u64, f.writes), f.filling.get(0));
 }
 
 test "beginFill answers filled and raced without claiming or marking" {

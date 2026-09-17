@@ -41,10 +41,10 @@ pub const Server = struct {
     last_method_warn_ms: std.atomic.Value(i64) = .init(0),
 
     pub fn bindAll(self: *Server, specs: []const proto.LeaseAddr) !void {
-        var seen_port: std.AutoHashMap(u16, void) = std.AutoHashMap(u16, void).init(self.gpa);
-        defer seen_port.deinit();
+        var seen_port: std.AutoHashMapUnmanaged(u16, void) = .empty;
+        defer seen_port.deinit(self.gpa);
         for (specs) |a| {
-            const entry = try seen_port.getOrPut(a.port);
+            const entry = try seen_port.getOrPut(self.gpa, a.port);
             if (entry.found_existing) continue;
             try self.bindOne("0.0.0.0", a.port);
         }
@@ -1499,10 +1499,10 @@ fn groupPathsByPeerId(gpa: std.mem.Allocator, paths: []const discover.Path) ![][
         for (groups.items) |g| gpa.free(g);
         groups.deinit(gpa);
     }
-    var group_of = std.StringHashMap(usize).init(gpa);
-    defer group_of.deinit();
+    var group_of: std.StringHashMapUnmanaged(usize) = .empty;
+    defer group_of.deinit(gpa);
     for (paths, 0..) |p, pi| {
-        const gop = try group_of.getOrPut(p.peer_id);
+        const gop = try group_of.getOrPut(gpa, p.peer_id);
         if (!gop.found_existing) {
             const g = try gpa.alloc(usize, 1);
             errdefer gpa.free(g);
@@ -1558,10 +1558,10 @@ fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catal
     }
     // peer_id -> group slot: each group's first index carries the group's
     // peer id by construction (the entry that created the group).
-    var group_of = std.StringHashMap(usize).init(gpa);
-    defer group_of.deinit();
+    var group_of: std.StringHashMapUnmanaged(usize) = .empty;
+    defer group_of.deinit(gpa);
     for (groups, 0..) |g, gi| {
-        try group_of.put(paths[g[0]].peer_id, gi);
+        try group_of.put(gpa, paths[g[0]].peer_id, gi);
     }
 
     const slots = try gpa.alloc(?bool, groups.len);
