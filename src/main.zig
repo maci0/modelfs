@@ -972,6 +972,8 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     return .{ .cmd = cmd, .opts = opts, .rest = try rest.toOwnedSlice(gpa) };
 }
 
+const max_psk_file_bytes = proto.max_psk_bytes + "\r\n".len;
+
 fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     // An empty shared secret would authenticate every "Bearer " request;
     // refuse it before any socket is bound.
@@ -999,7 +1001,7 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     const p = try sys.toZ(&z, opts.psk_file);
     var open_errno: i32 = 0;
     var file_mode: sys.c.mode_t = 0;
-    const raw = sys.readFileAllocOpenErrno(gpa, p, proto.max_psk_bytes, &open_errno, &file_mode) catch |err| switch (err) {
+    const raw = sys.readFileAllocOpenErrno(gpa, p, max_psk_file_bytes, &open_errno, &file_mode) catch |err| switch (err) {
         // Remediation output for operators, like every other usage print in
         // this file: suppressed under test so the named errors stay
         // assertable without tripping the runner's error-log counter. A
@@ -1045,6 +1047,11 @@ fn loadPsk(gpa: std.mem.Allocator, opts: Opts) ![]u8 {
     if (trimmed.len == 0) {
         if (!builtin.is_test) std.log.err("PSK at {s} is empty; refusing to serve unauthenticated", .{opts.psk_file});
         return error.EmptyPsk;
+    }
+    if (trimmed.len > proto.max_psk_bytes) {
+        if (!builtin.is_test)
+            std.log.err("PSK at {s} is longer than {d} bytes after trimming; refusing", .{ opts.psk_file, proto.max_psk_bytes });
+        return error.PskTooLarge;
     }
     return dupeHeaderSafePsk(gpa, trimmed);
 }
@@ -4362,8 +4369,6 @@ test "loadPsk refuses empty secrets and trims file contents" {
         const behind_blocker = try std.fmt.bufPrint(&qb, "{s}/x.psk", .{blocker});
         try std.testing.expectError(error.PskUnreadable, loadPsk(gpa, .{ .psk_file = behind_blocker }));
     }
-    // A PSK over the 4096-byte read cap is a read failure of an existing
-    // file (FileTooBig), equally distinct from a missing one.
     {
         var pb: [160]u8 = undefined;
         const big_psk = try std.fmt.bufPrint(&pb, "{s}/big.psk", .{scratch});
@@ -4404,6 +4409,32 @@ test "loadPsk refuses empty secrets and trims file contents" {
         defer gpa.free(psk);
         try std.testing.expectEqualStrings("secret", psk);
     }
+}
+
+test "loadPsk file and inline limits agree with newline terminated secrets" {
+    const gpa = std.testing.allocator;
+    var db: [128]u8 = undefined;
+    const scratch = try sys.scratchDir(&db, "modelfs-psk-limit");
+    defer sys.deleteTree(std.testing.io, scratch);
+    var pb: [192]u8 = undefined;
+    const path = try sys.joinZ(&pb, scratch, "key.psk");
+
+    inline for (.{ proto.max_psk_bytes - 1, proto.max_psk_bytes }) |size| {
+        inline for (.{ "", "\n", "\r\n" }) |suffix| {
+            const raw = ("k" ** size) ++ suffix;
+            try std.testing.expectEqual(@as(i32, 0), sys.writeFileOwnerOnly(path, raw));
+            const from_file = try loadPsk(gpa, .{ .psk_file = std.mem.span(path) });
+            defer gpa.free(from_file);
+            const from_env = try loadPsk(gpa, .{ .psk_value = raw });
+            defer gpa.free(from_env);
+            try std.testing.expectEqualStrings("k" ** size, from_file);
+            try std.testing.expectEqualStrings(from_env, from_file);
+        }
+    }
+    const oversized = "k" ** (proto.max_psk_bytes + 1);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileOwnerOnly(path, oversized));
+    try std.testing.expectError(error.PskTooLarge, loadPsk(gpa, .{ .psk_file = std.mem.span(path) }));
+    try std.testing.expectError(error.PskTooLarge, loadPsk(gpa, .{ .psk_value = oversized }));
 }
 
 test "loadPsk refuses line breaks but rides every other byte header-safe" {

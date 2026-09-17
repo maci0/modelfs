@@ -132,8 +132,8 @@ or inject terminal escapes. Origin-write precondition, CLI-triggered (B3).
 
 | Source | Code | Accepted |
 |---|---|---|
-| PSK file (`--psk`, default `/etc/modelfs.psk`) or `MODELFS_PSK_VALUE` | `loadPsk` src/main.zig | Up to 4096 bytes after surrounding-whitespace trim. A whitespace-only value is empty and refused; interior CR/LF is refused |
-| Hugging Face token: `HF_TOKEN`, else `$HF_HOME/token`, else `~/.cache/huggingface/token` | `loadToken` src/hf.zig | Up to 4096 bytes after the same trim; whitespace-only counts as unset. No flag carries it, and `cmdPull` disables core dumps for the run when one is loaded |
+| PSK file (`--psk`, default `/etc/modelfs.psk`) or `MODELFS_PSK_VALUE` | `loadPsk` src/main.zig | Up to 4096 bytes after surrounding-whitespace trim. Files may contain at most 4098 raw bytes, allowing a maximum-length secret with LF or CRLF. A whitespace-only value is empty and refused; interior CR/LF is refused |
+| Hugging Face token: `HF_TOKEN`, else `$HF_HOME/token`, else `~/.cache/huggingface/token` | `loadToken` src/hf.zig | Up to 4096 bytes after trimming for `HF_TOKEN`; files are capped at 4096 raw bytes, including whitespace. Whitespace-only counts as unset. No flag carries it, and `cmdPull` disables core dumps for the run when one is loaded |
 | `MODELFS_ORIGIN/CACHE/PSK/PSK_VALUE/ID/LOG` | src/main.zig | Same values as their flags; an explicit flag wins. Whitespace-trimmed (`envValue`), empty counts as unset, except a whitespace-only `MODELFS_PSK_VALUE` which is refused as empty. Any other `MODELFS_*` name is refused as a typo (`checkKnownEnv`) |
 
 ### Cache-dir artifacts read back at runtime
