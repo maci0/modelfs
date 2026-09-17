@@ -3226,7 +3226,11 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             if (!builtin.is_test) std.log.warn("corrupt piece-hash manifest {s}; skipping", .{proto.displayName(name)});
             skipped += 1;
             continue;
-        } orelse continue;
+        } orelse {
+            if (!builtin.is_test) std.log.warn("unusable piece-hash manifest {s}; skipping", .{proto.displayName(name)});
+            skipped += 1;
+            continue;
+        };
         total_pieces += m.entries.len;
         manifests.append(gpa, m) catch return 1;
         sorted.append(gpa, piece.digestSorted(gpa, m.entries) catch return 1) catch return 1;
@@ -3539,6 +3543,34 @@ test "cmdDupesAll scans the manifest store and --all is dupes-only" {
     try std.testing.expect(parsed_ok.opts.all);
     try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &env, &.{ "peers", "--all", "--origin", origin_d }));
     try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &env, &.{ "verify", "--all", "--origin", origin_d, "m.bin" }));
+}
+
+test "cmdDupesAll rejects unusable published manifests without a partial report" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var ob: [128]u8 = undefined;
+    const origin = try sys.scratchDir(&ob, "modelfs-dupes-unusable");
+    defer sys.deleteTree(io, origin);
+
+    const entries = [_]piece.ManifestEntry{.{ .idx = 0, .hash = [_]u8{0x11} ** piece.digest_len }};
+    try writeManifestForTest(gpa, origin, "good.bin", 16, 16, &entries);
+    try writeManifestForTest(gpa, origin, "bad.bin", 16, 16, &entries);
+    var store = store_mod.Store.init(gpa, io, origin, "", 16);
+    defer store.deinit();
+    var pb: [sys.c.PATH_MAX]u8 = undefined;
+    const path = try store.manifestPath(&pb, "bad.bin");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    for ([_][]const u8{ "", "MFS", "junk", "MFSM junk" }) |blob| {
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(path, blob));
+        try std.testing.expectEqual(@as(u8, 1), try cmdDupesAll(io, gpa, .{ .origin = origin }));
+        try std.testing.expectEqual(@as(usize, 0), out.items.len);
+        try std.testing.expectEqual(@as(u8, 1), try cmdDupes(io, gpa, .{ .origin = origin }, &.{ "good.bin", "bad.bin" }));
+        try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    }
 }
 
 test "cmdDupesAll ignores unpublished manifest temporaries" {
