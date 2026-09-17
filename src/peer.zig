@@ -487,7 +487,7 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
             // check has passed. Echoing it verbatim would let a PSK holder
             // forge follow-up journal lines (CR/LF) or inject terminal
             // escapes, the same class a planted lease name already cannot.
-            std.log.warn("peer http: rejected unsupported {s} from {s}", .{ discover.displayName(method), peerAddrText(peer, &abuf) });
+            std.log.warn("peer http: rejected unsupported {s} from {s}", .{ proto.displayName(method), peerAddrText(peer, &abuf) });
         }
         // RFC 9110 §15.5.5: a 405 must name the methods the resource
         // supports, so a probing client can discover the shape of the API.

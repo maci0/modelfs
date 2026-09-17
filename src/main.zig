@@ -503,13 +503,13 @@ fn parseLogLevel(s: []const u8) ?std.log.Level {
 fn takeLogLevel(source: []const u8, raw: []const u8) !std.log.Level {
     return parseLogLevel(raw) orelse {
         if (!builtin.is_test)
-            std.debug.print("{s} {s}: want err, warn, info, or debug\n", .{ source, discover.displayName(raw) });
+            std.debug.print("{s} {s}: want err, warn, info, or debug\n", .{ source, proto.displayName(raw) });
         return error.BadLogLevel;
     };
 }
 
 /// Refusal line for a MODELFS_-prefixed variable no flag answers to. The
-/// name goes through discover.displayName, never verbatim: like MODELFS_ID,
+/// name goes through proto.displayName, never verbatim: like MODELFS_ID,
 /// it arrives from whatever composed this process's environment (a systemd
 /// Environment= line, CI wrapper, remote shell), and a name holding ESC,
 /// CR/LF, or their UTF-8 C1 spellings must refuse without injecting terminal
@@ -517,7 +517,7 @@ fn takeLogLevel(source: []const u8, raw: []const u8) !std.log.Level {
 /// as the generic line; the refusal itself is the point and stays
 /// unconditional either way.
 fn unknownEnvLine(buf: []u8, name: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "unknown environment variable {s} (see 'modelfs help')\n", .{discover.displayName(name)}) catch "unknown environment variable (see 'modelfs help')\n";
+    return std.fmt.bufPrint(buf, "unknown environment variable {s} (see 'modelfs help')\n", .{proto.displayName(name)}) catch "unknown environment variable (see 'modelfs help')\n";
 }
 
 /// First unknown `MODELFS_*` name in the environment, or null. The name
@@ -621,7 +621,7 @@ fn rejectOutsideMount(cmd: []const u8, flag: []const u8) !void {
 }
 
 /// Refusal line for an --id/MODELFS_ID value failing discover.validId. The
-/// offending text goes through discover.displayName, never verbatim: the id
+/// offending text goes through proto.displayName, never verbatim: the id
 /// can arrive from the environment (a systemd Environment= line, CI wrapper,
 /// remote shell), and this is the same echo policy discover.hostname answers
 /// to -- an id holding ESC, CR/LF, or their UTF-8 C1 spellings must refuse
@@ -629,7 +629,7 @@ fn rejectOutsideMount(cmd: []const u8, flag: []const u8) !void {
 /// the staging buffer render as the generic line; the refusal itself is the
 /// point and stays unconditional either way.
 fn badIdLine(buf: []u8, id: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "--id \"{s}\": must be printable ASCII without / \\ \" or a leading dot\n", .{discover.displayName(id)}) catch "--id unusable as cluster id (see 'modelfs help')\n";
+    return std.fmt.bufPrint(buf, "--id \"{s}\": must be printable ASCII without / \\ \" or a leading dot\n", .{proto.displayName(id)}) catch "--id unusable as cluster id (see 'modelfs help')\n";
 }
 
 /// Watermark percentages: parse failures name the flag instead of surfacing
@@ -1621,18 +1621,18 @@ fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Envir
         return 2;
     };
     if (!hf.repoOk(repo)) {
-        printErr("modelfs: {s} is not a Hugging Face owner/repo id\n", .{discover.displayName(repo)});
+        printErr("modelfs: {s} is not a Hugging Face owner/repo id\n", .{proto.displayName(repo)});
         return 2;
     }
     if (!hf.revisionOk(opts.revision)) {
-        printErr("modelfs: --revision {s} is not a branch, tag, or commit\n", .{discover.displayName(opts.revision)});
+        printErr("modelfs: --revision {s} is not a branch, tag, or commit\n", .{proto.displayName(opts.revision)});
         return 2;
     }
     // Default destination is the repo id, so two models never collide and
     // the mount path reads like the model card it came from.
     const dest = opts.dest orelse repo;
     if (dest.len != 0 and (!store_mod.relOk(dest) or discover.relIsCluster(dest))) {
-        printErr("modelfs: --dest {s} is not a path under the origin\n", .{discover.displayName(dest)});
+        printErr("modelfs: --dest {s} is not a path under the origin\n", .{proto.displayName(dest)});
         return 2;
     }
 
@@ -1679,7 +1679,7 @@ fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Envir
     var report: hf.Report = .{};
     hf.pull(gpa, io, &client, origin, dest, repo, opts.revision, token, &report) catch |err| {
         printErr("modelfs: pull {s}@{s} failed ({t}) after {d} file(s); rerun to resume\n", .{
-            discover.displayName(repo), discover.displayName(opts.revision), err, report.pulled,
+            proto.displayName(repo), proto.displayName(opts.revision), err, report.pulled,
         });
         return 1;
     };
@@ -3200,17 +3200,17 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         const blob = sys.readFileAllocNoFollowOpenErrno(gpa, fp, store_mod.Store.max_manifest_bytes, &open_errno) catch |err| switch (err) {
             error.OpenFailed => {
                 if (open_errno != sys.c.ENOENT)
-                    if (!builtin.is_test) std.log.warn("manifest open failed for {s} (errno {d}); skipping", .{ discover.displayName(name), open_errno });
+                    if (!builtin.is_test) std.log.warn("manifest open failed for {s} (errno {d}); skipping", .{ proto.displayName(name), open_errno });
                 continue;
             },
             else => {
-                if (!builtin.is_test) std.log.warn("manifest read failed for {s}: {t}; skipping", .{ discover.displayName(name), err });
+                if (!builtin.is_test) std.log.warn("manifest read failed for {s}: {t}; skipping", .{ proto.displayName(name), err });
                 continue;
             },
         };
         defer gpa.free(blob);
         const m = piece.manifestDecode(gpa, blob) catch {
-            if (!builtin.is_test) std.log.warn("corrupt piece-hash manifest {s}; skipping", .{discover.displayName(name)});
+            if (!builtin.is_test) std.log.warn("corrupt piece-hash manifest {s}; skipping", .{proto.displayName(name)});
             continue;
         } orelse continue;
         total_pieces += m.entries.len;

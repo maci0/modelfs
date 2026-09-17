@@ -243,6 +243,26 @@ pub fn containsControl(s: []const u8) bool {
     return containsControlBytes(s[i..]);
 }
 
+pub fn displayName(name: []const u8) []const u8 {
+    return if (!containsControl(name)) name else "<name withheld: control bytes>";
+}
+
+test "displayName echoes printable names and withholds the rest" {
+    try std.testing.expectEqualStrings("spark1.json", displayName("spark1.json"));
+    try std.testing.expectEqualStrings("POST", displayName("POST"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("a\nb"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("FOO\nforged"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("\x7f"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{2028}ERROR forged"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{202e}gnp"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{200b}"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{fe0f}"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{ad}"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{180f}"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{1bca0}"));
+    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{e0100}"));
+}
+
 /// Any byte in `w` is C0 (< 0x20), DEL (0x7f), or non-ASCII (>= 0x80).
 fn asciiWordHasControlOrNonAscii(w: u64) bool {
     const hi: u64 = 0x8080_8080_8080_8080;

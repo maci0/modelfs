@@ -797,7 +797,7 @@ And the counters worth knowing by name:
 | `http_completed` | completed timed `/have` and `/data` handlers, regardless of reply status or send outcome; paired with `http_nanos` in status.json and used as the `http_us` denominator |
 | `httpbad` | connections whose request head never completed |
 | `httpdrop` | connections closed because all inflight slots were taken: the server refusing work under saturation |
-| `http405` | requests refused for method. The journal line is deduplicated on the same window as the 401 warn and echoes the method through `discover.displayName`, since a PSK holder picks that token |
+| `http405` | requests refused for method. The journal line is deduplicated on the same window as the 401 warn and echoes the method through `proto.displayName`, since a PSK holder picks that token |
 | `meta_err` | getattr/open/readdir origin-infrastructure failures (EIO/ESTALE/ETIMEDOUT), so an `ls` during an NFS outage does not look like a slow-but-healthy `md_us` interval |
 | `lease_err` | discovery ticks with a failed lease publish or cluster refresh; increments once even when both fail (`tickCluster` src/fuse_fs.zig) |
 

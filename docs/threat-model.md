@@ -124,7 +124,7 @@ manifests are parsed by the fuzz-covered `manifestDecode` src/piece.zig, bounded
 `Store.max_manifest_bytes` (64 MiB in src/store.zig, capping allocations for up to ~14 TiB
 files at the default 8 MiB grid) to guard against unbounded allocation from untrusted artifacts.
 
-Skip-warn paths filter manifest file names through `discover.displayName(name)` (src/main.zig),
+Skip-warn paths filter manifest file names through `proto.displayName(name)` (src/main.zig),
 matching the printable gate on lease names so crafted manifest names cannot forge journal lines
 or inject terminal escapes. Origin-write precondition, CLI-triggered (B3).
 
@@ -220,7 +220,7 @@ Controls:
   (src/discover.zig), cache data (src/store.zig), pin markers and status.json (src/sys.zig), and
   the status staging rename (src/fuse_fs.zig).
 * Control-byte filtering before any untrusted name or id is echoed to logs or terminals
-  (`printable`/`displayName` src/discover.zig), applied in `peers` output (src/main.zig) and
+  (`containsControl`/`displayName` src/proto.zig), applied in `peers` output (src/main.zig) and
   refresh/sweep logging (src/discover.zig).
 
 `--seed HOST` is a sibling control-plane input. The hostname is resolved once at mount

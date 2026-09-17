@@ -166,16 +166,6 @@ pub fn printable(s: []const u8) bool {
     return !proto.containsControl(s);
 }
 
-/// Name safe to echo into a log line: the input when printable, else a fixed
-/// placeholder. Lease file names and piece-hash manifest names come off
-/// shared NFS storage anyone with origin write access can craft, and the
-/// peer 405 journal line echoes a request-line method a PSK holder chose,
-/// so every site that logs one of those goes through here rather than
-/// re-deciding the printable gate inline.
-pub fn displayName(name: []const u8) []const u8 {
-    return if (!proto.containsControl(name)) name else "<name withheld: control bytes>";
-}
-
 /// True when s is safe to publish as this node's cluster id. The id names
 /// the lease file (<origin>/.cluster/<id>.json), is embedded verbatim as a
 /// JSON string in that document, and is echoed into logs, so it must be
@@ -243,16 +233,16 @@ pub fn walkLeases(gpa: std.mem.Allocator, origin: []const u8, visitor: anytype) 
         const blob = sys.readFileBufNoFollowOpenErrno(&lease_buf, fp, &open_errno) catch |err| switch (err) {
             error.OpenFailed => {
                 if (open_errno != c.ENOENT)
-                    std.log.warn("lease open failed for {s} (errno {d})", .{ displayName(name), open_errno });
+                    std.log.warn("lease open failed for {s} (errno {d})", .{ proto.displayName(name), open_errno });
                 continue;
             },
             else => {
-                std.log.warn("lease read failed for {s}: {t}", .{ displayName(name), err });
+                std.log.warn("lease read failed for {s}: {t}", .{ proto.displayName(name), err });
                 continue;
             },
         };
         const parsed = proto.parseLease(gpa, blob) catch {
-            std.log.warn("skipping corrupt lease {s}", .{displayName(name)});
+            std.log.warn("skipping corrupt lease {s}", .{proto.displayName(name)});
             continue;
         };
         defer parsed.deinit();
@@ -1040,11 +1030,11 @@ pub const Catalog = struct {
             const urc = sys.unlink(fp);
             if (urc != 0) {
                 if (urc != -c.ENOENT) {
-                    std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ displayName(name), -urc });
+                    std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ proto.displayName(name), -urc });
                 }
                 continue;
             }
-            std.log.info("swept stale cluster lease {s}", .{displayName(name)});
+            std.log.info("swept stale cluster lease {s}", .{proto.displayName(name)});
         }
     }
 
@@ -1295,7 +1285,7 @@ pub fn hostname(buf: []u8) []const u8 {
     if (s.len == 0 or s.len >= buf.len or !validId(s)) {
         // Same echo policy as refresh/sweepLeases: a name failing the
         // printable gate must not forge log lines or inject terminal escapes.
-        std.log.warn("hostname \"{s}\" unusable as cluster id; using \"node\"", .{displayName(s)});
+        std.log.warn("hostname \"{s}\" unusable as cluster id; using \"node\"", .{proto.displayName(s)});
         return "node";
     }
     @memcpy(buf[0..s.len], s);
@@ -1565,22 +1555,6 @@ test "printable gates lease names and ids for log echo" {
     try std.testing.expect(printable("a\u{1bc9f}"));
 }
 
-test "displayName echoes printable names and withholds the rest" {
-    try std.testing.expectEqualStrings("spark1.json", displayName("spark1.json"));
-    try std.testing.expectEqualStrings("POST", displayName("POST"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("a\nb"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("FOO\nforged"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("\x7f"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{2028}ERROR forged"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{202e}gnp"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{200b}"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{fe0f}"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{ad}"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{180f}"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{1bca0}"));
-    try std.testing.expectEqualStrings("<name withheld: control bytes>", displayName("spark1\u{e0100}"));
-}
-
 test "relIsCluster matches the lease dir by prefix, not substring" {
     try std.testing.expect(relIsCluster(cluster_dir));
     try std.testing.expect(relIsCluster(cluster_dir ++ "/spark1.json"));
@@ -1660,7 +1634,7 @@ const fuzz_id_corpus = [_][]const u8{
 /// republishes, and daemon log lines. The harness pins all three edges:
 /// validId must equal an independent restatement of its published contract
 /// (so a table or loop drift cannot self-confirm); accepted ids are always
-/// printable, so displayName echoes them verbatim; and every accepted id
+/// printable, so proto.displayName echoes them verbatim; and every accepted id
 /// survives the write/read pair publish() and refresh() perform -- embedded
 /// by formatLease, parsed back by parseLease byte-exact. Rejected ids
 /// legitimately skip that last leg (the writer never publishes them).
@@ -1675,7 +1649,7 @@ fn fuzzIdGateOne(_: void, smith: *std.testing.Smith) anyerror!void {
     }
     try std.testing.expectEqual(ref, ok);
 
-    try std.testing.expectEqual(printable(id), std.mem.eql(u8, id, displayName(id)));
+    try std.testing.expectEqual(printable(id), std.mem.eql(u8, id, proto.displayName(id)));
     if (!ok) return;
 
     var doc_buf: [512]u8 = undefined;
