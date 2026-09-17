@@ -375,6 +375,11 @@ root-reserved `f_bfree`.
 
 Culling punches piece-sized holes (default 8 MiB, `FALLOC_FL_PUNCH_HOLE`), clears that bit,
 and leaves the sparse file. The next read hydrates that piece again.
+Mount and handover startup require `--piece` to be a positive multiple of the
+cache `data/` filesystem's `statfs.f_bsize` (`validateCachePieceSize` in src/main.zig).
+Partial-block punches zero bytes without freeing their blocks; this check prevents
+sub-block or unaligned piece grids from making culling ineffective, including on
+64-KiB-block aarch64 filesystems.
 
 Live entries are LRU by last access: FUSE reads, fills, and peer `/data` transfers
 stamp `last_access`. The cull skips `pin`, files accessed in the last 10 s, pieces this node is

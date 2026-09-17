@@ -95,7 +95,7 @@ then serves it. Files already there at the listed size are skipped, so a rerun r
 | `--listen [IP:]PORT` | `18080` | peer port; the IP is ignored, binding is always all interfaces |
 | `--advertise IP[:PORT],...` | every non-loopback IPv4 except 169.254 | replaces the auto-detected list, not additive |
 | `--seed HOST[:PORT]` | none | peer to try while `.cluster` has no live lease; repeatable |
-| `--piece SIZE` | `8M` | piece size |
+| `--piece SIZE` | `8M` | piece size; positive multiple of the cache filesystem block size |
 | `--direct-io` / `--kernel-cache` | `--direct-io` | the page cache is off by default because it is UMA RAM shared with the GPU; turning it on permits mmap and can OOM |
 | `--allow-other` | off | the only way a uid other than the mounter reaches the mount; needs `user_allow_other` |
 | `--detach` / `-f` | `-f` | background after mount, or stay in the foreground |

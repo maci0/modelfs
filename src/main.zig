@@ -68,7 +68,8 @@ const usage =
     \\                        0.0.0.0 and 255.255.255.255 are refused)
     \\  --psk FILE            Shared secret file (default /etc/modelfs.psk, mode 0600)
     \\  --seed HOST[:PORT]    Peer seed while origin/.cluster has no live lease; repeatable
-    \\  --piece SIZE          Piece size (default 8M)
+    \\  --piece SIZE          Piece size (default 8M); positive multiple of the
+    \\                        cache filesystem block size
     \\  --direct-io           FUSE direct_io (default; skips kernel cache)
     \\  --kernel-cache        Allow kernel page cache (uses UMA RAM, can OOM)
     \\  --brun N              Stop culling above N% free (default 10)
@@ -1175,6 +1176,58 @@ fn buildSeeds(gpa: std.mem.Allocator, specs: []const []const u8) !SeedList {
     return out;
 }
 
+fn checkCachePieceSize(piece_size: u32, block_size: u64) !void {
+    if (piece_size == 0 or block_size == 0 or piece_size % block_size != 0)
+        return error.BadCachePieceSize;
+}
+
+fn validateCachePieceSize(cache: []const u8, piece_size: u32) !void {
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    const path = try sys.joinZ(&buf, cache, "data");
+    var fs: sys.c.struct_statfs = undefined;
+    const rc = sys.statfsNoFollow(path, &fs);
+    if (rc != 0) {
+        if (!builtin.is_test) std.log.err("cannot inspect cache filesystem {s} (errno {d})", .{ path, -rc });
+        return error.CacheStatfs;
+    }
+    const block_size = std.math.cast(u64, fs.f_bsize) orelse 0;
+    checkCachePieceSize(piece_size, block_size) catch |err| {
+        if (!builtin.is_test) std.log.err("--piece {d} must be a positive multiple of cache filesystem block size {d}", .{ piece_size, block_size });
+        return err;
+    };
+}
+
+test "cache piece size must align to the filesystem block size" {
+    try checkCachePieceSize(4096, 4096);
+    try checkCachePieceSize(65536, 65536);
+    try checkCachePieceSize(piece.default_size, 65536);
+    try std.testing.expectError(error.BadCachePieceSize, checkCachePieceSize(4096, 65536));
+    try std.testing.expectError(error.BadCachePieceSize, checkCachePieceSize(65537, 65536));
+    try std.testing.expectError(error.BadCachePieceSize, checkCachePieceSize(0, 4096));
+    try std.testing.expectError(error.BadCachePieceSize, checkCachePieceSize(4096, 0));
+    try std.testing.expectError(error.BadCachePieceSize, checkCachePieceSize(std.math.maxInt(u32), 65536));
+}
+
+test "cache piece size validation probes the data filesystem" {
+    var buf: [128]u8 = undefined;
+    const cache = try sys.scratchDir(&buf, "modelfs-cache-geometry");
+    defer sys.deleteTree(std.testing.io, cache);
+    try std.testing.expectError(error.CacheStatfs, validateCachePieceSize(cache, piece.default_size));
+
+    var store = store_mod.Store.init(std.testing.allocator, std.testing.io, "/unused", cache, piece.default_size);
+    defer store.deinit();
+    try std.testing.expectEqual(@as(i32, 0), store.ensureLayout());
+    var path_buf: [sys.c.PATH_MAX]u8 = undefined;
+    const data = try sys.joinZ(&path_buf, cache, "data");
+    var fs: sys.c.struct_statfs = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.statfsNoFollow(data, &fs));
+    const block_size = std.math.cast(u32, fs.f_bsize) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(block_size > 1);
+    try validateCachePieceSize(cache, block_size);
+    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(cache, block_size - 1));
+    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(cache, block_size + 1));
+}
+
 fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     const gpa = init.gpa;
     const origin_raw = opts.origin orelse {
@@ -1287,6 +1340,10 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         teardownMount(st);
         return 1;
     }
+    validateCachePieceSize(cache, opts.piece) catch {
+        teardownMount(st);
+        return 1;
+    };
     // One wall-clock instant for both lease steps, like every discovery tick
     // (discLoop): publish's until stamp and refresh's expiry filter decide
     // against the same sample instead of two reads drifting across startup,
@@ -1686,6 +1743,10 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
         teardownMount(st);
         return 1;
     }
+    validateCachePieceSize(owned.cache, owned.piece) catch {
+        teardownMount(st);
+        return 1;
+    };
     for (owned.listen_fds) |fd| {
         st.server.adoptListenFd(@intCast(fd)) catch |err| {
             std.log.err("adopt listen fd {d}: {t}", .{ fd, err });
