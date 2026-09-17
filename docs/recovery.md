@@ -338,7 +338,9 @@ A backup never restored is a hypothesis. Monthly, on the NAS:
 **creation time**, not name order, where hourly/daily/monthly suffixes would decide. It then:
 
 1. Clones it onto a mountpoint that is not the live export (sibling `modelfs-drill`, or
-   `MF_DRILL_CLONE_MP`). A collision with the live tree fails the drill, because that path would
+   `MF_DRILL_CLONE_MP`), explicitly setting `readonly=on`, `sharenfs=off`, and `sharesmb=off`.
+   The clone stays read-only and unshared even with `MF_DRILL_KEEP` set, regardless of inherited
+   pool properties. A collision with the live tree fails the drill, because that path would
    checksum production against itself.
 2. Diffs the restored tree against the live dataset (`MF_DRILL_LIVE` overrides that path;
    default is the dataset's mountpoint).

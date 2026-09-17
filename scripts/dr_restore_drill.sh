@@ -372,7 +372,8 @@ fi
 # clock set during a multi-minute clone would otherwise log a negative or
 # huge RTO. Suspend time counts, which is what recovery.md's RTO row wants.
 T0="$(awk '{print $1}' /proc/uptime)"
-zfs clone -o "mountpoint=${CLONE_MP_WANT}" "${SNAP}" "${CLONE}" || die "zfs clone of ${SNAP} failed"
+zfs clone -o "mountpoint=${CLONE_MP_WANT}" -o readonly=on \
+    -o sharenfs=off -o sharesmb=off "${SNAP}" "${CLONE}" || die "zfs clone of ${SNAP} failed"
 trap cleanup EXIT
 CLONE_MP="$(zfs get -H -o value mountpoint "${CLONE}")"
 if [[ "${CLONE_MP}" == "${LIVE}" ]]; then

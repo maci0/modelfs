@@ -235,6 +235,9 @@ case "${sub}" in
     clone)
         read_state
         mp="${ORIGIN_MP}"
+        read_only=""
+        share_nfs=""
+        share_smb=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -o)
@@ -243,6 +246,15 @@ case "${sub}" in
                     case "${kv}" in
                         mountpoint=*)
                             mp="${kv#mountpoint=}"
+                            ;;
+                        readonly=*)
+                            read_only="${kv#readonly=}"
+                            ;;
+                        sharenfs=*)
+                            share_nfs="${kv#sharenfs=}"
+                            ;;
+                        sharesmb=*)
+                            share_smb="${kv#sharesmb=}"
                             ;;
                         *)
                             ;;
@@ -255,6 +267,10 @@ case "${sub}" in
         done
         snap="${1-}"
         clone="${2-}"
+        if [[ "${read_only}" != on || "${share_nfs}" != off || "${share_smb}" != off ]]; then
+            echo "stub zfs: drill clone must be read-only and unshared" >&2
+            exit 1
+        fi
         [[ -n "${snap}" && -n "${clone}" ]] || exit 1
         [[ "${snap}" == "${SNAP_NAME}" ]] || exit 1
         require_fixture_path "${mp}"
