@@ -22,11 +22,11 @@ One standing exception, which is not a finding:
 
 ## The decision tree
 
-For each candidate, in order. Stop at the first answer.
+For each candidate, answer every question before choosing a verdict. A caller count or an available replacement alone does not justify an edit; name the current cost and prove the replacement preserves behavior, ownership, errors, and testability.
 
-1. **Does it need to exist at all?** One call site, no boundary crossed, no illegal state prevented, no test seam: inline it and delete the name.
-2. **Does the stdlib already have it?** `std.ArrayList`, `std.AutoHashMapUnmanaged`, `std.crypto`, `std.json`, `std.http`, `std.Io`. A hand-rolled equivalent is a finding unless a comment names what the stdlib version costs here.
-3. **Does the platform already have it?** `sendfile`, `fallocate` punch-hole, `memfd` seals, `O_NOFOLLOW`. This tree prefers a syscall to a data structure; a Zig-side reimplementation of a kernel guarantee is a finding.
+1. **Does it need to exist at all?** One call site, no boundary crossed, no illegal state prevented, no test seam: candidate for inlining, not an automatic deletion. Keep a helper that names policy or isolates resource lifetime; inline only when the caller remains understandable and no contract is lost.
+2. **Does the stdlib already have it?** Check `std.ArrayList`, `std.AutoHashMapUnmanaged`, `std.crypto`, `std.json`, `std.http`, and `std.Io` in the toolchain named by `build.zig.zon`. Compare the actual APIs and callers, including allocation, blocking, and error semantics. A missing explanatory comment is not proof of redundancy.
+3. **Does the platform already have it?** Compare `sendfile`, `fallocate` punch-hole, `memfd` seals, and `O_NOFOLLOW` with the required guarantee and supported targets. Preserve `src/sys.zig` wrappers that provide the sanctioned syscall layer (`zig-idiomatic-review.md`, house idiom 1); do not replace their callers with raw syscalls.
 4. **Is a second mechanism appearing for a job that already has one?** Two path gates, two cache-path builders, two clocks, two config formats, an alias beside a real name. **Reject.** This is the most expensive finding class here, because the copies drift silently.
 5. **Does it sit in the right layer?** Check against the map in `zig-best-practices-review.md` item A and the module table in docs/architecture.md.
 6. **Does it pay for itself?** Count real call sites, name what breaks without it, and name what it costs on the hot path.
