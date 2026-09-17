@@ -743,6 +743,17 @@ test "rename flag passthrough keeps NOREPLACE and EXCHANGE semantics" {
     var db: [128]u8 = undefined;
     const scratch = try sys.scratchDir(&db, "modelfs-rename-flags");
     defer sys.deleteTree(io, scratch);
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-rename-flags");
+    defer sys.deleteTree(io, cache_d);
+
+    var st: State = undefined;
+    st.init(std.testing.allocator, io, scratch, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    const previous_state = tls_state;
+    tls_state = &st;
+    defer tls_state = previous_state;
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
 
     var az: [192]u8 = undefined;
     var bz: [192]u8 = undefined;
@@ -756,13 +767,14 @@ test "rename flag passthrough keeps NOREPLACE and EXCHANGE semantics" {
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(b_z, "BBB"));
 
     // NOREPLACE onto an existing destination fails EEXIST; b keeps its bytes.
-    const rc = sys.renameAt2(sys.c.AT_FDCWD, a_z, sys.c.AT_FDCWD, b_z, sys.c.RENAME_NOREPLACE);
+    const rc = mf_rename("/a.bin", "/b.bin", sys.c.RENAME_NOREPLACE);
     try std.testing.expectEqual(-sys.c.EEXIST, rc);
     var rb: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("AAA", try sys.readFileBuf(&rb, a_z));
     try std.testing.expectEqualStrings("BBB", try sys.readFileBuf(&rb, b_z));
 
     // EXCHANGE swaps the two names' contents in place.
-    try std.testing.expectEqual(@as(i32, 0), sys.renameAt2(sys.c.AT_FDCWD, a_z, sys.c.AT_FDCWD, b_z, sys.c.RENAME_EXCHANGE));
+    try std.testing.expectEqual(@as(i32, 0), mf_rename("/a.bin", "/b.bin", sys.c.RENAME_EXCHANGE));
     try std.testing.expectEqualStrings("BBB", try sys.readFileBuf(&rb, a_z));
     try std.testing.expectEqualStrings("AAA", try sys.readFileBuf(&rb, b_z));
 }

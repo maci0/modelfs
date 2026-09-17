@@ -1018,6 +1018,10 @@ test "decode masks pad bits past nbits" {
     try std.testing.expectEqual(@as(u32, 2), bf2.filled());
     try std.testing.expect(bf2.get(0));
     try std.testing.expect(bf2.get(9));
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, bf2.bytes);
+    var normalized_buf: [256]u8 = undefined;
+    const normalized = try bf2.encodeTo(4096, 40960, &normalized_buf);
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02 }, normalized[16..]);
 }
 
 test "stale bitfield size resets" {
