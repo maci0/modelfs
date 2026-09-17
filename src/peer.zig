@@ -1045,6 +1045,8 @@ fn reply(fd: c_int, s: []const u8) void {
 fn replyStatus(self: *Server, fd: c_int, status: []const u8) void {
     if (status.len >= 3 and status[0] == '5')
         _ = self.store.stats.http_5xx.fetchAdd(1, .monotonic);
+    if (std.mem.eql(u8, status, "400 Bad Request"))
+        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
     var buf: [96]u8 = undefined;
     const res = std.fmt.bufPrint(&buf, "HTTP/1.1 {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{status}) catch return;
     reply(fd, res);
@@ -4567,7 +4569,7 @@ fn serveConnCheck(head: []const u8) anyerror!void {
     const got = rbuf[0..got_len];
 
     try std.testing.expectEqual(
-        @as(u64, @intFromBool(want == .dropped)),
+        @as(u64, @intFromBool(want == .dropped or want == .bad_path or want == .bad_range)),
         st.stats.http_malformed.load(.monotonic) - malformed_before,
     );
     try std.testing.expectEqual(
@@ -4844,7 +4846,7 @@ fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
     const got = rbuf[0..got_len];
 
     try std.testing.expectEqual(
-        @as(u64, @intFromBool(want == .dropped)),
+        @as(u64, @intFromBool(want == .dropped or want == .bad_path or want == .bad_range)),
         f.st.stats.http_malformed.load(.monotonic) - malformed_before,
     );
     try std.testing.expectEqual(
