@@ -549,37 +549,49 @@ pub fn chmod(path: [*:0]const u8, mode: c.mode_t) i32 {
         close(fd);
         return lk;
     }
-    var rc = c.fchmodat(fd, "", mode, c.AT_EMPTY_PATH);
+    const rc = c.fchmodat(fd, "", mode, c.AT_EMPTY_PATH);
     if (rc != 0) {
         const e0: i32 = negErrno();
-        // fchmodat(AT_EMPTY_PATH) needs the fchmodat2 syscall (kernel 6.6+)
-        // or a new-enough libc; older stacks answer EINVAL/ENOSYS. Reopen
-        // through /proc/self/fd -- its magic link is ours to follow -- and
-        // fchmod the file itself, which works everywhere. Any other errno
-        // (EACCES, EROFS, ...) is the real answer and returns as-is, as do
-        // fallback failures: the platform's own errno, never a fake one.
         if (e0 != -c.EINVAL and e0 != -c.ENOSYS) {
             close(fd);
             return e0;
         }
-        var pbuf: [32]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pbuf, "/proc/self/fd/{d}", .{fd}) catch {
-            close(fd);
-            return e0;
-        };
-        const rfd = open(p, c.O_RDONLY | c.O_NONBLOCK, 0);
-        if (rfd < 0) {
-            close(fd);
-            return e0;
-        }
-        rc = c.fchmod(rfd, mode);
-        const e1: i32 = if (rc != 0) negErrno() else 0;
-        close(rfd);
+        const result = chmodViaProc(fd, mode);
         close(fd);
-        return e1;
+        return result;
     }
     close(fd);
     return 0;
+}
+
+fn chmodViaProc(fd: c_int, mode: c.mode_t) i32 {
+    var pbuf: [32]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&pbuf, "/proc/self/fd/{d}", .{fd}) catch unreachable;
+    if (c.chmod(p, mode) != 0) return negErrno();
+    return 0;
+}
+
+test "chmod proc fallback restores permissions without read access" {
+    var db: [128]u8 = undefined;
+    const scratch = try scratchDir(&db, "modelfs-chmod-proc");
+    defer deleteTree(std.testing.io, scratch);
+
+    var pbuf: [192]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&pbuf, "{s}/file", .{scratch});
+    try std.testing.expectEqual(@as(i32, 0), writeFile(path, "contents"));
+    const fd = open(path, c.O_PATH | c.O_NOFOLLOW, 0);
+    try std.testing.expect(fd >= 0);
+    defer close(fd);
+
+    try std.testing.expectEqual(@as(i32, 0), chmodViaProc(fd, 0o000));
+    var st: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), fstat(fd, &st));
+    try std.testing.expectEqual(@as(c.mode_t, 0o000), st.st_mode & 0o777);
+    try std.testing.expectEqual(@as(i32, 0), chmodViaProc(fd, 0o640));
+    try std.testing.expectEqual(@as(i32, 0), fstat(fd, &st));
+    try std.testing.expectEqual(@as(c.mode_t, 0o640), st.st_mode & 0o777);
+    var bytes: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("contents", try readFileBuf(&bytes, path));
 }
 
 /// opendir(3) without following a final symlink. O_NOFOLLOW (not O_PATH: that
