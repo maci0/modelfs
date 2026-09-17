@@ -333,7 +333,7 @@ empty body on errors.
 |---|---|
 | 200 | `/ping` (`text/plain`, body `ok`) or `/have` (`application/octet-stream` bitmap + `X-Piece-Size`) |
 | 206 | `/data` partial content (`Content-Range`, `application/octet-stream`) |
-| 400 | Authenticated GET with an empty target, missing or invalid HTTP version, or extra request-line tokens; missing, empty, undecodable, or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; missing, malformed, or inverted (`end < start`) `Range` on `/data` |
+| 400 | Authenticated GET with an empty target, missing or invalid HTTP version, or extra request-line tokens; missing, empty, undecodable, or unsafe (`..`, absolute) `path`, or a `path` too long to name any file under the origin root; a request `Content-Length` that is not unsigned decimal digits (RFC 9110 `1*DIGIT`); missing, malformed, or inverted (`end < start`) `Range` on `/data` |
 | 401 | Missing or wrong bearer token (`WWW-Authenticate: Bearer`), including on non-GET |
 | 404 | Unknown path, a `.cluster` control path, or the origin has no regular file at `path` |
 | 405 | Authenticated request whose method is not GET (`Allow: GET`) |
