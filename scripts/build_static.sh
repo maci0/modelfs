@@ -95,6 +95,6 @@ fi
 size="$(stat -c%s "${bin}")"
 echo "static binary: ${bin} (${size} bytes)"
 if [[ -n "${prefix}" ]]; then
-    cp "${bin}" "${prefix}/modelfs-${arch}-linux-musl"
+    cp -T --remove-destination -- "${bin}" "${prefix}/modelfs-${arch}-linux-musl"
     echo "release artifact: ${prefix}/modelfs-${arch}-linux-musl"
 fi
