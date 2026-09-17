@@ -2263,8 +2263,11 @@ pub const Store = struct {
                 file.manifest_dirty = true;
             }
             i = span.start;
+            while (i < @min(span.end, cov.start)) : (i += 1) {
+                if (file.hashes.remove(i)) file.manifest_dirty = true;
+            }
+            i = @max(span.start, cov.end);
             while (i < span.end) : (i += 1) {
-                if (i >= cov.start and i < cov.end) continue;
                 if (file.hashes.remove(i)) file.manifest_dirty = true;
             }
         } else {
@@ -6790,6 +6793,58 @@ test "copyIntoCache records fully covered piece digests and drops boundary ones"
     piece.digest("0123456789abcdef", &h0);
     try std.testing.expectEqualSlices(u8, &h0, &st.expectedHash(f, 0, 0).?);
     try std.testing.expect(st.expectedHash(f, 1, 0) == null);
+}
+
+test "copyIntoCache only drops partially overwritten boundary hashes" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-boundary");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-boundary");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+    const initial = [_]u8{'a'} ** 256;
+    const patch = [_]u8{'b'} ** 256;
+    const f = try st.get("boundary.bin", initial.len, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    const ranges = [_]struct { off: usize, len: usize }{
+        .{ .off = 0, .len = 192 },
+        .{ .off = 8, .len = 192 },
+        .{ .off = 16, .len = 192 },
+        .{ .off = 15, .len = 2 },
+        .{ .off = 17, .len = 3 },
+        .{ .off = 16, .len = 0 },
+        .{ .off = 248, .len = 8 },
+    };
+    for (ranges) |range| {
+        try std.testing.expect(st.copyIntoCache(f, 0, &initial));
+        const generation = f.writes;
+        try std.testing.expect(st.copyIntoCache(f, range.off, patch[0..range.len]));
+        try std.testing.expectEqual(generation + 1, f.writes);
+        var expected = initial;
+        @memcpy(expected[range.off..][0..range.len], patch[0..range.len]);
+        var actual: [initial.len]u8 = undefined;
+        try std.testing.expectEqual(@as(isize, actual.len), st.readCache(f, &actual, 0, sys.monoSec(std.testing.io)));
+        try std.testing.expectEqualSlices(u8, &expected, &actual);
+        for (0..initial.len / 16) |i| {
+            const start = i * 16;
+            const end = start + 16;
+            const overlaps = range.len != 0 and start < range.off + range.len and end > range.off;
+            const covered = start >= range.off and end <= range.off + range.len;
+            if (overlaps and !covered) {
+                try std.testing.expect(st.expectedHash(f, @intCast(i), 0) == null);
+            } else {
+                var h: [piece.digest_len]u8 = undefined;
+                piece.digest(expected[start..end], &h);
+                try std.testing.expectEqualSlices(u8, &h, &st.expectedHash(f, @intCast(i), 0).?);
+            }
+            try std.testing.expect(st.hasPiece(f, @intCast(i), sys.monoSec(std.testing.io)));
+        }
+    }
 }
 
 test "copyIntoCache preserves matching prefixes and updates changed or missing hashes" {
