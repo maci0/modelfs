@@ -1234,7 +1234,8 @@ pub fn localIpv4(gpa: std.mem.Allocator) ![][]const u8 {
             }
         }
         if (dup) continue;
-        try list.append(gpa, try gpa.dupe(u8, span));
+        try list.ensureUnusedCapacity(gpa, 1);
+        list.appendAssumeCapacity(try gpa.dupe(u8, span));
     }
     // getifaddrs enumeration order varies across reboots and machines;
     // hopsBetween takes the min so order is already irrelevant there, but
@@ -1912,6 +1913,22 @@ test "localIpv4 returns only advertiseable sorted deduped addresses" {
             try std.testing.expect(!std.mem.eql(u8, ip, later));
         }
     }
+}
+
+test "localIpv4 releases addresses on allocation failure" {
+    const Runner = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const ips = localIpv4(gpa) catch |err| switch (err) {
+                error.Ifaddrs => return error.SkipZigTest,
+                else => return err,
+            };
+            defer {
+                for (ips) |ip| gpa.free(ip);
+                gpa.free(ips);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "isDialableHost refuses unspecified and limited broadcast" {
