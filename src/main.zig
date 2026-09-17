@@ -708,9 +708,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // documented set is refused like any other malformed knob: silently
     // keeping the default would leave the operator believing verbosity
     // changed. --log overwrites this below (explicit flag wins).
-    if (envValue(environ, "MODELFS_LOG")) |v| {
-        opts.log_level = try takeLogLevel("MODELFS_LOG", v);
-    }
+    var log_set = false;
     // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin/unpin
     // never read the id, so an ambient shell-wide variable must neither leak
     // into them nor fail them with BadId the way the explicit flag is
@@ -752,6 +750,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         if (std.mem.eql(u8, flag, "--log")) {
             const raw = try takeValue(args, flag, &i, inline_val);
             opts.log_level = try takeLogLevel(flag, raw);
+            log_set = true;
         } else if (std.mem.eql(u8, flag, "--origin")) {
             opts.origin = try takeValue(args, flag, &i, inline_val);
         } else if (std.mem.eql(u8, flag, "--cache")) {
@@ -900,6 +899,11 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             return error.UnknownFlag;
         } else {
             try rest.append(gpa, a);
+        }
+    }
+    if (!log_set) {
+        if (envValue(environ, "MODELFS_LOG")) |v| {
+            opts.log_level = try takeLogLevel("MODELFS_LOG", v);
         }
     }
     // Flag and env sources share one gate: an empty id makes this node
@@ -3790,6 +3794,26 @@ test "parseArgs --log wins over MODELFS_LOG on every command" {
     try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{ "peers", "--log", "" }));
     try std.testing.expectError(error.BadLogLevel, takeLogLevel("--log", "err\x1b[31m"));
     try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "unpin", "--log" }));
+}
+
+test "parseArgs explicit log overrides an invalid environment default" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("MODELFS_LOG", "verbose");
+    for ([_][]const u8{ "mount", "status", "peers", "pin", "unpin", "verify", "dupes", "pull", "update" }) |cmd| {
+        try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{cmd}));
+        for ([_][]const []const u8{
+            &.{ cmd, "--log", "err" },
+            &.{ cmd, "--log=err" },
+        }) |args| {
+            const parsed = try parseArgs(gpa, &environ, args);
+            defer freeParsed(parsed, gpa);
+            try std.testing.expectEqual(std.log.Level.err, parsed.opts.log_level);
+        }
+        try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{ cmd, "--log=invalid" }));
+        try std.testing.expectError(error.BadLogLevel, parseArgs(gpa, &environ, &.{ cmd, "--", "--log=err" }));
+    }
 }
 
 test "parseArgs refuses unknown commands before flag scanning" {
