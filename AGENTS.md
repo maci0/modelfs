@@ -19,6 +19,9 @@ respects this tree's layout, gates, and constraints.
 ## Gates
 
 `./scripts/check.sh` is the blocking gate. **Never loosen a gate to pass it.**
+If prerequisites such as `.venv/bin` are unavailable, or session restrictions
+prevent running the gate, stop verification and state the blocker; do not claim
+it passed or bypass those restrictions to install tools or run commands.
 It runs:
 
 - `zig fmt --check`, and `zig build test`
