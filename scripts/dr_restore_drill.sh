@@ -433,7 +433,9 @@ pick_sample() {
         die "find failed under ${CLONE_MP}"
     sort -z -nr -o "${CANDIDATES}" "${CANDIDATES}.raw" || die "sort of sample candidates failed"
     rm -f "${CANDIDATES}.raw"
-    while IFS=$'\t' read -r -d '' sz f; do
+    while IFS= read -r -d '' candidate; do
+        sz="${candidate%%$'\t'*}"
+        f="${candidate#*$'\t'}"
         [[ -n "${f}" ]] || continue
         SAMPLE_LIVE_SZ="$(stat -c %s "${LIVE}${f#"${CLONE_MP}"}" 2>/dev/null || echo -1)"
         if [[ "${sz}" == "${SAMPLE_LIVE_SZ}" && "${sz}" -gt 0 ]]; then

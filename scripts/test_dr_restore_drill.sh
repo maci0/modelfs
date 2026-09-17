@@ -478,6 +478,15 @@ else
     fail "sampler did not pick small.bin: $(cat "${LOG7}" 2>/dev/null || true)"
 fi
 
+LIVE_NAMES="${TEMP}/live-names"
+SNAP_NAMES="${TEMP}/snap-names"
+mkdir -p "${LIVE_NAMES}/gguf" "${SNAP_NAMES}/gguf"
+SAMPLE_NAME=$'model.gguf\t'
+printf 'stable-bytes' >"${SNAP_NAMES}/gguf/${SAMPLE_NAME}"
+cp -a "${SNAP_NAMES}/gguf/${SAMPLE_NAME}" "${LIVE_NAMES}/gguf/${SAMPLE_NAME}"
+write_env tank/models "${LIVE_NAMES}" tank/models@names "${FRESH}" "${SNAP_NAMES}"
+expect_ok "sampler preserves a trailing tab in a filename" "${LIVE_NAMES}" "${TEMP}/names.log"
+
 # --- 8. clone mountpoint colliding with live is refused before clone
 LIVE8="${TEMP}/live8"
 SNAP8="${TEMP}/snap8"
