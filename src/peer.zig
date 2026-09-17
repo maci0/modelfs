@@ -1391,6 +1391,12 @@ fn probeWorker(ctx: *ProbeCtx) void {
                 continue;
             };
             defer ctx.gpa.free(rep.bits);
+            if (rep.piece_size != 0 and rep.piece_size != ctx.local_piece_size) {
+                if (ctx.stats) |s| _ = s.probe_err.fetchAdd(1, .monotonic);
+                if (ctx.cat.noteProbeDown(p.ip, p.port))
+                    std.log.warn("peer {s}:{d} /have grid mismatch for {s}: {d}, expected {d}; trying next path", .{ p.ip, p.port, ctx.rel, rep.piece_size, ctx.local_piece_size });
+                continue;
+            }
             if (ctx.cat.clearProbeDown(p.ip, p.port))
                 std.log.info("peer {s}:{d} /have probe recovered", .{ p.ip, p.port });
             ctx.cat.havePut(ctx.rel, p.ip, p.port, rep.bits, rep.piece_size, ctx.now_ms);
@@ -3808,6 +3814,9 @@ test "fillFromPeers counts failed /have probes but not healthy misses" {
 
 test "fillFromPeers excludes peers whose advertised piece size differs" {
     const gpa = std.testing.allocator;
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
     var ob: [128]u8 = undefined;
     const origin_d = try sys.scratchDir(&ob, "modelfs-ffp-o-grid");
     defer sys.deleteTree(std.testing.io, origin_d);
@@ -3858,13 +3867,19 @@ test "fillFromPeers excludes peers whose advertised piece size differs" {
     });
 
     var out: [16]u8 = undefined;
-    try fillFromPeers(gpa, "secret", &cat, "grid.bin", 0, 16, &out, null);
+    var stats: store_mod.Stats = .{};
+    try fillFromPeers(gpa, "secret", &cat, "grid.bin", 0, 16, &out, &stats);
     try std.testing.expectEqualSlices(u8, &pattern, &out);
+    try std.testing.expectEqual(@as(u64, 1), stats.probe_err.load(.monotonic));
+    try std.testing.expectEqual(@as(?bool, null), cat.haveHas("grid.bin", "127.0.0.1", srv_mis.port(), 0, 16, sys.monoMs(cat.io)));
+    try std.testing.expectEqual(@as(?bool, true), cat.haveHas("grid.bin", "127.0.0.1", srv_ok.port(), 0, 16, sys.monoMs(cat.io)));
 
     // With only the misaligned holder listed, nothing may answer at all:
     // NoPeer surfaces and the caller falls through to the origin tier.
     _ = cat.paths.pop();
-    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "grid.bin", 0, 16, &out, null));
+    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "grid.bin", 0, 16, &out, &stats));
+    try std.testing.expectEqual(@as(u64, 2), stats.probe_err.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), stats.fill_err_peer.load(.monotonic));
 }
 
 const seed_reply_ok = fuzzcorpus.entry("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nX-Piece-Size: 4096\r\nConnection: close\r\n\r\nabc");
