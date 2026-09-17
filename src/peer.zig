@@ -3999,6 +3999,7 @@ const fuzz_reply_corpus = [_][]const u8{
 /// deterministic stand-in for the peer side of the response parsers. False
 /// when the pair could not be created or the bytes could not be staged.
 fn stageWire(wire: []const u8, out: *[2]c_int) bool {
+    out.* = .{ -1, -1 };
     if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, out) != 0) return false;
     const staged = sys.writeAll(out[0], wire) == @as(isize, @intCast(wire.len));
     sys.close(out[0]);
@@ -4497,6 +4498,7 @@ fn serveConnCheck(head: []const u8) anyerror!void {
     _ = srv.http_inflight.fetchAdd(1, .monotonic);
 
     handleConn(&srv, fds[1], std.mem.zeroes(c.struct_sockaddr_in));
+    fds[1] = -1;
 
     var rbuf: [512]u8 = undefined;
     var got_len: usize = 0;
@@ -4773,6 +4775,7 @@ fn serveDataCheck(f: *DataFixture, head: []const u8) anyerror!void {
     _ = f.srv.http_inflight.fetchAdd(1, .monotonic);
 
     handleConn(&f.srv, fds[1], std.mem.zeroes(c.struct_sockaddr_in));
+    fds[1] = -1;
 
     var rbuf: [2048]u8 = undefined;
     var got_len: usize = 0;
@@ -5042,6 +5045,7 @@ fn stageRequest(srv: *Server, head: []const u8, rbuf: []u8) ![]u8 {
     defer std.testing.log_level = prev_log_level;
     _ = srv.http_inflight.fetchAdd(1, .monotonic);
     handleConn(srv, fds[1], std.mem.zeroes(c.struct_sockaddr_in));
+    fds[1] = -1;
     var got_len: usize = 0;
     while (got_len < rbuf.len) {
         const r = c.recv(fds[0], &rbuf[got_len], rbuf.len - got_len, c.MSG_DONTWAIT);
