@@ -1038,6 +1038,7 @@ const seed_codec_raw_bytes = codecEntry("raw \xff\xfe.bin", "a+b%20c");
 const seed_codec_control = codecEntry("\x00\x1b\x7f", "%41%4");
 const seed_codec_empty = codecEntry("", "");
 const seed_codec_escapes_only = codecEntry("%%%", "%25%25%25");
+const seed_codec_expanded_utf8 = codecEntry("model.bin", "权" ** 30);
 
 const fuzz_codec_corpus = [_][]const u8{
     &seed_codec_plain,
@@ -1047,6 +1048,7 @@ const fuzz_codec_corpus = [_][]const u8{
     &seed_codec_control,
     &seed_codec_empty,
     &seed_codec_escapes_only,
+    &seed_codec_expanded_utf8,
 };
 
 /// Asserts the codec contract from both ends of the trust boundary: the
@@ -1097,7 +1099,7 @@ fn fuzzUrlCodecOne(_: void, smith: *std.testing.Smith) anyerror!void {
     var reenc_buf: [enc_buf.len]u8 = undefined;
     const re_enc = try urlEncode(&reenc_buf, got);
     var again_buf: [256]u8 = undefined;
-    const again = try urlDecode(again_buf[0..re_enc.len], re_enc);
+    const again = try urlDecode(again_buf[0..got.len], re_enc);
     try std.testing.expectEqualStrings(got, again);
 }
 
