@@ -113,7 +113,9 @@ elif [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib.sh" ]]; then
 else
     SCRATCH_DIR="/var/tmp/modelfs-drill"
 fi
-mkdir -p "${SCRATCH_DIR}" || die "cannot create scratch dir ${SCRATCH_DIR}"
+if [[ "${AGE_ONLY}" -eq 0 ]]; then
+    mkdir -p "${SCRATCH_DIR}" || die "cannot create scratch dir ${SCRATCH_DIR}"
+fi
 command -v zfs >/dev/null 2>&1 || die "zfs not found; this drill runs on the NAS"
 # GNU findutils/coreutils are required for the sampler below: find -printf,
 # sort -z, and stat -c are not in BusyBox/BSD. This host (Rocky/RHEL NAS)

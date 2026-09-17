@@ -803,6 +803,15 @@ cp -a "${SNAP15}/gguf/m.gguf" "${LIVE15}/gguf/m.gguf"
 LOG15="${TEMP}/drill15.log"
 write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
 expect_age_ok "age-only succeeds on a fresh snapshot" "${LIVE15}" "${LOG15}"
+AGE_SCRATCH="${TEMP}/age-only-unused"
+expect_age_ok "age-only does not create scratch" "${LIVE15}" "${LOG15}" \
+    MF_DRILL_SCRATCH="${AGE_SCRATCH}"
+if [[ -e "${AGE_SCRATCH}" ]]; then
+    fail "age-only created an unused scratch directory"
+fi
+printf 'not a directory\n' >"${TEMP}/scratch-blocker"
+expect_age_ok "age-only does not require writable scratch" "${LIVE15}" "${LOG15}" \
+    MF_DRILL_SCRATCH="${TEMP}/scratch-blocker/unused"
 if [[ -f "${STUB_STATE}/clone" ]]; then
     fail "age-only left a clone dataset behind"
 else
