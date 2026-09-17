@@ -20,7 +20,8 @@ EOF
 
 unset MF_DRILL_LOG_MAX_AGE MF_NAS_DEST MF_OFFSITE_DATASET MF_OFFSITE_MAX_AGE \
     MF_RESTORE_FROM MF_RESTORE_LOCAL_FROM MF_RESTORE_MOUNTPOINT \
-    MF_RESTORE_SHARENFS MF_RESTORE_LOG CHILD_DS CHILD_SNAP CHILD_CREATION
+    MF_RESTORE_SHARENFS MF_RESTORE_LOG CHILD_DS CHILD_SNAP CHILD_CREATION \
+    MF_STUB_CLONE_RACE
 
 mkdir -p "${SCRATCH_DIR}"
 
@@ -257,6 +258,13 @@ case "${sub}" in
         [[ -n "${snap}" && -n "${clone}" ]] || exit 1
         [[ "${snap}" == "${SNAP_NAME}" ]] || exit 1
         require_fixture_path "${mp}"
+        if [[ "${MF_STUB_CLONE_RACE:-0}" -eq 1 ]]; then
+            mkdir -p "${mp}"
+            printf 'concurrent recovery\n' >"${mp}/keepme"
+            write_clone "${clone}" "${mp}" no
+            exit 1
+        fi
+        [[ ! -f "${STATE}/clone" ]] || exit 1
         mkdir -p "${mp}"
         if [[ -d "${SNAP_TREE}" ]]; then
             cp -a "${SNAP_TREE}/." "${mp}/"
@@ -445,10 +453,17 @@ if [[ -f "${STUB_STATE}/clone" && ! -s "${LOG_CLEANUP}" ]]; then
 else
     fail "failed cleanup lost the clone or published success"
 fi
-expect_fail "retry after failed cleanup preserves the mounted clone" "already exists and is mounted" \
+expect_fail "retry after failed cleanup preserves the mounted clone" "already exists" \
     "${LIVE1}" "${LOG_CLEANUP}"
 zfs unmount tank/drill
-expect_ok "retry recovers after the leftover clone is unmounted" "${LIVE1}" "${LOG_CLEANUP}"
+expect_fail "retry preserves an unmounted leftover clone" "already exists" "${LIVE1}" "${LOG_CLEANUP}"
+if [[ -f "${STUB_STATE}/clone" && ! -s "${LOG_CLEANUP}" ]]; then
+    pass "unmounted leftover survives without publishing success"
+else
+    fail "retry deleted an unmounted dataset or published success"
+fi
+zfs destroy tank/drill
+expect_ok "retry recovers after explicit leftover removal" "${LIVE1}" "${LOG_CLEANUP}"
 LOG_LINES="$(wc -l <"${LOG_CLEANUP}")"
 if [[ ! -f "${STUB_STATE}/clone" && "${LOG_LINES}" -eq 1 ]]; then
     pass "cleanup recovery publishes only the completed retry"
@@ -630,8 +645,33 @@ cp -a "${SNAP12}/gguf/m.gguf" "${LIVE12}/gguf/m.gguf"
 LOG12="${TEMP}/drill12.log"
 write_env tank/models "${LIVE12}" tank/models@ok "${FRESH}" "${SNAP12}"
 printf 'CLONE_NAME=%q\nCLONE_MP=%q\nCLONE_MOUNTED=%q\n' tank/drill "${TEMP}/leftover" yes >"${STUB_STATE}/clone"
-expect_fail "mounted leftover clone is refused" "already exists and is mounted" \
+expect_fail "mounted leftover clone is refused" "already exists" \
     "${LIVE12}" "${LOG12}"
+rm -f "${STUB_STATE}/clone"
+
+LEFTOVER="${TEMP}/unrelated-dataset"
+mkdir -p "${LEFTOVER}"
+printf 'recovery copy\n' >"${LEFTOVER}/keepme"
+printf 'CLONE_NAME=%q\nCLONE_MP=%q\nCLONE_MOUNTED=%q\n' tank/drill "${LEFTOVER}" no >"${STUB_STATE}/clone"
+expect_fail "unrelated unmounted dataset is refused" "already exists" "${LIVE12}" "${LOG12}"
+if [[ -f "${STUB_STATE}/clone" && -f "${LEFTOVER}/keepme" && ! -s "${LOG12}" ]] &&
+    [[ "$(<"${LEFTOVER}/keepme")" == "recovery copy" ]]; then
+    pass "unrelated dataset and its recovery file survive the drill"
+else
+    fail "drill modified an unrelated dataset or published success"
+fi
+rm -f "${STUB_STATE}/clone"
+
+RACE_MP="${TEMP}/concurrent-dataset"
+RACE_LOG="${TEMP}/concurrent.log"
+expect_fail "clone collision is an alarm" "zfs clone of" "${LIVE12}" "${RACE_LOG}" \
+    MF_STUB_CLONE_RACE=1 MF_DRILL_CLONE_MP="${RACE_MP}"
+if [[ -f "${STUB_STATE}/clone" && -f "${RACE_MP}/keepme" && ! -s "${RACE_LOG}" ]] &&
+    [[ "$(<"${RACE_MP}/keepme")" == "concurrent recovery" ]]; then
+    pass "failed clone leaves the concurrent dataset untouched"
+else
+    fail "failed clone removed a dataset it did not create"
+fi
 rm -f "${STUB_STATE}/clone"
 
 # --- 13. unwritable artifact log fails before clone

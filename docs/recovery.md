@@ -290,9 +290,10 @@ A backup never restored is a hypothesis. Monthly, on the NAS:
 2. Diffs the restored tree against the live dataset (`MF_DRILL_LIVE` overrides that path;
    default is the dataset's mountpoint).
 3. Checksums one size-stable file on both sides.
-4. Removes the clone unless `MF_DRILL_KEEP` is set. Cleanup failure exits nonzero without
-   appending a success log line. A mounted leftover must be inspected and unmounted before
-   rerunning; an unmounted leftover is removed by the next run.
+4. Removes only a clone successfully created by this invocation, unless `MF_DRILL_KEEP` is
+   set. Cleanup failure exits nonzero without appending a success log line. Any pre-existing
+   sibling `drill` dataset is refused, mounted or not: inspect it and remove it explicitly
+   before rerunning. A failed clone command never triggers dataset deletion.
 5. Appends the log line that proves the drill ran.
 
 `.cluster` leases and the `.zfs` snapdir are skipped in the file count, the diff, and the

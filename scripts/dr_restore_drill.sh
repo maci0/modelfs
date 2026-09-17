@@ -314,15 +314,8 @@ if [[ "${PARENT}" == "${DATASET}" ]]; then
 fi
 CLONE="${PARENT}/drill"
 
-# A clone left over from a crashed run must go before we can reuse the name;
-# refuse to destroy one that is still mounted, because that inspection is
-# somebody's open investigation.
 if zfs list -H -o name "${CLONE}" >/dev/null 2>&1; then
-    CLONE_MOUNTED="$(zfs get -H -o value mounted "${CLONE}")"
-    if [[ "${CLONE_MOUNTED}" == "yes" ]]; then
-        die "${CLONE} already exists and is mounted; inspect and destroy it first"
-    fi
-    zfs destroy "${CLONE}" || die "stale ${CLONE} exists and could not be destroyed"
+    die "${CLONE} already exists; inspect and remove it explicitly before rerunning"
 fi
 
 cleanup() {
@@ -338,7 +331,6 @@ cleanup() {
         fi
     fi
 }
-trap cleanup EXIT
 
 LIVE="${MF_DRILL_LIVE:-$(zfs get -H -o value mountpoint "${DATASET}")}"
 case "${LIVE}" in
@@ -376,6 +368,7 @@ fi
 # huge RTO. Suspend time counts, which is what recovery.md's RTO row wants.
 T0="$(awk '{print $1}' /proc/uptime)"
 zfs clone -o "mountpoint=${CLONE_MP_WANT}" "${SNAP}" "${CLONE}" || die "zfs clone of ${SNAP} failed"
+trap cleanup EXIT
 CLONE_MP="$(zfs get -H -o value mountpoint "${CLONE}")"
 if [[ "${CLONE_MP}" == "${LIVE}" ]]; then
     die "clone ${CLONE} mounted at the live tree ${LIVE}; restore is unproven"
