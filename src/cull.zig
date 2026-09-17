@@ -20,7 +20,7 @@ pub const Water = struct {
 ///     punching candidates every round while free space sits still.
 /// cachefilesd documents the same ordering constraint on its config values.
 pub fn ordered(w: Water) bool {
-    return w.brun > w.bcull and w.bcull > w.bstop;
+    return w.brun <= 100 and w.brun > w.bcull and w.bcull > w.bstop;
 }
 
 pub const Phase = enum { run, cull, stop };
@@ -79,6 +79,12 @@ test "ordered rejects the orderings that break phase hysteresis" {
     // punching candidates each round while free space never moves.
     try std.testing.expect(!ordered(.{ .brun = 5, .bcull = 10, .bstop = 3 }));
     try std.testing.expect(!ordered(.{ .brun = 7, .bcull = 7, .bstop = 3 }));
+}
+
+test "ordered rejects percentages above 100" {
+    try std.testing.expect(!ordered(.{ .brun = 101, .bcull = 99, .bstop = 0 }));
+    try std.testing.expect(!ordered(.{ .brun = 103, .bcull = 102, .bstop = 101 }));
+    try std.testing.expect(!ordered(.{ .brun = std.math.maxInt(u32), .bcull = 7, .bstop = 3 }));
 }
 
 test "freePercent" {

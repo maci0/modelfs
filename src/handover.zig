@@ -667,6 +667,66 @@ test "update token entropy failures leave output unchanged" {
     }
 }
 
+test "handover encode and decode validate watermark percentages and ordering" {
+    const gpa = std.testing.allocator;
+    var knobs = Knobs{
+        .origin = "/o",
+        .cache = "/c",
+        .id = "n",
+        .mount = "/m",
+        .piece = 4096,
+        .listen = 1,
+        .water = .{ .brun = 100, .bcull = 99, .bstop = 0 },
+        .direct_io = true,
+        .allow_other = false,
+        .fuse_fd = 3,
+        .listen_fds = &.{3},
+        .advertise = &.{},
+        .seeds = &.{},
+        .psk = "secret",
+    };
+    const blob = try encode(gpa, knobs);
+    defer gpa.free(blob);
+    var got = try decode(gpa, blob);
+    defer got.deinit();
+    try std.testing.expectEqualDeep(knobs.water, got.water);
+
+    const invalid = [_]cull.Water{
+        .{ .brun = 101, .bcull = 99, .bstop = 0 },
+        .{ .brun = 103, .bcull = 102, .bstop = 101 },
+        .{ .brun = std.math.maxInt(u32), .bcull = 7, .bstop = 3 },
+        .{ .brun = 7, .bcull = 7, .bstop = 3 },
+        .{ .brun = 10, .bcull = 3, .bstop = 3 },
+    };
+    const json = blob[magic.len..std.mem.findScalarPos(u8, blob, magic.len, '\n').?];
+    var parsed = try std.json.parseFromSlice(JsonDoc, gpa, json, .{});
+    defer parsed.deinit();
+    for (invalid) |water| {
+        knobs.water = water;
+        if (encode(gpa, knobs)) |bytes| {
+            gpa.free(bytes);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.BadWatermarks, err);
+        }
+
+        parsed.value.brun = water.brun;
+        parsed.value.bcull = water.bcull;
+        parsed.value.bstop = water.bstop;
+        const invalid_json = try std.json.Stringify.valueAlloc(gpa, parsed.value, .{});
+        defer gpa.free(invalid_json);
+        const invalid_blob = try std.mem.concat(gpa, u8, &.{ magic, invalid_json, "\n", knobs.psk });
+        defer gpa.free(invalid_blob);
+        if (decode(gpa, invalid_blob)) |value| {
+            var owned = value;
+            owned.deinit();
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.BadWatermarks, err);
+        }
+    }
+}
+
 test "handover encode and decode refuse PSK with line breaks" {
     const gpa = std.testing.allocator;
     var knobs = Knobs{

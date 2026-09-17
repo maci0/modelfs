@@ -662,7 +662,8 @@ cluster PSK, log level) is reconstituted from a sealed memfd, so the PSK never a
 (`cmdUpdate` src/main.zig; `execHandover` / `attach` src/fuse_fs.zig; codec src/handover.zig).
 The replacement preserves the daemon's effective log level rather than re-reading its
 startup environment or the update command's `--log`. State from older images without a
-log-level field retains the previous handover default of `info`.
+log-level field retains the previous handover default of `info`. Both encoding and decoding
+require watermarks to satisfy `100 >= brun > bcull > bstop >= 0`, matching startup validation.
 Filesystem paths retain their exact bytes: the JSON codec writes valid UTF-8 as strings and
 non-UTF-8 paths as byte arrays, and accepts both on decode. This covers origin/cache/mount,
 cached inode and open-handle paths, and the replacement binary path in `update.req`.
