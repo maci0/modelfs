@@ -39,6 +39,9 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} does not name build.zig.zon version v${zon}" >&2
             exit 1
           fi
+      - name: test native static release build
+        if: matrix.target == 'x86_64-linux-musl'
+        run: zig build test -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast -Dfuse-static
       - name: build static single-file binary
         run: ./scripts/build_static.sh ${{ matrix.target }} --prefix .scratch/release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
