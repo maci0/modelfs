@@ -96,4 +96,33 @@ for s in "${scripts[@]}"; do
     esac
 done
 
+expect_static_args() {
+    local want="$1" rc=0
+    shift
+    (
+        zig() { exit 99; }
+        export -f zig
+        timeout 2 "${SCRIPTS_DIR}/build_static.sh" "$@"
+    ) >"${help_out}" 2>"${help_err}" || rc=$?
+    [[ "${rc}" -eq "${want}" ]] || fail "build_static.sh $* exited ${rc}, want ${want}"
+    if [[ "${want}" -eq 0 ]]; then
+        [[ ! -s "${help_err}" ]] || fail "build_static.sh $* wrote to stderr"
+        [[ "$(cat "${help_out}")" == Usage:* ]] || fail "build_static.sh $* omitted stdout usage"
+    else
+        [[ ! -s "${help_out}" ]] || fail "build_static.sh $* wrote to stdout"
+        [[ "$(cat "${help_err}")" == Usage:* ]] || fail "build_static.sh $* omitted stderr usage"
+    fi
+}
+
+for target in x86_64-linux-musl aarch64-linux-musl; do
+    expect_static_args 2 "${target}" --not-a-flag
+    expect_static_args 2 "${target}" extra
+    expect_static_args 2 "${target}" --prefix
+    expect_static_args 2 "${target}" --prefix ""
+    expect_static_args 2 "${target}" --prefix "${SCRATCH_DIR}/unused" extra
+    expect_static_args 2 "${target}" --help extra
+    expect_static_args 0 "${target}" --help
+    expect_static_args 0 "${target}" -h
+done
+
 echo "=== script --help ok ==="

@@ -28,28 +28,42 @@ legs cannot clobber each other, and a native zig-out/ build survives.
 EOF
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+if [[ "$#" -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
     usage
     exit 0
 fi
 
 target="${1:-}"
 prefix=""
-if [[ "${2:-}" == "--prefix" ]]; then
-    if [[ -z "${3:-}" || "${3:0:1}" == "-" ]]; then
-        usage >&2
-        echo "--prefix needs a directory argument" >&2
-        exit 2
-    fi
-    prefix="${3}"
-fi
-
 case "${target}" in
     x86_64-linux-musl) arch=x86_64 machine=3e00 ;;
     aarch64-linux-musl) arch=aarch64 machine=b700 ;;
     *)
         usage >&2
         echo "unsupported target '${target}': this project ships static musl x86_64 and aarch64 only" >&2
+        exit 2
+        ;;
+esac
+
+case "$#" in
+    1) ;;
+    2)
+        if [[ "$2" == "-h" || "$2" == "--help" ]]; then
+            usage
+            exit 0
+        fi
+        usage >&2
+        exit 2
+        ;;
+    3)
+        if [[ "$2" != "--prefix" || -z "$3" || "${3:0:1}" == "-" ]]; then
+            usage >&2
+            exit 2
+        fi
+        prefix="$3"
+        ;;
+    *)
+        usage >&2
         exit 2
         ;;
 esac
