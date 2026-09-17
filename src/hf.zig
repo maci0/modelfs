@@ -84,10 +84,10 @@ pub fn revisionOk(rev: []const u8) bool {
     return segmentsOk(rev);
 }
 
-fn appendEncoded(w: *std.ArrayList(u8), gpa: std.mem.Allocator, path: []const u8) !void {
+fn appendEncoded(w: *std.ArrayList(u8), gpa: std.mem.Allocator, path: []const u8, preserve_slashes: bool) !void {
     const hex = "0123456789ABCDEF";
     for (path) |ch| {
-        if (unreserved(ch) or ch == '/') {
+        if (unreserved(ch) or (preserve_slashes and ch == '/')) {
             try w.append(gpa, ch);
             continue;
         }
@@ -102,7 +102,14 @@ fn appendEncoded(w: *std.ArrayList(u8), gpa: std.mem.Allocator, path: []const u8
 pub fn treeUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8) ![]u8 {
     if (!repoOk(repo)) return error.BadRepo;
     if (!revisionOk(revision)) return error.BadRevision;
-    return std.fmt.allocPrint(gpa, "https://" ++ host ++ "/api/models/{s}/tree/{s}?recursive=1", .{ repo, revision });
+    var w: std.ArrayList(u8) = .empty;
+    errdefer w.deinit(gpa);
+    try w.appendSlice(gpa, "https://" ++ host ++ "/api/models/");
+    try w.appendSlice(gpa, repo);
+    try w.appendSlice(gpa, "/tree/");
+    try appendEncoded(&w, gpa, revision, false);
+    try w.appendSlice(gpa, "?recursive=1");
+    return w.toOwnedSlice(gpa);
 }
 
 /// One file's bytes at that revision. Caller frees.
@@ -114,9 +121,9 @@ pub fn fileUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8, p
     try w.appendSlice(gpa, "https://" ++ host ++ "/");
     try w.appendSlice(gpa, repo);
     try w.appendSlice(gpa, "/resolve/");
-    try w.appendSlice(gpa, revision);
+    try appendEncoded(&w, gpa, revision, false);
     try w.append(gpa, '/');
-    try appendEncoded(&w, gpa, path);
+    try appendEncoded(&w, gpa, path, true);
     return w.toOwnedSlice(gpa);
 }
 
@@ -405,6 +412,17 @@ fn fetchOne(
     if (sys.rename(part, path) != 0) {
         return error.RenameFailed;
     }
+}
+
+test "revision slashes are encoded as one URL segment" {
+    const gpa = std.testing.allocator;
+    const tree = try treeUrl(gpa, "a/b", "refs/pr/3");
+    defer gpa.free(tree);
+    try std.testing.expectEqualStrings("https://huggingface.co/api/models/a/b/tree/refs%2Fpr%2F3?recursive=1", tree);
+
+    const file = try fileUrl(gpa, "a/b", "refs/pr/3", "sub/model.gguf");
+    defer gpa.free(file);
+    try std.testing.expectEqualStrings("https://huggingface.co/a/b/resolve/refs%2Fpr%2F3/sub/model.gguf", file);
 }
 
 test "repo and revision ids take only what goes into a URL as written" {
