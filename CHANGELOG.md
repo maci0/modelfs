@@ -6,13 +6,16 @@
 
 These changes are not in `v0.14.1`. The next release needs a minor bump under
 CONTRIBUTING's `0.y.z` policy because token lookup changes for existing configurations.
-The peer HTTP and persisted cache formats are unchanged.
+The peer HTTP response and persisted cache formats are unchanged; malformed
+peer request paths are now rejected as described below.
 
 - **`modelfs pull` trims surrounding spaces, tabs, CR, and LF from `HF_HOME` and `HOME`.** Previously those bytes were part of the token directory name. A whitespace-only `HF_HOME` now falls back to `HOME` instead of looking in a whitespace-named directory. Remove surrounding whitespace from these environment values; if it is intentional in a directory name, supply the token through `HF_TOKEN` instead (never argv).
 - **`modelfs pull` no longer falls back to anonymous access on token-file errors.** In `0.14.1`, an unreadable or oversized token file, or an overlong token path, was treated as no token. These now exit 1 before any network request; allocation failures also propagate. Check permissions on `$HF_HOME/token` or `$HOME/.cache/huggingface/token`, keep the file at most 4096 bytes (including whitespace), and shorten overlong home paths. A nonempty valid `HF_TOKEN` still overrides the file. For intentional anonymous pulls, leave the resolved token file absent or empty; merely unsetting `HF_TOKEN` still enables file lookup.
 - **`lease_err` counts discovery ticks with either a publish or refresh failure.** In `0.14.1` it counted only failed publishes. Monitors must interpret it as failed lease maintenance, not a count of failed writes; a tick with both failures still increments once.
 - **`http_us` uses the new `http_completed` counter rather than `httpok + http5xx`.** The old denominator omitted timed misses, out-of-range requests, and interrupted sends. The tick line and `status.json` now expose `http_completed`; update strict parsers to accept it and compute latency from interval deltas of `http_nanos / http_completed / 1000`, guarding a zero denominator. Older nodes lack this counter: do not treat a missing value as zero latency. `/ping` and requests rejected before a timed handler remain excluded.
 - **`reads_warm` no longer counts origin fallbacks as cache hits.** In `0.14.1`, a read whose pieces were marked cached could count as warm even when the cache read failed and the origin served it. The hit-rate formula remains `reads_warm / reads_ok`, but reported hit rates may decrease after upgrading without any change in the workload.
+- **`fill_err_peer` now includes peer-candidate setup failures**, such as allocation failure before probing. `0.14.1` omitted these failures. A rising count does not necessarily mean a remote peer failed; `probe_err` still counts failed `/have` probes, not local setup errors.
+- **Peer `/have` and `/data` reject incomplete percent escapes with HTTP 400.** `0.14.1` treated a trailing `%` or `%2` as literal filename bytes. Custom clients must percent-encode literal `%` as `%25`; filenames containing percent signs remain supported. Existing modelfs clients already encode these paths correctly, so mixed fleets need no change.
 
 ### Security - 2026-09-17
 
@@ -23,6 +26,8 @@ The peer HTTP and persisted cache formats are unchanged.
 
 ### Fixed - 2026-09-17
 
+- **An explicit `--log` overrides an invalid `MODELFS_LOG` value.** `0.14.1` rejected the environment value before reading the flag. Without `--log`, an invalid environment value still fails rather than silently choosing a default.
+- **Restore-drill sampling preserves tabs in filenames.** `scripts/dr_restore_drill.sh` no longer strips trailing tabs when matching a snapshot sample to its live file, avoiding false failures or selection of the wrong live pathname.
 - **A read racing cache-entry removal no longer claims a fill on a dead entry.** `Store.beginFill` returns `.raced` so callers retry or use the origin rather than filling an entry that cannot be marked.
 - **`modelfs update` removes its acknowledgement after success or timeout.** Mount startup also logs resolved seed addresses for diagnosing discovery configuration.
 - **`modelfs update` preserves non-UTF-8 filesystem paths**, including origin, cache, mount, open handles, cached inodes, and the replacement binary. Previously these paths failed encoding with `NonUtf8Knob`. Valid UTF-8 still uses JSON strings; other path bytes use arrays. A running `0.14.1` mount still has its old encoder, so restart it with the new binary if these paths prevent the first live update.
