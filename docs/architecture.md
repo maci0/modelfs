@@ -354,7 +354,9 @@ A `/data` end past EOF clamps to it, and `bytes=N-` means through EOF (RFC 9110)
 (`bytes=-N`) are rejected. The `bytes` unit is case-insensitive in both `Range` and
 `Content-Range`; responses use lowercase. Wire integers (`Range`, `Content-Range`, `Content-Length`,
 `X-Piece-Size`) are unsigned decimal digits only: a leading sign or interior
-underscore is malformed, the same rule RFC 9110 uses for Content-Length. Status lines are
+underscore is malformed, the same rule RFC 9110 uses for Content-Length. Leading zeros are
+accepted, including fields longer than 20 digits when the numeric value fits `u64`;
+request and response head limits still apply. Status lines are
 `HTTP/1.1` plus a 3-digit code, so `2000` is not 200 and `4040` is not a healthy miss.
 
 The fetching peer requires `206` plus a `Content-Range` whose start matches the request, whose

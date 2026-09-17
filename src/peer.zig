@@ -2924,6 +2924,37 @@ test "peer GET requests reject malformed Content-Length consistently" {
     try serveDataCheck(fixture, "POST /ping HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nContent-Length: nope\r\n\r\n");
 }
 
+test "peer wire integers accept zero padding on every endpoint and response" {
+    const gpa = std.testing.allocator;
+    const fixture = try DataFixture.create(gpa);
+    defer fixture.destroy();
+    const zeros = "0" ** 32;
+
+    for ([_][]const u8{ "/ping", "/have?path=m.bin", "/data?path=m.bin" }, [_][]const u8{ "200", "200", "206" }) |target, status| {
+        var req_buf: [512]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nAuthorization: Bearer fuzz-psk\r\nContent-Length: {s}\r\nRange: bytes={s}0-{s}15\r\n\r\n", .{ target, zeros, zeros, zeros });
+        var reply_buf: [512]u8 = undefined;
+        const got = try stageRequest(&fixture.srv, req, &reply_buf);
+        try std.testing.expect(got.len >= 12);
+        try std.testing.expectEqualStrings(status, got[9..12]);
+        try serveDataCheck(fixture, req);
+    }
+
+    const have_wire = "HTTP/1.1 200 OK\r\nX-Piece-Size: " ++ zeros ++ "16\r\nContent-Length: " ++ zeros ++ "1\r\n\r\n\x01";
+    const have = try haveFromHead(gpa, std.testing.io, -1, have_wire, have_wire.len - 1, have_wire.len);
+    defer gpa.free(have.bits);
+    try std.testing.expectEqual(@as(u32, 16), have.piece_size);
+    try std.testing.expectEqualSlices(u8, &.{1}, have.bits);
+
+    const data_wire = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes " ++ zeros ++ "16-" ++ zeros ++ "23/" ++ zeros ++ "48\r\nContent-Length: " ++ zeros ++ "8\r\n\r\nABCDEFGH";
+    const pair = try responsePair(data_wire);
+    defer sys.close(pair[0]);
+    defer sys.close(pair[1]);
+    var out: [8]u8 = undefined;
+    const body = try readRangeBodyAllocDeadline(gpa, std.testing.io, pair[1], 16, 23, &out, null);
+    try std.testing.expectEqualStrings("ABCDEFGH", body);
+}
+
 test "peer paths reject incomplete percent escapes and preserve encoded percent names" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
@@ -4007,7 +4038,7 @@ fn stageWire(wire: []const u8, out: *[2]c_int) bool {
 }
 
 fn refDigitsU64(s: []const u8) ?u64 {
-    if (s.len == 0 or s.len > 20) return null;
+    if (s.len == 0) return null;
     for (s) |ch| {
         if (ch < '0' or ch > '9') return null;
     }

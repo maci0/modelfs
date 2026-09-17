@@ -93,7 +93,7 @@ pub const Range = struct { start: u64, end: u64 };
 /// length cannot size a body (or an advertised piece grid) differently
 /// from a Range the same peer sent.
 pub fn parseU64Fast(s: []const u8) ?u64 {
-    if (s.len == 0 or s.len > 20) return null;
+    if (s.len == 0) return null;
     var n: u64 = 0;
     for (s) |ch| {
         if (ch < '0' or ch > '9') return null;
@@ -709,9 +709,6 @@ test "range and query" {
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), open.end);
     try std.testing.expect(parseRange("bytes=-") == null);
     try std.testing.expect(parseRange("chunks=0-5") == null);
-    // 20-digit values above u64 max are rejected, not overflowed. 21-digit
-    // strings die on the length gate; u64 max+1 is still 20 digits and is
-    // the wrap the mul/add ladder must refuse.
     try std.testing.expect(parseRange("bytes=0-99999999999999999999") == null);
     try std.testing.expect(parseRange("bytes=99999999999999999999-0") == null);
     try std.testing.expect(parseU64Fast("18446744073709551616") == null);
@@ -768,6 +765,25 @@ test "range and query" {
     try std.testing.expect(queryGet("/have?x=1", "path") == null);
     try std.testing.expectEqualStrings("/have", pathOnly("/have?path=x"));
     try std.testing.expectEqualStrings("/data", pathOnly("/data"));
+}
+
+test "wire integers accept leading zeros without weakening overflow checks" {
+    const zeros = "0" ** 32;
+    try std.testing.expectEqual(@as(?u64, 0), parseU64Fast(zeros));
+    try std.testing.expectEqual(@as(?u64, 16), parseU64Fast(zeros ++ "16"));
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), parseU64Fast(zeros ++ "18446744073709551615"));
+    for ([_][]const u8{ "18446744073709551616", "100000000000000000000", "+16", "16_0", "16Mi", " 16" }) |suffix| {
+        var buf: [64]u8 = undefined;
+        const value = try std.fmt.bufPrint(&buf, "{s}{s}", .{ zeros, suffix });
+        try std.testing.expect(parseU64Fast(value) == null);
+    }
+    const range = parseRange("bytes=" ++ zeros ++ "16-" ++ zeros ++ "31").?;
+    try std.testing.expectEqual(@as(u64, 16), range.start);
+    try std.testing.expectEqual(@as(u64, 31), range.end);
+    const content_range = parseContentRange("bytes " ++ zeros ++ "16-" ++ zeros ++ "31/" ++ zeros ++ "48").?;
+    try std.testing.expectEqual(@as(u64, 16), content_range.start);
+    try std.testing.expectEqual(@as(u64, 31), content_range.end);
+    try std.testing.expectEqual(@as(u64, 48), content_range.complete);
 }
 
 test "Content-Range requires a complete length beyond the inclusive end" {
@@ -1147,7 +1163,7 @@ fn refQueryGet(target: []const u8, key: []const u8) ?[]const u8 {
 /// main.zig's refParseSize). The digit pre-scan keeps parseInt's sign and
 /// underscore tolerance out of the accepted set.
 fn refDigitsU64(s: []const u8) ?u64 {
-    if (s.len == 0 or s.len > 20) return null;
+    if (s.len == 0) return null;
     for (s) |ch| {
         if (ch < '0' or ch > '9') return null;
     }
