@@ -72,7 +72,7 @@ python_version = "3.12"
 # silently skip Linux-only branches or apply Darwin/Windows stdlib.
 platform = "linux"
 # Same target set scripts/check.sh passes, so a bare `mypy` matches the gate.
-files = ["scripts"]
+files = ["."]
 # A third-party import without stubs or a py.typed marker is checked,
 # not silently typed as Any. This tree already passes it.
 follow_untyped_imports = true

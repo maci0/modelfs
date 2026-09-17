@@ -345,7 +345,6 @@ echo "=== ruff format --check ==="
 ruff format --check || fail "ruff format --check reported unformatted files; fix with: .venv/bin/ruff format"
 
 echo "=== mypy ==="
-# files = ["scripts"] in pyproject.toml, so a bare `mypy` matches this gate.
 mypy || fail "mypy reported errors"
 
 echo "=== sbom ==="
