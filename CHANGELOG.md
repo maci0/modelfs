@@ -9,7 +9,10 @@ CONTRIBUTING's `0.y.z` policy because token lookup changes for existing configur
 The peer HTTP and persisted cache formats are unchanged.
 
 - **`modelfs pull` trims surrounding spaces, tabs, CR, and LF from `HF_HOME` and `HOME`.** Previously those bytes were part of the token directory name. A whitespace-only `HF_HOME` now falls back to `HOME` instead of looking in a whitespace-named directory. Remove surrounding whitespace from these environment values; if it is intentional in a directory name, supply the token through `HF_TOKEN` instead (never argv).
+- **`modelfs pull` no longer falls back to anonymous access on token-file errors.** In `0.14.1`, an unreadable or oversized token file, or an overlong token path, was treated as no token. These now exit 1 before any network request; allocation failures also propagate. Check permissions on `$HF_HOME/token` or `$HOME/.cache/huggingface/token`, keep the file at most 4096 bytes (including whitespace), and shorten overlong home paths. A nonempty valid `HF_TOKEN` still overrides the file. For intentional anonymous pulls, leave the resolved token file absent or empty; merely unsetting `HF_TOKEN` still enables file lookup.
 - **`lease_err` counts discovery ticks with either a publish or refresh failure.** In `0.14.1` it counted only failed publishes. Monitors must interpret it as failed lease maintenance, not a count of failed writes; a tick with both failures still increments once.
+- **`http_us` uses the new `http_completed` counter rather than `httpok + http5xx`.** The old denominator omitted timed misses, out-of-range requests, and interrupted sends. The tick line and `status.json` now expose `http_completed`; update strict parsers to accept it and compute latency from interval deltas of `http_nanos / http_completed / 1000`, guarding a zero denominator. Older nodes lack this counter: do not treat a missing value as zero latency. `/ping` and requests rejected before a timed handler remain excluded.
+- **`reads_warm` no longer counts origin fallbacks as cache hits.** In `0.14.1`, a read whose pieces were marked cached could count as warm even when the cache read failed and the origin served it. The hit-rate formula remains `reads_warm / reads_ok`, but reported hit rates may decrease after upgrading without any change in the workload.
 
 ### Security - 2026-09-17
 
@@ -22,6 +25,14 @@ The peer HTTP and persisted cache formats are unchanged.
 
 - **A read racing cache-entry removal no longer claims a fill on a dead entry.** `Store.beginFill` returns `.raced` so callers retry or use the origin rather than filling an entry that cannot be marked.
 - **`modelfs update` removes its acknowledgement after success or timeout.** Mount startup also logs resolved seed addresses for diagnosing discovery configuration.
+- **`modelfs update` preserves non-UTF-8 filesystem paths**, including origin, cache, mount, open handles, cached inodes, and the replacement binary. Previously these paths failed encoding with `NonUtf8Knob`. Valid UTF-8 still uses JSON strings; other path bytes use arrays. A running `0.14.1` mount still has its old encoder, so restart it with the new binary if these paths prevent the first live update.
+- **`modelfs pull --revision` handles slash-containing revisions**, such as `refs/pr/3`, as one encoded URL segment instead of mistaking them for directory separators.
+- **`modelfs dupes` no longer labels matching partial manifests as byte-identical.** Identity requires complete coverage on the same piece grid. Shifted overlap now counts distinct shared digests with no same-index match on that grid; repeated aligned pieces no longer subtract unrelated shifted digests. Re-run `modelfs verify` to publish complete manifests before relying on duplicate classifications.
+- **Disk-only cache eviction preserves the sidecar's origin identity.** Surviving pieces retain their identity check across restart; the sidecar format is unchanged.
+- **Cache writes with unchanged middle pieces still invalidate changed boundary digests.** Previously the retry shortcut could leave stale boundary hashes after a partial-piece write, or retain stale cache bits when an in-flight transfer blocked the cache write.
+- **Peer range reads reject a numeric `Content-Range` total at or below the inclusive range end.** Unknown totals (`*`) remain accepted, and existing modelfs servers already send valid totals. Partial `sendfile` progress is retained on a later send failure so a fallback does not resend bytes already transferred.
+- **Permission changes on unreadable files work on older kernels** through the `/proc/self/fd` fallback when `fchmodat2` is unavailable.
+- **Re-running `scripts/install_nas_backup.sh --install` preserves an existing `sanoid.conf`.** Previously it overwrote host-specific dataset and retention settings. Units and wrappers still refresh; apply intended configuration changes to the host's existing file. Failed copies no longer truncate installed files, so the installer can be retried.
 
 ### Performance - 2026-09-17
 
