@@ -2116,8 +2116,13 @@ pub const Store = struct {
                     self.clearHashes(file);
                     truncateCacheFd(file, end);
                     _ = self.saveBits(file, false);
-                } else |_| {
-                    std.log.warn("bitfield shrink failed for {s}; stale tail pieces refill", .{rel});
+                } else |err| {
+                    @memset(file.bits.bytes, 0);
+                    file.writes += 1;
+                    self.clearHashes(file);
+                    _ = self.saveBits(file, false);
+                    std.log.warn("bitfield shrink failed for {s}: {t}; cache invalidated and pieces refill", .{ rel, err });
+                    return;
                 }
             }
             file.last_access.store(now_sec, .monotonic);
@@ -3333,6 +3338,43 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
         defer side.deinit(gpa);
         try std.testing.expectEqual(@as(u32, 0), side.filled());
     }
+}
+
+test "cacheFillIdentified invalidates stale content when shrink allocation fails" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-shrink-oom");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-shrink-oom");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var st = Store.init(failing.allocator(), std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+    const f = try st.get("shrink.bin", 64, 0);
+    defer st.releaseFile(f);
+    try std.testing.expect(st.copyIntoCache(f, 0, "0123456789abcdef"));
+    try std.testing.expect(st.hasPiece(f, 0, 0));
+    try std.testing.expect(f.hashes.contains(0));
+    const generation = f.writes;
+
+    failing.fail_index = failing.alloc_index;
+    st.cacheFillIdentified("shrink.bin", 32, 16, "fedcba9876543210", .{}, 0);
+    failing.fail_index = std.math.maxInt(usize);
+
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+    try std.testing.expectEqual(@as(u32, 0), f.hashes.count());
+    try std.testing.expect(f.writes > generation);
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = try st.cacheMetaPath(&mb, "shrink.bin");
+    const blob = try sys.readFileAlloc(gpa, mp, 4096);
+    defer gpa.free(blob);
+    var side = try piece.Bitfield.decode(gpa, blob, 16, 64);
+    defer side.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 0), side.filled());
 }
 
 test "cold get persists a stale-sidecar wipe so a restart cannot reload stale marks" {
