@@ -3257,7 +3257,7 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
             const ov = piece.manifestOverlapPrepared(a.manifest, b.manifest, a.by_digest, b.by_digest);
             // Shifted = digests shared outside the aligned positions: the
             // only overlap CDC (Level 3) could recover.
-            const shifted = ov.shared -| ov.aligned;
+            const shifted = ov.shifted;
             if (!printOut(io, gpa, "overlap {s} vs {s}: {d}/{d} aligned, {d} shared digest(s), {d} shifted{s}\n", .{
                 a.rel,
                 b.rel,
@@ -3270,6 +3270,42 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
         }
     }
     return 0;
+}
+
+test "cmdDupes counts shifted digests independently of repeated aligned pieces" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-dupes-repeated");
+    defer sys.deleteTree(std.testing.io, origin_d);
+
+    const h0 = [_]u8{0x11} ** piece.digest_len;
+    const h1 = [_]u8{0x22} ** piece.digest_len;
+    const h2 = [_]u8{0x33} ** piece.digest_len;
+    const a_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h0 },
+        .{ .idx = 2, .hash = h1 },
+        .{ .idx = 3, .hash = h2 },
+    };
+    const b_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h0 },
+        .{ .idx = 2, .hash = h2 },
+        .{ .idx = 3, .hash = h1 },
+    };
+    try writeManifestForTest(gpa, origin_d, "a.bin", 16, 64, &a_entries);
+    try writeManifestForTest(gpa, origin_d, "b.bin", 16, 64, &b_entries);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    try std.testing.expectEqual(@as(u8, 0), try cmdDupes(std.testing.io, gpa, .{ .origin = origin_d }, &.{ "a.bin", "b.bin" }));
+    try std.testing.expectEqualStrings(
+        "a.bin: 4 piece(s), 16 grid, 64 bytes\n" ++
+            "b.bin: 4 piece(s), 16 grid, 64 bytes\n" ++
+            "overlap a.bin vs b.bin: 2/4 aligned, 3 shared digest(s), 2 shifted\n",
+        out.items,
+    );
 }
 
 test "cmdDupes reports manifest overlap and gates its paths" {

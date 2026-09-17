@@ -462,6 +462,7 @@ pub const Overlap = struct {
     /// Distinct digests present in both files, whatever the index: content
     /// shared somewhere in the file.
     shared: u64 = 0,
+    shifted: u64 = 0,
     /// True when the files have the same size and every piece matches:
     /// an outright duplicate (same bytes, possibly different path). Both
     /// manifests must run the same grid and cover every piece the size
@@ -509,7 +510,11 @@ pub fn digestEql(a: *const [digest_len]u8, b: *const [digest_len]u8) bool {
 
 /// Digest ordering for the shared-content merge.
 fn digestLess(_: void, x: ManifestEntry, y: ManifestEntry) bool {
-    return digestOrder(&x.hash, &y.hash) == .lt;
+    return switch (digestOrder(&x.hash, &y.hash)) {
+        .lt => true,
+        .gt => false,
+        .eq => x.idx < y.idx,
+    };
 }
 
 /// Owned digest-sorted copy of `entries`. A pair scan sorts each manifest
@@ -568,10 +573,27 @@ pub fn manifestOverlapPrepared(
                 // not inflate "shared digest(s)" once per occurrence.
                 ov.shared += 1;
                 const h = a_dig[i].hash;
+                var ai = i;
+                var bj = j;
                 i += 1;
                 j += 1;
                 while (i < a_dig.len and digestEql(&a_dig[i].hash, &h)) i += 1;
                 while (j < b_dig.len and digestEql(&b_dig[j].hash, &h)) j += 1;
+                var aligned = false;
+                if (a.piece_size == b.piece_size) {
+                    while (ai < i and bj < j) {
+                        if (a_dig[ai].idx == b_dig[bj].idx) {
+                            aligned = true;
+                            break;
+                        }
+                        if (a_dig[ai].idx < b_dig[bj].idx) {
+                            ai += 1;
+                        } else {
+                            bj += 1;
+                        }
+                    }
+                }
+                if (!aligned) ov.shifted += 1;
             },
         }
     }
