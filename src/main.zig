@@ -3188,6 +3188,7 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         sorted.deinit(gpa);
     }
     var total_pieces: u64 = 0;
+    var skipped: usize = 0;
     while (sys.readdir(dir)) |ent| {
         const name = sys.dirName(ent);
         if (name.len == 0 or name[0] == '.') continue;
@@ -3199,18 +3200,22 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         var open_errno: i32 = 0;
         const blob = sys.readFileAllocNoFollowOpenErrno(gpa, fp, store_mod.Store.max_manifest_bytes, &open_errno) catch |err| switch (err) {
             error.OpenFailed => {
-                if (open_errno != sys.c.ENOENT)
+                if (open_errno != sys.c.ENOENT) {
                     if (!builtin.is_test) std.log.warn("manifest open failed for {s} (errno {d}); skipping", .{ proto.displayName(name), open_errno });
+                    skipped += 1;
+                }
                 continue;
             },
             else => {
                 if (!builtin.is_test) std.log.warn("manifest read failed for {s}: {t}; skipping", .{ proto.displayName(name), err });
+                skipped += 1;
                 continue;
             },
         };
         defer gpa.free(blob);
         const m = piece.manifestDecode(gpa, blob) catch {
             if (!builtin.is_test) std.log.warn("corrupt piece-hash manifest {s}; skipping", .{proto.displayName(name)});
+            skipped += 1;
             continue;
         } orelse continue;
         total_pieces += m.entries.len;
@@ -3218,6 +3223,7 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         sorted.append(gpa, piece.digestSorted(gpa, m.entries) catch return 1) catch return 1;
     }
 
+    if (skipped > 0) return 1;
     if (manifests.items.len == 0) {
         if (!printOut(io, gpa, "no manifests to compare\n", .{})) return 1;
         return 0;
@@ -3247,7 +3253,10 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 /// re-export would share, shifted overlap is what only CDC could recover,
 /// and byte-identical files are outright duplicates. A path with no
 /// manifest (never ingested through modelfs, or never fully hashed) is
-/// reported as such and contributes nothing.
+/// reported as such and contributes nothing. A manifest that cannot be
+/// read or decoded fails the command (exit 1): a report omitting one of
+/// the named paths silently would understate the overlap it exists to
+/// measure.
 fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []const u8) !u8 {
     const origin_raw = opts.origin orelse {
         std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
@@ -3271,6 +3280,7 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
         by_digest: []piece.ManifestEntry,
     };
     var files: std.ArrayList(File) = .empty;
+    var failed = false;
     defer {
         for (files.items) |f| {
             gpa.free(f.by_digest);
@@ -3293,20 +3303,24 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
                         std.debug.print("{s}: no piece-hash manifest (not ingested through modelfs, or never fully hashed)\n", .{rel});
                 } else {
                     if (!builtin.is_test) std.log.err("manifest open failed for {s} (errno {d})", .{ rel, open_errno });
+                    failed = true;
                 }
                 continue;
             },
             else => {
                 if (!builtin.is_test) std.log.err("manifest read failed for {s}: {t}", .{ rel, err });
+                failed = true;
                 continue;
             },
         };
         defer gpa.free(blob);
         const m = piece.manifestDecode(gpa, blob) catch {
             if (!builtin.is_test) std.log.err("corrupt piece-hash manifest for {s}", .{rel});
+            failed = true;
             continue;
         } orelse {
             if (!builtin.is_test) std.log.err("unusable piece-hash manifest for {s}", .{rel});
+            failed = true;
             continue;
         };
         files.append(gpa, .{
@@ -3316,6 +3330,7 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
         }) catch return 1;
     }
 
+    if (failed) return 1;
     if (files.items.len == 0) {
         // Same empty-report result as cmdDupesAll: the "nothing to compare"
         // line is the report, so it rides stdout where a pipe sees it, not
@@ -3422,6 +3437,16 @@ test "cmdDupes reports manifest overlap and gates its paths" {
     try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{"../escape.bin"}));
     try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{".cluster/spark1.json"}));
     try std.testing.expectEqual(@as(u8, 2), try cmdDupes(std.testing.io, gpa, .{}, &.{"a.bin"}));
+    // A corrupt manifest fails the command instead of undercounting the
+    // overlap the report exists to measure.
+    try writeManifestForTest(gpa, origin_d, "c.bin", 16, 32, &a_entries);
+    var mb: [256]u8 = undefined;
+    var zb: [256]u8 = undefined;
+    const mname = piece.manifestName("c.bin", &mb);
+    var pbuf: [256]u8 = undefined;
+    const mp = try std.fmt.bufPrint(&pbuf, "{s}/.cluster/manifests/{s}", .{ origin_d, mname });
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileNoFollow(try sys.toZ(&zb, mp), "MFSM junk"));
+    try std.testing.expectEqual(@as(u8, 1), try cmdDupes(std.testing.io, gpa, opts, &.{ "a.bin", "c.bin" }));
 }
 
 /// Writes a piece-hash manifest for rel directly under origin's
