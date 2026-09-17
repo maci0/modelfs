@@ -7014,6 +7014,54 @@ test "sidecar identity trailer wipes a same-size rewrite across restart" {
     }
 }
 
+test "torn sidecar identity cannot preserve stale pieces across restart" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-torn-id");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-torn-id");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+    const old_id = OriginId{ .mtime_sec = 100, .ino = 7, .known = true };
+    const new_id = OriginId{ .mtime_sec = 200, .ino = 7, .known = true };
+    var mb: [c.PATH_MAX]u8 = undefined;
+    var blob_buf: [128]u8 = undefined;
+    const blob = blk: {
+        var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        defer st.deinit();
+        try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+        const f = try st.getIdentified("torn.bin", 16, old_id, 1000);
+        defer st.releaseFile(f);
+        _ = try st.beginFill(f, 0, 1000);
+        try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, "0123456789abcdef", null, 1000));
+        break :blk try sys.readFileBuf(&blob_buf, try st.cacheMetaPath(&mb, "torn.bin"));
+    };
+    const body_len = blob.len - OriginId.encoded_len;
+    for (1..OriginId.encoded_len) |extra| {
+        {
+            var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+            defer st.deinit();
+            const path = try st.cacheMetaPath(&mb, "torn.bin");
+            try std.testing.expectEqual(@as(i32, 0), sys.writeFile(path, blob[0 .. body_len + extra]));
+            const f = try st.getIdentified("torn.bin", 16, new_id, 1000);
+            defer st.releaseFile(f);
+            try std.testing.expect(!st.hasPiece(f, 0, 1000));
+            try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+        }
+        {
+            var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+            defer st.deinit();
+            const f = try st.getIdentified("torn.bin", 16, new_id, 1000);
+            defer st.releaseFile(f);
+            try std.testing.expect(!st.hasPiece(f, 0, 1000));
+        }
+    }
+}
+
 test "manifest load does not replace a local origin-fill hash" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;

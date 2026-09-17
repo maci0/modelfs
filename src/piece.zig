@@ -304,6 +304,10 @@ pub const Bitfield = struct {
         if (!std.mem.eql(u8, blob[0..4], magic)) return error.BadBitfield;
         const ps = std.mem.readInt(u32, blob[4..8], .little);
         const fs = std.mem.readInt(u64, blob[8..16], .little);
+        if (ps == 0) return error.BadBitfield;
+        const body_len = 16 + bytesLen(count(fs, ps));
+        if (blob.len != body_len and blob.len != body_len + manifest_identity_len)
+            return error.BadBitfield;
         const n = count(file_size, piece_size);
         var bf = try init(gpa, n);
         if (ps != piece_size or fs != file_size) {
@@ -977,6 +981,28 @@ test "bitfield set get persist" {
     try std.testing.expectError(error.NoSpaceLeft, bf.encodeTo(4096, 40960, direct[0..8]));
 }
 
+test "bitfield decode rejects truncated bodies and incomplete identity trailers" {
+    const gpa = std.testing.allocator;
+    var bf = try Bitfield.init(gpa, 10);
+    defer bf.deinit(gpa);
+    bf.set(0);
+    bf.set(9);
+    var buf: [64]u8 = @splat(0);
+    const body = try bf.encodeTo(4096, 40960, &buf);
+    for (0..body.len) |n| {
+        try std.testing.expectError(error.BadBitfield, Bitfield.decode(gpa, buf[0..n], 4096, 40960));
+    }
+    for (1..manifest_identity_len) |n| {
+        try std.testing.expectError(error.BadBitfield, Bitfield.decode(gpa, buf[0 .. body.len + n], 4096, 40960));
+    }
+    try std.testing.expectError(error.BadBitfield, Bitfield.decode(gpa, buf[0 .. body.len + manifest_identity_len + 1], 4096, 40960));
+    for ([_]usize{ body.len, body.len + manifest_identity_len }) |n| {
+        var decoded = try Bitfield.decode(gpa, buf[0..n], 4096, 40960);
+        defer decoded.deinit(gpa);
+        try std.testing.expectEqualSlices(u8, bf.bytes, decoded.bytes);
+    }
+}
+
 test "decode masks pad bits past nbits" {
     const gpa = std.testing.allocator;
     var bf = try Bitfield.init(gpa, 10);
@@ -1248,7 +1274,20 @@ fn fuzzBitfieldDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const gi: usize = @intCast(smith.value(u64) % decode_geos.len);
     const geo = decode_geos[gi];
 
-    var bf = Bitfield.decode(gpa, blob, geo.ps, geo.fs) catch return;
+    const valid = blk: {
+        if (blob.len < 16 or !std.mem.eql(u8, blob[0..4], magic)) break :blk false;
+        const ps = std.mem.readInt(u32, blob[4..8], .little);
+        const fs = std.mem.readInt(u64, blob[8..16], .little);
+        if (ps == 0) break :blk false;
+        const n = @min(fs / ps + @intFromBool(fs % ps != 0), std.math.maxInt(u32));
+        const body_len = 16 + (n + 7) / 8;
+        break :blk blob.len == body_len or blob.len == body_len + manifest_identity_len;
+    };
+    if (!valid) {
+        try std.testing.expectError(error.BadBitfield, Bitfield.decode(gpa, blob, geo.ps, geo.fs));
+        return;
+    }
+    var bf = try Bitfield.decode(gpa, blob, geo.ps, geo.fs);
     defer bf.deinit(gpa);
 
     try std.testing.expectEqual(count(geo.fs, geo.ps), bf.nbits);
