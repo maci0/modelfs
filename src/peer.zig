@@ -494,6 +494,14 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
         reply(fd, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
+    const version = it.next() orelse "";
+    if (target.len == 0 or
+        (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) or
+        it.next() != null)
+    {
+        replyStatus(self, fd, "400 Bad Request");
+        return;
+    }
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) {
         // Liveness probe: what health checks, load balancers, and monitoring
@@ -2857,6 +2865,31 @@ test "handleConn counts a targetless request line as malformed" {
     try std.testing.expectEqual(before + 2, srv.store.stats.http_malformed.load(.monotonic));
 }
 
+test "peer GET requests require a complete request line" {
+    const fixture = try DataFixture.create(std.testing.allocator);
+    defer fixture.destroy();
+
+    for ([_][]const u8{ "/ping", "/have?path=m.bin", "/data?path=m.bin" }) |target| {
+        for ([_][]const u8{ "", " ", " HTTP/1.1 extra", " garbage", " HTTP/1.x" }) |suffix| {
+            var req_buf: [256]u8 = undefined;
+            const req = try std.fmt.bufPrint(&req_buf, "GET {s}{s}\r\nAuthorization: Bearer fuzz-psk\r\nRange: bytes=0-15\r\n\r\n", .{ target, suffix });
+            var reply_buf: [512]u8 = undefined;
+            const got = try stageRequest(&fixture.srv, req, &reply_buf);
+            try std.testing.expectEqualStrings("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", got);
+        }
+    }
+    for ([_][]const u8{ "HTTP/1.0", "HTTP/1.1" }) |version| {
+        var req_buf: [256]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET /ping {s}\r\nAuthorization: Bearer fuzz-psk\r\n\r\n", .{version});
+        var reply_buf: [512]u8 = undefined;
+        const got = try stageRequest(&fixture.srv, req, &reply_buf);
+        try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+        try std.testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nok"));
+    }
+    try std.testing.expectEqual(@as(u64, 0), fixture.st.stats.http_ok.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), fixture.st.stats.http_completed.load(.monotonic));
+}
+
 test "peer paths reject incomplete percent escapes and preserve encoded percent names" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
@@ -4365,6 +4398,10 @@ fn classifyServedHead(head: []const u8) ServeClass {
     const auth = auth_h orelse "";
     if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
     if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
+    const version = it.next() orelse return .bad_path;
+    if (target.len == 0 or
+        (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) or
+        it.next() != null) return .bad_path;
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
     const is_have = std.mem.eql(u8, path, "/have");
@@ -4578,6 +4615,10 @@ fn classifyDataHead(head: []const u8) DataClass {
     const auth = auth_h orelse "";
     if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
     if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
+    const version = it.next() orelse return .bad_path;
+    if (target.len == 0 or
+        (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) or
+        it.next() != null) return .bad_path;
     const path = proto.pathOnly(target);
     if (std.mem.eql(u8, path, "/ping")) return .ping_ok;
     const is_have = std.mem.eql(u8, path, "/have");
