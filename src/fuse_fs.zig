@@ -31,6 +31,7 @@ pub const State = struct {
     mountpoint: []const u8 = "",
     allow_other: bool = false,
     detach: bool = false,
+    log_level: std.log.Level = .info,
     listen_port: u16 = 0,
     fuse_fd: c_int = -1,
     /// Wakes `ioRead` from a blocking FUSE read when SIGUSR2 asks for a
@@ -2811,6 +2812,7 @@ fn execHandover(st: *State) !void {
         .water = st.store.water,
         .direct_io = st.direct_io,
         .allow_other = st.allow_other,
+        .log_level = st.log_level,
         .fuse_fd = st.fuse_fd,
         .listen_fds = st.server.listen_fds.items,
         .advertise = st.catalog.addrs,

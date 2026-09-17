@@ -45,6 +45,7 @@ pub const Knobs = struct {
     advertise: []const proto.LeaseAddr,
     seeds: []const proto.LeaseAddr,
     psk: []const u8,
+    log_level: std.log.Level = .info,
     /// The FUSE_INIT request the kernel sent, verbatim. The kernel sends it
     /// once per connection, so an image that inherits the connection has to
     /// replay it rather than negotiate; every derived form drops wire bits
@@ -74,6 +75,7 @@ pub const Owned = struct {
     advertise: []proto.LeaseAddr,
     seeds: []proto.LeaseAddr,
     psk: []u8,
+    log_level: std.log.Level = .info,
     init: []u8 = &.{},
     nodes: []NodeSnap = &.{},
     opens: []OpenSnap = &.{},
@@ -104,6 +106,7 @@ const JsonDoc = struct {
     advertise: []const proto.LeaseAddr,
     seeds: []const proto.LeaseAddr,
     psk_len: usize,
+    log_level: std.log.Level = .info,
     init: []const u8 = "",
     nodes: []const NodeSnap = &.{},
     opens: []const OpenSnap = &.{},
@@ -155,6 +158,7 @@ pub fn encode(gpa: std.mem.Allocator, k: Knobs) ![]u8 {
         .advertise = k.advertise,
         .seeds = k.seeds,
         .psk_len = k.psk.len,
+        .log_level = k.log_level,
         .init = init_hex,
         .nodes = k.nodes,
         .opens = k.opens,
@@ -207,6 +211,7 @@ pub fn decode(gpa: std.mem.Allocator, blob: []const u8) !Owned {
         .advertise = try a.alloc(proto.LeaseAddr, d.advertise.len),
         .seeds = try a.alloc(proto.LeaseAddr, d.seeds.len),
         .psk = try a.dupe(u8, psk_bytes),
+        .log_level = d.log_level,
         .init = try a.alloc(u8, d.init.len / 2),
         .nodes = try a.alloc(NodeSnap, d.nodes.len),
         .opens = try a.alloc(OpenSnap, d.opens.len),
@@ -342,6 +347,7 @@ test "handover encode/decode round-trips knobs and keeps the PSK off argv" {
         .opens = &.{.{ .fh = 9, .path = "/gguf/a.gguf" }},
         .next_ino = 6,
         .next_fh = 10,
+        .log_level = .err,
     };
     const blob = try encode(gpa, knobs);
     defer gpa.free(blob);
@@ -406,6 +412,32 @@ test "handover encode/decode round-trips knobs and keeps the PSK off argv" {
     try std.testing.expectEqualStrings(psk, from_fd.psk);
     try std.testing.expectEqual(knobs.listen, from_fd.listen);
     try std.testing.expectEqual(knobs.piece, from_fd.piece);
+    try std.testing.expectEqual(knobs.log_level, from_fd.log_level);
+    inline for (std.meta.tags(std.log.Level)) |level| {
+        var configured = knobs;
+        configured.log_level = level;
+        const encoded = try encode(gpa, configured);
+        defer gpa.free(encoded);
+        var decoded = try decode(gpa, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(level, decoded.log_level);
+    }
+}
+
+test "handover log level defaults for older images and rejects invalid values" {
+    const gpa = std.testing.allocator;
+    const legacy_blob = seed_handover_ok[4..];
+    var legacy = try decode(gpa, legacy_blob);
+    defer legacy.deinit();
+    try std.testing.expectEqual(std.log.Level.info, legacy.log_level);
+    const end = std.mem.findScalar(u8, legacy_blob, '}').?;
+    for ([_][]const u8{ "\"verbose\"", "null", "true", "{}" }) |value| {
+        const blob = try std.fmt.allocPrint(gpa, "{s},\"log_level\":{s}{s}", .{
+            legacy_blob[0..end], value, legacy_blob[end..],
+        });
+        defer gpa.free(blob);
+        try std.testing.expectError(error.BadJson, decode(gpa, blob));
+    }
 }
 
 test "handover decode owns arena blocks allocated for snapshot paths" {

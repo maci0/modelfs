@@ -1328,6 +1328,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     st.mountpoint = mount_abs;
     st.allow_other = opts.allow_other;
     st.detach = opts.detach;
+    st.log_level = opts.log_level;
     st.listen_port = eff_port;
     // From here every error return owns st. Without this, an allocation
     // failure while building the fuse argv escaped without teardown,
@@ -1701,6 +1702,7 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
         std.crypto.secureZero(u8, owned.psk);
         owned.deinit();
     }
+    active_log_level = owned.log_level;
     // argv and the state blob name the same mount or this is not the
     // handover the exec intended.
     if (!std.mem.eql(u8, handoff.mount, owned.mount)) {
@@ -1725,6 +1727,7 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
     st.init(gpa, init.io, owned.origin, owned.cache, owned.piece, owned.water, owned.id, owned.advertise, local_ips, owned.seeds, owned.psk, owned.direct_io);
     st.mountpoint = owned.mount;
     st.allow_other = owned.allow_other;
+    st.log_level = owned.log_level;
     st.listen_port = owned.listen;
     st.setInitRequest(owned.init) catch {
         printErr("modelfs: handover state carries no usable FUSE_INIT request\n", .{});
