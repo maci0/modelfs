@@ -166,6 +166,8 @@ pub fn printable(s: []const u8) bool {
     return !proto.containsControl(s);
 }
 
+pub const max_id_bytes: usize = c.NAME_MAX - ".json.tmp".len;
+
 /// True when s is safe to publish as this node's cluster id. The id names
 /// the lease file (<origin>/.cluster/<id>.json), is embedded verbatim as a
 /// JSON string in that document, and is echoed into logs, so it must be
@@ -174,7 +176,7 @@ pub fn printable(s: []const u8) bool {
 /// dot (walkLeases skips dot files). An id failing this gate would otherwise
 /// partition its own node out of peer discovery while NFS fallback hides it.
 pub fn validId(s: []const u8) bool {
-    if (s.len == 0) return false;
+    if (s.len == 0 or s.len > max_id_bytes) return false;
     if (s[0] == '.') return false;
     for (s) |ch| {
         if (ch < 0x20 or ch > 0x7e) return false;
@@ -1589,6 +1591,15 @@ test "validId gates the lease file name and JSON document" {
     try std.testing.expect(!validId("h\xc3\xa9llo"));
 }
 
+test "validId reserves filename space for atomic lease staging" {
+    try std.testing.expect(validId("x" ** 246));
+    try std.testing.expect(!validId("x" ** 247));
+    try std.testing.expect(!validId("x" ** 255));
+    try std.testing.expect(!validId("x" ** 4096));
+}
+
+const seed_id_max = fuzzcorpus.entry("x" ** 246);
+const seed_id_overlong = fuzzcorpus.entry("x" ** 247);
 const seed_id_plain = fuzzcorpus.entry("spark1");
 const seed_id_dotted = fuzzcorpus.entry("node-9.a");
 const seed_id_punct = fuzzcorpus.entry("x~!@#$%^&*()+=[]{};',<>?|`");
@@ -1609,6 +1620,8 @@ const seed_id_shy = fuzzcorpus.entry("spark1\u{ad}");
 const seed_id_vs17 = fuzzcorpus.entry("spark1\u{e0100}");
 
 const fuzz_id_corpus = [_][]const u8{
+    &seed_id_max,
+    &seed_id_overlong,
     &seed_id_plain,
     &seed_id_dotted,
     &seed_id_punct,
@@ -1639,11 +1652,11 @@ const fuzz_id_corpus = [_][]const u8{
 /// by formatLease, parsed back by parseLease byte-exact. Rejected ids
 /// legitimately skip that last leg (the writer never publishes them).
 fn fuzzIdGateOne(_: void, smith: *std.testing.Smith) anyerror!void {
-    var buf: [128]u8 = undefined;
+    var buf: [512]u8 = undefined;
     const id = buf[0..smith.slice(&buf)];
     const ok = validId(id);
 
-    var ref = id.len > 0 and id[0] != '.';
+    var ref = id.len > 0 and id.len <= 246 and id[0] != '.';
     for (id) |ch| {
         if (ch < 0x20 or ch > 0x7e or ch == '/' or ch == '"' or ch == '\\') ref = false;
     }
@@ -2062,6 +2075,26 @@ test "shortName strips domain" {
     try std.testing.expectEqualStrings("spark1", shortName("spark1"));
     try std.testing.expectEqualStrings("spark2", shortName("spark2.local"));
     try std.testing.expectEqualStrings("spark1", shortName("spark1.lan.example"));
+}
+
+test "publish supports the longest valid cluster id" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-long-id");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const id = "x" ** 246;
+    const addrs = [_]proto.LeaseAddr{.{ .ip = "127.0.0.1", .port = proto.default_port }};
+    var cat = Catalog.init(gpa, std.testing.io, origin_d, id, &addrs, &.{}, &.{});
+    defer cat.deinit();
+    cat.publish(100);
+    try std.testing.expectEqual(@as(i32, 0), cat.publish_rc);
+    var pbuf: [c.PATH_MAX]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&pbuf, "{s}/.cluster/{s}.json", .{ origin_d, id });
+    const blob = try sys.readFileAlloc(gpa, path, 4096);
+    defer gpa.free(blob);
+    const parsed = try proto.parseLease(gpa, blob);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(id, parsed.value.id);
 }
 
 test "publish stages a parseable lease, leaves no tmp, and replaces in place" {

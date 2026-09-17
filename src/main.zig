@@ -629,7 +629,7 @@ fn rejectOutsideMount(cmd: []const u8, flag: []const u8) !void {
 /// the staging buffer render as the generic line; the refusal itself is the
 /// point and stays unconditional either way.
 fn badIdLine(buf: []u8, id: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "--id \"{s}\": must be printable ASCII without / \\ \" or a leading dot\n", .{proto.displayName(id)}) catch "--id unusable as cluster id (see 'modelfs help')\n";
+    return std.fmt.bufPrint(buf, "--id \"{s}\": must be 1..{d} bytes of printable ASCII without / \\ \" or a leading dot\n", .{ proto.displayName(id), discover.max_id_bytes }) catch "--id unusable as cluster id (see 'modelfs help')\n";
 }
 
 /// Watermark percentages: parse failures name the flag instead of surfacing
@@ -3685,6 +3685,22 @@ test "parseArgs rejects bad values" {
     // A non-empty env id answers to the same gate.
     try environ.put("MODELFS_ID", "x\"y");
     try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
+}
+
+test "cluster ids must fit the staged lease filename" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--id", "x" ** 246 });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expectEqualStrings("x" ** 246, parsed.opts.id.?);
+    }
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{ "mount", "--id", "x" ** 247 }));
+    try environ.put("MODELFS_ID", "x" ** 247);
+    try std.testing.expectError(error.BadId, parseArgs(gpa, &environ, &.{"mount"}));
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(std.mem.find(u8, badIdLine(&buf, "x" ** 247), "1..246 bytes") != null);
 }
 
 test "empty environment variables read as unset" {

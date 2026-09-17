@@ -165,8 +165,9 @@ identity is byte-exact. Incoming lease JSON whose `id` fails `validId` is ignore
 
 ## Discovery
 
-Node identity is the hostname, not an IP. Each spark writes a lease on the **origin** (not
-through FUSE):
+Node identity is the hostname, not an IP. IDs are limited to 246 bytes so the atomic
+`<id>.json.tmp` staging name fits Linux's 255-byte filename limit. Each spark writes a lease
+on the **origin** (not through FUSE):
 
 ```
 <origin>/.cluster/<id>.json
