@@ -1016,10 +1016,10 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
         }
         const rc = st.store.completeFill(file, idx, buf, filled_digest, sys.monoSec(st.io));
         if (rc != 0) {
-            // Hydrated bytes the cache fs refused: the piece stays unmarked and
-            // the reader gets EIO, so name the refusal like serveData's twin
-            // branch. Failed fills keep their error counts and no time (and no
-            // fill or byte totals): the tick line's averages stay miss-only.
+            // Cache-write refusal leaves the piece unmarked. serveHydrated
+            // tries the origin before returning this errno to the reader.
+            // Failed fills keep their error counts but contribute no time,
+            // fill count, or byte totals to the tick line's averages.
             _ = st.store.stats.fill_err_cache.fetchAdd(1, .monotonic);
             std.log.warn("cache write refused {s} piece {d} (errno {d}); piece unmarked", .{ file.rel, idx, -rc });
             return rc;

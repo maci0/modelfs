@@ -1229,11 +1229,10 @@ pub const Store = struct {
     /// recorded alongside the bit so the piece carries a trusted hash from
     /// birth (the fill paths hash the in-hand buffer, so a rehash of the
     /// cache copy later has a reference to compare against). Recording under
-    /// the same file.mu window as the bit keeps the two consistent: a punch
-    /// or size wipe that clears the bit also invalidates the hash via
-    /// clearHashes, and a recorded hash for a piece whose bit never
-    /// landed would let a peer fill verify against bytes that were never
-    /// written.
+    /// file.mu keeps the digest tied to the admitted fill's generation and
+    /// geometry. Content invalidation drops hashes through clearHashes;
+    /// punching only clears the mark and retains the trusted digest for
+    /// refill verification.
     pub fn finishPiece(self: *Store, file: *Cached, idx: u32, ok: bool, fill_len: u32, hash: ?[piece.digest_len]u8, now_sec: i64) void {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);

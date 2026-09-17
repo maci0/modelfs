@@ -402,19 +402,27 @@ sidecar are punched as a whole KEEP_SIZE extent.
 
 ```mermaid
 flowchart TD
-    free["cull.freePercent: f_bavail of the cache fs"] --> cmp{"against the watermarks"}
-    cmp --> "|>= brun|" idle["idle: no round"]
-    cmp --> "|bcull..brun|" round["cull one round"]
-    cmp --> "|<= bstop|" hard["cull harder: keep going to brun"]
+    reap["reapIdle, every 30 s: unlink empty unpinned artifacts idle 300 s"] --> free["freePercentChecked: f_bavail of the cache fs"]
+    free --> |statfs failed| idle["idle: no round"]
+    free --> |sample available| cmp{"against the watermarks"}
+    cmp --> |free >= brun| idle
+    cmp --> |bcull < free < brun| prior{"already culling?"}
+    prior --> |no| idle
+    prior --> |yes| round["cull one round; wait 1 s"]
+    cmp --> |bstop < free <= bcull| round
+    cmp --> |free <= bstop| hard["cull one round; wait 500 ms"]
     round --> sample["considerIdle: sample the 32 oldest idle live entries"]
     hard --> sample
     sample --> skip["skip: pin, < 10 s idle, filling, or xfer in flight"]
-    sample --> punch["punchPiece: save sidecar, then PUNCH_HOLE, clear bit"]
-    punch --> empty{"nothing punchable in the sample?"}
-    empty --> "|yes|" disk["cullOneOnDisk: sample data/ by mtime, punch orphan pieces or whole files"]
-    empty --> |no| reap
-    disk --> reap["reapIdle, every 30 s: unlink empty unpinned artifacts idle 300 s"]
+    sample --> empty{"nothing punchable in the sample?"}
+    empty --> |yes| disk["cullOneOnDisk: sample data/ by mtime, punch orphan pieces or whole files"]
+    empty --> |no| punch["punchPiece: clear bit, durably save sidecar, then PUNCH_HOLE"]
 ```
+
+`cull.phase` in src/cull.zig starts culling at or below `--bcull` and stops at or above
+`--brun`; between them it keeps the previous phase. `cullLoop` in src/fuse_fs.zig calls
+`cullOne` up to 16 times per round, stopping early when nothing can be culled. At or
+below `--bstop`, the wait between rounds drops from 1 s to 500 ms.
 
 `pin` is a marker under `pin/`. Culling itself never unlinks: after every piece is punched,
 `reapIdle` (every 30 s, 300 s idle) unlinks empty unpinned data and meta artifacts so the
