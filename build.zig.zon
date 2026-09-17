@@ -8,6 +8,8 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        ".deps/libfuse3-3.16.2/include",
+        ".deps/libfuse3-3.16.2/lib",
         "LICENSE",
         "CHANGELOG.md",
         "README.md",
