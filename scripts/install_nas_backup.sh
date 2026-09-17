@@ -46,7 +46,7 @@ if [[ "${DEST}" != "/" ]]; then
     DEST="${DEST%/}"
 fi
 
-copy_one() {
+copy_one() (
     local src="$1"
     local rel="$2"
     local dest_path
@@ -64,9 +64,18 @@ copy_one() {
         return 0
     fi
     mkdir -p "$(dirname "${dest_path}")"
-    cp -a "${src}" "${dest_path}"
+    local temporary
+    temporary="$(mktemp "${dest_path}.tmp.XXXXXX")"
+    trap 'rm -f -- "${temporary}"' EXIT
+    trap 'exit 1' HUP INT TERM
+    cp -a -- "${src}" "${temporary}"
+    if [[ "${rel}" == "etc/sanoid/sanoid.conf" ]]; then
+        mv -nT -- "${temporary}" "${dest_path}"
+    else
+        mv -fT -- "${temporary}" "${dest_path}"
+    fi
     echo "copied ${dest_path}"
-}
+)
 
 [[ -d "${NAS_DIR}" ]] || {
     echo "install FAIL: ${NAS_DIR} is missing" >&2

@@ -1247,6 +1247,43 @@ else
     pass "installer --install preserves the snapshot policy and repairs missing files"
 fi
 
+INTERRUPTED_DEST="${TEMP}/interrupted-root"
+COPY_FAIL_BIN="${TEMP}/copy-fail-bin"
+mkdir -p "${COPY_FAIL_BIN}"
+cat >"${COPY_FAIL_BIN}/cp" <<'COPYFAIL'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' '[tank/models]' >"${@: -1}"
+exit 1
+COPYFAIL
+chmod +x "${COPY_FAIL_BIN}/cp"
+INTERRUPTED_RC=0
+INTERRUPTED_OUT="$(PATH="${COPY_FAIL_BIN}:${PATH}" MF_NAS_DEST="${INTERRUPTED_DEST}" \
+    "${INSTALLER}" --install 2>&1)" || INTERRUPTED_RC=$?
+if [[ "${INTERRUPTED_RC}" -eq 0 ]]; then
+    fail "installer accepted a failed policy copy: ${INTERRUPTED_OUT}"
+elif [[ -e "${INTERRUPTED_DEST}/etc/sanoid/sanoid.conf" ]]; then
+    fail "installer published an incomplete snapshot policy"
+else
+    INTERRUPTED_LEFTOVERS="$(find "${INTERRUPTED_DEST}/etc/sanoid" -mindepth 1 -print -quit)"
+    if [[ -n "${INTERRUPTED_LEFTOVERS}" ]]; then
+        fail "installer left a temporary policy after copy failure"
+    else
+        pass "installer failed policy copy leaves no published or temporary file"
+    fi
+fi
+RETRY_RC=0
+RETRY_OUT="$(MF_NAS_DEST="${INTERRUPTED_DEST}" "${INSTALLER}" --install 2>&1)" || RETRY_RC=$?
+if [[ "${RETRY_RC}" -ne 0 ]]; then
+    fail "installer retry after copy failure: rc=${RETRY_RC}: ${RETRY_OUT}"
+elif ! cmp -s "${SCRIPTS_DIR}/nas/sanoid.conf" "${INTERRUPTED_DEST}/etc/sanoid/sanoid.conf"; then
+    fail "installer retry preserved an incomplete snapshot policy"
+elif ! cmp -s "${SCRIPTS_DIR}/check_offsite.sh" "${INTERRUPTED_DEST}/usr/local/sbin/modelfs-check-offsite"; then
+    fail "installer retry did not finish installing wrappers"
+else
+    pass "installer retry after copy failure installs the complete policy and wrappers"
+fi
+
 # --- check_offsite.sh: site-loss copy freshness
 OFFSITE="${SCRIPTS_DIR}/check_offsite.sh"
 OFFSITE_BIN="${TEMP}/offsitebin"
