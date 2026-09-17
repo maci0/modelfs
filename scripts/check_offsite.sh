@@ -106,6 +106,7 @@ while IFS= read -r child; do
         *)
             ;;
     esac
+    NOW="$(date -u +%s)"
     CHILD_AGE=$((NOW - CHILD_CTIME))
     if [[ "${CHILD_AGE}" -lt 0 ]]; then
         die "offsite child snapshot ${CHILD_SNAP} has creation ${CHILD_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"

@@ -229,6 +229,7 @@ if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
         *)
             ;;
     esac
+    NOW="$(date -u +%s)"
     REPLICA_AGE=$((NOW - REPLICA_CTIME))
     if [[ "${REPLICA_AGE}" -lt 0 ]]; then
         die "replica newest snapshot ${REPLICA_SNAP} has creation ${REPLICA_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"
@@ -255,6 +256,7 @@ if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
             *)
                 ;;
         esac
+        NOW="$(date -u +%s)"
         REPL_CHILD_AGE=$((NOW - REPL_CHILD_CTIME))
         if [[ "${REPL_CHILD_AGE}" -lt 0 ]]; then
             die "replica child snapshot ${REPL_CHILD_SNAP} has creation ${REPL_CHILD_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"
@@ -293,6 +295,7 @@ while IFS= read -r child; do
         *)
             ;;
     esac
+    NOW="$(date -u +%s)"
     CHILD_AGE=$((NOW - CHILD_CTIME))
     if [[ "${CHILD_AGE}" -lt 0 ]]; then
         die "child snapshot ${CHILD_SNAP} has creation ${CHILD_CTIME} in the future of now ${NOW}: host clock and ZFS disagree"
