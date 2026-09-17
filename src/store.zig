@@ -1843,7 +1843,8 @@ pub const Store = struct {
     /// Bytes past `piece.trackedEnd` have no bit and a sparse cache pread
     /// returns hole zeros as a successful read, so those ranges go to origin
     /// without touching the cache fd.
-    pub fn readServed(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64) isize {
+    pub fn readServed(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64, cache_hit: ?*bool) isize {
+        if (cache_hit) |hit| hit.* = false;
         file.mu.lockUncancelable(self.io);
         const fsize = file.size;
         const dead = file.dead.load(.acquire);
@@ -1857,7 +1858,10 @@ pub const Store = struct {
         if (!piece.rangeTracked(.{ .off = off, .len = buf.len }, fsize, self.piece_size))
             return self.originPread(file.rel, buf, off);
         const n = self.readCache(file, buf, off, now_sec);
-        if (n >= 0) return n;
+        if (n >= 0) {
+            if (cache_hit) |hit| hit.* = true;
+            return n;
+        }
         std.log.warn("cache read failed for {s} (errno {d}); serving from origin", .{ file.rel, -n });
         return self.originPread(file.rel, buf, off);
     }
@@ -5534,7 +5538,7 @@ test "readServed answers from origin once the entry is dead" {
     f.dead.store(true, .release);
 
     var rd: [origin_pattern.len]u8 = undefined;
-    const n = st.readServed(f, &rd, 0, sys.monoSec(std.testing.io));
+    const n = st.readServed(f, &rd, 0, sys.monoSec(std.testing.io), null);
     try std.testing.expectEqual(@as(isize, @intCast(rd.len)), n);
     try std.testing.expectEqualStrings(origin_pattern, &rd);
 }
@@ -5576,7 +5580,7 @@ test "readServed falls back to origin when the cache tier cannot answer" {
     const prev_log_level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
-    const n = st.readServed(f, &rb, 0, sys.monoSec(std.testing.io));
+    const n = st.readServed(f, &rb, 0, sys.monoSec(std.testing.io), null);
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
     try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
 
@@ -5618,7 +5622,7 @@ test "readServed takes origin for the tail past the u32 piece-index clamp" {
     f.mu.unlock(std.testing.io);
 
     var rb: [16]u8 = undefined;
-    const n = st.readServed(f, rb[0..pattern.len], tail_off, sys.monoSec(std.testing.io));
+    const n = st.readServed(f, rb[0..pattern.len], tail_off, sys.monoSec(std.testing.io), null);
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
     try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
 }

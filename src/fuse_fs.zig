@@ -984,7 +984,12 @@ fn serveHydrated(
 ) isize {
     std.debug.assert(span.len == buf.len);
     const rc = if (ready) 0 else ensureRange(st, file, span, file_size);
-    if (rc == 0) return st.store.readServed(file, buf, span.off, sys.monoSec(st.io));
+    if (rc == 0) {
+        var cache_hit = false;
+        const got = st.store.readServed(file, buf, span.off, sys.monoSec(st.io), &cache_hit);
+        if (ready and cache_hit) _ = st.store.stats.reads_warm.fetchAdd(1, .monotonic);
+        return got;
+    }
     const got = st.store.originPread(rel, buf, span.off);
     if (got >= 0) {
         std.log.warn("hydration failed for {s} (errno {d}); serving this read from origin", .{ rel, -rc });
@@ -1083,7 +1088,6 @@ fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*
     } else {
         _ = st.store.stats.reads_ok.fetchAdd(1, .monotonic);
         _ = st.store.stats.bytes_read.fetchAdd(@intCast(got), .monotonic);
-        if (ready) _ = st.store.stats.reads_warm.fetchAdd(1, .monotonic);
     }
     return @intCast(got);
 }
@@ -3567,6 +3571,70 @@ test "serveHydrated falls back to origin when the cache cannot land a fill" {
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
     try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
     try std.testing.expect(!st.store.hasPiece(file, 0, sys.monoSec(st.io)));
+}
+
+test "mf_read counts warm hits only when the cache serves the bytes" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-read-stats");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-read-stats");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    const previous_state = tls_state;
+    tls_state = &st;
+    defer tls_state = previous_state;
+    const previous_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_level;
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+
+    const pattern = "0123456789abcdef";
+    var pb: [sys.c.PATH_MAX]u8 = undefined;
+    const origin_z = try st.store.originPath(&pb, "warm.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, pattern));
+    var rb: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, 16), mf_read("/warm.bin", &rb, rb.len, 0, null));
+    try std.testing.expectEqualStrings(pattern, &rb);
+    try std.testing.expectEqual(@as(u64, 0), st.store.stats.snap().reads_warm);
+    try std.testing.expectEqual(@as(c_int, 16), mf_read("/warm.bin", &rb, rb.len, 0, null));
+    try std.testing.expectEqualStrings(pattern, &rb);
+    try std.testing.expectEqual(@as(u64, 1), st.store.stats.snap().reads_warm);
+
+    const file = st.store.lookupRef("warm.bin").?;
+    defer st.store.releaseFile(file);
+    sys.close(file.cache_fd);
+    file.cache_fd = -1;
+    var db: [sys.c.PATH_MAX]u8 = undefined;
+    const cache_z = try st.store.cacheDataPath(&db, "warm.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.unlink(cache_z));
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(cache_z), 0o755));
+
+    try std.testing.expectEqual(@as(c_int, 16), mf_read("/warm.bin", &rb, rb.len, 0, null));
+    try std.testing.expectEqualStrings(pattern, &rb);
+    try std.testing.expectEqual(@as(u64, 1), st.store.stats.snap().reads_warm);
+    try std.testing.expectEqual(@as(u64, 3), st.store.stats.snap().reads_ok);
+    try std.testing.expectEqual(@as(u64, 48), st.store.stats.snap().bytes_read);
+
+    try std.testing.expectEqual(@as(i32, 0), sys.unlink(origin_z));
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_read("/warm.bin", &rb, rb.len, 0, null));
+    try std.testing.expectEqual(@as(u64, 1), st.store.stats.snap().reads_err);
+    try std.testing.expectEqual(@as(u64, 1), st.store.stats.snap().reads_warm);
+
+    try statusJson(&st);
+    var sb: [sys.c.PATH_MAX]u8 = undefined;
+    const status_z = try st.store.cacheStatusPath(&sb);
+    const blob = try sys.readFileAlloc(gpa, status_z, 4096);
+    defer gpa.free(blob);
+    const doc = try std.json.parseFromSlice(struct { stats: store_mod.Stats.Snap }, gpa, blob, .{ .ignore_unknown_fields = true });
+    defer doc.deinit();
+    try std.testing.expectEqual(@as(u64, 1), doc.value.stats.reads_warm);
+    try std.testing.expectEqual(@as(u64, 3), doc.value.stats.reads_ok);
+    try std.testing.expectEqual(@as(u64, 1), doc.value.stats.reads_err);
 }
 
 test "fileForRead uses a live entry without restatting origin" {

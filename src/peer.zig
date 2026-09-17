@@ -868,7 +868,7 @@ fn streamRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: pi
             return;
         }
         const take = @min(remaining, buf.len);
-        const n = self.store.readServed(file, buf[0..take], off, sys.monoSec(self.io));
+        const n = self.store.readServed(file, buf[0..take], off, sys.monoSec(self.io), null);
         if (n < 0 or @as(u64, @intCast(n)) != take) {
             // Same contract as the sendfile path: the peer sees a truncated
             // body, so the local log must carry where and why. A negative
