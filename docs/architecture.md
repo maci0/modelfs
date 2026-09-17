@@ -736,7 +736,7 @@ and drill scripts keep their knobs outside this namespace (`MF_TEST_*`, `MF_DRIL
   interfaces.
 * `--advertise IP[:PORT][,...]` replaces the auto-detected NIC list rather than adding to it,
   and falls back to `127.0.0.1` when no NIC qualifies. A defaulted advertise port follows
-  `--listen`; an explicit non-default port is bound as written (`leaseAddrs` in src/main.zig).
+  `--listen`; every explicit port, including `18080`, is bound as written (`leaseAddrs` in src/main.zig).
 * `--listen`, `--advertise`, and `--seed` all refuse port 0: an ephemeral bind would still
   advertise 0 in the lease.
 * `--advertise` and `--seed` also refuse `0.0.0.0` and `255.255.255.255` (`isDialableHost` in

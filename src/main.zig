@@ -320,7 +320,7 @@ const Opts = struct {
     allow_other: bool = false,
     detach: bool = false,
     listen_port: ?u16 = null,
-    advertise: std.ArrayList(proto.LeaseAddr) = .empty,
+    advertise: std.ArrayList(struct { ip: []const u8, port: ?u16 = null }) = .empty,
     seed: std.ArrayList([]const u8) = .empty,
 };
 
@@ -866,7 +866,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                     if (!builtin.is_test) std.debug.print("--advertise {s}: {s} is not a dialable peer address\n", .{ v, hp.ip });
                     return error.UndialableIp;
                 }
-                try opts.advertise.append(gpa, hp);
+                try opts.advertise.append(gpa, .{
+                    .ip = hp.ip,
+                    .port = if (std.mem.findScalar(u8, tok, ':') != null) hp.port else null,
+                });
             }
         } else if (std.mem.eql(u8, flag, "--seed")) {
             try rejectOutsideMount(cmd, flag);
@@ -1098,11 +1101,8 @@ fn leaseAddrs(gpa: std.mem.Allocator, opts: Opts, local_ips: []const []const u8,
     var addrs: std.ArrayList(proto.LeaseAddr) = .empty;
     errdefer addrs.deinit(gpa);
     if (opts.advertise.items.len > 0) {
-        try addrs.appendSlice(gpa, opts.advertise.items);
-        if (opts.listen_port != null) {
-            for (addrs.items) |*a| {
-                if (a.port == proto.default_port) a.port = eff_port;
-            }
+        for (opts.advertise.items) |a| {
+            try addrs.append(gpa, .{ .ip = a.ip, .port = a.port orelse eff_port, .mbps = 0 });
         }
     } else {
         for (local_ips) |ip| {
@@ -1306,10 +1306,6 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     }
     if (local_ips.len == 0) std.log.warn("no non-loopback IPv4; advertise may be empty", .{});
 
-    // Effective listening port: an explicit --listen wins over the default,
-    // including for --advertise entries that did not spell out their own
-    // ":PORT" (they carry 18080 from parsing). The spec itself was validated
-    // at flag-parse time, so nothing can fail here.
     const eff_port: u16 = opts.listen_port orelse proto.default_port;
 
     var addrs = try leaseAddrs(gpa, opts, local_ips, eff_port);
@@ -4171,9 +4167,9 @@ test "parseArgs trims whitespace in --advertise lists" {
     defer freeParsed(parsed, gpa);
     try std.testing.expectEqual(@as(usize, 2), parsed.opts.advertise.items.len);
     try std.testing.expectEqualStrings("10.0.0.1", parsed.opts.advertise.items[0].ip);
-    try std.testing.expectEqual(@as(u16, proto.default_port), parsed.opts.advertise.items[0].port);
+    try std.testing.expectEqual(@as(?u16, null), parsed.opts.advertise.items[0].port);
     try std.testing.expectEqualStrings("10.0.0.2", parsed.opts.advertise.items[1].ip);
-    try std.testing.expectEqual(@as(u16, 19091), parsed.opts.advertise.items[1].port);
+    try std.testing.expectEqual(@as(?u16, 19091), parsed.opts.advertise.items[1].port);
 }
 
 test "parseArgs trims surrounding whitespace on --seed" {
@@ -4516,15 +4512,38 @@ test "buildSeeds releases resolved ips on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "leaseAddrs preserves explicit default ports regardless of flag order" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    const cases = [_][]const []const u8{
+        &.{ "mount", "--listen", "19091", "--advertise", "127.0.0.1:18080,127.0.0.2,127.0.0.3:19090" },
+        &.{ "mount", "--advertise", "127.0.0.3:19090,127.0.0.2,127.0.0.1:18080", "--listen", "19091" },
+        &.{ "mount", "--advertise", "127.0.0.1:18080,127.0.0.2,127.0.0.3:19090" },
+    };
+    for (cases) |args| {
+        const parsed = try parseArgs(gpa, &environ, args);
+        defer freeParsed(parsed, gpa);
+        const eff_port = parsed.opts.listen_port orelse proto.default_port;
+        var addrs = try leaseAddrs(gpa, parsed.opts, &.{}, eff_port);
+        defer addrs.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 3), addrs.items.len);
+        try std.testing.expectEqualStrings("127.0.0.1", addrs.items[0].ip);
+        try std.testing.expectEqual(@as(u16, 18080), addrs.items[0].port);
+        try std.testing.expectEqualStrings("127.0.0.2", addrs.items[1].ip);
+        try std.testing.expectEqual(eff_port, addrs.items[1].port);
+        try std.testing.expectEqualStrings("127.0.0.3", addrs.items[2].ip);
+        try std.testing.expectEqual(@as(u16, 19090), addrs.items[2].port);
+    }
+}
+
 test "leaseAddrs follows --listen and falls back to loopback" {
     const gpa = std.testing.allocator;
 
-    // Explicit --advertise entries keep their own port unless they carried
-    // the default and an explicit --listen overrides it.
     {
         var opts = Opts{};
         opts.listen_port = 19091;
-        try opts.advertise.append(gpa, .{ .ip = "10.0.0.1", .port = proto.default_port });
+        try opts.advertise.append(gpa, .{ .ip = "10.0.0.1" });
         try opts.advertise.append(gpa, .{ .ip = "10.0.0.2", .port = 19090 });
         defer opts.advertise.deinit(gpa);
         var addrs = try leaseAddrs(gpa, opts, &.{}, 19091);
@@ -4539,7 +4558,7 @@ test "leaseAddrs follows --listen and falls back to loopback" {
         var opts = Opts{};
         opts.listen_port = 19091;
         try opts.advertise.append(gpa, .{ .ip = "10.0.0.2", .port = 19090 });
-        try opts.advertise.append(gpa, .{ .ip = "10.0.0.1", .port = proto.default_port });
+        try opts.advertise.append(gpa, .{ .ip = "10.0.0.1" });
         defer opts.advertise.deinit(gpa);
         var addrs = try leaseAddrs(gpa, opts, &.{}, 19091);
         defer addrs.deinit(gpa);
