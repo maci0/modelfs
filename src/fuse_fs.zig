@@ -2704,6 +2704,10 @@ test "removeHandoverSignal clears live_* and restores SIGUSR2 to SIG_DFL" {
     try std.testing.expect(handler == null);
 }
 
+/// Snapshot the inode table for the handover blob, sorted by ino. Hash-map
+/// iteration order must not leak into the blob: two images with the same
+/// tables should produce byte-identical state, so a replay or digest
+/// comparison of two runs is not confounded by Zig's per-process hash seed.
 fn snapNodes(st: *State, gpa: std.mem.Allocator) ![]handover.NodeSnap {
     st.nodes_mu.lockUncancelable(st.io);
     defer st.nodes_mu.unlock(st.io);
@@ -2713,9 +2717,16 @@ fn snapNodes(st: *State, gpa: std.mem.Allocator) ![]handover.NodeSnap {
     while (it.next()) |e| {
         try list.append(gpa, .{ .ino = e.key_ptr.*, .path = e.value_ptr.path, .nlookup = e.value_ptr.nlookup });
     }
+    std.mem.sort(handover.NodeSnap, list.items, {}, struct {
+        fn lessThan(_: void, a: handover.NodeSnap, b: handover.NodeSnap) bool {
+            return a.ino < b.ino;
+        }
+    }.lessThan);
     return list.toOwnedSlice(gpa);
 }
 
+/// Snapshot the open-handle table for the handover blob, sorted by fh for
+/// the same byte-for-byte determinism snapNodes gives the inode table.
 fn snapOpens(st: *State, gpa: std.mem.Allocator) ![]handover.OpenSnap {
     st.nodes_mu.lockUncancelable(st.io);
     defer st.nodes_mu.unlock(st.io);
@@ -2725,6 +2736,11 @@ fn snapOpens(st: *State, gpa: std.mem.Allocator) ![]handover.OpenSnap {
     while (it.next()) |e| {
         try list.append(gpa, .{ .fh = e.key_ptr.*, .path = e.value_ptr.* });
     }
+    std.mem.sort(handover.OpenSnap, list.items, {}, struct {
+        fn lessThan(_: void, a: handover.OpenSnap, b: handover.OpenSnap) bool {
+            return a.fh < b.fh;
+        }
+    }.lessThan);
     return list.toOwnedSlice(gpa);
 }
 
@@ -3095,6 +3111,137 @@ test "restoreMaps rebuilds the tables a handover snapshot carried" {
     try std.testing.expectEqual(@as(?[]const u8, null), pathForIno(&st, 5, &buf));
     forgetOpen(&st, 9);
     forgetOpen(&st, 10);
+}
+
+test "handover snapshot bytes do not carry hash-map iteration order" {
+    const gpa = std.testing.allocator;
+    // Two tables holding the same inode/handle set, built so the second map
+    // lands in a different internal layout: extra entries churned in and
+    // removed shift slots without changing the surviving set. The snapshots
+    // must be identical bytes anyway, so a replayed handover blob is a
+    // function of the state alone and a diff against a divergent replay
+    // names the first state that differs.
+    var st = tableFixture(gpa);
+    defer freeTables(&st);
+    const a = try internPath(&st, "/gguf/a.bin");
+    const b = try internPath(&st, "/gguf/b.bin");
+    const dir = try internPath(&st, "/gguf");
+    const fh_a = rememberOpen(&st, "/gguf/a.bin");
+    const fh_b = rememberOpen(&st, "/gguf/b.bin");
+
+    var st2 = tableFixture(gpa);
+    defer freeTables(&st2);
+    const a2 = try internPath(&st2, "/gguf/a.bin");
+    const b2 = try internPath(&st2, "/gguf/b.bin");
+    const dir2 = try internPath(&st2, "/gguf");
+    const fh_a2 = rememberOpen(&st2, "/gguf/a.bin");
+    const fh_b2 = rememberOpen(&st2, "/gguf/b.bin");
+    // Same names mint in the same order on both fixtures: the tables are a
+    // function of the lookup history, not of map layout.
+    try std.testing.expectEqual(a, a2);
+    try std.testing.expectEqual(b, b2);
+    try std.testing.expectEqual(dir, dir2);
+    try std.testing.expectEqual(fh_a, fh_a2);
+    try std.testing.expectEqual(fh_b, fh_b2);
+    // Layout churn: insert and fully forget extra names so st2's maps carry
+    // tombstone-shifted slots the first fixture never sees. The surviving
+    // set is unchanged, so any snapshot difference would be iteration order.
+    var churn: u64 = 0;
+    while (churn < 24) : (churn += 1) {
+        var nbuf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nbuf, "/churn/{d}", .{churn});
+        const ino = try internPath(&st2, name);
+        dropLookup(&st2, ino, 1);
+        const fh = rememberOpen(&st2, name);
+        forgetOpen(&st2, fh);
+    }
+
+    const node_snaps = try snapNodes(&st, gpa);
+    defer gpa.free(node_snaps);
+    const open_snaps = try snapOpens(&st, gpa);
+    defer gpa.free(open_snaps);
+    const node_snaps2 = try snapNodes(&st2, gpa);
+    defer gpa.free(node_snaps2);
+    const open_snaps2 = try snapOpens(&st2, gpa);
+    defer gpa.free(open_snaps2);
+
+    const knobs = handover.Knobs{
+        .origin = "/origin",
+        .cache = "/cache",
+        .id = "n1",
+        .mount = "/mnt",
+        .piece = 4096,
+        .listen = 1,
+        .water = .{},
+        .direct_io = true,
+        .allow_other = false,
+        .fuse_fd = -1,
+        .listen_fds = &.{},
+        .advertise = &.{},
+        .seeds = &.{},
+        .psk = &.{},
+    };
+    // Identical inputs to the real serialization: the churn advanced st2's
+    // counters, but those are carried fields, not table state, so both
+    // blobs take the same ones. Byte-equal blobs mean the encoded snapshot
+    // is a function of the surviving tables alone.
+    const blob = try handover.encode(gpa, .{
+        .origin = knobs.origin,
+        .cache = knobs.cache,
+        .id = knobs.id,
+        .mount = knobs.mount,
+        .piece = knobs.piece,
+        .listen = knobs.listen,
+        .water = knobs.water,
+        .direct_io = knobs.direct_io,
+        .allow_other = knobs.allow_other,
+        .fuse_fd = knobs.fuse_fd,
+        .listen_fds = knobs.listen_fds,
+        .advertise = knobs.advertise,
+        .seeds = knobs.seeds,
+        .psk = knobs.psk,
+        .init = &.{},
+        .nodes = node_snaps,
+        .opens = open_snaps,
+        .next_ino = st.next_ino,
+        .next_fh = st.next_fh,
+    });
+    defer gpa.free(blob);
+    const blob2 = try handover.encode(gpa, .{
+        .origin = knobs.origin,
+        .cache = knobs.cache,
+        .id = knobs.id,
+        .mount = knobs.mount,
+        .piece = knobs.piece,
+        .listen = knobs.listen,
+        .water = knobs.water,
+        .direct_io = knobs.direct_io,
+        .allow_other = knobs.allow_other,
+        .fuse_fd = knobs.fuse_fd,
+        .listen_fds = knobs.listen_fds,
+        .advertise = knobs.advertise,
+        .seeds = knobs.seeds,
+        .psk = knobs.psk,
+        .init = &.{},
+        .nodes = node_snaps2,
+        .opens = open_snaps2,
+        .next_ino = st.next_ino,
+        .next_fh = st.next_fh,
+    });
+    defer gpa.free(blob2);
+    try std.testing.expectEqualSlices(u8, blob, blob2);
+    // Sorted order in the snapshot itself: a diff against a divergent replay
+    // names the first state that differs instead of shuffling per process.
+    try std.testing.expect(std.sort.isSorted(handover.NodeSnap, node_snaps, {}, struct {
+        fn lessThan(_: void, x: handover.NodeSnap, y: handover.NodeSnap) bool {
+            return x.ino < y.ino;
+        }
+    }.lessThan));
+    try std.testing.expect(std.sort.isSorted(handover.OpenSnap, open_snaps, {}, struct {
+        fn lessThan(_: void, x: handover.OpenSnap, y: handover.OpenSnap) bool {
+            return x.fh < y.fh;
+        }
+    }.lessThan));
 }
 
 test "fuse operations wire every supported handler" {
