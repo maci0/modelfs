@@ -1882,6 +1882,10 @@ pub const Store = struct {
     }
 
     pub fn originPwrite(self: *Store, rel: []const u8, buf: []const u8, off: u64) isize {
+        return self.originPwriteWithIo(rel, buf, off, sys.pwriteAll, sys.closeWrite);
+    }
+
+    fn originPwriteWithIo(self: *Store, rel: []const u8, buf: []const u8, off: u64, comptime write: anytype, comptime close: anytype) isize {
         var path: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.originPath(&path, rel) catch return -c.ENAMETOOLONG;
         // Same O_NOFOLLOW contract as every other daemon write into a tree
@@ -1896,12 +1900,14 @@ pub const Store = struct {
             self.noteOriginIo(rel, rc, "write");
             return rc;
         }
-        const n = sys.pwriteAll(fd, buf, off);
-        const cr = sys.closeWrite(fd);
+        const n = write(fd, buf, off);
+        const cr = close(fd);
         const rc: i32 = if (n < 0) @intCast(n) else if (cr != 0) cr else 0;
         self.noteOriginIo(rel, rc, "write");
-        if (n < 0) return n;
-        if (cr != 0) return @intCast(cr);
+        if (rc != 0) {
+            self.distrust(rel);
+            return rc;
+        }
         return n;
     }
 
@@ -2874,6 +2880,77 @@ test "originPread and originPwrite raise and clear origin_io_down" {
     st.origin_io_down.store(true, .monotonic);
     try std.testing.expectEqual(@as(isize, 5), st.originPwrite("real.bin", rbuf[0..5], 0));
     try std.testing.expect(!st.origin_io_down.load(.monotonic));
+}
+
+test "failed origin writes invalidate live and persisted cache trust" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "write-failure-origin");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "write-failure-cache");
+    defer sys.deleteTree(std.testing.io, cache_d);
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
+    const Fault = struct {
+        fn partial(fd: c_int, data: []const u8, off: u64) isize {
+            const n = sys.pwriteAll(fd, data[0..4], off);
+            return if (n < 0) n else -c.ENOSPC;
+        }
+
+        fn close(fd: c_int) i32 {
+            sys.close(fd);
+            return -c.EIO;
+        }
+    };
+    const rel = "model.bin";
+    const old = "0123456789abcdef";
+    const fresh = "abcdefghijklmnop";
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const origin_z = try st.originPath(&pbuf, rel);
+    inline for (.{ false, true }) |partial| {
+        for ([_]bool{ true, false }) |live| {
+            try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, old));
+            st.cacheFillIdentified(rel, 16, 0, old, .{}, 0);
+            {
+                const cached = st.lookupRef(rel) orelse return error.TestUnexpectedResult;
+                defer st.releaseFile(cached);
+                try std.testing.expect(cached.bits.get(0));
+                try std.testing.expectEqual(@as(u32, 1), cached.hashes.count());
+            }
+            var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+            var sb: c.struct_stat = undefined;
+            const meta_z = try st.cacheMetaPath(&mbuf, rel);
+            try std.testing.expectEqual(@as(i32, 0), sys.statPath(meta_z, &sb));
+            if (!live) {
+                st.deinit();
+                st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+            }
+            const rc = st.originPwriteWithIo(rel, fresh, 0, if (partial) Fault.partial else sys.pwriteAll, if (partial) sys.closeWrite else Fault.close);
+            try std.testing.expectEqual(@as(isize, if (partial) -c.ENOSPC else -c.EIO), rc);
+            if (st.lookupRef(rel)) |file| {
+                defer st.releaseFile(file);
+                try std.testing.expect(live);
+                try std.testing.expect(file.bits.lastSet() == null);
+                try std.testing.expectEqual(@as(u32, 0), file.hashes.count());
+                try std.testing.expect(file.writes != 0);
+            } else {
+                try std.testing.expect(!live);
+            }
+            try std.testing.expectEqual(@as(i32, -c.ENOENT), sys.statPath(meta_z, &sb));
+            var out: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(if (partial) "abcd456789abcdef" else fresh, try sys.readFileBuf(&out, origin_z));
+            const reloaded = try st.get(rel, 16, 0);
+            defer st.releaseFile(reloaded);
+            try std.testing.expect(reloaded.bits.lastSet() == null);
+            st.forget(rel);
+        }
+    }
 }
 
 test "rangeFilled is true only when every covered piece is marked" {
