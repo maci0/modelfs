@@ -140,7 +140,7 @@ jobs:
           sha256sum modelfs-* > SHA256SUMS
           cat SHA256SUMS
           chmod +x modelfs-x86_64-linux-musl
-          test "$(./modelfs-x86_64-linux-musl version)" = "${zon}"
+          test "$(./modelfs-x86_64-linux-musl version)" = "modelfs ${zon}"
           ./modelfs-x86_64-linux-musl help >/dev/null
           gh release create "${TAG}" --verify-tag --draft \
             --title "modelfs ${TAG}" --notes-file release-notes.md \

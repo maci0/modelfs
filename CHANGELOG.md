@@ -54,6 +54,7 @@ as described below.
 
 ### Fixed - 2026-09-18
 
+- **Release publication accepts the CLI's existing version output.** The pre-publication smoke test now expects `modelfs <version>`, not a bare version number. Previously it rejected every correctly versioned binary before creating the draft release; CLI output and the tag/manifest equality check are unchanged.
 - **Opening an existing regular file with `O_TRUNC` truncates the origin and invalidates its cached contents.** `0.14.1` ignored the flag in the open handler. Applications must omit `O_TRUNC` when they intend to preserve existing data.
 - **Truncation invalidates cached bytes even if closing the origin file reports an error.** The error still reaches the caller, but an already-completed origin truncation no longer leaves the old cached tail readable. Cache shrink allocation failures also clear cached marks and hashes rather than retaining stale content; affected pieces refill.
 - **Malformed piece sidecars are discarded and refilled.** Truncated bitmap bodies, incomplete identity trailers, extra trailing bytes, and zero piece sizes are now rejected instead of partially decoded. Valid `MFS1` sidecars, both with and without the optional 24-byte identity trailer, remain readable; no data migration is required.
