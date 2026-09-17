@@ -146,8 +146,8 @@ const fuse_static_cflags = [_][]const u8{
 };
 
 fn addVendoredFuse(m: *std.Build.Module) void {
-    m.addIncludePath(.{ .cwd_relative = fuse_static_root ++ "/include" });
-    m.addIncludePath(.{ .cwd_relative = fuse_static_root ++ "/lib" });
+    m.addIncludePath(m.owner.path(fuse_static_root ++ "/include"));
+    m.addIncludePath(m.owner.path(fuse_static_root ++ "/lib"));
     m.addCSourceFiles(.{ .files = &fuse_static_source_paths, .flags = &fuse_static_cflags });
 }
 
@@ -242,7 +242,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const fuse_inc = if (fuse_static)
-        fuse_static_root ++ "/include"
+        b.pathFromRoot(fuse_static_root ++ "/include")
     else
         fuse_inc_opt orelse "/usr/include/fuse3";
     const fuse_lib = if (fuse_static) null else fuse_lib_opt;
@@ -308,7 +308,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     if (target.result.abi == .musl) {
-        tc.addIncludePath(.{ .cwd_relative = "src/c-musl-shim" });
+        tc.addIncludePath(b.path("src/c-musl-shim"));
     }
     tc.defineCMacro("_GNU_SOURCE", "1");
     // 31 while the daemon calls only the plain/_31-suffixed libfuse3
