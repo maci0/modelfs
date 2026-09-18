@@ -2,13 +2,13 @@
 
 ## [Unreleased]
 
-### Upgrade from 0.14.1 - 2026-09-17
+## [0.15.0] - 2026-09-18
 
-These changes are not in `v0.14.1`. The next release needs a minor bump under
-CONTRIBUTING's `0.y.z` policy because token lookup, accepted cache piece sizes,
-and cluster ID limits change for existing configurations. The peer HTTP response
-and persisted cache formats are unchanged; malformed peer requests are now rejected
-as described below.
+Token lookup, accepted cache piece sizes, and cluster ID limits change for
+existing configurations. The peer HTTP response and persisted cache formats
+are unchanged; malformed peer requests are now rejected as described below.
+
+### Upgrade from 0.14.1 - 2026-09-17
 
 - **Mount and handover startup reject piece sizes not aligned to the cache filesystem.** `0.14.1` accepted positive `--piece` values smaller than, or not divisible by, the cache `data/` filesystem's `statfs.f_bsize`; these now exit 1 because partial-block hole punches cannot reclaim those blocks. For example, `--piece 4K` no longer works on a 64-KiB-block filesystem; use `--piece 64K` or another positive multiple. The default `8M` is unchanged and aligns to both 4-KiB and 64-KiB blocks. Check custom grids before `modelfs update`: the replacement validates the inherited size after exec, so a rejected size terminates the mount rather than leaving the old image running. Stop and remount with a valid `--piece` (or `MODELFS_PIECE`); `update` cannot change the grid. Changing it makes old sidecar marks unusable and the cache refills, without migrating origin data. Use the same grid across the fleet to retain peer sharing; differing grids ignore each other's `/have` bits, and manifests on the old grid are not used for verification.
 - **`modelfs pull` trims surrounding spaces, tabs, CR, and LF from `HF_HOME` and `HOME`.** Previously those bytes were part of the token directory name. A whitespace-only `HF_HOME` now falls back to `HOME` instead of looking in a whitespace-named directory. Remove surrounding whitespace from these environment values; if it is intentional in a directory name, supply the token through `HF_TOKEN` instead (never argv).
@@ -30,7 +30,7 @@ as described below.
 
 ### Security - 2026-09-17
 
-- **`modelfs pull` refuses tokens containing embedded CR or LF**, from `HF_TOKEN` or the token file, with exit 1 before downloading. `0.14.1` passed these values to the HTTP client without this check. Replace malformed values with a single-line token; surrounding whitespace is still trimmed. Fixed in the unreleased tree, not yet in a tagged release.
+- **`modelfs pull` refuses tokens containing embedded CR or LF**, from `HF_TOKEN` or the token file, with exit 1 before downloading. `0.14.1` passed these values to the HTTP client without this check. Replace malformed values with a single-line token; surrounding whitespace is still trimmed.
 - **Temporary PSK and Hugging Face token buffers are wiped before release**, including decoded handover PSKs and the pull authorization buffer. `0.14.1` freed these copies without wiping them.
 - **Handover encoding and decoding reject PSKs containing CR or LF**, and update acknowledgements escape JSON token bytes. Normal CLI-generated hexadecimal update tokens are unchanged.
 - **Lease cleanup and pin checks use the link's metadata rather than following symlinks**, and invalid log-level diagnostics suppress control bytes.
@@ -1198,7 +1198,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/maci0/modelfs/releases/tag/v0.15.0
 [0.14.1]: https://github.com/maci0/modelfs/releases/tag/v0.14.1
 [0.14.0]: https://github.com/maci0/modelfs/releases/tag/v0.14.0
 [0.13.0]: https://github.com/maci0/modelfs/releases/tag/v0.13.0
