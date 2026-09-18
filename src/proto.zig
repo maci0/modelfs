@@ -206,6 +206,32 @@ pub fn headerGet2(head: []const u8, name_a: []const u8, name_b: []const u8) stru
     return .{ a, b };
 }
 
+/// One-pass twin of `headerGet` for three names. Same match and trim as
+/// `headerGet2`; first occurrence of each name wins. `handleConn` uses this
+/// for Authorization+Range+Content-Length so the request head is not
+/// scanned three times.
+pub fn headerGet3(head: []const u8, name_a: []const u8, name_b: []const u8, name_c: []const u8) struct { ?[]const u8, ?[]const u8, ?[]const u8 } {
+    var a: ?[]const u8 = null;
+    var b: ?[]const u8 = null;
+    var c: ?[]const u8 = null;
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    _ = it.next(); // status / request line
+    while (it.next()) |line| {
+        if (line.len == 0) break;
+        if (a != null and b != null and c != null) break;
+        const col = std.mem.findScalar(u8, line, ':') orelse continue;
+        const name = line[0..col];
+        const val = std.mem.trim(u8, line[col + 1 ..], " \t");
+        if (a == null and col == name_a.len and std.ascii.eqlIgnoreCase(name, name_a))
+            a = val
+        else if (b == null and col == name_b.len and std.ascii.eqlIgnoreCase(name, name_b))
+            b = val
+        else if (c == null and col == name_c.len and std.ascii.eqlIgnoreCase(name, name_c))
+            c = val;
+    }
+    return .{ a, b, c };
+}
+
 /// Timing-safe bearer check. Tokens are hashed with SHA-256 first so a
 /// length mismatch cannot leak through a byte-by-byte compare: the
 /// comparison is always 32 bytes.
@@ -832,6 +858,97 @@ test "headerGet2 matches two headerGet calls in one pass" {
     const cr, const cl2 = headerGet2(dup, "Content-Range", "Content-Length");
     try std.testing.expectEqualStrings("bytes 0-0/1", cr.?);
     try std.testing.expectEqualStrings("1", cl2.?);
+}
+
+test "headerGet3 matches three headerGet calls in one pass" {
+    const head = "GET /data HTTP/1.1\r\nAuthorization: Bearer  tok123 \r\nRange: bytes=0-9\r\nX-Piece-Size: 4096\r\nContent-Length: 16\r\n\r\n";
+    const auth, const rh, const cl = headerGet3(head, "Authorization", "Range", "Content-Length");
+    try std.testing.expectEqualStrings("Bearer  tok123", auth.?);
+    try std.testing.expectEqualStrings("bytes=0-9", rh.?);
+    try std.testing.expectEqualStrings("16", cl.?);
+    const a, const b = headerGet2(head, "Authorization", "Range");
+    try std.testing.expectEqual(a, auth);
+    try std.testing.expectEqual(b, rh);
+    try std.testing.expectEqual(headerGet(head, "Content-Length"), cl);
+    const missing, const host, const extra = headerGet3(head, "Content-Range", "Host", "X-No-Such");
+    try std.testing.expect(missing == null);
+    try std.testing.expect(host == null);
+    try std.testing.expect(extra == null);
+    const dup = "HTTP/1.1 206\r\ncontent-length: 1\r\nContent-Length: 99\r\nContent-Range: bytes 0-0/1\r\nAuthorization: Bearer x\r\n\r\n";
+    const cr, const cl2, const auth2 = headerGet3(dup, "Content-Range", "Content-Length", "Authorization");
+    try std.testing.expectEqualStrings("bytes 0-0/1", cr.?);
+    try std.testing.expectEqualStrings("1", cl2.?);
+    try std.testing.expectEqualStrings("Bearer x", auth2.?);
+}
+
+test "headerGet3 retires fewer instructions than headerGet2 plus headerGet" {
+    // Work counter, not wall clock: one pass must beat two walks on the
+    // handleConn Authorization+Range then Content-Length shape. Skips when
+    // perf_event_open is unavailable (paranoid, missing PMU).
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var attr = linux.perf_event_attr{
+        .type = .HARDWARE,
+        .config = @intFromEnum(linux.PERF.COUNT.HW.INSTRUCTIONS),
+        .flags = .{
+            .disabled = true,
+            .exclude_kernel = true,
+            .exclude_hv = true,
+            .exclude_idle = true,
+        },
+    };
+    const rc = linux.perf_event_open(&attr, 0, -1, -1, 0);
+    const n: isize = @bitCast(rc);
+    if (n < 0) return error.SkipZigTest;
+    const fd: linux.fd_t = @intCast(n);
+    defer _ = linux.close(fd);
+
+    const head = "GET /data?path=gguf%2Fmodel.gguf HTTP/1.1\r\nHost: 10.0.0.1:18080\r\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\nRange: bytes=0-8388607\r\nX-Piece-Size: 8388608\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const inner: usize = 2000;
+    var w: usize = 0;
+    while (w < 200) : (w += 1) {
+        std.mem.doNotOptimizeAway(headerGet2(head, "Authorization", "Range"));
+        std.mem.doNotOptimizeAway(headerGet(head, "Content-Length"));
+        std.mem.doNotOptimizeAway(headerGet3(head, "Authorization", "Range", "Content-Length"));
+    }
+
+    const read_count = struct {
+        fn go(pfd: linux.fd_t) u64 {
+            var buf: [8]u8 = undefined;
+            const got = linux.read(pfd, &buf, 8);
+            if (got != 8) return 0;
+            return std.mem.readInt(u64, &buf, .little);
+        }
+    }.go;
+
+    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.RESET, 0);
+    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.ENABLE, 0);
+    var i: usize = 0;
+    while (i < inner) : (i += 1) {
+        const a, const b = headerGet2(head, "Authorization", "Range");
+        const c = headerGet(head, "Content-Length");
+        std.mem.doNotOptimizeAway(a);
+        std.mem.doNotOptimizeAway(b);
+        std.mem.doNotOptimizeAway(c);
+    }
+    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.DISABLE, 0);
+    const two = read_count(fd);
+
+    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.RESET, 0);
+    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.ENABLE, 0);
+    i = 0;
+    while (i < inner) : (i += 1) {
+        const a, const b, const c = headerGet3(head, "Authorization", "Range", "Content-Length");
+        std.mem.doNotOptimizeAway(a);
+        std.mem.doNotOptimizeAway(b);
+        std.mem.doNotOptimizeAway(c);
+    }
+    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.DISABLE, 0);
+    const one = read_count(fd);
+
+    try std.testing.expect(two > 0);
+    try std.testing.expect(one > 0);
+    try std.testing.expect(one < two);
 }
 
 test "HaveBits.hasPiece respects advertised grid" {

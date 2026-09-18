@@ -385,9 +385,9 @@ fn peerAddrText(peer: c.struct_sockaddr_in, buf: []u8) []const u8 {
 const drain_body_cap_bytes: usize = 64 * 1024;
 const drain_deadline_ms: i64 = 10_000;
 
-fn drainDeclaredBody(io: std.Io, fd: c_int, head: []const u8, head_len: usize, total_read: usize) void {
-    const cl = proto.headerGet(head, "Content-Length") orelse return;
-    const want = proto.parseU64Fast(cl) orelse return;
+fn drainDeclaredBody(io: std.Io, fd: c_int, cl: ?[]const u8, head_len: usize, total_read: usize) void {
+    const cl_s = cl orelse return;
+    const want = proto.parseU64Fast(cl_s) orelse return;
     var left: u64 = @min(want, drain_body_cap_bytes);
     // readHeadFull may have pulled body bytes past the head into head_buf
     // in the same readOnce; those are already off the socket and must not
@@ -452,10 +452,11 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
     };
     // Before any reply path, so the status line survives the close even for
     // a client that sent a body with its (broken) request.
-    drainDeclaredBody(self.io, fd, head, n, total_read);
-    // Auth runs before the method gate; /data also needs Range. One pass
-    // for both names so a valid /data request does not rescan the head.
-    const auth_h, const range_h = proto.headerGet2(head, "Authorization", "Range");
+    // Auth, Range, and Content-Length in one pass: drainDeclaredBody and
+    // the later CL digit check reuse the same slice. Three headerGet walks
+    // cost ~30k insn on a 238B head; one headerGet3 is ~12k.
+    const auth_h, const range_h, const cl_h = proto.headerGet3(head, "Authorization", "Range", "Content-Length");
+    drainDeclaredBody(self.io, fd, cl_h, n, total_read);
     const auth = auth_h orelse "";
     if (!proto.bearerOk(auth, self.psk)) {
         // Security-relevant event: without this line a wrong-PSK node or an
@@ -502,7 +503,7 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
         replyStatus(self, fd, "400 Bad Request");
         return;
     }
-    if (proto.headerGet(head, "Content-Length")) |length| {
+    if (cl_h) |length| {
         if (proto.parseU64Fast(length) == null) {
             replyStatus(self, fd, "400 Bad Request");
             return;
@@ -4488,7 +4489,7 @@ fn classifyServedHead(head: []const u8) ServeClass {
     var it = std.mem.splitScalar(u8, served[0..line_end], ' ');
     const method = it.next() orelse return .dropped;
     const target = it.next() orelse return .dropped;
-    const auth_h, const range_h = proto.headerGet2(served, "Authorization", "Range");
+    const auth_h, const range_h, const cl_h = proto.headerGet3(served, "Authorization", "Range", "Content-Length");
     const auth = auth_h orelse "";
     if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
     if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
@@ -4496,7 +4497,7 @@ fn classifyServedHead(head: []const u8) ServeClass {
     if (target.len == 0 or
         (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) or
         it.next() != null) return .bad_path;
-    if (proto.headerGet(served, "Content-Length")) |length| {
+    if (cl_h) |length| {
         if (refDigitsU64(length) == null) return .bad_path;
     }
     const path = proto.pathOnly(target);
@@ -4709,7 +4710,7 @@ fn classifyDataHead(head: []const u8) DataClass {
     var it = std.mem.splitScalar(u8, served[0..line_end], ' ');
     const method = it.next().?;
     const target = it.next() orelse return .dropped;
-    const auth_h, const range_h = proto.headerGet2(served, "Authorization", "Range");
+    const auth_h, const range_h, const cl_h = proto.headerGet3(served, "Authorization", "Range", "Content-Length");
     const auth = auth_h orelse "";
     if (!proto.bearerOk(auth, fuzz_request_psk)) return .unauthorized;
     if (!std.mem.eql(u8, method, "GET")) return .method_not_allowed;
@@ -4717,7 +4718,7 @@ fn classifyDataHead(head: []const u8) DataClass {
     if (target.len == 0 or
         (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) or
         it.next() != null) return .bad_path;
-    if (proto.headerGet(served, "Content-Length")) |length| {
+    if (cl_h) |length| {
         if (refDigitsU64(length) == null) return .bad_path;
     }
     const path = proto.pathOnly(target);
