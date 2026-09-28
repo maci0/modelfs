@@ -113,16 +113,21 @@ answers `--help` without starting work.
 ## Build and release checks
 
 `./scripts/ci.sh` does not run CI's `static-linux` jobs. Reproduce that job's
-test and ELF checks on an x86_64 Linux host with:
+test, ELF, and smoke checks on an x86_64 Linux host with:
 
 ```bash
 zig build test -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast -Dfuse-static
 ./scripts/build_static.sh x86_64-linux-musl --prefix .scratch/static
+.scratch/static/modelfs-x86_64-linux-musl version
 ```
 
-On an aarch64 Linux host, use `aarch64-linux-musl` in both commands.
+On an aarch64 Linux host, use `aarch64-linux-musl` in all three commands.
 The tests execute the target binary, so use the host's architecture;
 `build_static.sh` alone can cross-compile but does not run the unit tests.
+The last command is the one the CI job adds: the ELF checks read program and
+dynamic headers, so a binary that links and then cannot start passes them.
+Each `static-linux` leg runs on a runner of its own target's architecture,
+which is what lets the job execute what it built.
 The separate prefix preserves the native development binary in `zig-out/`.
 These builds compile the vendored libfuse3 and do not need distro headers.
 

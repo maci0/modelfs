@@ -86,6 +86,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Each leg's runner is its own target's architecture, so a leg
+          # can execute the binary it just built. Add a cross leg here and
+          # this step needs a condition; today there is none to write.
           - target: x86_64-linux-musl
             runner: ubuntu-24.04
           - target: aarch64-linux-musl
@@ -96,6 +99,17 @@ jobs:
         run: zig build test -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dfuse-static
       - name: Build and verify the static single-file binary
         run: ./scripts/build_static.sh ${{ matrix.target }} --prefix .scratch/static
+      # assert_static_elf reads the program and dynamic headers, so it
+      # passes on a binary that links cleanly and then cannot start: a
+      # static-PIE relocation musl rejects at load, a musl init path that
+      # faults, a vendored libfuse3 constructor that runs before main.
+      # release.yml's publish job smoke-tests the x86_64 binary, but only
+      # at tag time, so nothing caught that between pushes. `version`
+      # exits 0 without touching /dev/fuse, the origin, or the network.
+      # The artifact name is modelfs-<arch>-linux-musl, which for both
+      # shipped targets is modelfs-<target>.
+      - name: Run the static single-file binary
+        run: .scratch/static/modelfs-${{ matrix.target }} version
 
   # Enforces what CONTRIBUTING promises under "Cutting a release": two
   # ReleaseFast builds from differently named trees, with TZ/locale/
