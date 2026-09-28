@@ -3,6 +3,7 @@
 //! inflight).
 const std = @import("std");
 const proto = @import("proto.zig");
+const store_mod = @import("store.zig");
 const sys = @import("sys.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 const c = sys.c;
@@ -981,11 +982,34 @@ pub const Catalog = struct {
     pub fn sweepLeases(self: *Catalog) void {
         var dbuf: [sys.c.PATH_MAX]u8 = undefined;
         const dirz = self.clusterDir(&dbuf) catch return;
+        const cutoff = self.sweepCutoff(dirz) orelse return;
+        self.sweepDir(dirz, cutoff, .leases);
+
+        // The manifests dir is swept too, not just the cluster dir. A
+        // manifest publish stages as `<hex>.tmp.<tid>` and renames it, and a
+        // crash between the two leaves the staging file on shared origin
+        // storage forever: the name is keyed by thread id, so a later publish
+        // on a restarted node never reuses or overwrites it. Without this the
+        // dir grows by one file per (model, crashing node) forever.
+        var mbuf: [sys.c.PATH_MAX]u8 = undefined;
+        const mdirz = sys.joinZ(&mbuf, std.mem.span(dirz), store_mod.Store.manifests_dir_leaf) catch return;
+        self.sweepDir(mdirz, cutoff, .staging);
+    }
+
+    /// Which names one sweep round will consider.
+    const SweepKind = enum {
+        /// Cluster dir: lease `<id>.json` (never our own) plus any `.tmp`.
+        leases,
+        /// Manifests dir: staging `.tmp` only. Published manifests are named
+        /// by content hash and carry no extension, so they are never touched.
+        staging,
+    };
+
+    fn sweepDir(self: *Catalog, dirz: [*:0]const u8, cutoff: i64, kind: SweepKind) void {
         // Same O_NOFOLLOW directory open as walkLeases: following a planted
         // `.cluster` symlink would unlink names under the target.
         const dir = sys.opendirNoFollow(dirz) orelse return;
         defer sys.closedir(dir);
-        const cutoff = self.sweepCutoff(dirz) orelse return;
 
         // Collect then sort: NFS readdir order must not decide which stale
         // claim is unlinked first. A crash mid-sweep would otherwise leave
@@ -1002,6 +1026,7 @@ pub const Catalog = struct {
             const name = sys.dirName(ent);
             if (name.len == 0 or name[0] == '.') continue;
             if (std.mem.endsWith(u8, name, ".json")) {
+                if (kind != .leases) continue;
                 if (std.mem.eql(u8, name[0 .. name.len - ".json".len], self.self_id)) continue;
             } else if (!std.mem.endsWith(u8, name, ".tmp")) {
                 continue;
@@ -1037,7 +1062,11 @@ pub const Catalog = struct {
                 }
                 continue;
             }
-            std.log.info("swept stale cluster lease {s}", .{proto.displayName(name)});
+            if (kind == .leases) {
+                std.log.info("swept stale cluster lease {s}", .{proto.displayName(name)});
+            } else {
+                std.log.info("swept abandoned manifest staging file {s}", .{proto.displayName(name)});
+            }
         }
     }
 

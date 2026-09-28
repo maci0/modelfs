@@ -1589,13 +1589,16 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             sys.sleepMs(io, update_poll_ms);
             continue;
         };
-        defer gpa.free(ack_blob);
-        const ack = handover.decodeAck(gpa, ack_blob) catch {
-            sys.sleepMs(io, update_poll_ms);
-            continue;
+        // Block scope, not defer: a stale ack from a previous update keeps
+        // this polling for the full 30s, and a function-scoped defer would
+        // hold every one of those blobs and parse arenas until the wait ends.
+        const matched = blk: {
+            defer gpa.free(ack_blob);
+            const ack = handover.decodeAck(gpa, ack_blob) catch break :blk false;
+            defer ack.deinit();
+            break :blk std.mem.eql(u8, ack.value.token, &tok);
         };
-        defer ack.deinit();
-        if (std.mem.eql(u8, ack.value.token, &tok)) {
+        if (matched) {
             _ = sys.unlink(ack_path);
             if (!printOut(io, gpa, "updated pid {d}\n", .{pid})) return 1;
             return 0;
@@ -2694,6 +2697,8 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
         .stdout = .ignore,
         .stderr = .ignore,
     });
+    // std.process.Child.kill signals and reaps, so this is the whole
+    // teardown; a second wait trips Child's own `id == null` assert.
     defer child.kill(std.testing.io);
 
     var ready_buf: [192]u8 = undefined;

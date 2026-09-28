@@ -1126,8 +1126,11 @@ pub const Store = struct {
     /// min_idle_secs, unpinned, not mid-fill, and holds nothing worth keeping:
     /// idle entries get their fd closed; entries that are still fully empty
     /// are evicted outright (their data/meta/pin artifacts carry no cached
-    /// bytes). Bounds the files map on nodes that churn through many model
-    /// paths without unlinks.
+    /// bytes). This bounds the per-path bookkeeping, not the map itself: an
+    /// entry that has cached a piece is never evicted before its unlink, so
+    /// the files map still grows with the number of distinct model paths this
+    /// node has ever read. The cache bound is a separate, deliberate question
+    /// (see cull.zig for what does drop cached entries).
     pub fn reapIdle(self: *Store, now_sec: i64, min_idle_secs: i64) void {
         var cands: std.ArrayList(*Cached) = .empty;
         defer cands.deinit(self.gpa);
@@ -1439,9 +1442,14 @@ pub const Store = struct {
 
     /// Origin-side manifest directory: `<origin>/.cluster/manifests/`. Flat
     /// hex names (piece.manifestName), so no nested directories and no
-    /// traversal risk; lease walks and sweeps skip it (no .json/.tmp names,
-    /// and walkLeases only parses .json files).
-    pub const manifests_dir = ".cluster/manifests";
+    /// traversal risk; walkLeases only parses .json files and so never
+    /// descends here. `modelfs dupes` and the lease sweep reach it by
+    /// appending `manifests_dir_leaf` to a path they already hold.
+    pub const manifests_dir = ".cluster/" ++ manifests_dir_leaf;
+
+    /// Last component of `manifests_dir`, for callers that already hold
+    /// `<origin>/.cluster`.
+    pub const manifests_dir_leaf = "manifests";
 
     /// Upper bound on a manifest blob read from shared storage. A fully
     /// hashed file at the default 8 MiB grid costs 36 bytes per piece, so
