@@ -276,6 +276,12 @@ fn writeOut(io: std.Io, bytes: []const u8) bool {
 var captured_stdout: ?*std.ArrayList(u8) = null;
 var captured_stderr: ?*std.ArrayList(u8) = null;
 
+/// Writes one operator-facing line to stderr, truncated to 512 bytes on a
+/// stack buffer: a rendered line longer than that is printed unformatted
+/// instead, so no diagnostic is lost to a length cap. Under test the bytes
+/// go to `captured_stderr`; an append failure there is swallowed, because
+/// that buffer belongs to the installing test and the line it drops is a
+/// stderr diagnostic no assertion reads.
 fn printErr(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, fmt, args) catch {
@@ -1927,7 +1933,10 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
     }
     // The request that triggered this exec carries the token the waiting
     // CLI matches against the ack. It is consumed here so a leftover cannot
-    // make a later SIGUSR2 replay an update nobody asked for.
+    // make a later SIGUSR2 replay an update nobody asked for. Every step is
+    // allowed to fail open with no token: the handover already succeeded,
+    // and the mount is better served by a SIGUSR2 that finds no matching
+    // request than by this image refusing to exec.
     {
         var pbuf: [sys.c.PATH_MAX]u8 = undefined;
         if (sys.joinZ(&pbuf, owned.cache, handover.req_file)) |rp| {

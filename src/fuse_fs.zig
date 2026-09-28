@@ -2586,6 +2586,9 @@ export fn ll_release(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, fi: ?*fuse.fuse
     forgetOpen(st, fiFh(fi));
     if (p) |path| {
         var zbuf: [sys.c.PATH_MAX]u8 = undefined;
+        // A path too long to NUL-terminate cannot name an artifact the
+        // release would tear down, and RELEASE has no error to answer with:
+        // the open state is already forgotten above either way.
         if (sys.toZ(&zbuf, path)) |z| {
             _ = mf_release(z, fi);
         } else |_| {}
@@ -4165,7 +4168,8 @@ test "hydratePiece fails closed when write generation keeps discarding fills" {
                 if (g == gen) break;
                 // The hydrator is parked in completeFill on the content_mu
                 // held here with the previous claim still recorded: it needs
-                // that lock to discard and claim again.
+                // that lock to discard and claim again. A refused yield is a
+                // busy spin the deadline below still bounds.
                 file.content_mu.unlock(st.io);
                 holding_content = false;
                 std.Thread.yield() catch {};
@@ -4173,7 +4177,9 @@ test "hydratePiece fails closed when write generation keeps discarding fills" {
                 holding_content = true;
             } else {
                 // Sleeping between the discard and the retry's claim. Keep
-                // content_mu so the retry parks instead of filling.
+                // content_mu so the retry parks instead of filling. A yield
+                // the kernel refuses is a busy spin the deadline below
+                // still bounds, so it is swallowed rather than fatal.
                 std.Thread.yield() catch {};
             }
             if (sys.monoNs(st.io) > deadline) {

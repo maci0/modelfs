@@ -1835,7 +1835,9 @@ pub const Store = struct {
             // First publish for this file (or after an operator wiped
             // .cluster): create the manifests dir, same lazy-mkdir shape as
             // lease publish (an unconditional mkdirAll would cost one failed
-            // mkdir per publish for the life of the cluster).
+            // mkdir per publish for the life of the cluster). A dir path
+            // past PATH_MAX cannot name a creatable directory, so the second
+            // write below fails and takes the retry path it already has.
             var mid: [sys.c.PATH_MAX]u8 = undefined;
             if (self.manifestsDirPath(&mid)) |d| {
                 _ = sys.mkdirAll(std.mem.span(d), 0o755);
@@ -3891,6 +3893,8 @@ test "cacheFillIdentified shrink drops an in-flight fill of a surviving piece" {
             }
         }.run, .{ &st, f, stale[0..], &claimed });
 
+        // A refused yield is a busy spin; the filler below sets the flag
+        // before it can return, so the loop always ends.
         while (!claimed.load(.acquire))
             std.Thread.yield() catch {};
         st.cacheFillIdentified("race.bin", 32, 16, &fresh, OriginId{}, sys.monoSec(std.testing.io));
