@@ -2,7 +2,7 @@
 # jobs (x86_64 and native aarch64) run this instead of repeating the recipe,
 # which is how a step could be added to one job's gate and not the other.
 #
-# The checkout and the Zig toolchain come from the checkout-zig action the
+# The checkout and the Zig toolchain come from the steps the
 # job runs first. Run steps need an explicit `shell`: a composite action has
 # no workflow-level default.
 name: setup-gate-tooling

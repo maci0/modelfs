@@ -35,7 +35,10 @@ jobs:
       # Checkout without a leftover write token, then the pinned Zig
       # toolchain resolved from build.zig.zon. The composite action owns
       # both, and the compile-cache entry setup-zig keeps per job.
-      - uses: ./.github/actions/checkout-zig
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       - uses: ./.github/actions/setup-gate-tooling
       # shellcheck is preinstalled on ubuntu-24.04 runners.
       - name: Static analysis gate
@@ -49,7 +52,10 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - uses: ./.github/actions/checkout-zig
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       - uses: ./.github/actions/setup-gate-tooling
       - name: Static analysis gate
         run: ./scripts/check.sh
@@ -64,7 +70,10 @@ jobs:
     # Same hang guard as the check job.
     timeout-minutes: 30
     steps:
-      - uses: ./.github/actions/checkout-zig
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       # ReleaseFast: the deployment build README documents, not Debug, so the
       # gate exercises the codegen that actually ships. Same script
       # scripts/ci.sh runs, so the flags cannot drift from a local pre-push.
@@ -94,7 +103,10 @@ jobs:
           - target: aarch64-linux-musl
             runner: ubuntu-24.04-arm
     steps:
-      - uses: ./.github/actions/checkout-zig
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       - name: Test native static release build
         run: zig build test -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dfuse-static
       - name: Build and verify the static single-file binary
@@ -126,7 +138,10 @@ jobs:
     # carries.
     timeout-minutes: 45
     steps:
-      - uses: ./.github/actions/checkout-zig
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       # The script builds against the system libfuse3 like the check job does;
       # reproducibility is a property of our inputs, not of the headers' bytes
       # being identical across the two build trees (they are only read).
