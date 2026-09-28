@@ -93,17 +93,8 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
-      - name: bundle license texts and dependency provenance
-        run: |
-          tar --format=gnu --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner --mode=0644 -czf dist/modelfs-licenses.tar.gz \
-            LICENSE \
-            .deps/libfuse3-3.16.2/LICENSE \
-            .deps/libfuse3-3.16.2/LGPL2.txt \
-            .deps/libfuse3-3.16.2/GPL2.txt \
-            .deps/libfuse3-3.16.2/README.md \
-            .deps/fuse3-arm64/NOTICE \
-            .deps/fuse3-arm64/copyright \
-            .deps/fuse3-arm64/README.md
+      - name: package and checksum the release assets
+        run: ./scripts/package_release.sh --dist dist
       - name: checksum and publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -126,20 +117,8 @@ jobs:
             echo "release ${TAG} already exists; refusing to replace it" >&2
             exit 1
           fi
-          # The rel-* prefix keeps the artifact directories from colliding
-          # with the binaries' own names; after the flatten, the SHA256SUMS
-          # lines name exactly the assets a downloader sees. The sparks
-          # artifact is a single file named just "modelfs"; it takes its
-          # release name here.
-          mv dist/rel-x86_64-linux-musl/modelfs-x86_64-linux-musl dist/
-          mv dist/rel-aarch64-linux-musl/modelfs-aarch64-linux-musl dist/
-          mv dist/rel-sparks/modelfs dist/modelfs-aarch64-linux-gnu
-          rmdir dist/rel-*
           cd dist
-          rm -f SHA256SUMS
-          sha256sum modelfs-* > SHA256SUMS
-          cat SHA256SUMS
-          chmod +x modelfs-x86_64-linux-musl
+          # The packaged host-arch binary must be the one the tag named.
           test "$(./modelfs-x86_64-linux-musl version)" = "modelfs ${zon}"
           ./modelfs-x86_64-linux-musl help >/dev/null
           gh release create "${TAG}" --verify-tag --draft \

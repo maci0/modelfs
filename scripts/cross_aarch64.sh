@@ -3,7 +3,9 @@
 # aarch64-linux-gnu.2.39, ReleaseFast, vendored arm64 libfuse3. Extracts the
 # committed .deb files first (scripts/extract_fuse3_arm64.sh). Both
 # .github/workflows/ci.yml and scripts/ci.sh run this, so the flags cannot
-# drift apart the way the old inlined extract recipe used to.
+# drift apart the way the old inlined extract recipe used to. The flags come
+# from cross_aarch64_flags in lib.sh, which scripts/repro_check.sh reads too:
+# the reproducibility proof covers the exact recipe this builds.
 set -euo pipefail
 export LC_ALL=C
 export TZ=UTC
@@ -43,18 +45,13 @@ command -v od >/dev/null 2>&1 || fail "od not found on PATH (used to assert the 
 require_zig
 
 "${SCRIPTS_DIR}/extract_fuse3_arm64.sh"
-FUSE_INC="${SCRATCH_DIR}/fuse3-arm64/root/usr/include/fuse3"
-FUSE_LIB="${SCRATCH_DIR}/fuse3-arm64/lib"
+fuse_arm64_paths
 [[ -d "${FUSE_INC}" ]] || fail "missing ${FUSE_INC} after extract"
 [[ -d "${FUSE_LIB}" ]] || fail "missing ${FUSE_LIB} after extract"
 
-build_args=(
-    zig build
-    -Dtarget=aarch64-linux-gnu.2.39
-    -Doptimize=ReleaseFast
-    "-Dfuse-include=${FUSE_INC}"
-    "-Dfuse-lib=${FUSE_LIB}"
-)
+build_args=(zig build)
+cross_aarch64_flags
+build_args+=("${CROSS_AARCH64_FLAGS[@]}")
 if [[ -n "${PREFIX}" ]]; then
     build_args+=(--prefix "${PREFIX}")
     bin="${PREFIX}/bin/modelfs"

@@ -127,6 +127,7 @@ Other build checks:
 ```bash
 ./scripts/cross_aarch64.sh             # aarch64 ReleaseFast against the vendored libfuse3
 ./scripts/repro_check.sh               # two ReleaseFast builds from different paths, byte-compared
+./scripts/package_release.sh --dist D # flatten, bundle licenses, checksum the release assets
 ./scripts/install_libfuse3_dev.sh      # the apt install CI does (needs passwordless sudo -n)
 python3 scripts/run_benchmarks_and_plots.py   # live benchmarks into .scratch/benchmarks/
 ```
@@ -232,6 +233,11 @@ candidate locally the same way CI does:
 ./scripts/repro_check.sh    # builds twice (path/TZ/locale varied), diffs the bytes
 ```
 
+That covers all four recipes a release ships: the host glibc build, both musl
+static targets, and the `aarch64-linux-gnu` spark binary, whose flags come from
+`cross_aarch64_flags` in `scripts/lib.sh` so the proof cannot drift onto a
+near-miss of what `scripts/cross_aarch64.sh` builds.
+
 or by hand by building twice from two different paths and comparing
 `sha256sum zig-out/bin/modelfs` output.
 
@@ -243,8 +249,11 @@ no shared libraries), refuses a tag that does not name `build.zig.zon`'s
 version, and attaches the two musl static binaries, the
 `aarch64-linux-gnu` spark build (from `scripts/cross_aarch64.sh`), and
 `modelfs-licenses.tar.gz` containing the project license and both vendored
-libfuse variants' license texts and provenance. `SHA256SUMS` covers all four
-assets on the GitHub release named after the tag. Re-tagging buys nothing: the workflow fires on
+libfuse variants' license texts and provenance. The asset arrangement, the
+license bundle, and the digest list are produced by
+`scripts/package_release.sh`, which normalizes the tar's entry order, mtimes,
+and ownership so the archive is byte-identical across runs. `SHA256SUMS`
+covers all four assets on the GitHub release named after the tag. Re-tagging buys nothing: the workflow fires on
 tag creation, and a mismatched tag fails the build. The repository itself
 stays the source of truth for package consumers (the Zig package tarball is
 whatever `.paths` lists) and for anyone building from the tagged commit.

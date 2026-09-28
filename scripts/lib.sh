@@ -63,6 +63,35 @@ version_ge() {
     }'
 }
 
+# The spark-node deploy ABI and the one place its cross-build flags live.
+# scripts/cross_aarch64.sh builds the binary and scripts/repro_check.sh
+# proves it byte-identical; both take the flags from here so the two cannot
+# drift into testing a recipe the release does not ship.
+CROSS_TARGET="aarch64-linux-gnu.2.39"
+
+# The vendored arm64 libfuse3 paths cross_aarch64.sh extracts, exported as
+# FUSE_INC and FUSE_LIB. Call scripts/extract_fuse3_arm64.sh first.
+fuse_arm64_paths() {
+    FUSE_INC="${SCRATCH_DIR}/fuse3-arm64/root/usr/include/fuse3"
+    FUSE_LIB="${SCRATCH_DIR}/fuse3-arm64/lib"
+}
+
+# The spark cross-build's -D flags, as the global array
+# CROSS_AARCH64_FLAGS: the same set the sparks CI job and release.yml build
+# with. An array rather than printed lines so callers splice it directly and
+# a failed subshell cannot be masked by a process substitution.
+# shellcheck disable=SC2034 # read by the scripts that source this file
+CROSS_AARCH64_FLAGS=()
+cross_aarch64_flags() {
+    # shellcheck disable=SC2034 # read by the callers of this function
+    CROSS_AARCH64_FLAGS=(
+        "-Dtarget=${CROSS_TARGET}"
+        "-Doptimize=ReleaseFast"
+        "-Dfuse-include=${FUSE_INC}"
+        "-Dfuse-lib=${FUSE_LIB}"
+    )
+}
+
 # Named preflight for scripts that invoke `zig build`: a missing toolchain
 # otherwise dies as bash "command not found" with no pointer at setup.
 require_zig() {

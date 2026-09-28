@@ -5,6 +5,10 @@
 ### Gate hardening - 2026-09-28
 - **`scripts/check.sh` fails when the local shellcheck does not define an optional check named in `.shellcheckrc`.** Those checks are enabled by name, and a shellcheck that never had one ignores the name silently, so the gate could report a pass while running fewer rules than CI does. The gate now requires every `enable=` in `.shellcheckrc` to appear in `shellcheck --list-optional`. No shell changes: the same scripts lint clean, and the set of enabled rules is unchanged on a current shellcheck.
 
+### Build reproducibility and release packaging - 2026-09-28
+- **The reproducibility proof covers the `aarch64-linux-gnu` spark binary.** `release.yml` publishes three binaries, but `scripts/repro_check.sh` compared only the host build and the two musl static targets, so the glibc spark artifact shipped with no byte-identical rebuild proof. The script now builds it twice as well, and takes its flags from the new `cross_aarch64_flags` helper in `scripts/lib.sh` that `scripts/cross_aarch64.sh` also uses, so the proof cannot drift onto a near-miss of the recipe releases ship.
+- **Release asset packaging moved out of the release workflow into `scripts/package_release.sh`.** The license-tar and `SHA256SUMS` recipes were inline YAML that no gate could shellcheck or exercise. The script flattens the `rel-<target>/` artifact directories, bundles the license and NOTICE files with entry order, mtimes, and ownership normalized, and writes the digest list under `LC_ALL=C` so its bytes do not follow the runner's collation order. It honors `SOURCE_DATE_EPOCH` when set and falls back to 0. No change to the published asset set.
+
 ## [0.17.0] - 2026-09-28
 
 Minor bump with no behavior changes since 0.16.0.

@@ -46,6 +46,7 @@ answers --help):
   ./scripts/install_nas_backup.sh           copy NAS snapshot/replica/drill units (dry-run by default)
   ./scripts/repro_check.sh                  two ReleaseFast builds, compare bytes
   ./scripts/build_static.sh <target>        static musl release build (also run by release.yml)
+  ./scripts/package_release.sh --dist DIR   flatten, bundle licenses, checksum release assets
 
 Setup, once per clone: see CONTRIBUTING.md.
 EOF

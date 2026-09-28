@@ -4,10 +4,11 @@
 # the ReleaseFast binary twice from two independently named copies of the
 # tracked sources, varying the timezone, locale, and SOURCE_DATE_EPOCH the
 # second build sees, then fails unless both binaries are byte-identical.
-# The recipes are the host glibc build and the two musl static single-file
-# release targets (--fuse-static compiles the vendored libfuse3 in), so the
-# claim stays enforced for exactly the artifacts releases ship rather than
-# merely documented. CI runs this as its own job.
+# The recipes are the host glibc build, the two musl static single-file
+# release targets (--fuse-static compiles the vendored libfuse3 in), and the
+# aarch64 glibc spark binary linked against the vendored arm64 libfuse3, so
+# the claim stays enforced for exactly the three artifacts releases attach
+# rather than merely documented. CI runs this as its own job.
 set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
@@ -17,10 +18,10 @@ usage_no_args "$@" <<'EOF'
 Usage: ./scripts/repro_check.sh
 
 For each shipped build recipe (host glibc, x86_64-linux-musl static,
-aarch64-linux-musl static): two ReleaseFast builds from differently named
-trees (TZ/locale varied); fails unless the binaries are byte-identical.
-Same recipes as CI's reproducibility job. See CONTRIBUTING.md (Cutting a
-release).
+aarch64-linux-musl static, aarch64-linux-gnu cross): two ReleaseFast builds
+from differently named trees (TZ/locale varied); fails unless the binaries
+are byte-identical. Same recipes as CI's reproducibility job. See
+CONTRIBUTING.md (Cutting a release).
 EOF
 
 fail() {
@@ -103,7 +104,20 @@ run_repro() {
 
 # The shipped build recipes, in release order. The musl recipes are the
 # static single-file release targets; their bytes must not depend on the
-# build tree any more than the host build's.
+# build tree any more than the host build's. The last one is the glibc spark
+# binary release.yml publishes as modelfs-aarch64-linux-gnu: it needs the
+# extracted vendored arm64 libfuse3, so extract it once (the libs are only
+# read, so both legs legitimately share them), and take the flags from
+# cross_aarch64_flags so this proves the recipe cross_aarch64.sh builds
+# rather than a near-miss of it.
 run_repro "host-glibc"
 run_repro "x86_64-linux-musl" -Dtarget=x86_64-linux-musl -Dfuse-static
 run_repro "aarch64-linux-musl" -Dtarget=aarch64-linux-musl -Dfuse-static
+
+if ! command -v dpkg-deb >/dev/null 2>&1 && ! command -v ar >/dev/null 2>&1; then
+    fail "the aarch64-linux-gnu recipe needs dpkg-deb, or binutils ar plus zstd, to unpack the vendored libfuse3"
+fi
+"${SCRIPTS_DIR}/extract_fuse3_arm64.sh"
+fuse_arm64_paths
+cross_aarch64_flags
+run_repro "aarch64-linux-gnu" "${CROSS_AARCH64_FLAGS[@]}"

@@ -192,12 +192,16 @@ jobs:
   # ReleaseFast builds from differently named trees, with TZ/locale/
   # SOURCE_DATE_EPOCH varied between them, must produce byte-identical
   # binaries. scripts/repro_check.sh owns the recipe; this job only runs it,
-  # so local verification and CI cannot drift apart.
+  # so local verification and CI cannot drift apart. It covers all four
+  # shipped recipes, including the aarch64 glibc spark binary the release
+  # attaches: the script extracts the vendored arm64 libfuse3 itself, so no
+  # extra setup step is needed here beyond the headers the host leg reads.
   reproducibility:
     runs-on: ubuntu-24.04
-    # Two cold ReleaseFast builds plus checkout fit well inside the same hang
-    # guard every other job carries.
-    timeout-minutes: 30
+    # Eight cold ReleaseFast builds (four shipped recipes, built twice each)
+    # plus checkout fit well inside the same hang guard every other job
+    # carries.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
