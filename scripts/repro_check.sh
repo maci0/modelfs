@@ -85,10 +85,23 @@ build_one() {
 run_repro() {
     local label="$1"
     shift
+    local build_args=()
+    local has_opt=0
+    for arg in "$@"; do
+        if [[ "${arg}" == -Doptimize=* ]]; then
+            has_opt=1
+            break
+        fi
+    done
+    if [[ "${has_opt}" -eq 0 ]]; then
+        build_args+=("-Doptimize=ReleaseFast")
+    fi
+    build_args+=("$@")
+
     echo "=== [${label}] Build 1: short path, default TZ/locale ==="
-    build_one "${BUILD_A}" "${label}" -- zig build -Doptimize=ReleaseFast "$@"
+    build_one "${BUILD_A}" "${label}" -- zig build "${build_args[@]}"
     echo "=== [${label}] Build 2: long path, TZ=Asia/Tokyo, LC_ALL=C.UTF-8, fixed SOURCE_DATE_EPOCH ==="
-    build_one "${BUILD_B}" "${label}" -- env TZ=Asia/Tokyo LC_ALL=C.UTF-8 SOURCE_DATE_EPOCH=1234567890 zig build -Doptimize=ReleaseFast "$@"
+    build_one "${BUILD_B}" "${label}" -- env TZ=Asia/Tokyo LC_ALL=C.UTF-8 SOURCE_DATE_EPOCH=1234567890 zig build "${build_args[@]}"
 
     local bin_a="${BUILD_A}/zig-out/bin/modelfs" bin_b="${BUILD_B}/zig-out/bin/modelfs"
     [[ -f "${bin_a}" ]] || fail "[${label}] build 1 produced no binary at ${bin_a}"
