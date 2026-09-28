@@ -2228,7 +2228,7 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     switch (discover.walkLeases(gpa, origin, &acc)) {
         .ok => {},
         .path_too_long => {
-            std.log.err("origin path too long to name {s}/{s}", .{ origin, discover.cluster_dir });
+            std.log.err("origin path too long to name {s}/{s}", .{ origin, proto.cluster_dir });
             return 1;
         },
         .missing_dir => {
@@ -2236,7 +2236,7 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             // .cluster dir here is a fresh/empty cluster, not an error: same
             // exit-0 empty output as below, with the reason on stdout next
             // to where the listing would have been.
-            return if (printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, discover.cluster_dir })) 0 else 1;
+            return if (printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, proto.cluster_dir })) 0 else 1;
         },
         .io_err => |e| {
             // EIO/ENOTDIR/EACCES: the origin is there but .cluster cannot
@@ -2246,7 +2246,7 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             // live`); the reason belongs on stderr, like status's "cannot
             // read" / "not running" lines.
             if (!builtin.is_test)
-                std.debug.print("cannot read cluster leases at {s}/{s} (errno {d})\n", .{ origin, discover.cluster_dir, e });
+                std.debug.print("cannot read cluster leases at {s}/{s} (errno {d})\n", .{ origin, proto.cluster_dir, e });
             return 1;
         },
     }
@@ -3440,7 +3440,7 @@ test "cmdPeers separates unreachable origins from empty clusters" {
         defer captured_stdout = null;
         try std.testing.expectEqual(@as(u8, 0), try cmdPeers(std.testing.io, gpa, .{ .origin = origin_d }));
         try std.testing.expect(std.mem.find(u8, out.items, "no cluster leases") != null);
-        try std.testing.expect(std.mem.find(u8, out.items, discover.cluster_dir) != null);
+        try std.testing.expect(std.mem.find(u8, out.items, proto.cluster_dir) != null);
         try std.testing.expect(std.mem.find(u8, out.items, "spark") == null);
     }
 
@@ -3834,7 +3834,7 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         // walkLeases / cmdPeers apply to origin/.cluster. Stdout is the
         // report a pipe consumes; the reason belongs on stderr.
         if (!builtin.is_test)
-            std.debug.print("cannot read manifests at {s}/{s} (errno {d})\n", .{ origin, store_mod.Store.manifests_dir, e });
+            std.debug.print("cannot read manifests at {s}/{s} (errno {d})\n", .{ origin, proto.manifests_dir, e });
         return 1;
     };
     defer sys.closedir(dir);
@@ -4823,7 +4823,7 @@ test "cmdPull names a bad repo, revision, or destination and never opens a socke
         .{ .repo = "owner/..", .opts = .{ .origin = origin_d }, .want = "not a Hugging Face owner/repo id" },
         .{ .repo = "owner/repo", .opts = .{ .origin = origin_d, .revision = "bad ref" }, .want = "not a branch, tag, or commit" },
         .{ .repo = "owner/repo", .opts = .{ .origin = origin_d, .dest = "../escape" }, .want = "not a path under the origin" },
-        .{ .repo = "owner/repo", .opts = .{ .origin = origin_d, .dest = discover.cluster_dir }, .want = "not a path under the origin" },
+        .{ .repo = "owner/repo", .opts = .{ .origin = origin_d, .dest = proto.cluster_dir }, .want = "not a path under the origin" },
     };
     for (cases) |case| {
         var err: std.ArrayList(u8) = .empty;

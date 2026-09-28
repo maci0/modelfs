@@ -430,6 +430,37 @@ pub const max_psk_bytes: usize = 4096;
 /// bare word there is error.BadListen, never a silent fallback to this.
 pub const default_port: u16 = 18080;
 
+/// The origin's reserved namespace, one level under the origin: the lease
+/// documents live directly in it, the piece-hash manifests in the
+/// `manifests` subdirectory, and every path under it is hidden from the
+/// mount, `/have`, and `/data`. Every layer that names this directory takes
+/// it from here, so a spelling change cannot leave the writer of a lease
+/// disagreeing with the reader of one.
+pub const cluster_dir: []const u8 = ".cluster";
+
+/// Last component of `manifests_dir`, for callers that already hold
+/// `<origin>/.cluster` and append one more segment to it.
+pub const manifests_dir_leaf: []const u8 = "manifests";
+
+/// `<origin>/.cluster/manifests`. Flat hex names (piece.manifestName), so no
+/// nested directories and no traversal risk; walkLeases only parses .json
+/// files and so never descends here. The lease sweep reaches it by appending
+/// `manifests_dir_leaf` to the `.cluster` path it already holds.
+pub const manifests_dir: []const u8 = cluster_dir ++ "/" ++ manifests_dir_leaf;
+
+test "the cluster path namespace is spelled once and nests" {
+    // store, discover, peer, fuse_fs and the CLI all name these three. The
+    // manifests dir is the cluster dir plus its leaf by construction, so a
+    // change to either cannot leave a second spelling in the tree.
+    try std.testing.expectEqualStrings(".cluster", cluster_dir);
+    try std.testing.expectEqualStrings("manifests", manifests_dir_leaf);
+    try std.testing.expectEqualStrings(".cluster/manifests", manifests_dir);
+    // The leaf is what a caller holding <origin>/.cluster appends, so it
+    // must be the last segment of the joined path and nothing else.
+    try std.testing.expect(std.mem.endsWith(u8, manifests_dir, "/" ++ manifests_dir_leaf));
+    try std.testing.expect(std.mem.startsWith(u8, manifests_dir, cluster_dir ++ "/"));
+}
+
 pub const LeaseAddr = struct {
     ip: []const u8,
     port: u16,

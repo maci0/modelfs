@@ -3,7 +3,6 @@
 //! inflight).
 const std = @import("std");
 const proto = @import("proto.zig");
-const store_mod = @import("store.zig");
 const sys = @import("sys.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 const c = sys.c;
@@ -134,9 +133,11 @@ pub fn pickBest(cands: []const PathCand) ?usize {
 
 /// Name of the origin-side control directory holding cluster leases
 /// (<origin>/.cluster/<id>.json). Hidden from the FUSE mount, peer `/have`
-/// and `/data`, and `modelfs pin`; read by `modelfs peers`. Every module
-/// referencing the path must use this constant.
-pub const cluster_dir = ".cluster";
+/// and `/data`, and `modelfs pin`; read by `modelfs peers`. Defined in
+/// proto, next to the lease document that lives in it and the manifest
+/// directory under it, so every layer that names the path agrees on the
+/// spelling.
+const cluster_dir = proto.cluster_dir;
 
 /// True when an origin-relative path names the lease directory or a file
 /// under it. Prefix, not substring: a model named `.clusterfoo` is not the
@@ -992,7 +993,7 @@ pub const Catalog = struct {
         // every time, so no later publish reuses or overwrites it. Without
         // this the dir grows by one file per (model, crashing node) forever.
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
-        const mdirz = sys.joinZ(&mbuf, std.mem.span(dirz), store_mod.Store.manifests_dir_leaf) catch return;
+        const mdirz = sys.joinZ(&mbuf, std.mem.span(dirz), proto.manifests_dir_leaf) catch return;
         self.sweepDir(mdirz, cutoff, .staging);
     }
 
@@ -3040,7 +3041,7 @@ test "sweepLeases unlinks abandoned manifest staging files and keeps published o
     const cdir = try sys.joinZ(&nb, origin, cluster_dir);
     try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(cdir), 0o755));
     var mb: [256]u8 = undefined;
-    const mdir = try sys.joinZ(&mb, std.mem.span(cdir), store_mod.Store.manifests_dir_leaf);
+    const mdir = try sys.joinZ(&mb, std.mem.span(cdir), proto.manifests_dir_leaf);
     try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(mdir), 0o755));
 
     // The cutoff is the own lease's mtime minus the sweep age, so the own

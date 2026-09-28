@@ -66,7 +66,7 @@ New code goes in the module that already owns that concern.
 | `c.h`, `c.zig` | Sole door to libfuse3 and libc |
 | `sys.zig` | Syscall wrappers: EINTR retry, CLOEXEC, nofollow/owner-only writes, process liveness (`pidAlive`); IPv4 `bind`/`accept`/`connectIn`/`listen`/`getsockname` and socket options through `std.c`; shared IPv4 text rendering (`dottedQuad` takes network-order `s_addr`, returns a slice of the caller's buffer or null when too small) |
 | `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`), the persisted bitfield codec, and piece-hash manifest overlap (`manifestOverlapPrepared`) |
-| `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`) |
+| `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`), and the origin's cluster path namespace (`cluster_dir`, `manifests_dir`) |
 | `cull.zig` | Free-space watermark policy |
 | `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
 | `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`) |
@@ -79,12 +79,13 @@ New code goes in the module that already owns that concern.
 | `determinism.zig` | Test-only source guards: the wall clock and sleep are read only through `sys.zig`, and entropy only through `io.randomSecure` |
 | `root.zig` | Test aggregator for `zig build test` |
 
-`main` → `fuse_fs` → `peer` → `store` → `discover` → (`piece`, `proto`, `cull`, `sys`) → `c`.
-`discover` sits below `store` because the lease sweep names the manifest dir through
-`Store.manifests_dir_leaf` rather than spelling the leaf again. `proto` and `piece` share the
-last group, not two levels of it: `proto` reads `piece`'s bitfield codec, and `store` needs
-both. `handover` and `hf` sit beside `fuse_fs`/`main`: neither speaks FUSE, and `hf` is the one
-place that reaches a host outside the cluster (HTTPS through `std.http.Client`, CLI only).
+`main` → `fuse_fs` → `peer` → `store` → (`piece`, `proto`, `cull`, `sys`) → `c`, with `discover`
+a sibling of `store`: both name the origin's `.cluster` namespace through `proto`, so neither
+imports the other and the lease sweep reaches the manifest dir by appending `proto`'s leaf
+rather than spelling it again. `proto` and `piece` share the last group, not two levels of it:
+`proto` reads `piece`'s bitfield codec, and `store` needs both. `handover` and `hf` sit beside
+`fuse_fs`/`main`: neither speaks FUSE, and `hf` is the one place that reaches a host outside
+the cluster (HTTPS through `std.http.Client`, CLI only).
 
 Time and entropy are the two nondeterminism doors, and both are parameters rather than
 globals. `sys.zig` holds the clock (`nowSec` for cross-host lease instants, `monoSec` /

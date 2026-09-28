@@ -84,9 +84,26 @@ pub fn revisionOk(rev: []const u8) bool {
     return segmentsOk(rev);
 }
 
+/// Percent-encodes one URL path segment: every byte outside the unreserved
+/// set, '/' included. A revision is a single segment even when it names a
+/// ref with slashes in it, so `refs/pr/3` has to reach the API as one
+/// `refs%2Fpr%2F3` rather than three path segments.
+fn appendSegment(w: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (s) |ch| {
+        if (unreserved(ch)) {
+            try w.append(gpa, ch);
+            continue;
+        }
+        try w.append(gpa, '%');
+        try w.append(gpa, hex[ch >> 4]);
+        try w.append(gpa, hex[ch & 0xf]);
+    }
+}
+
 /// Percent-encodes a repo file path, keeping '/' as the segment separator. A
-/// repo and a revision are never encoded: `idOk` already admits only
-/// unreserved bytes and '/', so encoding either would be the identity.
+/// repo is never encoded either: `idOk` already admits only unreserved bytes
+/// and '/', and its own slash separates owner from name.
 fn appendEncoded(w: *std.ArrayList(u8), gpa: std.mem.Allocator, path: []const u8) !void {
     const hex = "0123456789ABCDEF";
     for (path) |ch| {
@@ -110,7 +127,7 @@ fn treeUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8) ![]u8
     try w.appendSlice(gpa, "https://" ++ host ++ "/api/models/");
     try w.appendSlice(gpa, repo);
     try w.appendSlice(gpa, "/tree/");
-    try w.appendSlice(gpa, revision);
+    try appendSegment(&w, gpa, revision);
     try w.appendSlice(gpa, "?recursive=1");
     return w.toOwnedSlice(gpa);
 }
@@ -124,7 +141,7 @@ fn fileUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8, path:
     try w.appendSlice(gpa, "https://" ++ host ++ "/");
     try w.appendSlice(gpa, repo);
     try w.appendSlice(gpa, "/resolve/");
-    try w.appendSlice(gpa, revision);
+    try appendSegment(&w, gpa, revision);
     try w.append(gpa, '/');
     try appendEncoded(&w, gpa, path);
     return w.toOwnedSlice(gpa);

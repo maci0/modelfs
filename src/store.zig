@@ -1528,18 +1528,6 @@ pub const Store = struct {
         return rangeFilled(file, span, file_size, self.piece_size);
     }
 
-    /// Origin-side manifest directory: `<origin>/.cluster/manifests/`. Flat
-    /// hex names (piece.manifestName), so no nested directories and no
-    /// traversal risk; walkLeases only parses .json files and so never
-    /// descends here. The lease sweep reaches it by appending
-    /// `manifests_dir_leaf` to the `.cluster` path it already holds;
-    /// `manifestsDirPath` is the accessor for callers holding an origin.
-    pub const manifests_dir = ".cluster/" ++ manifests_dir_leaf;
-
-    /// Last component of `manifests_dir`, for callers that already hold
-    /// `<origin>/.cluster`.
-    pub const manifests_dir_leaf = "manifests";
-
     /// Upper bound on a manifest blob read from shared storage. A fully
     /// hashed file at the default 8 MiB grid costs 36 bytes per piece, so
     /// this bounds files up to ~14 TiB; anything larger is treated as a
@@ -1549,7 +1537,7 @@ pub const Store = struct {
 
     /// `<origin>/.cluster/manifests`.
     pub fn manifestsDirPath(self: *const Store, buf: []u8) ![*:0]u8 {
-        return sys.joinZ(buf, self.origin, manifests_dir);
+        return sys.joinZ(buf, self.origin, proto.manifests_dir);
     }
 
     /// `<origin>/.cluster/manifests/<hex(blake3(rel))>`.

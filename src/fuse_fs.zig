@@ -783,7 +783,7 @@ test "readdir omits names relOk would refuse" {
         const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ scratch, name });
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), "x"));
     }
-    const cluster_p = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ scratch, discover.cluster_dir });
+    const cluster_p = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ scratch, proto.cluster_dir });
     try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_p, 0o755));
 
     const dir = sys.opendirNoFollow(try sys.toZ(&zbuf, scratch)) orelse
@@ -805,7 +805,7 @@ test "readdir omits names relOk would refuse" {
     var seen_raw = false;
     for (got.items) |n| {
         try std.testing.expect(store_mod.relOk(n));
-        try std.testing.expect(!std.mem.eql(u8, n, discover.cluster_dir));
+        try std.testing.expect(!std.mem.eql(u8, n, proto.cluster_dir));
         try std.testing.expect(std.mem.findScalar(u8, n, '\n') == null);
         try std.testing.expect(std.mem.find(u8, n, "\u{200b}") == null);
         if (std.mem.eql(u8, n, "ok.bin")) seen_ok = true;
@@ -1651,7 +1651,7 @@ const OriginDirNames = struct {
         while (sys.readdir(@ptrCast(self.dir))) |ent| {
             const name = sys.dirName(ent);
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            if (self.hide_cluster and std.mem.eql(u8, name, discover.cluster_dir)) continue;
+            if (self.hide_cluster and std.mem.eql(u8, name, proto.cluster_dir)) continue;
             if (!store_mod.relOk(name)) continue;
             return name;
         }
@@ -1730,7 +1730,7 @@ pub fn tickCluster(st: *State, now: i64) void {
     st.catalog.refresh(now);
     if (st.catalog.originErrno() != 0)
         _ = st.store.stats.lease_err.fetchAdd(1, .monotonic);
-    st.store.noteOriginIo(discover.cluster_dir, st.catalog.originErrno(), "lease");
+    st.store.noteOriginIo(proto.cluster_dir, st.catalog.originErrno(), "lease");
 }
 
 fn countMetaErr(st: *State, rc: i32) void {
