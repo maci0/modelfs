@@ -821,8 +821,8 @@ pub fn readFileBuf(buf: []u8, path: [*:0]const u8) ![]u8 {
 /// failure, like readFileAllocOpenErrno does. O_NONBLOCK, like the lease
 /// walk's opendirNoFollow: a FIFO planted at a .json name must not block
 /// open(2) forever and wedge the discovery thread -- the flag is ignored on
-/// regular files and turns a FIFO open into an immediate zero-byte read,
-/// which the lease parser rejects as corrupt.
+/// regular files, and the preadAll below fails with ESPIPE on the FIFO, so
+/// the walk skips the entry as an unreadable lease.
 pub fn readFileBufNoFollowOpenErrno(buf: []u8, path: [*:0]const u8, open_errno_out: ?*i32) ![]u8 {
     return readFileBufFlags(buf, path, c.O_NOFOLLOW | c.O_NONBLOCK, open_errno_out);
 }
