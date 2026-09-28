@@ -6,7 +6,6 @@ figures land in .scratch/benchmarks/ (gitignored); pass --update-docs to
 regenerate the tracked docs/benchmarks.md and docs/figures/.
 """
 
-import argparse
 import os
 import shutil
 import subprocess
@@ -20,10 +19,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
-from typing import override
 
-# Sibling module (this directory is sys.path[0] when the script runs): the
-# daemon-readiness policy shared with cluster_verify.py.
+# Sibling modules (this directory is sys.path[0] when the script runs): the
+# daemon-readiness policy shared with cluster_verify.py, and the
+# capitalized-usage parser shared with sbom.py.
+import cli_parser
 import peer_ping
 
 BENCH_PSK = "bench_psk_key_123456789"
@@ -1016,21 +1016,9 @@ peer latency.
     print(f"✓ Generated Benchmark Report: {report_path}")
 
 
-class _Parser(argparse.ArgumentParser):
-    """argparse's usage line, capitalized to match the shell scripts."""
-
-    @override
-    def format_usage(self) -> str:
-        return super().format_usage().replace("usage:", "Usage:", 1)
-
-    @override
-    def format_help(self) -> str:
-        return super().format_help().replace("usage:", "Usage:", 1)
-
-
 def main() -> None:
     reexec_under_venv()
-    parser = _Parser(
+    parser = cli_parser.Parser(
         description="Run the modelfs benchmarks and render report + figures.",
     )
     parser.add_argument(

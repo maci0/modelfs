@@ -1036,7 +1036,7 @@ pub const Catalog = struct {
         const prefix = name[0..mark];
         if (prefix.len == 0) return false;
         for (prefix) |ch| {
-            if (!std.ascii.isLower(ch) or !std.ascii.isHex(ch)) return false;
+            if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return false;
         }
         const tail = name[mark + ".tmp".len ..];
         if (tail.len == 0) return true;

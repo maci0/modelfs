@@ -10,17 +10,20 @@ No network. Stdlib only.
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+# Sibling module (this directory is sys.path[0] when the script runs): the
+# capitalized-usage parser shared with run_benchmarks_and_plots.py.
+import cli_parser
 
 _PKG = re.compile(r"^([A-Za-z0-9_.-]+)==([^\\\s;]+)(?:\s*;\s*([^\\]+?))?\s*\\?\s*$")
 _SHA1_HEX_LEN = 40
@@ -794,20 +797,8 @@ def self_test(root: Path) -> None:
     print("ok: sbom self-test")
 
 
-class _Parser(argparse.ArgumentParser):
-    """argparse's usage line, capitalized to match the shell scripts."""
-
-    @override
-    def format_usage(self) -> str:
-        return super().format_usage().replace("usage:", "Usage:", 1)
-
-    @override
-    def format_help(self) -> str:
-        return super().format_help().replace("usage:", "Usage:", 1)
-
-
 def main(argv: list[str]) -> int:
-    parser = _Parser(
+    parser = cli_parser.Parser(
         description=(
             "Generate or verify sbom.cdx.json from the in-tree lock, SHA256SUMS, "
             "vendored source, and CI workflows."
