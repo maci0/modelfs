@@ -45,7 +45,9 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # MF_RESTORE_LOG (dr_pool_restore.sh), MF_HOTRELOAD_PORT
 # (test_hot_reload.sh), MF_SYNCOID_SRC, MF_SYNCOID_DEST
 # (nas/syncoid-models.service), MF_DRILL_DATASET (nas/modelfs-drill.service,
-# nas/modelfs-snap-age.service).
+# nas/modelfs-snap-age.service), MF_STUB_CLONE_RACE, MF_STUB_DESTROY_FAIL,
+# MF_STUB_UNMOUNT_FAIL (test_dr_restore_drill.sh's stub zfs). check.sh
+# compares the members read under scripts/ against this list.
 
 # Dotted numeric compare: 0.16.1 >= 0.16.0, 3.12.4 >= 3.12, 0.15.99 < 0.16.0.
 # Extra trailing components on cur count as 0 against a longer min.

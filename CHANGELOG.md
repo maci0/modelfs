@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Gate hardening - 2026-09-28
+- **`scripts/check.sh` now checks the harness rules the linters cannot see.** A script that hardcodes a repo-relative path or a `/tmp` `mktemp` template, a unit that exports a `MODELFS_`-spelled knob, and an `MF_` knob missing from the `lib.sh` member list all passed shellcheck, ruff, and mypy: the daemon refuses unknown `MODELFS_*` names, so the first of these kills every `modelfs` call in that shell, the second charges a piece cache to RAM, and the third is a knob nobody has checked. The gate now fails on each, and the `lib.sh` sourcing rule is a declared exemption list rather than a reviewer's memory, so a new script or unit is covered the moment it lands. No harness script's behavior changes.
+
 ### Dependency inventory - 2026-09-28
 - **The CycloneDX inventory now covers the vendored libfuse3 static source.** `sbom.cdx.json` listed the arm64 `.deb` files, the Python tool lock, the SHA-pinned actions, and the Zig pin, but not `.deps/libfuse3-3.16.2/`, which `-Dfuse-static` compiles into every shipped release binary. A consumer or scanner reading the record could not see the largest third-party code input in the release, nor its license. `scripts/sbom.py` now discovers each `.deps/libfuse3-<version>/` tree, lists it as a required component with the purl of the upstream tag it was vendored from, its SPDX id, and every digest from that tree's `SHA256SUMS`, and fails generation when the sums miss a file present on disk or list one that is gone. Self-tests cover the parser, the coverage checks, and the generated component.
 

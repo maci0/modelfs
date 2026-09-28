@@ -339,6 +339,117 @@ shopt -u nullglob
 [[ "${#sh_files[@]}" -gt 0 ]] || fail "no shell scripts found under scripts/"
 shellcheck "${sh_files[@]}" || fail "shellcheck reported violations"
 
+# Properties of the harness itself, which no linter can see: a script that
+# exports a MODELFS_-spelled knob, a unit that exports one, or a piece cache
+# under /tmp passes shellcheck, ruff, and mypy while the modelfs calls in
+# that shell die on an unknown environment variable, or a run artifact is
+# charged to RAM. Check them here so a new script or unit is covered by
+# default instead of by a reviewer's memory.
+echo "=== harness policy ==="
+
+# Every mktemp template names the scratch dir. The two exceptions write
+# outside the repo by design: install_nas_backup.sh stages the unit copy
+# beside its destination (an atomic rename needs the same filesystem) and
+# run_vm_cluster_e2e.sh puts qemu disk images under libvirt's own directory.
+# A bare mktemp template lands on tmpfs, where a multi-gigabyte piece cache
+# is charged to RAM.
+unscoped_mktemp=""
+for sh in "${sh_files[@]}"; do
+    while IFS= read -r hit; do
+        line="${hit#*:}"
+        if [[ "${line}" != *SCRATCH_DIR* && "${line}" != *dest_path* \
+            && "${line}" != */var/lib/libvirt/images/* ]]; then
+            unscoped_mktemp="${unscoped_mktemp} ${hit}"
+        fi
+    done < <(grep -nE '^[^#]*mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+[^[:space:]]*XXXXXX' "${sh}" || true)
+done
+[[ -z "${unscoped_mktemp}" ]] \
+    || fail "mktemp without a SCRATCH_DIR template (tmpfs payload):${unscoped_mktemp//$'\n'/, }"
+
+# ROOT_DIR, SCRATCH_DIR, and SCRIPTS_DIR come from lib.sh and nowhere else,
+# so a script that reads one without sourcing it resolves them to nothing. A
+# script that reads none is exempt, but must be named here: an unnamed one
+# is a script that hardcodes a repo-relative path or a scratch location, and
+# naming it is a deliberate act.
+no_lib_sh=(
+    check_drill_log.sh
+    check_offsite.sh
+    dr_pool_restore.sh
+    hold_monthlies.sh
+    install_libfuse3_dev.sh
+)
+lib_sh_violations=""
+unsourced=""
+unnamed=""
+for sh in "${sh_files[@]}"; do
+    base="${sh##*/}"
+    if [[ "${base}" == "lib.sh" ]]; then
+        continue
+    fi
+    sources_lib_sh=0
+    if grep -q 'lib\.sh' "${sh}"; then
+        sources_lib_sh=1
+    fi
+    uses_lib_sh=0
+    if grep -qE '(^|[^A-Za-z0-9_])(ROOT_DIR|SCRATCH_DIR|SCRIPTS_DIR)' "${sh}"; then
+        uses_lib_sh=1
+    fi
+    listed=0
+    for exempt in "${no_lib_sh[@]}"; do
+        if [[ "${exempt}" == "${base}" ]]; then
+            listed=1
+        fi
+    done
+    if [[ "${uses_lib_sh}" -eq 1 && "${sources_lib_sh}" -eq 0 ]]; then
+        unsourced="${unsourced} ${base}"
+    fi
+    if [[ "${uses_lib_sh}" -eq 0 && "${listed}" -eq 0 ]]; then
+        unnamed="${unnamed} ${base}"
+    fi
+done
+[[ -z "${unsourced}" ]] \
+    || fail "scripts read ROOT_DIR/SCRATCH_DIR/SCRIPTS_DIR without sourcing lib.sh:${unsourced}"
+[[ -z "${unnamed}" ]] \
+    || fail "scripts using neither lib.sh nor a named exemption:${unnamed}; add the name to no_lib_sh in check.sh or source lib.sh"
+for exempt in "${no_lib_sh[@]}"; do
+    if [[ ! -e "${SCRIPTS_DIR}/${exempt}" ]]; then
+        lib_sh_violations="${lib_sh_violations} ${exempt}"
+    fi
+done
+[[ -z "${lib_sh_violations}" ]] \
+    || fail "no_lib_sh in check.sh names scripts that no longer exist:${lib_sh_violations}"
+
+# The daemon refuses any MODELFS_* name it does not document, so a unit or
+# a harness that exports one makes every modelfs call in that environment
+# fail before the command runs. Units also keep secrets off ExecStart: argv
+# is world-readable through /proc/<pid>/cmdline.
+nas_unit_violations=""
+for unit in "${SCRIPTS_DIR}"/nas/*.service; do
+    [[ -e "${unit}" ]] || continue
+    if grep -qE '^[[:space:]]*Environment=.*MODELFS_' "${unit}"; then
+        nas_unit_violations="${nas_unit_violations} ${unit##*/}:Environment=MODELFS_"
+    fi
+    if grep -qiE '^[[:space:]]*ExecStart=.*(psk|token|secret)' "${unit}"; then
+        nas_unit_violations="${nas_unit_violations} ${unit##*/}:secret on ExecStart"
+    fi
+    if grep -qE '^[[:space:]]*(Environment|ExecStart)=.*[^A-Za-z0-9_]/tmp(/|[^A-Za-z0-9_])' "${unit}"; then
+        nas_unit_violations="${nas_unit_violations} ${unit##*/}:/tmp payload"
+    fi
+done
+[[ -z "${nas_unit_violations}" ]] \
+    || fail "NAS unit policy (harness knobs stay MF_, no secret on ExecStart, no /tmp payload):${nas_unit_violations}"
+
+# lib.sh's comment block is the one list of harness knobs; the daemon's
+# prefix is the other. A new MF_ knob that is not listed there is a knob
+# nobody has checked against the daemon, so fail until the list catches up.
+documented_mf="$(sed -n '/^# Environment namespaces/,/^$/p' "${SCRIPTS_DIR}/lib.sh" \
+    | grep -oE 'MF_[A-Z0-9_]+' | sort -u)"
+read_mf="$({ grep -rhoE '\$\{MF_[A-Z0-9_]+[:}]' "${sh_files[@]}" || true; grep -rhoE 'MF_[A-Z0-9_]+=' "${sh_files[@]}" || true; } \
+    | grep -oE 'MF_[A-Z0-9_]+' | sort -u)"
+undocumented_mf="$(comm -23 <(printf '%s\n' "${read_mf}") <(printf '%s\n' "${documented_mf}") | tr '\n' ' ')"
+[[ -z "${undocumented_mf}" ]] \
+    || fail "MF_ knobs read under scripts/ but absent from the lib.sh member list:${undocumented_mf}"
+
 # The NAS drill cannot run here (no zfs pool). The stub suite is what
 # keeps a clone-onto-live or empty-snapshot false pass from shipping.
 echo "=== restore drill (stub zfs) ==="
