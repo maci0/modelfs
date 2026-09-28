@@ -428,26 +428,25 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
         // Connect-and-drop scanners, dribbled heads, oversized heads: the
         // request never became routable, so there is nothing to answer and
         // logging each one would only hand scanners a log-flooding lever.
-        // Counted so a probe storm is still visible in status.json.
-        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
+        countMalformed(self);
         return;
     };
     const head = head_buf[0..n];
     const line_end = std.mem.find(u8, head, "\r\n") orelse {
-        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
+        countMalformed(self);
         return;
     };
     const line = head[0..line_end];
     var it = std.mem.splitScalar(u8, line, ' ');
     const method = it.next() orelse {
-        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
+        countMalformed(self);
         return;
     };
+    // A completed head whose request line names no target ("HELP\r\n") is the
+    // same scanner noise the timeout/oversize paths count; a bare drop here
+    // would make those probes invisible to status.json.
     const target = it.next() orelse {
-        // A completed head whose request line names no target ("HELP\r\n")
-        // is the same scanner noise the timeout/oversize paths count; a
-        // bare drop here would make those probes invisible to status.json.
-        _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
+        countMalformed(self);
         return;
     };
     // Before any reply path, so the status line survives the close even for
@@ -496,10 +495,15 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
         return;
     }
     const version = it.next() orelse "";
-    if (target.len == 0 or
-        (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) or
-        it.next() != null)
-    {
+    if (target.len == 0) {
+        replyStatus(self, fd, "400 Bad Request");
+        return;
+    }
+    if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) {
+        replyStatus(self, fd, "400 Bad Request");
+        return;
+    }
+    if (it.next() != null) {
         replyStatus(self, fd, "400 Bad Request");
         return;
     }
@@ -547,31 +551,38 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
         replyStatus(self, fd, "404 Not Found");
         return;
     }
+    // Both data-plane routes time only the reply they actually serve: a
+    // request rejected above (including /data's missing or unparsable Range)
+    // returns before the defer is armed, so http_completed counts served
+    // data-plane requests only, and /ping stays untimed.
     if (std.mem.eql(u8, path, "/have")) {
-        const t0 = sys.monoNs(self.io);
-        defer {
-            _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
-            _ = self.store.stats.http_completed.fetchAdd(1, .monotonic);
-        }
+        defer noteCompleted(self, sys.monoNs(self.io));
         serveHave(self, fd, rel);
         return;
     }
-    {
-        const rh = range_h orelse {
-            replyStatus(self, fd, "400 Bad Request");
-            return;
-        };
-        const rg = proto.parseRange(rh) orelse {
-            replyStatus(self, fd, "400 Bad Request");
-            return;
-        };
-        const t0 = sys.monoNs(self.io);
-        defer {
-            _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - t0, 0)), .monotonic);
-            _ = self.store.stats.http_completed.fetchAdd(1, .monotonic);
-        }
-        serveData(self, fd, rel, rg);
-    }
+    const rh = range_h orelse {
+        replyStatus(self, fd, "400 Bad Request");
+        return;
+    };
+    const rg = proto.parseRange(rh) orelse {
+        replyStatus(self, fd, "400 Bad Request");
+        return;
+    };
+    defer noteCompleted(self, sys.monoNs(self.io));
+    serveData(self, fd, rel, rg);
+}
+
+/// Charge one served data-plane reply to the latency sum and the completed
+/// counter. `start_ns` is read at the arming site, not here.
+fn noteCompleted(self: *Server, start_ns: i128) void {
+    _ = self.store.stats.http_nanos.fetchAdd(@intCast(@max(sys.monoNs(self.io) - start_ns, 0)), .monotonic);
+    _ = self.store.stats.http_completed.fetchAdd(1, .monotonic);
+}
+
+/// Count one head that never became a routable request. Scanners get silence;
+/// the counter keeps a probe storm visible in status.json.
+fn countMalformed(self: *Server) void {
+    _ = self.store.stats.http_malformed.fetchAdd(1, .monotonic);
 }
 
 fn decodePath(target: []const u8, out: []u8) ![]u8 {
