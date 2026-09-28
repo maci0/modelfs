@@ -3146,6 +3146,13 @@ fn execHandover(st: *State) !void {
         gpa.free(blob);
     }
     const state_fd = try handover.writeStateFd(blob);
+    // Every exit below execve leaves this image running, so the memfd has to
+    // close on each of them: the Cloexec failures, and the execve itself
+    // when it fails. execve does not return on success, where the fd has to
+    // stay open for the next image. Past the point the flag is cleared the
+    // fd is no longer close-on-exec, so an unclosed one would also leave the
+    // cluster PSK live in a descriptor any later fork inherits.
+    errdefer sys.close(state_fd);
     // Everything the next image must find has to survive execve; the sealed
     // memfd carries the secret, so the fd number is all argv needs.
     if (sys.setCloexec(state_fd, false) != 0) return error.Cloexec;
