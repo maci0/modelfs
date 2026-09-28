@@ -94,7 +94,7 @@ pub const Server = struct {
 
     /// Empty the listen list without closing or shutting down, so exec can
     /// inherit the fds. stop() would close them.
-    pub fn detachListenFds(self: *Server) void {
+    fn detachListenFds(self: *Server) void {
         self.listen_fds.deinit(self.gpa);
         self.listen_fds = .empty;
     }

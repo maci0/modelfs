@@ -254,7 +254,7 @@ pub const OriginId = struct {
     ino: u64 = 0,
     known: bool = false,
 
-    pub const encoded_len: usize = piece.manifest_identity_len;
+    const encoded_len: usize = piece.manifest_identity_len;
 
     pub fn fromStat(st: c.struct_stat) OriginId {
         return .{
@@ -268,7 +268,7 @@ pub const OriginId = struct {
     /// True when `observed` is a different object or a strictly newer write
     /// of the same object. An older or equal mtime on the same ino is NFS
     /// attribute lag after our own write, not a rewrite.
-    pub fn contentChanged(recorded: OriginId, observed: OriginId) bool {
+    fn contentChanged(recorded: OriginId, observed: OriginId) bool {
         if (!recorded.known or !observed.known) return false;
         if (recorded.ino != observed.ino) return true;
         if (observed.mtime_sec != recorded.mtime_sec)
@@ -289,7 +289,7 @@ pub const OriginId = struct {
     /// A piece-hash manifest sampled at `st` then predates the rewrite and
     /// must not fill `Cached.hashes` (it still names the previous object's
     /// digests at the same file_size).
-    pub fn newerThanMtime(self: OriginId, st: c.struct_stat) bool {
+    fn newerThanMtime(self: OriginId, st: c.struct_stat) bool {
         if (!self.known) return false;
         const sec = st.st_mtim.tv_sec;
         const nsec: i64 = @intCast(st.st_mtim.tv_nsec);
@@ -636,7 +636,7 @@ pub const Store = struct {
         return piece.sidecarPieceSize(&hdr);
     }
 
-    pub fn cachePinPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
+    fn cachePinPath(self: *const Store, buf: []u8, rel: []const u8) ![*:0]u8 {
         return self.cacheSubPath(buf, "pin", rel);
     }
 

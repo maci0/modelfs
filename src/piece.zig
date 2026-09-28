@@ -51,7 +51,7 @@ pub fn len(file_size: u64, idx: u32, piece_size: u32) u32 {
 
 /// Byte offset of bit `idx` in a packed little-endian bitfield. Floor
 /// division: bits 0..7 live in byte 0.
-pub fn bitByte(idx: u32) usize {
+fn bitByte(idx: u32) usize {
     return @divFloor(@as(usize, idx), 8);
 }
 
@@ -476,7 +476,7 @@ pub const Overlap = struct {
 /// Lexicographical order for 32-byte digests. Big-endian u64 comparisons
 /// evaluate 8 bytes at a time and produce identical ordering to byte-by-byte
 /// comparison, while resolving 99.6% of random digests on the first compare.
-pub fn digestOrder(a: *const [digest_len]u8, b: *const [digest_len]u8) std.math.Order {
+fn digestOrder(a: *const [digest_len]u8, b: *const [digest_len]u8) std.math.Order {
     const a0 = std.mem.readInt(u64, a[0..8], .big);
     const b0 = std.mem.readInt(u64, b[0..8], .big);
     if (a0 < b0) return .lt;
@@ -497,7 +497,7 @@ pub fn digestOrder(a: *const [digest_len]u8, b: *const [digest_len]u8) std.math.
 }
 
 /// Equality test for 32-byte digests using 64-bit word XORs.
-pub fn digestEql(a: *const [digest_len]u8, b: *const [digest_len]u8) bool {
+fn digestEql(a: *const [digest_len]u8, b: *const [digest_len]u8) bool {
     const a0 = std.mem.readInt(u64, a[0..8], .little);
     const b0 = std.mem.readInt(u64, b[0..8], .little);
     const a1 = std.mem.readInt(u64, a[8..16], .little);

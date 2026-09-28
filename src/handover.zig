@@ -10,7 +10,7 @@ const fuzzcorpus = @import("fuzzcorpus.zig");
 
 pub const magic = "MFHO1\n";
 pub const internal_cmd = "_handover";
-pub const state_fd_flag = "--state-fd";
+const state_fd_flag = "--state-fd";
 pub const req_file = "update.req";
 pub const ack_file = "update.ack";
 pub const token_bytes: usize = 16;
@@ -26,7 +26,7 @@ pub const init_max: usize = 4096;
 /// are a few hundred bytes plus one path per cached inode and open handle;
 /// a megabyte is far past any live mount and bounds what a planted fd can
 /// make the new image allocate.
-pub const max_state_bytes: usize = 1 << 20;
+const max_state_bytes: usize = 1 << 20;
 
 /// Serializable serving identity. Strings are borrowed from the caller on
 /// encode and owned by `Owned` on decode.

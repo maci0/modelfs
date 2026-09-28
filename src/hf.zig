@@ -14,20 +14,20 @@ pub const default_revision = "main";
 /// Cap on a repo listing. The largest model repos list a few thousand
 /// files; 8 MiB of JSON is well past any of them and keeps a broken or
 /// hostile endpoint from driving an unbounded allocation.
-pub const max_listing_bytes: usize = 8 << 20;
+const max_listing_bytes: usize = 8 << 20;
 
 /// Suffix a download carries until its bytes are complete. A pull that dies
 /// mid-file leaves this behind rather than a short file at the real name
 /// that a later pull would count as already done.
-pub const partial_ext = ".part";
+const partial_ext = ".part";
 
 /// Where the access token comes from. Never a flag: argv is world-readable
 /// through /proc/<pid>/cmdline, the same reason `--psk-value` does not
 /// exist. `HF_TOKEN` first, then the file `huggingface-cli login` writes.
 pub const token_env = "HF_TOKEN";
-pub const home_env = "HF_HOME";
-pub const token_under_home = "token";
-pub const token_under_cache = ".cache/huggingface/token";
+const home_env = "HF_HOME";
+const token_under_home = "token";
+const token_under_cache = ".cache/huggingface/token";
 
 /// Cap on the token file, matching `proto.max_psk_bytes` for the other
 /// secret this tree reads off disk. A larger file is a wrong file.
@@ -35,8 +35,8 @@ pub const max_token_bytes: usize = 4096;
 
 /// Hugging Face caps ids at 96 characters per part; this bounds the URL
 /// buffers rather than restating their rule.
-pub const max_repo_bytes: usize = 200;
-pub const max_revision_bytes: usize = 200;
+const max_repo_bytes: usize = 200;
+const max_revision_bytes: usize = 200;
 
 /// Unreserved characters (RFC 3986). Anything else in a repo file name is
 /// percent-encoded before it reaches a URL, so a name holding '?' or '#'
@@ -99,7 +99,7 @@ fn appendEncoded(w: *std.ArrayList(u8), gpa: std.mem.Allocator, path: []const u8
 
 /// The recursive file listing for one revision: type, path, and size per
 /// entry. Caller frees.
-pub fn treeUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8) ![]u8 {
+fn treeUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8) ![]u8 {
     if (!repoOk(repo)) return error.BadRepo;
     if (!revisionOk(revision)) return error.BadRevision;
     var w: std.ArrayList(u8) = .empty;
@@ -113,7 +113,7 @@ pub fn treeUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8) !
 }
 
 /// One file's bytes at that revision. Caller frees.
-pub fn fileUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8, path: []const u8) ![]u8 {
+fn fileUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8, path: []const u8) ![]u8 {
     if (!repoOk(repo)) return error.BadRepo;
     if (!revisionOk(revision)) return error.BadRevision;
     var w: std.ArrayList(u8) = .empty;
@@ -148,7 +148,7 @@ const TreeItem = struct {
 /// one that would escape the destination, name the cluster control dir, or
 /// carry control bytes is refused here, before any of it reaches a join
 /// against the origin.
-pub fn parseTree(gpa: std.mem.Allocator, json: []const u8, dest: []const u8) !Listing {
+fn parseTree(gpa: std.mem.Allocator, json: []const u8, dest: []const u8) !Listing {
     const parsed = std.json.parseFromSlice([]TreeItem, gpa, json, .{ .ignore_unknown_fields = true }) catch return error.BadListing;
     defer parsed.deinit();
 
@@ -168,7 +168,7 @@ pub fn parseTree(gpa: std.mem.Allocator, json: []const u8, dest: []const u8) !Li
 }
 
 /// `dest/path`, or just `path` when the destination is the origin root.
-pub fn joinRel(buf: []u8, dest: []const u8, path: []const u8) ![]const u8 {
+fn joinRel(buf: []u8, dest: []const u8, path: []const u8) ![]const u8 {
     if (dest.len == 0) {
         if (path.len > buf.len) return error.NameTooLong;
         @memcpy(buf[0..path.len], path);

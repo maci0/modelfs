@@ -123,7 +123,7 @@ pub const State = struct {
         self.init_len.store(msg.len, .release);
     }
 
-    pub fn spawnWorkers(self: *State) void {
+    fn spawnWorkers(self: *State) void {
         // Reserve before spawning: an append failure after a spawn used to
         // detach that worker beyond the workers-list joins, letting it run
         // unsupervised against State after deinit's drain gave up waiting.
@@ -2560,7 +2560,7 @@ export fn ll_readdir(req: fuse.fuse_req_t, ino: fuse.fuse_ino_t, size: usize, of
     _ = fuse.fuse_reply_buf(req, &reply[0], used);
 }
 
-pub fn llOps() fuse.fuse_lowlevel_ops {
+fn llOps() fuse.fuse_lowlevel_ops {
     var o = std.mem.zeroes(fuse.fuse_lowlevel_ops);
     o.init = ll_init;
     o.destroy = ll_destroy;
@@ -3057,7 +3057,7 @@ fn execHandover(st: *State) !void {
 }
 
 /// Tells the waiting `modelfs update` that this image is the one serving.
-pub fn writeAck(st: *State, token: []const u8) void {
+fn writeAck(st: *State, token: []const u8) void {
     const gpa = st.gpa;
     const blob = handover.encodeAck(gpa, token) catch return;
     defer gpa.free(blob);
