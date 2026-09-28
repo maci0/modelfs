@@ -300,6 +300,14 @@ in `fillFromPeers`): without it each worker would `/have` every peer at once and
 cache; cap overflow probes without joining, so a many-file cold start cannot stall behind a
 slot that will never name that rel.
 
+Two bounds keep the wait from becoming a stall. The retry poll backs off
+(`probe_wait_poll_ms` to `probe_wait_poll_max_ms`), because a fixed short poll re-takes
+`Catalog.mu` and `have_mu` on every iteration, against the same locks the owner's `havePut`
+writes and the discovery tick's `refresh` takes. And the total wait is bounded
+(`probe_wait_max_ms`): one walk costs up to `dial_timeout_ms` per address, so a peer that is
+down or wedged can hold the claim for seconds. Past the bound the waiter takes the unclaimed
+probe cap overflow already takes. The work is then done twice, which beats never being done.
+
 ---
 
 ## Auth and HTTP

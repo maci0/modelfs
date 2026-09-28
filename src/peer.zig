@@ -1750,6 +1750,23 @@ fn fetchFromCands(
     return error.NoPeer;
 }
 
+/// Sleep a filler that found the probe claim busy takes between cache
+/// re-checks, and the ceiling it backs off to while the owner walks. The
+/// first re-check follows the owner's first havePut closely; a fixed short
+/// poll re-takes `Catalog.mu` and `have_mu` 500 times a second for the whole
+/// walk, against the same locks every other filler's havePut and the
+/// discovery tick's refresh need.
+const probe_wait_poll_ms: u32 = 2;
+const probe_wait_poll_max_ms: u32 = 32;
+
+/// How long a filler waits for another filler's shared probe walk before
+/// probing on its own. One walk costs at most a dial timeout per address
+/// (`dial_timeout_ms`), so a peer that is down or wedged can hold the claim
+/// for seconds while this read stalls behind it. Past the bound the waiter
+/// takes the same unclaimed probe `probe_inflight_cap` overflow takes: the
+/// work is then done twice, which beats never being done.
+const probe_wait_max_ms: i64 = 2_000;
+
 /// Hydrate one piece from the cluster: probe one best-first address walk
 /// per peer, then fetch from the max-score path whose /have bit is set.
 /// Sequential fallback (never two sources at once); error.NoPeer means the
@@ -1773,13 +1790,15 @@ pub fn fillFromPeers(
     // saturate the 16 inflight slots.
     var cand_buf: [discover.Catalog.cached_cand_cap]discover.PathCand = undefined;
     var ip_buf: [discover.Catalog.cached_cand_cap][discover.Catalog.ip4_text_max]u8 = undefined;
+    var waited_ms: i64 = 0;
+    var poll_ms: u32 = probe_wait_poll_ms;
     while (true) {
         const now_ms = sys.monoMs(cat.io);
         if (cat.collectCachedCands(rel, idx, piece_size, now_ms, &cand_buf, &ip_buf)) |cached| {
             return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cached, stats);
         }
         const claim = cat.probeTryClaim(rel);
-        if (claim != .busy) {
+        if (claim != .busy or waited_ms >= probe_wait_max_ms) {
             defer if (claim == .claimed) cat.probeRelease(rel);
             // The previous owner may have populated the cache while we
             // claimed; skip the wire if so.
@@ -1800,8 +1819,13 @@ pub fn fillFromPeers(
         // Another filler of this file owns the walk. Yield like beginFill's
         // in-flight claim spin: the owner fills the have cache, then this
         // loop hits collectCachedCands. The injected Io lets a simulator
-        // interleave instead of blocking wall time.
-        sys.sleepMs(cat.io, 2);
+        // interleave instead of blocking wall time. The poll backs off so a
+        // slow owner is not paid for in catalog lock traffic, and the wait
+        // is bounded so a claim the owner never gives back cannot park this
+        // FUSE worker on a read that can never complete.
+        sys.sleepMs(cat.io, poll_ms);
+        waited_ms += poll_ms;
+        poll_ms = @min(poll_ms *| 2, probe_wait_poll_max_ms);
     }
 }
 
@@ -4074,6 +4098,44 @@ test "fillFromPeers counts failed /have probes but not healthy misses" {
     var out: [16]u8 = undefined;
     try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "x.bin", 0, 16, &out, &st.stats));
     try std.testing.expectEqual(@as(u64, 1), st.stats.probe_err.load(.monotonic));
+}
+
+test "fillFromPeers probes on its own once the shared-walk wait runs out" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-ffp-o-stale");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-ffp-c-stale");
+    defer sys.deleteTree(std.testing.io, cache_d);
+    var st = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+
+    const dead_port = try freeTcpPort();
+    var cat = discover.Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    try cat.paths.append(gpa, .{
+        .peer_id = "dead",
+        .ip = "127.0.0.1",
+        .port = dead_port,
+        .ewma_bps = 1e9,
+        .hops = 0,
+    });
+
+    // A claim this fill cannot take and whose owner never comes back: the
+    // walk it names is not going to populate the have cache. Unbounded, the
+    // yield loop below spins on the catalog locks until the process does,
+    // and the read never returns. The waiter must fall through to its own
+    // probe, exactly as probe_inflight_cap overflow already does, and fail
+    // the piece the way a peer that is simply down fails it.
+    try std.testing.expectEqual(discover.Catalog.ProbeClaim.claimed, cat.probeTryClaim("x.bin"));
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.NoPeer, fillFromPeers(gpa, "secret", &cat, "x.bin", 0, 16, &out, &st.stats));
+    try std.testing.expectEqual(@as(u64, 1), st.stats.probe_err.load(.monotonic));
+    // The other filler's claim is still its own: giving up on waiting is not
+    // giving up its line, and this fill took none to release.
+    try std.testing.expectEqual(discover.Catalog.ProbeClaim.busy, cat.probeTryClaim("x.bin"));
+    cat.probeRelease("x.bin");
 }
 
 test "fillFromPeers excludes peers whose advertised piece size differs" {
