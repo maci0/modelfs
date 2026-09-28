@@ -986,11 +986,11 @@ pub const Catalog = struct {
         self.sweepDir(dirz, cutoff, .leases);
 
         // The manifests dir is swept too, not just the cluster dir. A
-        // manifest publish stages as `<hex>.tmp.<tid>` and renames it, and a
-        // crash between the two leaves the staging file on shared origin
-        // storage forever: the name is keyed by thread id, so a later publish
-        // on a restarted node never reuses or overwrites it. Without this the
-        // dir grows by one file per (model, crashing node) forever.
+        // manifest publish stages as `<hex>.tmp.<pid>.<seq>` and renames it,
+        // and a crash between the two leaves the staging file on shared origin
+        // storage forever: the name carries a fresh pid and publish ordinal
+        // every time, so no later publish reuses or overwrites it. Without
+        // this the dir grows by one file per (model, crashing node) forever.
         var mbuf: [sys.c.PATH_MAX]u8 = undefined;
         const mdirz = sys.joinZ(&mbuf, std.mem.span(dirz), store_mod.Store.manifests_dir_leaf) catch return;
         self.sweepDir(mdirz, cutoff, .staging);
@@ -1000,10 +1000,34 @@ pub const Catalog = struct {
     const SweepKind = enum {
         /// Cluster dir: lease `<id>.json` (never our own) plus any `.tmp`.
         leases,
-        /// Manifests dir: staging `.tmp` only. Published manifests are named
-        /// by content hash and carry no extension, so they are never touched.
+        /// Manifests dir: staging temp names only (isStagingName). Published
+        /// manifests are named by content hash and carry no extension, so they
+        /// are never touched.
         staging,
     };
+
+    /// True for the manifest publish temp `Store.publishManifest` stages:
+    /// `<hex>.tmp.<pid>.<seq>`, or bare `<hex>.tmp` if the ordinal did not fit
+    /// its buffer. The marker is therefore `.tmp` or `.tmp.<digits>`, and the
+    /// name does not end in `.tmp`: a suffix test alone never matches, and the
+    /// staging sweep silently collected nothing. Requiring a lowercase-hex
+    /// prefix and digits-only suffix keeps a planted name of any other shape
+    /// out of the unlink set.
+    fn isStagingName(name: []const u8) bool {
+        const mark = std.mem.indexOf(u8, name, ".tmp") orelse return false;
+        const prefix = name[0..mark];
+        if (prefix.len == 0) return false;
+        for (prefix) |ch| {
+            if (!std.ascii.isLower(ch) or !std.ascii.isHex(ch)) return false;
+        }
+        const tail = name[mark + ".tmp".len ..];
+        if (tail.len == 0) return true;
+        if (tail[0] != '.') return false;
+        for (tail[1..]) |ch| {
+            if (!std.ascii.isDigit(ch) and ch != '.') return false;
+        }
+        return tail.len > 1;
+    }
 
     fn sweepDir(self: *Catalog, dirz: [*:0]const u8, cutoff: i64, kind: SweepKind) void {
         // Same O_NOFOLLOW directory open as walkLeases: following a planted
@@ -1028,8 +1052,12 @@ pub const Catalog = struct {
             if (std.mem.endsWith(u8, name, ".json")) {
                 if (kind != .leases) continue;
                 if (std.mem.eql(u8, name[0 .. name.len - ".json".len], self.self_id)) continue;
-            } else if (!std.mem.endsWith(u8, name, ".tmp")) {
-                continue;
+            } else {
+                const matched = switch (kind) {
+                    .leases => std.mem.endsWith(u8, name, ".tmp"),
+                    .staging => isStagingName(name),
+                };
+                if (!matched) continue;
             }
             const owned = self.gpa.dupe(u8, name) catch return;
             names.append(self.gpa, owned) catch {
@@ -1058,7 +1086,8 @@ pub const Catalog = struct {
             const urc = sys.unlink(fp);
             if (urc != 0) {
                 if (urc != -c.ENOENT) {
-                    std.log.warn("lease sweep unlink failed for {s} (errno {d})", .{ proto.displayName(name), -urc });
+                    const what = if (kind == .leases) "cluster lease" else "manifest staging file";
+                    std.log.warn("sweep unlink failed for stale {s} {s} (errno {d})", .{ what, proto.displayName(name), -urc });
                 }
                 continue;
             }
@@ -2925,4 +2954,70 @@ test "probeDown and fetchDown cap evict by addr, never insert order" {
     try std.testing.expect(fetch_lo.noteFetchDown("10.0.0.1", 99));
     try std.testing.expect(!Fill.fetchHas(&fetch_lo, 1));
     try std.testing.expect(Fill.fetchHas(&fetch_lo, 3));
+}
+
+test "isStagingName matches the manifest publish temp and nothing else" {
+    // Store.publishManifest stages as `<hex>.tmp.<pid>.<seq>`, so a plain
+    // ".tmp" suffix test never fires and the staging sweep collected nothing.
+    try std.testing.expect(Catalog.isStagingName("ab12cd34.tmp.4242.0"));
+    try std.testing.expect(Catalog.isStagingName("ab12cd34.tmp.1"));
+    // The bufPrint-overflow fallback in publishManifest writes a bare ".tmp".
+    try std.testing.expect(Catalog.isStagingName("ab12cd34.tmp"));
+    // A published manifest is flat hex with no extension: never swept.
+    try std.testing.expect(!Catalog.isStagingName("ab12cd34"));
+    try std.testing.expect(!Catalog.isStagingName("ab12cd34.json"));
+    // Planted shapes that must not reach unlink.
+    try std.testing.expect(!Catalog.isStagingName(".tmp.1"));
+    try std.testing.expect(!Catalog.isStagingName("AB12CD34.tmp.1"));
+    try std.testing.expect(!Catalog.isStagingName("ab12cd34.tmp.evil"));
+    try std.testing.expect(!Catalog.isStagingName("ab12cd34.tmpx.1"));
+    try std.testing.expect(!Catalog.isStagingName("ab12cd34.tmp."));
+}
+
+test "sweepLeases unlinks abandoned manifest staging files and keeps published ones" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin = try sys.scratchDir(&ob, "modelfs-o-sweep-staging");
+    defer sys.deleteTree(std.testing.io, origin);
+
+    var nb: [256]u8 = undefined;
+    const cdir = try sys.joinZ(&nb, origin, cluster_dir);
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(cdir), 0o755));
+    var mb: [256]u8 = undefined;
+    const mdir = try sys.joinZ(&mb, std.mem.span(cdir), store_mod.Store.manifests_dir_leaf);
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(std.mem.span(mdir), 0o755));
+
+    // The cutoff is the own lease's mtime minus the sweep age, so the own
+    // lease is fresh and every name below is aged well past it.
+    const now = sys.monoSec(std.testing.io);
+    var ob2: [256]u8 = undefined;
+    const own = try sys.joinZ(&ob2, std.mem.span(cdir), "me.json");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(own, "{}"));
+    try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, std.mem.span(own), now));
+
+    const hex = "ab12cd34ef5678901234567890abcdef1234567890123456789abcdef";
+    var fb: [512]u8 = undefined;
+    for ([_][]const u8{
+        hex,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
+        "deadbeef.tmp.4242.0",
+        "cafebabe.tmp.99",
+    }) |leaf| {
+        const p = try sys.joinZ(&fb, std.mem.span(mdir), leaf);
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(p, "MFS1"));
+        try std.testing.expectEqual(@as(i32, 0), sys.touchPath(std.testing.io, std.mem.span(p), now - 3600));
+    }
+
+    var cat = Catalog.init(gpa, std.testing.io, origin, "me", &.{}, &.{}, &.{});
+    defer cat.deinit();
+    cat.sweepLeases();
+
+    var sb: [512]u8 = undefined;
+    var want: c.struct_stat = undefined;
+    const kept = try sys.joinZ(&sb, std.mem.span(mdir), hex);
+    try std.testing.expectEqual(@as(i32, 0), sys.lstatPath(kept, &want));
+    for ([_][]const u8{ "deadbeef.tmp.4242.0", "cafebabe.tmp.99" }) |leaf| {
+        const p = try sys.joinZ(&sb, std.mem.span(mdir), leaf);
+        try std.testing.expectEqual(@as(i32, -sys.c.ENOENT), sys.lstatPath(p, &want));
+    }
 }

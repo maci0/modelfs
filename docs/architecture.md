@@ -497,8 +497,11 @@ reference for peer fills. Hashes ride in memory and in the manifest, not in the 
 
 Manifest blobs are bounded (64 MiB, `Store.max_manifest_bytes`), parsed by a fuzzed codec
 (`piece.manifestDecode`), and published atomically (tmp + rename, lazy mkdir of
-`.cluster/manifests` like lease publish); lease walks and sweeps skip them (no `.json`/`.tmp`
-names).
+`.cluster/manifests` like lease publish); lease walks skip them (no `.json` names). A crash
+between a publish's staging write and its rename leaves `<hex>.tmp.<pid>.<seq>` on shared
+storage, and no later publish reuses that name, so the same tick sweep unlinks manifest
+staging files past the 300 s age alongside the stale leases. Published manifests are flat hex
+with no extension and are never swept.
 
 ---
 
