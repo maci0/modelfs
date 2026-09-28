@@ -47,7 +47,7 @@ Severity guide:
 
 ## Output format
 
-Report in chat: scope (docs covered, date), a findings table using the template above, counts by severity, and an ordered fix plan (doc corrections first, code-bug reports second), and a short note with the top findings and whether tests were run.
+Report in chat: scope (docs covered, date), a findings table using the template above, counts by severity, and an ordered fix plan (doc corrections first, code-bug reports second), and a short note with the top findings and whether `./scripts/check.sh` was run after any fix.
 
 ## Important
 
