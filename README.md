@@ -112,10 +112,28 @@ Secrets never take a flag, because argv is world-readable through `/proc`:
 
 `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID`, and `MODELFS_LOG` set the same
 values as their flags; an explicit flag wins, values are whitespace-trimmed, and an empty one
-counts as unset. `MODELFS_ID` is read for `mount` only, like `--id`. Any other `MODELFS_*` name
+counts as unset. `MODELFS_ID` is read for `mount` and `config` only, like `--id`. Any other `MODELFS_*` name
 is refused as a typo. Full rules, including the
 `MODELFS_PSK_VALUE` exclusivity and the address gates, are in
 [docs/architecture.md](docs/architecture.md).
+
+`modelfs config` prints the knobs a mount would run with, one `key = value (source)` line each,
+where the source is the flag, the variable, or `(default)`. It names the inline PSK as set and
+never prints the secret, touches neither the daemon nor the origin, and takes the mount options
+so a value can be checked before it is committed to. `diff` between two hosts answers what
+differs:
+
+```console
+$ MODELFS_ORIGIN=/net/192.168.0.100/models MODELFS_LOG=err modelfs config
+origin = /net/192.168.0.100/models (MODELFS_ORIGIN)
+cache = /var/cache/modelfs (default)
+id = (unset: mount uses the short hostname) (default)
+psk_file = /etc/modelfs.psk (default)
+psk_value = (unset) (default)
+log = err (MODELFS_LOG)
+piece = 8388608 (default)
+...
+```
 
 Only the GPU nodes run `modelfs`. Workstations mount the same export over plain NFS
 ([docs/operations.md](docs/operations.md)).

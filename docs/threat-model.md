@@ -140,6 +140,10 @@ or inject terminal escapes. Origin-write precondition, CLI-triggered (B3).
 | Hugging Face token: `HF_TOKEN`, else `$HF_HOME/token`, else `~/.cache/huggingface/token` | `loadToken` src/hf.zig | Up to 4096 bytes after trimming for `HF_TOKEN`; files are capped at 4096 raw bytes, including whitespace. Whitespace-only counts as unset. No flag carries it, and `cmdPull` disables core dumps for the run when one is loaded |
 | `MODELFS_ORIGIN/CACHE/PSK/PSK_VALUE/ID/LOG` | src/main.zig | Same values as their flags; an explicit flag wins. Whitespace-trimmed (`envValue`), empty counts as unset, except a whitespace-only `MODELFS_PSK_VALUE` which is refused as empty. Any other `MODELFS_*` name is refused as a typo (`checkKnownEnv` over the `env_knobs` table) |
 
+`modelfs config` prints the resolved value and source of every knob except the inline PSK,
+which it reports as set and never renders; a file PSK is printed by path only, since the path
+is configuration and the contents are the secret.
+
 ### Cache-dir artifacts read back at runtime
 
 `meta/*.pieces` bitfields, `pin/` markers, `status.json`, and `update.req`/`update.ack`. Read by
@@ -610,8 +614,9 @@ believing an option took effect. `parseArgs` and the command entry points (src/m
 rather than ignore.
 
 * **Scope.** Mount-only options are refused on status/peers/pin/unpin/verify/dupes/pull/update
-  (`rejectOutsideMount`); `--all` is refused outside dupes and `--revision`/`--dest` outside
-  pull (`rejectOutsideCommand`).
+  (`rejectOutsideMount`, which shares the `mountScope` predicate with the `MODELFS_ID` read);
+  `config` accepts them because it reports mount's own knobs. `--all` is refused outside dupes
+  and `--revision`/`--dest` outside pull (`rejectOutsideCommand`).
 * **Shape.** Positional arity is enforced at parse (exit 2), percentages clamp to 0..100
   (`parsePercent`), and watermark ordering is validated cross-field (`cull.ordered`).
 * **Paths.** `--origin` must be an existing directory for mount, peers, verify, dupes, and

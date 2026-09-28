@@ -54,8 +54,15 @@ const usage =
     \\  modelfs dupes --all --origin PATH
     \\  modelfs pull <owner/repo> --origin PATH [--revision REF] [--dest REL]
     \\  modelfs update [--cache PATH]
+    \\  modelfs config [mount options]
     \\  modelfs version
     \\  modelfs help
+    \\
+    \\config prints the knobs a mount would run with, one per line as
+    \\"key = value (source)", where source is the flag, the variable, or
+    \\(default). The inline PSK is reported as set, never printed. It takes
+    \\the mount options, so a value can be checked before it is committed
+    \\to, and it touches neither the daemon nor the origin.
     \\
     \\verify checks cached pieces against trusted hashes and clears mismatched
     \\cache marks so later reads refill them. Mismatches exit 1, even after
@@ -90,13 +97,14 @@ const usage =
     \\  --dest REL            Where under --origin the files land (default: the
     \\                        repo id, so owner/repo lands at origin/owner/repo)
     \\
-    \\mount/status/peers/pin/unpin/verify/dupes/pull/update:
+    \\mount/config/status/peers/pin/unpin/verify/dupes/pull/update:
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
     \\
     \\status/peers/pin/unpin/verify/dupes/pull/update take only the flags shown on
-    \\their Usage line plus the shared --origin/--cache/--psk/--log values.
-    \\dupes --all scans every manifest on the origin and refuses a path
-    \\list; mount-only options are refused on the rest. Every command also
+    \\their Usage line plus the shared --origin/--cache/--psk/--log values;
+    \\config takes the mount options. dupes --all scans every manifest on the
+    \\origin and refuses a path list; mount-only options are refused on the
+    \\rest. Every command also
     \\accepts -h/--help and -V/--version. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
     \\accept --name VALUE or --name=VALUE. Usage errors exit 2 with one
@@ -105,7 +113,7 @@ const usage =
     \\stdout.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
-    \\MODELFS_ID (mount only, like --id) MODELFS_LOG set the same values
+    \\MODELFS_ID (mount and config, like --id) MODELFS_LOG set the same values
     \\as their flags; an explicit flag wins. MODELFS_PSK_VALUE cannot be
     \\combined with --psk or MODELFS_PSK on mount. Every MODELFS_* value
     \\is trimmed of surrounding whitespace. An empty or whitespace-only
@@ -123,6 +131,7 @@ const usage =
     \\  modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models
     \\  modelfs dupes --all --origin /net/192.168.0.100/models
     \\  modelfs pull unsloth/Qwen3-8B-GGUF --origin /net/192.168.0.100/models
+    \\  modelfs config --origin /net/192.168.0.100/models
     \\
     \\Cluster leases live on the origin at .cluster/<id>.json, not under the
     \\FUSE mount. Same PSK on every node. Desktop can stay on plain NFS.
@@ -246,6 +255,13 @@ pub fn main(init: std.process.Init) !u8 {
         }
         return cmdUpdate(init.io, gpa, parsed.opts);
     }
+    if (std.mem.eql(u8, parsed.cmd, "config")) {
+        if (parsed.rest.len != 0) {
+            std.debug.print("config takes no arguments (see 'modelfs help')\n", .{});
+            return 2;
+        }
+        return cmdConfig(init.io, gpa, parsed.opts);
+    }
     // parseArgs refuses anything outside the commands dispatched above, so
     // this point is unreachable unless the knownCommand list and this
     // dispatch drift apart; failing loudly here surfaces that immediately.
@@ -335,7 +351,47 @@ const Opts = struct {
     listen_port: ?u16 = null,
     advertise: std.ArrayList(struct { ip: []const u8, port: ?u16 = null }) = .empty,
     seed: std.ArrayList([]const u8) = .empty,
+    /// Which knobs the environment filled, and which an explicit flag
+    /// supplied. The value alone cannot say: a resolved origin looks the
+    /// same whether it came from MODELFS_ORIGIN, --origin, or the default,
+    /// and "an explicit flag wins" is only checkable if the winner is
+    /// named. `config` reports it; nothing else reads these.
+    from_env: KnobSet = .{},
+    from_flag: KnobSet = .{},
 };
+
+/// One bit per knob `config` reports. A knob has exactly three sources, in
+/// precedence order: an explicit flag, its MODELFS_ variable, the default.
+const KnobSet = packed struct {
+    origin: bool = false,
+    cache: bool = false,
+    psk_file: bool = false,
+    psk_value: bool = false,
+    id: bool = false,
+    log: bool = false,
+    piece: bool = false,
+    brun: bool = false,
+    bcull: bool = false,
+    bstop: bool = false,
+    direct_io: bool = false,
+    allow_other: bool = false,
+    detach: bool = false,
+    listen: bool = false,
+    advertise: bool = false,
+    seed: bool = false,
+};
+
+/// The source a resolved knob came from, in the documented precedence order:
+/// the flag first, then the variable, then the default. A flag and its
+/// variable can both be set (the flag wins), and only this order reports
+/// that correctly. `env_name` is empty for the mount-only knobs, which have
+/// no variable: nothing reads from_env for them, so the name would only
+/// advertise a knob that does not exist.
+fn knobSource(from_env: bool, from_flag: bool, env_name: []const u8, flag_name: []const u8) []const u8 {
+    if (from_flag) return flag_name;
+    if (from_env) return env_name;
+    return "(default)";
+}
 
 fn parseHostPort(s: []const u8) !proto.LeaseAddr {
     // Every consumer inet_pton's the ip field (bind, dial, hops scoring), so
@@ -652,10 +708,18 @@ fn rejectOutsideCommand(cmd: []const u8, want: []const u8, flag: []const u8) !vo
 }
 
 fn rejectOutsideMount(cmd: []const u8, flag: []const u8) !void {
-    if (!std.mem.eql(u8, cmd, "mount")) {
+    if (!mountScope(cmd)) {
         if (!builtin.is_test) std.debug.print("{s} only applies to modelfs mount\n", .{flag});
         return error.FlagOutsideMount;
     }
+}
+
+/// True for the commands whose configuration is the mount's: mount itself,
+/// and config, which reports exactly the knobs a mount would run with and
+/// therefore accepts and resolves the same mount options. Everywhere else a
+/// mount-only option is refused rather than read and ignored.
+fn mountScope(cmd: []const u8) bool {
+    return std.mem.eql(u8, cmd, "mount") or std.mem.eql(u8, cmd, "config");
 }
 
 /// Refusal line for an --id/MODELFS_ID value failing discover.validId. The
@@ -692,11 +756,11 @@ fn parsePercent(flag: []const u8, raw: []const u8) !u32 {
 /// the dispatched subset, and every "want ..." message renders this list, so
 /// one list keeps the refusal and its help text from drifting.
 const all_commands = [_][]const u8{
-    "mount", "status", "peers",  "pin",     "unpin", "verify",
-    "dupes", "pull",   "update", "version", "help",
+    "mount", "status", "peers",  "pin",    "unpin",   "verify",
+    "dupes", "pull",   "update", "config", "version", "help",
 };
 
-const dispatched_commands = all_commands[0..9];
+const dispatched_commands = all_commands[0..10];
 
 /// The command words main() dispatches on; the bare help/version forms are
 /// answered before parseArgs ever runs. Keeping one list means a newly added
@@ -711,7 +775,7 @@ fn knownCommand(cmd: []const u8) bool {
 
 /// The `want a, b, c ...` tail shared by every missing/unknown-command line.
 fn commandList() []const u8 {
-    return "mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help";
+    return "mount, status, peers, pin, unpin, verify, dupes, pull, update, config, version, help";
 }
 
 /// The one command word within a typo of `typed`, or null when nothing is
@@ -815,12 +879,15 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         switch (knob.field) {
             .origin => if (envValue(environ, knob.name)) |v| {
                 opts.origin = v;
+                opts.from_env.origin = true;
             },
             .cache => if (envValue(environ, knob.name)) |v| {
                 opts.cache = v;
+                opts.from_env.cache = true;
             },
             .psk_file => if (envValue(environ, knob.name)) |v| {
                 opts.psk_file = v;
+                opts.from_env.psk_file = true;
                 psk_file_set = true;
             },
             // The only inline-secret spelling: no flag carries the secret,
@@ -831,16 +898,21 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             // stays set so loadPsk can refuse EmptyPsk instead of envValue
             // treating it as unset and falling through to /etc/modelfs.psk.
             .psk_value => if (environ.get(knob.name)) |raw| {
-                if (raw.len != 0) opts.psk_value = std.mem.trim(u8, raw, " \t\r\n");
+                if (raw.len != 0) {
+                    opts.psk_value = std.mem.trim(u8, raw, " \t\r\n");
+                    opts.from_env.psk_value = true;
+                }
             },
             // MODELFS_ID follows the --id flag's mount-only scope:
             // status/peers/pin/unpin never read the id, so an ambient
             // shell-wide variable must neither leak into them nor fail them
             // with BadId the way the explicit flag is refused by
-            // rejectOutsideMount.
-            .id => if (std.mem.eql(u8, cmd, "mount")) {
+            // rejectOutsideMount. config is mount's own view of the knobs
+            // it would run with, so it reads the id too.
+            .id => if (mountScope(cmd)) {
                 if (envValue(environ, knob.name)) |v| {
                     opts.id = v;
+                    opts.from_env.id = true;
                 }
             },
             // The journal is the only configuration observability this
@@ -890,11 +962,14 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         if (std.mem.eql(u8, flag, "--log")) {
             const raw = try takeValue(args, flag, &i, inline_val);
             opts.log_level = try takeLogLevel(flag, raw);
+            opts.from_flag.log = true;
             log_set = true;
         } else if (std.mem.eql(u8, flag, "--origin")) {
             opts.origin = try takeValue(args, flag, &i, inline_val);
+            opts.from_flag.origin = true;
         } else if (std.mem.eql(u8, flag, "--cache")) {
             opts.cache = try takeValue(args, flag, &i, inline_val);
+            opts.from_flag.cache = true;
         } else if (std.mem.eql(u8, flag, "--all")) {
             // dupes-only: the other commands have no whole-store scan, and
             // an accepted-and-ignored --all would read as a working knob.
@@ -910,8 +985,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         } else if (std.mem.eql(u8, flag, "--id")) {
             try rejectOutsideMount(cmd, flag);
             opts.id = try takeValue(args, flag, &i, inline_val);
+            opts.from_flag.id = true;
         } else if (std.mem.eql(u8, flag, "--psk")) {
             opts.psk_file = try takeValue(args, flag, &i, inline_val);
+            opts.from_flag.psk_file = true;
             psk_file_set = true;
         } else if (std.mem.eql(u8, flag, "--piece")) {
             try rejectOutsideMount(cmd, flag);
@@ -931,38 +1008,48 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 return error.ZeroPieceSize;
             }
             opts.piece = @intCast(psz);
+            opts.from_flag.piece = true;
         } else if (std.mem.eql(u8, flag, "--brun")) {
             try rejectOutsideMount(cmd, flag);
             opts.water.brun = try parsePercent(flag, try takeValue(args, flag, &i, inline_val));
+            opts.from_flag.brun = true;
         } else if (std.mem.eql(u8, flag, "--bcull")) {
             try rejectOutsideMount(cmd, flag);
             opts.water.bcull = try parsePercent(flag, try takeValue(args, flag, &i, inline_val));
+            opts.from_flag.bcull = true;
         } else if (std.mem.eql(u8, flag, "--bstop")) {
             try rejectOutsideMount(cmd, flag);
             opts.water.bstop = try parsePercent(flag, try takeValue(args, flag, &i, inline_val));
+            opts.from_flag.bstop = true;
         } else if (std.mem.eql(u8, flag, "--direct-io")) {
             try rejectOutsideMount(cmd, flag);
             try rejectInlineValue(flag, inline_val);
             opts.direct_io = true;
+            opts.from_flag.direct_io = true;
         } else if (std.mem.eql(u8, flag, "--kernel-cache")) {
             try rejectOutsideMount(cmd, flag);
             try rejectInlineValue(flag, inline_val);
             opts.direct_io = false;
+            opts.from_flag.direct_io = true;
         } else if (std.mem.eql(u8, flag, "--allow-other")) {
             try rejectOutsideMount(cmd, flag);
             try rejectInlineValue(flag, inline_val);
             opts.allow_other = true;
+            opts.from_flag.allow_other = true;
         } else if (std.mem.eql(u8, flag, "--detach")) {
             try rejectOutsideMount(cmd, flag);
             try rejectInlineValue(flag, inline_val);
             opts.detach = true;
+            opts.from_flag.detach = true;
         } else if (std.mem.eql(u8, flag, "-f") or std.mem.eql(u8, flag, "--foreground")) {
             try rejectOutsideMount(cmd, flag);
             try rejectInlineValue(flag, inline_val);
             opts.detach = false;
+            opts.from_flag.detach = true;
         } else if (std.mem.eql(u8, flag, "--listen")) {
             try rejectOutsideMount(cmd, flag);
             const raw = try takeValue(args, flag, &i, inline_val);
+            opts.from_flag.listen = true;
             opts.listen_port = listenPort(raw) catch |err| {
                 if (!builtin.is_test) {
                     if (err == error.ZeroPort)
@@ -1009,6 +1096,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                     .ip = hp.ip,
                     .port = if (std.mem.findScalar(u8, tok, ':') != null) hp.port else null,
                 });
+                opts.from_flag.advertise = true;
             }
         } else if (std.mem.eql(u8, flag, "--seed")) {
             try rejectOutsideMount(cmd, flag);
@@ -1034,6 +1122,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 return error.UndialableIp;
             }
             try opts.seed.append(gpa, s);
+            opts.from_flag.seed = true;
         } else if (flag.len > 0 and flag[0] == '-') {
             // Plain print, like every other usage error in this loop; the
             // logger's level prefix is noise for a one-shot CLI failure.
@@ -1047,6 +1136,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     if (!log_set) {
         if (envValue(environ, envName(.log))) |v| {
             opts.log_level = try takeLogLevel(envName(.log), v);
+            opts.from_env.log = true;
         }
     }
     // Flag and env sources share one gate: an empty id makes this node
@@ -1782,6 +1872,69 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     _ = sys.unlink(req_path);
     _ = sys.unlink(ack_path);
     return 1;
+}
+
+/// The knobs a mount would run with, one `key = value (source)` line each.
+/// The source is what an operator cannot otherwise see: a resolved origin
+/// reads the same whether it came from MODELFS_ORIGIN, --origin, or the
+/// default, so the documented "an explicit flag wins" is only checkable
+/// when the winner is named. `diff` between two hosts answers "what
+/// differs between these nodes".
+///
+/// The inline PSK is named by its variable and never printed; a file PSK is
+/// named by path, which is configuration. No value here is validated twice:
+/// parseArgs ran the same gates mount runs, so a bad knob is refused before
+/// anything is written.
+fn cmdConfig(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const w = &aw.writer;
+
+    if (opts.origin) |v| {
+        try w.print("origin = {s} ({s})\n", .{ v, knobSource(opts.from_env.origin, opts.from_flag.origin, "MODELFS_ORIGIN", "--origin") });
+    } else {
+        try w.print("origin = (unset: modelfs mount needs --origin or MODELFS_ORIGIN) (default)\n", .{});
+    }
+    try w.print("cache = {s} ({s})\n", .{ opts.cache, knobSource(opts.from_env.cache, opts.from_flag.cache, "MODELFS_CACHE", "--cache") });
+    if (opts.id) |v| {
+        try w.print("id = {s} ({s})\n", .{ v, knobSource(opts.from_env.id, opts.from_flag.id, "MODELFS_ID", "--id") });
+    } else {
+        try w.print("id = (unset: mount uses the short hostname) (default)\n", .{});
+    }
+    try w.print("psk_file = {s} ({s})\n", .{ opts.psk_file, knobSource(opts.from_env.psk_file, opts.from_flag.psk_file, "MODELFS_PSK", "--psk") });
+    if (opts.psk_value != null) {
+        // The secret itself never reaches this line: a config dump lands in
+        // a terminal scrollback, a CI job log, and a paste.
+        try w.print("psk_value = set, value not shown ({s})\n", .{knobSource(opts.from_env.psk_value, false, "MODELFS_PSK_VALUE", "--psk")});
+    } else {
+        try w.print("psk_value = (unset) (default)\n", .{});
+    }
+    try w.print("log = {s} ({s})\n", .{ @tagName(opts.log_level), knobSource(opts.from_env.log, opts.from_flag.log, "MODELFS_LOG", "--log") });
+    try w.print("piece = {d} ({s})\n", .{ opts.piece, knobSource(false, opts.from_flag.piece, "", "--piece") });
+    try w.print("brun = {d} ({s})\n", .{ opts.water.brun, knobSource(false, opts.from_flag.brun, "", "--brun") });
+    try w.print("bcull = {d} ({s})\n", .{ opts.water.bcull, knobSource(false, opts.from_flag.bcull, "", "--bcull") });
+    try w.print("bstop = {d} ({s})\n", .{ opts.water.bstop, knobSource(false, opts.from_flag.bstop, "", "--bstop") });
+    try w.print("listen = {d} ({s})\n", .{ opts.listen_port orelse proto.default_port, knobSource(false, opts.from_flag.listen, "", "--listen") });
+    if (opts.advertise.items.len == 0) {
+        try w.print("advertise = (auto-detect) (default)\n", .{});
+    } else {
+        try w.print("advertise = ", .{});
+        for (opts.advertise.items, 0..) |a, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.print("{s}:{d}", .{ a.ip, a.port orelse (opts.listen_port orelse proto.default_port) });
+        }
+        try w.print(" ({s})\n", .{knobSource(false, opts.from_flag.advertise, "", "--advertise")});
+    }
+    if (opts.seed.items.len == 0) {
+        try w.print("seed = (none) (default)\n", .{});
+    } else {
+        try w.print("seed = {s} ({s})\n", .{ opts.seed.items, knobSource(false, opts.from_flag.seed, "", "--seed") });
+    }
+    try w.print("direct_io = {s} ({s})\n", .{ if (opts.direct_io) "on" else "off", knobSource(false, opts.from_flag.direct_io, "", "--direct-io/--kernel-cache") });
+    try w.print("allow_other = {s} ({s})\n", .{ if (opts.allow_other) "on" else "off", knobSource(false, opts.from_flag.allow_other, "", "--allow-other") });
+    try w.print("detach = {s} ({s})\n", .{ if (opts.detach) "on" else "off", knobSource(false, opts.from_flag.detach, "", "--detach/-f") });
+
+    return if (writeOut(io, aw.written())) 0 else 1;
 }
 
 /// Pulls one Hugging Face model revision onto the origin. No daemon and no
@@ -2641,6 +2794,95 @@ test "every name in the MODELFS_ namespace applies to its option" {
             .log => try std.testing.expectEqual(std.log.Level.err, parsed.opts.log_level),
         }
     }
+}
+
+test "config reports every resolved knob and the source it came from" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin");
+    try environ.put("MODELFS_ORIGIN", "/env/origin");
+    try environ.put("MODELFS_CACHE", "/env/cache");
+    try environ.put("MODELFS_LOG", "err");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    const parsed = try parseArgs(gpa, &environ, &.{"config"});
+    defer freeParsed(parsed, gpa);
+    try std.testing.expectEqual(@as(u8, 0), try cmdConfig(std.testing.io, gpa, parsed.opts));
+
+    // A value without its source cannot be checked: origin reads the same
+    // whether the variable, the flag, or the default set it.
+    for ([_][]const u8{
+        "origin = /env/origin (MODELFS_ORIGIN)\n",
+        "cache = /env/cache (MODELFS_CACHE)\n",
+        "log = err (MODELFS_LOG)\n",
+        "piece = 8388608 (default)\n",
+        "psk_file = /etc/modelfs.psk (default)\n",
+        "psk_value = (unset) (default)\n",
+        "id = (unset: mount uses the short hostname) (default)\n",
+        "listen = 18080 (default)\n",
+        "advertise = (auto-detect) (default)\n",
+    }) |line| {
+        if (std.mem.indexOf(u8, out.items, line) == null) {
+            std.debug.print("missing config line: {s}\n", .{line});
+            return error.MissingConfigLine;
+        }
+    }
+}
+
+test "config names the flag that beat its variable and never prints the secret" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin");
+    try environ.put("MODELFS_ORIGIN", "/env/origin");
+    try environ.put("MODELFS_CACHE", "/env/cache");
+    try environ.put("MODELFS_PSK_VALUE", "cluster-secret-hex");
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+    // --cache beats MODELFS_CACHE, so the reported source must be the flag.
+    const parsed = try parseArgs(gpa, &environ, &.{ "config", "--cache", "/flag/cache" });
+    defer freeParsed(parsed, gpa);
+    try std.testing.expectEqual(@as(u8, 0), try cmdConfig(std.testing.io, gpa, parsed.opts));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "cache = /flag/cache (--cache)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "origin = /env/origin (MODELFS_ORIGIN)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "psk_value = set, value not shown (MODELFS_PSK_VALUE)") != null);
+    // The dump lands in a scrollback, a CI log, and a paste: the secret
+    // itself must not be in it.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "cluster-secret-hex") == null);
+}
+
+test "config takes the mount options and is refused them nowhere else" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    try environ.put("PATH", "/usr/bin");
+
+    // config is mount's own view of the knobs, so it resolves what mount
+    // resolves rather than refusing the very options it reports.
+    const parsed = try parseArgs(gpa, &environ, &.{ "config", "--origin", "/o", "--piece", "16M", "--id", "node-a", "--listen", "19091" });
+    defer freeParsed(parsed, gpa);
+    try std.testing.expectEqual(@as(u32, 16 << 20), parsed.opts.piece);
+    try std.testing.expectEqualStrings("node-a", parsed.opts.id.?);
+    try std.testing.expectEqual(@as(u16, 19091), parsed.opts.listen_port.?);
+
+    // MODELFS_ID follows --id's scope, which now includes config.
+    try environ.put("MODELFS_ID", "node-b");
+    const parsed_env = try parseArgs(gpa, &environ, &.{"config"});
+    defer freeParsed(parsed_env, gpa);
+    try std.testing.expectEqualStrings("node-b", parsed_env.opts.id.?);
+    // A non-mount command still neither reads it nor fails on it.
+    const parsed_status = try parseArgs(gpa, &environ, &.{"status"});
+    defer freeParsed(parsed_status, gpa);
+    try std.testing.expect(parsed_status.opts.id == null);
+    // and still refuses the mount-only flags outright.
+    try std.testing.expectError(error.FlagOutsideMount, parseArgs(gpa, &environ, &.{ "status", "--piece", "16M" }));
 }
 
 test "unknownEnvName reports the lexicographically first typo" {
@@ -4425,9 +4667,9 @@ test "reportUnknownCommand separates a mistyped flag, a bare --, and a word" {
     reportUnknownCommand("frobnicate");
     try std.testing.expectEqualStrings(
         \\unknown flag --hepl (see 'modelfs help')
-        \\missing command (want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)
-        \\unknown command "verifz" (did you mean verify? want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)
-        \\unknown command "frobnicate" (want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)
+        \\missing command (want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, version, help)
+        \\unknown command "verifz" (did you mean verify? want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, version, help)
+        \\unknown command "frobnicate" (want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, version, help)
         \\
     , out.items);
 }

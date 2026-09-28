@@ -164,7 +164,13 @@ parameter, not a sysctl, so persist it with `options nfs nfs4_disable_idmapping=
 | Is cachefilesd running (desktop)? | `pgrep -a cachefilesd` must show a process |
 | Is FS-Cache actually attached (desktop)? | `findmnt /models \| grep fsc` |
 | Is the NFS port reachable, or is it the firewall? | `timeout 5 bash -c "echo >/dev/tcp/192.168.0.100/2049"`, then `timeout 10 showmount -e 192.168.0.100` |
+| What configuration would a mount use here, and from where? | `modelfs config`; the inline PSK is reported as set, never printed |
+| Do two nodes agree? | `diff <(ssh spark-a modelfs config) <(ssh spark-b modelfs config)` |
 | Mount wedged? | `umount -l` the mountpoint |
+
+`modelfs config` needs no daemon and no origin, so it answers on a node whose mount is down,
+and it runs the same validation `mount` does: a knob it would refuse exits 2 with the named
+line, before anything is printed.
 
 The desktop FS-Cache defaults to `dir /var/cache/fscache` and culls LRU at about 7% free.
 `iflag=direct` skips it entirely, which is how to measure the NAS rather than the cache.

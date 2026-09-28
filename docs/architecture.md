@@ -815,10 +815,10 @@ The [README](../README.md) lists the flags. These are the rules behind them.
 
 ### Environment
 
-`MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, and `MODELFS_ID` (mount only, like `--id`) set
-the same values as their flags. `MODELFS_PSK_VALUE` carries an inline secret that no flag
-accepts. `MODELFS_LOG` and `--log` move the log ceiling (`err`, `warn`, `info` default, `debug`)
-on every command. An explicit flag always wins.
+`MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, and `MODELFS_ID` (mount and `config`, like
+`--id`) set the same values as their flags. `MODELFS_PSK_VALUE` carries an inline secret that no
+flag accepts. `MODELFS_LOG` and `--log` move the log ceiling (`err`, `warn`, `info` default,
+`debug`) on every command. An explicit flag always wins.
 
 Every `MODELFS_*` value is trimmed of surrounding whitespace (`envValue` in src/main.zig), so an
 EnvironmentFile trailing space or a copied path with a newline cannot become the path, and an
@@ -834,6 +834,18 @@ Any other `MODELFS_*` name is refused as a typo'd knob on every command. That is
 and drill scripts keep their knobs outside this namespace (`MF_TEST_*`, `MF_DRILL_*`). The
 namespace is the `env_knobs` table in src/main.zig: `checkKnownEnv` refuses every name outside
 it and `parseArgs` applies every name in it, so an accepted variable can never go unread.
+
+### Reading the effective configuration
+
+`modelfs config` (`cmdConfig` in src/main.zig) prints every knob a mount would run with, one
+`key = value (source)` line each, the source being the flag, the variable, or `(default)`. The
+value alone cannot answer whether the environment was read at all, so `Opts` carries a
+`from_env` and a `from_flag` bit per knob (`KnobSet`), set where the value is set, and
+`knobSource` reports them in the same precedence order the parser applies. `config` takes the
+mount options, so a value can be resolved and checked without starting a mount, and it reads
+neither the daemon nor the origin. The inline PSK is reported as set and never printed; a file
+PSK is reported by path, which is configuration and not the secret. Two hosts are compared by
+`diff`ing the two dumps.
 
 ### Addresses and paths
 
