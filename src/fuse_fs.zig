@@ -334,6 +334,74 @@ test "mf_create honors O_EXCL at the origin and keeps the legacy truncate" {
     try std.testing.expectEqual(@as(u64, 0), @as(u64, @intCast(sb.st_size)));
 }
 
+test "mf_statfs answers the origin filesystem in statvfs shape" {
+    // The reply is hand-mapped from struct statfs onto libfuse's statvfs, so
+    // every field is checked against the kernel's own statfs of the same
+    // name: a field copied from the wrong source, or the f_favail/f_namemax
+    // derivations dropped, would otherwise reach `df` as plausible numbers.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-statfs");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-statfs");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    const previous_state = tls_state;
+    tls_state = &st;
+    defer tls_state = previous_state;
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const origin_z = try st.store.originPath(&pbuf, "model.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(origin_z, "weights"));
+
+    var raw: sys.c.struct_statfs = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.statfsNoFollow(origin_z, &raw));
+    var out: fuse.struct_statvfs = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), mf_statfs("/model.bin", &out));
+    try std.testing.expect(out.f_blocks > 0);
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_bsize)), @as(u64, out.f_bsize));
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_frsize)), @as(u64, out.f_frsize));
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_blocks)), @as(u64, out.f_blocks));
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_bfree)), @as(u64, out.f_bfree));
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_bavail)), @as(u64, out.f_bavail));
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_files)), @as(u64, out.f_files));
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_ffree)), @as(u64, out.f_ffree));
+    // statfs has no f_favail: the reply carries the derivation its own libc
+    // wrappers make, f_ffree, not the free-block count.
+    try std.testing.expectEqual(@as(u64, out.f_ffree), @as(u64, out.f_favail));
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_flags)), @as(u64, out.f_flag));
+    // The spelling trap: statfs says f_namelen, statvfs says f_namemax.
+    try std.testing.expectEqual(@as(u64, @intCast(raw.f_namelen)), @as(u64, out.f_namemax));
+    // glibc types f_fsid as a struct, musl as a long, and the two statfs
+    // spellings mirror that: the same 8 bytes either way.
+    try std.testing.expectEqualSlices(
+        u8,
+        std.mem.asBytes(&raw.f_fsid)[0..8],
+        std.mem.asBytes(&out.f_fsid)[0..8],
+    );
+
+    // A null stbuf is the "count only" call: the statfs still runs and the
+    // handlers behind it still answer, so a transport error is not masked.
+    try std.testing.expectEqual(@as(c_int, 0), mf_statfs("/model.bin", null));
+
+    // Denials keep the shape the rest of the mount uses: no such name, a
+    // planted symlink (ELOOP, so `df` of a link to / cannot report the host
+    // root), and the hidden cluster directory.
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_statfs("/missing.bin", &out));
+    var lb: [sys.c.PATH_MAX]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        fuse.symlink(origin_z, try st.store.originPath(&lb, "link.bin")),
+    );
+    try std.testing.expectEqual(@as(c_int, -sys.c.ELOOP), mf_statfs("/link.bin", &out));
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_statfs("/.cluster", &out));
+}
+
 test "mf_open honors O_TRUNC for cold and cached files" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;

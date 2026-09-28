@@ -2356,6 +2356,55 @@ test "adoptListenFd serves /ping on the inherited fd without bind" {
     try std.testing.expectEqual(@as(usize, 0), second.listen_fds.items.len);
 }
 
+test "adoptListenFd refuses a non-listening fd and a reuseport listener" {
+    // The handover blob names the fd to inherit, so both gates the success
+    // path above never reaches have their own case: a replacement must not
+    // end up serving from a socket that cannot accept, and must not share a
+    // port with a still-live daemon.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-adopt-reject-o");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-adopt-reject-c");
+    defer sys.deleteTree(std.testing.io, cache_d);
+    var st = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+
+    var srv = Server{ .gpa = gpa, .io = std.testing.io, .psk = "adopt-secret", .store = &st };
+    defer srv.stop();
+
+    // A plain socket names fine and is not listening: getsockname alone
+    // cannot tell an inherited listener from anything else.
+    const plain = sys.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (plain < 0) return error.SkipZigTest;
+    defer sys.close(plain);
+    var plain_addr = loopbackAddr(0);
+    try std.testing.expectEqual(@as(i32, 0), sys.getsockname(plain, &plain_addr));
+    try std.testing.expectEqual(error.NotListening, srv.adoptListenFd(plain));
+    try std.testing.expectEqual(@as(usize, 0), srv.listen_fds.items.len);
+
+    // SO_REUSEPORT is the split-the-port failure the refusal exists for: the
+    // kernel would hand half the connections to a second daemon.
+    const rp = sys.socket(c.AF_INET, c.SOCK_STREAM, 0);
+    if (rp < 0) return error.SkipZigTest;
+    defer sys.close(rp);
+    var on: c_int = 1;
+    try std.testing.expectEqual(
+        @as(c_int, 0),
+        std.c.setsockopt(rp, c.SOL_SOCKET, @intCast(c.SO_REUSEPORT), @ptrCast(&on), @sizeOf(c_int)),
+    );
+    sys.setReuseAddr(rp);
+    var addr = loopbackAddr(0);
+    try std.testing.expectEqual(@as(i32, 0), sys.bind(rp, &addr));
+    try std.testing.expectEqual(@as(i32, 0), sys.listen(rp, 1));
+    try std.testing.expect(sys.reuseportIsOn(rp));
+    try std.testing.expectEqual(error.ReusePort, srv.adoptListenFd(rp));
+    // A refused fd is left with its owner, not adopted and closed here.
+    try std.testing.expectEqual(@as(usize, 0), srv.listen_fds.items.len);
+    try std.testing.expect(sys.reuseportIsOn(rp));
+}
+
 test "bindAll collapses duplicate specs and refuses an already-bound port" {
     const gpa = std.testing.allocator;
     const spec = struct {
