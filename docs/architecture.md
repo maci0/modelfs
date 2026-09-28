@@ -78,9 +78,12 @@ New code goes in the module that already owns that concern.
 | `main.zig` | CLI and mount wiring into `State.init` / `State.deinit`; mount-time `disableCoreDumps` / `scrubPskEnv` |
 | `root.zig` | Test aggregator for `zig build test` |
 
-`main` → `fuse_fs` → `peer` → (`store`, `discover`) → (`piece`, `proto`, `cull`, `sys`) → `c`.
-`handover` and `hf` sit beside `fuse_fs`/`main`: neither speaks FUSE, and `hf` is the one place
-that reaches a host outside the cluster (HTTPS through `std.http.Client`, CLI only).
+`main` → `fuse_fs` → `peer` → `store` → `discover` → (`piece`, `proto`, `cull`, `sys`) → `c`.
+`discover` sits below `store` because the lease sweep names the manifest dir through
+`Store.manifests_dir_leaf` rather than spelling the leaf again. `proto` and `piece` share the
+last group, not two levels of it: `proto` reads `piece`'s bitfield codec, and `store` needs
+both. `handover` and `hf` sit beside `fuse_fs`/`main`: neither speaks FUSE, and `hf` is the one
+place that reaches a host outside the cluster (HTTPS through `std.http.Client`, CLI only).
 
 `@cImport` is deprecated in Zig 0.16, so C declarations are translated once from `src/c.h` by
 `build.zig` (musl targets translate `src/c_musl.h`, which includes `c.h` after working around
@@ -95,9 +98,9 @@ target the way `c_musl.h` refuses one whose `struct timespec` it cannot reproduc
 statfs-to-statvfs copy in `mf_statfs` is the mirror-image case: both libcs spell `f_fsid` in
 four different types, and the same 8 bytes move either way on LP64.
 
-The commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`, `pull`, `update`)
-import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and
-name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`,
+The commands that skip FUSE (`status`, `peers`, `pin`, `unpin`, `verify`, `dupes`, `pull`,
+`update`) import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster`
+and name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`,
 `manifestPath`, `manifestsDirPath`) rather than reconstructing those joins. Status and update
 locate the heartbeat through `Store.cacheStatusPath`, which takes a cache root without
 requiring an initialized Store. Pin, verify, and
@@ -666,8 +669,9 @@ corrupt entries skipped. Rows sort by lease file name and each row's addresses b
 the listing.
 
 An unreachable `--origin`, or a regular file at `--origin`, exits 1 for mount, peers, verify,
-and dupes (`resolveOriginDir` in src/main.zig). An existing origin with no `.cluster` dir yet
-lists as empty and exits 0. An unreadable `.cluster` (EIO, ENOTDIR, EACCES) exits 1 with the
+dupes, and pull (`resolveOriginDir` in src/main.zig; `cmdPull` gates on it before any network
+request). An existing origin with no `.cluster` dir yet lists as empty and exits 0. An
+unreadable `.cluster` (EIO, ENOTDIR, EACCES) exits 1 with the
 reason on stderr (`cmdPeers`), so a pipe cannot read the failure as an empty fleet. `dupes --all`
 applies the same split to `origin/.cluster/manifests` (`cmdDupesAll`).
 

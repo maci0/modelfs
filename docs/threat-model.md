@@ -611,12 +611,12 @@ rather than ignore.
   pull (`rejectOutsideCommand`).
 * **Shape.** Positional arity is enforced at parse (exit 2), percentages clamp to 0..100
   (`parsePercent`), and watermark ordering is validated cross-field (`cull.ordered`).
-* **Paths.** `--origin` must be an existing directory for mount, peers, verify, and dupes
-  (`resolveOriginDir`): a regular file realpaths fine but can never hold leases or serve joined
-  reads, and `dupes --all` would otherwise exit 0 as an empty scan. Cache and mountpoint paths
-  that exist as a regular file are refused as "not a directory" (`ensureDirReal`). An origin
-  overlapping the cache is refused at mount (`pathsOverlap`), since piece files would land on
-  the shared store.
+* **Paths.** `--origin` must be an existing directory for mount, peers, verify, dupes, and
+  pull (`resolveOriginDir`): a regular file realpaths fine but can never hold leases or serve
+  joined reads, and `dupes --all` would otherwise exit 0 as an empty scan. Cache and mountpoint
+  paths that exist as a regular file are refused as "not a directory" (`ensureDirReal`). An
+  origin overlapping the cache is refused at mount (`pathsOverlap`), since piece files would
+  land on the shared store.
 * **Addresses.** Port 0 is refused on `--listen`/`--advertise`/`--seed` (an ephemeral bind whose
   lease would still advertise 0), and `--advertise`/`--seed` refuse `0.0.0.0` and
   `255.255.255.255` (`isDialableHost`).

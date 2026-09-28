@@ -41,6 +41,12 @@ It runs:
   and contributor-script `--help` handlers (`test_scripts_help.sh`)
 - vendored libfuse3 digest checks (both vendored dirs) and arm64 extract check
 - `test_dr_restore_drill.sh`
+- harness policy checks no linter can see: every `mktemp` template names
+  `SCRATCH_DIR`; a `scripts/**/*.sh` that reads `ROOT_DIR`, `SCRATCH_DIR`, or
+  `SCRIPTS_DIR` sources `lib.sh`, and one that reads none of the three is on
+  `check.sh`'s `no_lib_sh` exemption list; a `scripts/nas/*.service` exports
+  no `MODELFS_` knob, no secret on `ExecStart`, and no `/tmp` path; and every
+  `MF_` knob read under `scripts/` is listed in `lib.sh`'s member block
 - `ruff check`, `ruff format --check`, `mypy`, `scripts/sbom.py --self-test`,
   and `scripts/sbom.py --check`
 
