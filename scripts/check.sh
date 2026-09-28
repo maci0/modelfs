@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Single blocking gate for all static analysis: formatting, compile+unit tests,
-# restore-drill stub, vendored libfuse3 digests and extract, shell lint,
-# Python lint, Python type check, CycloneDX inventory.
+# restore-drill stub, review-guide gates, vendored libfuse3 digests and extract,
+# shell lint, Python lint, Python type check, CycloneDX inventory.
 set -euo pipefail
 export LC_ALL=C
 export TZ=UTC
@@ -15,10 +15,10 @@ Usage: ./scripts/check.sh
 
 The blocking static gate: zig fmt, changelog headings and tag links
 versus build.zig.zon, src/root.zig imports, unit tests, the restore-drill
-stub suite, vendored libfuse3 digests and extract, shellcheck, ruff, mypy,
-sbom. Same command the CI `check` job runs. Requires the pinned .venv
-from setup (python3/ruff/mypy inside .venv/bin, interpreter matching
-.python-version).
+stub suite, vendored libfuse3 digests and extract, review-guide applicability
+gates, shellcheck, ruff, mypy, sbom. Same command the CI `check` job runs.
+Requires the pinned .venv from setup (python3/ruff/mypy inside .venv/bin,
+interpreter matching .python-version).
 
 Contributor commands (also listed by `zig build --help`; each script
 answers --help):
@@ -472,6 +472,24 @@ read_mf="$({ grep -rhoE '\$\{?MF_[A-Z0-9_]+' "${sh_files[@]}" || true; grep -rho
 undocumented_mf="$(comm -23 <(printf '%s\n' "${read_mf}") <(printf '%s\n' "${documented_mf}") | tr '\n' ' ')"
 [[ -z "${undocumented_mf}" ]] \
     || fail "MF_ knobs read under scripts/ but absent from the lib.sh member list:${undocumented_mf}"
+
+# AGENTS.md says every review prompt under docs/review-guides/ names its own
+# applicability gate, so a prompt aimed at another tree skips instead of
+# reporting on code it does not own. A guide without one is a prompt that runs
+# everywhere; check it here so a new guide is covered by the gate rather than
+# by a reviewer's memory.
+echo "=== review guide applicability gates ==="
+shopt -s nullglob
+guide_files=(docs/review-guides/*.md)
+shopt -u nullglob
+[[ "${#guide_files[@]}" -gt 0 ]] || fail "no review guides under docs/review-guides/"
+ungated_guides=""
+for guide in "${guide_files[@]}"; do
+    grep -qi 'applicability gate' "${guide}" \
+        || ungated_guides="${ungated_guides} ${guide##*/}"
+done
+[[ -z "${ungated_guides}" ]] \
+    || fail "review guide without an applicability gate:${ungated_guides}"
 
 # The NAS drill cannot run here (no zfs pool). The stub suite is what
 # keeps a clone-onto-live or empty-snapshot false pass from shipping.

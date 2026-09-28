@@ -40,13 +40,19 @@ It runs:
   `.github/workflows/` and `.github/actions/`),
   and contributor-script `--help` handlers (`test_scripts_help.sh`)
 - vendored libfuse3 digest checks (both vendored dirs) and arm64 extract check
+  (`test_extract_fuse3_arm64.sh`)
 - `test_dr_restore_drill.sh`
+- release packaging rerun (`test_package_release.sh`), because the release job
+  is re-runnable
 - harness policy checks no linter can see: every `mktemp` template names
   `SCRATCH_DIR`; a `scripts/**/*.sh` that reads `ROOT_DIR`, `SCRATCH_DIR`, or
   `SCRIPTS_DIR` sources `lib.sh`, and one that reads none of the three is on
   `check.sh`'s `no_lib_sh` exemption list; a `scripts/nas/*.service` exports
   no `MODELFS_` knob, no secret on `ExecStart`, and no `/tmp` path; and every
   `MF_` knob read under `scripts/` is listed in `lib.sh`'s member block
+- one check per review guide under `docs/review-guides/`: each names its own
+  applicability gate, so a prompt for another tree skips instead of reviewing
+  code it does not own
 - `ruff check`, `ruff format --check`, `mypy`, `scripts/sbom.py --self-test`,
   and `scripts/sbom.py --check`
 
@@ -67,19 +73,29 @@ Suites outside the gate (most need hardware CI lacks):
 | `run_e2e_tests.sh` | nothing | CLI and protocol only, no FUSE |
 | `test_fault_tolerance.sh` | a live peer | peer loss and lease expiry; skips loudly without one |
 | `dr_restore_drill.sh` | the NAS | the monthly restore drill. `test_dr_restore_drill.sh` is the CI stand-in against a stub `zfs` |
+| `dr_pool_restore.sh`, `dr_point_restore.sh` | the NAS | recovery procedures C and B: replay a pool-loss copy, copy named paths back from a known-good snapshot. Both print the plan and write nothing without `--execute` |
+| `check_drill_log.sh`, `check_offsite.sh` | a drill log, a mounted offsite copy | alarm when the monthly drill log or the site-loss copy is missing or stale |
+| `repro_check.sh` | nothing | every shipped build recipe, two ReleaseFast builds, byte-identical or fail |
+| `cross_aarch64.sh` | nothing beyond the vendored `.deb` | aarch64 ReleaseFast; `ci.sh` gives it a `--prefix` under `.scratch/` so a native `zig-out/` survives |
 
 ## Constraints
 
-- **No secret reaches argv.** The PSK comes from `--psk FILE` or
-  `MODELFS_PSK_VALUE`, the Hugging Face token from `HF_TOKEN` or the token file;
-  argv is world-readable through `/proc/<pid>/cmdline`. A handover passes both
-  knobs and PSK on a sealed memfd for the same reason.
+- **No secret reaches argv.** The PSK comes from `--psk FILE`, from the file
+  path in `MODELFS_PSK`, or from the secret in `MODELFS_PSK_VALUE`, which the
+  mount refuses to combine with either of the first two; the Hugging Face
+  token from `HF_TOKEN`, else `$HF_HOME/token`, else
+  `~/.cache/huggingface/token`. argv is world-readable through
+  `/proc/<pid>/cmdline`. A handover passes both knobs and PSK on a sealed
+  memfd for the same reason.
 - **Only `src/hf.zig` may contact hosts outside the cluster.** The daemon
   talks to peers and the origin; `modelfs pull` is the one path that contacts
   a host outside the cluster, from the CLI, never from the mount.
 - **Run artifacts go to the repo's `.scratch/`**, never `/tmp`: it is tmpfs here,
   and a piece cache written there is charged to RAM. Shell `mktemp` templates
-  use `SCRATCH_DIR` from `scripts/lib.sh`; Python temporary caches, mounts,
+  use `SCRATCH_DIR` from `scripts/lib.sh`; `check.sh` exempts two by name,
+  `install_nas_backup.sh` staging beside its destination for an atomic rename
+  and `run_vm_cluster_e2e.sh` writing qemu images under
+  `/var/lib/libvirt/images`. Python temporary caches, mounts,
   origins, and logs set `dir=` to the repo's `.scratch/`, not the system default.
   `dr_restore_drill.sh` resolves its scratch in that order: `MF_DRILL_SCRATCH`
   when set, else the repo `.scratch/` while `lib.sh` sits beside it, else
