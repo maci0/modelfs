@@ -333,6 +333,30 @@ shopt -u nullglob
 [[ "${#sh_files[@]}" -gt 0 ]] || fail "no shell scripts found under scripts/"
 shellcheck "${sh_files[@]}" || fail "shellcheck reported violations"
 
+# The shell in a workflow or a composite action is the same shell the gate
+# lints everywhere else, and none of it lives under scripts/: the release
+# publish job alone holds the awk, cmp, and gh recipe that decides what a
+# release contains. Extract every `run:` value with scripts/ci_run_steps.awk
+# and lint the result as one bash script. The step count is asserted against
+# the number of `run:` keys, so an extractor that stopped matching fails
+# here instead of reporting a pass having linted nothing.
+# SC2154 and SC2312 are off for this pass alone: a step's `env:` and `with:`
+# values (TAG, GITHUB_OUTPUT, the matrix target) are YAML keys, not shell,
+# so they are in the workflow but not in the extracted body; and the release
+# job's `test "$(modelfs version)" = ...` is an assertion that reads a
+# command's output, which is what SC2312 flags.
+echo "=== shellcheck (CI run steps) ==="
+ci_shell_files=(.github/workflows/*.yml .github/actions/*/action.yml)
+[[ "${#ci_shell_files[@]}" -gt 0 ]] || fail "no CI workflow or composite action files found"
+ci_runs="$(awk '/^[[:space:]]*run:/ { n++ } END { print n + 0 }' "${ci_shell_files[@]}")"
+[[ "${ci_runs}" -gt 0 ]] || fail "no CI run: steps found to lint"
+ci_shell="$(awk -f "${SCRIPTS_DIR}/ci_run_steps.awk" "${ci_shell_files[@]}")"
+ci_steps="$(awk '/^# modelfs-ci-run-step$/ { n++ } END { print n + 0 }' <<<"${ci_shell}")"
+[[ "${ci_steps}" -eq "${ci_runs}" ]] \
+    || fail "extracted ${ci_steps} CI run steps but the workflows declare ${ci_runs} (scripts/ci_run_steps.awk stopped matching)"
+printf '%s\n' "${ci_shell}" | shellcheck -s bash -e SC2154,SC2312 - \
+    || fail "shellcheck reported violations in the CI run steps"
+
 # Properties of the harness itself, which no linter can see: a script that
 # exports a MODELFS_-spelled knob, a unit that exports one, or a piece cache
 # under /tmp passes shellcheck, ruff, and mypy while the modelfs calls in

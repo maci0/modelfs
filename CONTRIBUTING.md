@@ -64,7 +64,9 @@ starting work.
 
 Formatting, CHANGELOG headings and tag links versus `build.zig.zon`, unit tests, the
 restore-drill stub suite, vendored libfuse3 digest and extract checks,
-contributor-script `--help` handlers, shellcheck, the harness policy checks
+contributor-script `--help` handlers, shellcheck (every `scripts/**/*.sh`
+plus the `run:` steps the workflows and composite actions execute), the
+harness policy checks
 (lib.sh sourcing, `mktemp` scratch scope, NAS unit `Environment=`/`ExecStart`,
 `MF_` knob documentation), `ruff check`,
 `ruff format --check`, mypy, and the CycloneDX inventory: exactly what

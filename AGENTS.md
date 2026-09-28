@@ -35,7 +35,9 @@ It runs:
   `build.zig.zon`, `[name]:` footer links, and current-tag sentences in
   README.md, SECURITY.md, and docs/threat-model.md. Dated notes are `###`
 - shellcheck (`.shellcheckrc` on every `scripts/**/*.sh`, whose optional
-  check names `check.sh` verifies against `shellcheck --list-optional`),
+  check names `check.sh` verifies against `shellcheck --list-optional`, and
+  on the `run:` steps `scripts/ci_run_steps.awk` extracts from
+  `.github/workflows/` and `.github/actions/`),
   and contributor-script `--help` handlers (`test_scripts_help.sh`)
 - vendored libfuse3 digest checks (both vendored dirs) and arm64 extract check
 - `test_dr_restore_drill.sh`

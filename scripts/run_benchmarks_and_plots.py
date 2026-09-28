@@ -63,7 +63,7 @@ def reexec_under_venv() -> None:
         return
     # Absolute path of this tree's pinned interpreter; argv is that path plus
     # this script. os.execv is the no-shell form (S605 would be the risk).
-    os.execv(  # noqa: S606 -- argv is the absolute venv interpreter path
+    os.execv(  # ruff: ignore[start-process-with-no-shell] -- argv is the absolute venv interpreter path
         os.fspath(_VENV_PYTHON), [os.fspath(_VENV_PYTHON), _SCRIPT, *sys.argv[1:]]
     )
 
@@ -89,7 +89,7 @@ def unmount(mount_dir: str) -> None:
     if helper is None:
         return
     # argv is a resolved helper plus fixed -u; no shell, no user input.
-    subprocess.run([helper, "-u", mount_dir], capture_output=True, check=False)  # noqa: S603 -- resolved helper path, fixed args, no shell
+    subprocess.run([helper, "-u", mount_dir], capture_output=True, check=False)  # ruff: ignore[subprocess-without-shell-equals-true] -- resolved helper path, fixed args, no shell
 
 
 def stop_mount(p: subprocess.Popen[bytes], mount_dir: str) -> None:
@@ -122,7 +122,7 @@ def start_mount(
     bin_path: str, origin_dir: str, psk_file: str, spec: _MountSpec
 ) -> subprocess.Popen[bytes]:
     # argv is this tree's zig-out binary plus fixed mount flags.
-    return subprocess.Popen(  # noqa: S603 -- resolved binary path, fixed mount flags, no shell
+    return subprocess.Popen(  # ruff: ignore[subprocess-without-shell-equals-true] -- resolved binary path, fixed mount flags, no shell
         [
             bin_path,
             "mount",
@@ -154,7 +154,7 @@ def build_modelfs() -> str:
     if zig is None:
         sys.exit("zig not found on PATH -- see CONTRIBUTING.md")
     # argv is the resolved zig binary plus fixed build flags; no shell.
-    res = subprocess.run(  # noqa: S603 -- resolved zig binary, fixed build flags, no shell
+    res = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true] -- resolved zig binary, fixed build flags, no shell
         [zig, "build", "-Doptimize=ReleaseFast"],
         capture_output=True,
         text=True,
