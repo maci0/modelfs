@@ -292,17 +292,23 @@ place (X-filled value, preserving `MODELFS_PSK_VALUE=`) so the
 `auto_unmount` helper cannot inherit it, and wipes the in-memory copy on teardown
 (`disableCoreDumps` / `scrubPskEnv` in src/main.zig).
 
+Three routes, all `GET`, all closed after one response (`Connection: close` on both ends).
+The heads the daemon sends (`sendRequest` in src/peer.zig), `Range` only on `/data`:
+
 ```
-GET /ping
-GET /have?path=<url-encoded rel>
-GET /data?path=...
+GET /ping HTTP/1.1
+GET /have?path=<url-encoded rel> HTTP/1.1
+GET /data?path=<url-encoded rel> HTTP/1.1
 Range: bytes=start-end
+Host: <ip>:<port>
 Authorization: Bearer <psk>
+Connection: close
 ```
 
 Every request requires the bearer token, including `/ping` and non-GET methods: those answer
 401 without a token and 405 with one. The server listens `0.0.0.0` on each unique advertised
-port (default 18080).
+port (default 18080). `Host` is required of an HTTP/1.1 request and ignored by the server; the
+bearer token is the only credential, so there are no scopes or roles to document.
 
 At most 16 HTTP handlers run at once. A connection arriving while all 16 are busy is closed
 immediately without a reply, so saturation shows up on the fetching peer as a failed transfer

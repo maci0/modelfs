@@ -1874,44 +1874,118 @@ fn writeStatus(st: *State) void {
     statusJson(st) catch |err| std.log.warn("status.json update failed: {t}", .{err});
 }
 
+/// The scalars status.json carries beside its stats object. One struct so
+/// the renderer takes the document whole and the widest-possible-document
+/// test drives the same format string the daemon publishes through.
+const StatusFields = struct {
+    id: []const u8,
+    pid: i64,
+    uptime_s: i64,
+    peers: u32,
+    piece: u32,
+    inflight: u32,
+    cache_free_pct: i32,
+    origin_down: i32,
+    now_s: i64,
+    mono_s: i64,
+    stats: store_mod.Stats.Snap,
+};
+
+// Widest decimal rendering of an integer of type `T`, sign included.
+fn widestDigits(comptime T: type) usize {
+    @setEvalBranchQuota(4000);
+    const info = @typeInfo(T).int;
+    const sign: u7 = switch (info.signedness) {
+        .signed => 1,
+        .unsigned => 0,
+    };
+    const magnitude: u128 = (@as(u128, 1) << @intCast(info.bits - sign)) - 1;
+    var n: usize = 0;
+    var v = magnitude;
+    while (v > 0) : (v /= 10) n += 1;
+    return n + sign;
+}
+
+// `"name":<widest value>,` as the stats object emits it.
+fn widestMember(name: []const u8, comptime T: type) usize {
+    return 1 + name.len + 2 + widestDigits(T) + 1;
+}
+
+/// Upper bound on one status document: every counter and stamp at its widest
+/// decimal, the longest id `discover.validId` accepts, and the punctuation
+/// around them. Derived from the field list rather than guessed, because an
+/// overflow here is not a truncated line: the writer errors, status.json
+/// stops being rewritten, and the daemon reads as not running to every
+/// monitor keying on it. `status doc fits its buffer` fails if the two ever
+/// disagree.
+const status_doc_max_bytes: usize = blk: {
+    var n: usize = 2; // the document's braces
+    for (@typeInfo(StatusFields).@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, "id")) {
+            n += 1 + 4 + 2 + discover.max_id_bytes + 2; // `,"id":"",`
+        } else if (!std.mem.eql(u8, f.name, "stats")) {
+            n += widestMember(f.name, f.type);
+        }
+    }
+    n += 9; // `"stats":{`
+    for (@typeInfo(store_mod.Stats.Snap).@"struct".fields) |f| n += widestMember(f.name, f.type);
+    n += 2; // the stats object's closing brace
+    n += 1; // the trailing newline
+    break :blk n;
+};
+
+/// Renders the single-line document. The stats object is emitted from
+/// Stats.Snap's fields (the same list logStatsTick diffs), so a new counter
+/// publishes here by construction instead of by remembering to edit this
+/// document's format string.
+fn writeStatusDoc(w: *std.Io.Writer, f: StatusFields) !void {
+    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"origin_down\":{d},\"now_s\":{d},\"mono_s\":{d},\"stats\":{{", .{
+        f.id,
+        f.pid,
+        f.uptime_s,
+        f.peers,
+        f.piece,
+        f.inflight,
+        f.cache_free_pct,
+        f.origin_down,
+        f.now_s,
+        f.mono_s,
+    });
+    inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields, 0..) |sf, i| {
+        if (i != 0) try w.writeByte(',');
+        try w.print("\"{s}\":{d}", .{ sf.name, @field(f.stats, sf.name) });
+    }
+    try w.writeAll("}}\n");
+}
+
 fn statusJson(st: *State) !void {
-    var buf: [4096]u8 = undefined;
-    const npeers = st.catalog.peerCount();
-    const s = st.store.stats.snap();
+    var buf: [status_doc_max_bytes]u8 = undefined;
     // Saturation signal for monitors: the same sample culling runs on.
     // -1 means the cache filesystem could not be stat'ed (culling suspended).
     const cache_free_pct: i32 = if (st.store.freePercentChecked()) |pct| @intCast(pct) else -1;
     const origin_down: i32 = if (st.store.origin_io_down.load(.monotonic)) 1 else 0;
     // Single line like every other machine-read artifact here: consumers
     // tail/grep it and a multi-line document would break line-oriented
-    // parsing (journalctl, jq -line, watch loops). The stats object is
-    // emitted from Stats.Snap's fields (the same list logStatsTick diffs),
-    // so a new counter publishes here by construction instead of by
-    // remembering to edit this document's format string.
+    // parsing (journalctl, jq -line, watch loops).
     // One pair of samples for the whole document: uptime_s and mono_s share
     // the monotonic instant, and now_s is the matching wall-clock read.
     // mono_s is the wedge gate (same-machine CLOCK_MONOTONIC, immune to NTP
     // steps); now_s stays the human/monitor wall stamp.
     const now_mono = sys.monoSec(st.io);
-    const now_wall = sys.nowSec(st.io);
     var w = std.Io.Writer.fixed(&buf);
-    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"origin_down\":{d},\"now_s\":{d},\"mono_s\":{d},\"stats\":{{", .{
-        st.catalog.self_id,
-        sys.pidSelf(),
-        now_mono -| st.start_secs,
-        npeers,
-        st.store.piece_size,
-        st.server.http_inflight.load(.monotonic),
-        cache_free_pct,
-        origin_down,
-        now_wall,
-        now_mono,
+    try writeStatusDoc(&w, .{
+        .id = st.catalog.self_id,
+        .pid = sys.pidSelf(),
+        .uptime_s = now_mono -| st.start_secs,
+        .peers = st.catalog.peerCount(),
+        .piece = st.store.piece_size,
+        .inflight = st.server.http_inflight.load(.monotonic),
+        .cache_free_pct = cache_free_pct,
+        .origin_down = origin_down,
+        .now_s = sys.nowSec(st.io),
+        .mono_s = now_mono,
+        .stats = st.store.stats.snap(),
     });
-    inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields, 0..) |f, i| {
-        if (i != 0) try w.writeByte(',');
-        try w.print("\"{s}\":{d}", .{ f.name, @field(s, f.name) });
-    }
-    try w.writeAll("}}\n");
     const json = w.buffered();
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const p = try store_mod.Store.cacheStatusPath(st.store.cache, &pbuf);
@@ -3468,6 +3542,55 @@ test "fuse operations wire every supported handler" {
     try std.testing.expect(o.ioctl == null);
 }
 
+test "status doc fits its buffer at the widest id and every counter" {
+    const gpa = std.testing.allocator;
+    // The bound is a promise about the renderer, so render through the
+    // renderer: a new counter, a renamed key, or a longer id that outgrows
+    // it fails here rather than in production, where the overflow drops the
+    // error, stops the rewrite, and the daemon reads as not running.
+    var id: [discover.max_id_bytes]u8 = undefined;
+    @memset(&id, 'i');
+    try std.testing.expect(discover.validId(&id));
+
+    var stats: store_mod.Stats.Snap = .{};
+    inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields) |f| {
+        @field(stats, f.name) = std.math.maxInt(f.type);
+    }
+
+    var buf: [status_doc_max_bytes]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeStatusDoc(&w, .{
+        .id = &id,
+        .pid = std.math.minInt(i64),
+        .uptime_s = std.math.minInt(i64),
+        .peers = std.math.maxInt(u32),
+        .piece = std.math.maxInt(u32),
+        .inflight = std.math.maxInt(u32),
+        .cache_free_pct = std.math.minInt(i32),
+        .origin_down = std.math.minInt(i32),
+        .now_s = std.math.minInt(i64),
+        .mono_s = std.math.minInt(i64),
+        .stats = stats,
+    });
+    const doc = w.buffered();
+    // One line plus the newline: consumers tail/grep it line-oriented.
+    try std.testing.expect(doc[doc.len - 1] == '\n');
+    try std.testing.expect(std.mem.indexOfScalar(u8, doc[0 .. doc.len - 1], '\n') == null);
+    // Still the document every monitor parses, widest or not.
+    const StatusDoc = struct {
+        id: []const u8,
+        pid: i64,
+        cache_free_pct: i32,
+        stats: store_mod.Stats.Snap,
+    };
+    const parsed = try std.json.parseFromSlice(StatusDoc, gpa, doc, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(&id, parsed.value.id);
+    try std.testing.expectEqual(std.math.minInt(i64), parsed.value.pid);
+    try std.testing.expectEqual(std.math.maxInt(u64), parsed.value.stats.http_5xx);
+    try std.testing.expectEqual(std.math.maxInt(u64), parsed.value.stats.reads_ok);
+}
+
 test "statusJson publishes parseable liveness atomically and replaces in place" {
     const gpa = std.testing.allocator;
     var cb: [128]u8 = undefined;
@@ -3497,7 +3620,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expectEqual(@as(sys.c.mode_t, 0o600), stbuf.st_mode & 0o777);
     try std.testing.expect(sys.statPath(tmp_fp, &stbuf) != 0);
 
-    const blob = try sys.readFileAlloc(gpa, fp, 4096);
+    const blob = try sys.readFileAlloc(gpa, fp, status_doc_max_bytes);
     defer gpa.free(blob);
     const StatsDoc = store_mod.Stats.Snap;
     const StatusDoc = struct {
@@ -3558,7 +3681,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     _ = st.store.stats.statfs_nanos.fetchAdd(8000, .monotonic);
     st.store.origin_io_down.store(true, .monotonic);
     try statusJson(&st);
-    const blob2 = try sys.readFileAlloc(gpa, fp, 4096);
+    const blob2 = try sys.readFileAlloc(gpa, fp, status_doc_max_bytes);
     defer gpa.free(blob2);
     const doc2 = try std.json.parseFromSlice(StatusDoc, gpa, blob2, .{});
     defer doc2.deinit();
