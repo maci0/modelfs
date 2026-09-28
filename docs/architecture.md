@@ -515,6 +515,10 @@ The sidecar bitfield prefix is unchanged; an optional origin-identity trailer fo
 so a restart can still detect a same-size rewrite. The same identity is an optional trailer on
 the origin manifest, so a rewrite cannot keep the previous object's hashes as the trust
 reference for peer fills. Hashes ride in memory and in the manifest, not in the bit bytes.
+`OriginId` reads that trailer into an `i64` second, an `i64` nanosecond, and a `u64` inode, and
+`eql`, `contentChanged`, and `newerThanMtime` order those three fields; a fuzz harness drives
+the decode, the write/read pair, and the three predicates over raw trailer bytes from
+independent operands, so a corrupt stamp cannot reorder a load the codecs accept.
 
 Manifest blobs are bounded (64 MiB, `Store.max_manifest_bytes`), parsed by a fuzzed codec
 (`piece.manifestDecode`), and published atomically (tmp + rename, lazy mkdir of

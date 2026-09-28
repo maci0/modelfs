@@ -4317,6 +4317,198 @@ test "fuzz relOk denies traversal controls and C1 spellings for every input" {
     try std.testing.fuzz({}, fuzzRelOkOne, .{ .corpus = &fuzz_rel_corpus });
 }
 
+/// The trailer carries the three numeric fields only (`known` is a property
+/// of the reader, not of the bytes), so the seed helper takes them directly.
+fn oidSeed(sec: i64, nsec: i64, ino: u64) [OriginId.encoded_len]u8 {
+    var b: [OriginId.encoded_len]u8 = undefined;
+    const id: OriginId = .{ .mtime_sec = sec, .mtime_nsec = nsec, .ino = ino, .known = true };
+    id.write(&b);
+    return b;
+}
+
+const seed_oid_zero = fuzzcorpus.entry(&oidSeed(0, 0, 0));
+const seed_oid_known = fuzzcorpus.entry(&oidSeed(1, 2, 3));
+// Seconds the kernel never produces, planted in a shared artifact: a
+// far-future stamp, and the pre-epoch negative one.
+const seed_oid_future = fuzzcorpus.entry(&oidSeed(std.math.maxInt(i64), 0, 1));
+const seed_oid_past = fuzzcorpus.entry(&oidSeed(std.math.minInt(i64), std.math.minInt(i64), 1));
+// A negative nanosecond beside a positive second: the larger second must win
+// regardless of the sub-second field.
+const seed_oid_neg_nsec = fuzzcorpus.entry(&oidSeed(100, -1, 1));
+const seed_oid_nsec_only = fuzzcorpus.entry(&oidSeed(100, 999_999_999, 1));
+const seed_oid_ino_only = fuzzcorpus.entry(&oidSeed(100, 1, 7));
+const seed_oid_ff = fuzzcorpus.entry(&[_]u8{0xff} ** OriginId.encoded_len);
+const seed_oid_80 = fuzzcorpus.entry(&[_]u8{0x80} ** OriginId.encoded_len);
+const seed_oid_max_ino = fuzzcorpus.entry(&oidSeed(0, 0, std.math.maxInt(u64)));
+const seed_oid_past_one = fuzzcorpus.entry(&oidSeed(-1, 0, 0));
+
+const fuzz_oid_corpus = [_][]const u8{
+    &seed_oid_zero,
+    &seed_oid_known,
+    &seed_oid_future,
+    &seed_oid_past,
+    &seed_oid_neg_nsec,
+    &seed_oid_nsec_only,
+    &seed_oid_ino_only,
+    &seed_oid_ff,
+    &seed_oid_80,
+    &seed_oid_max_ino,
+    &seed_oid_past_one,
+};
+
+/// Independent restatement of OriginId.contentChanged through std.math.order
+/// instead of the shipped `!=` / `>` ladder, so a corrupted branch in one
+/// cannot self-confirm against the other.
+fn refContentChanged(recorded: OriginId, observed: OriginId) bool {
+    if (!recorded.known or !observed.known) return false;
+    if (recorded.ino != observed.ino) return true;
+    return refStampLess(recorded, observed);
+}
+
+fn refEql(a: OriginId, b: OriginId) bool {
+    if (!a.known or !b.known) return false;
+    if (a.ino != b.ino) return false;
+    if (std.math.order(a.mtime_sec, b.mtime_sec) != .eq) return false;
+    return a.mtime_nsec == b.mtime_nsec;
+}
+
+/// True when `a`'s (mtime_sec, mtime_nsec) pair orders strictly before `b`'s.
+/// The pair is a lexicographic stamp: the second field only ever breaks a tie
+/// on the first.
+fn refStampLess(a: OriginId, b: OriginId) bool {
+    return switch (std.math.order(a.mtime_sec, b.mtime_sec)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.mtime_nsec < b.mtime_nsec,
+    };
+}
+
+/// True when `a` is the strictly newer write. contentChanged asks whether
+/// the observed stamp is newer than the recorded one; newerThanMtime asks
+/// the same question with the stat on the other side.
+fn refStampNewer(a: OriginId, b: OriginId) bool {
+    return switch (std.math.order(a.mtime_sec, b.mtime_sec)) {
+        .gt => true,
+        .lt => false,
+        .eq => a.mtime_nsec > b.mtime_nsec,
+    };
+}
+
+/// The identity trailer of a `meta/*.pieces` sidecar and of an `MFSM`
+/// manifest is shared storage that reaches trust decisions: `read` turns 24
+/// raw bytes off those artifacts into the stamp `eql`, `contentChanged`, and
+/// `newerThanMtime` compare against the origin's own stat. The manifest
+/// harness fuzzes those bytes but stops before they are interpreted, so
+/// nothing pins the decode, the write/read pair, or the ordering the three
+/// predicates promise. A stamp carrying a far-future or negative second
+/// makes the loader retry forever (one corrupt artifact permanently
+/// disabling trusted-hash loads) or accept a same-size rewrite's old
+/// digests as current. Drives the whole set over the raw bytes with an
+/// independent scalar restatement of the predicates.
+fn fuzzOriginIdOne(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [2 * OriginId.encoded_len]u8 = undefined;
+    const bytes = buf[0..smith.slice(&buf)];
+    // A short slice zero-pads rather than reading uninitialized memory, so
+    // the all-zero identity and the truncated-blob shapes are reachable.
+    var raws = [_][OriginId.encoded_len]u8{[_]u8{0} ** OriginId.encoded_len} ** 2;
+    for (raws[0..2], 0..) |*raw, i| {
+        const off = @min(i * OriginId.encoded_len, bytes.len);
+        const take = @min(bytes.len - off, OriginId.encoded_len);
+        @memcpy(raw[0..take], bytes[off..][0..take]);
+    }
+
+    const a = OriginId.read(&raws[0]);
+    const b = OriginId.read(&raws[1]);
+
+    // read names a known identity for every 24-byte input, so every
+    // downstream comparison runs on a hostile stamp rather than short
+    // circuiting past the check.
+    for ([_]OriginId{ a, b }) |id| {
+        try std.testing.expect(id.known);
+        // write/read is the identity on raw bytes: whatever the shared
+        // artifact carried, the publisher must stamp the same identity.
+        var out: [OriginId.encoded_len]u8 = undefined;
+        id.write(&out);
+        try std.testing.expect(OriginId.eql(id, OriginId.read(&out)));
+    }
+    try std.testing.expectEqual(
+        std.mem.readInt(i64, raws[0][0..8], .little),
+        a.mtime_sec,
+    );
+    try std.testing.expectEqual(
+        std.mem.readInt(i64, raws[0][8..16], .little),
+        a.mtime_nsec,
+    );
+    try std.testing.expectEqual(
+        std.mem.readInt(u64, raws[0][16..24], .little),
+        a.ino,
+    );
+
+    for ([_][2]OriginId{ .{ a, b }, .{ b, a } }) |pair| {
+        const recorded = pair[0];
+        const observed = pair[1];
+        try std.testing.expectEqual(
+            refContentChanged(recorded, observed),
+            OriginId.contentChanged(recorded, observed),
+        );
+        try std.testing.expectEqual(
+            refEql(recorded, observed),
+            OriginId.eql(recorded, observed),
+        );
+    }
+
+    // An identity is never a newer write than its own mtime: readBits and
+    // the manifest load both ask that question about a stamp that may have
+    // come off shared storage, and a true answer there discards a manifest
+    // this node published itself.
+    var st_a: c.struct_stat = std.mem.zeroes(c.struct_stat);
+    st_a.st_mtim.tv_sec = a.mtime_sec;
+    st_a.st_mtim.tv_nsec = a.mtime_nsec;
+    st_a.st_ino = @intCast(a.ino);
+    try std.testing.expect(!a.newerThanMtime(st_a));
+
+    // A stamp compared against another stamp is a total order: distinct
+    // (sec, nsec) pairs claim exactly one direction, so a corrupted field
+    // cannot make both records look newer than each other and wedge the
+    // loader's retry on both.
+    const st_b: c.struct_stat = blk: {
+        var s: c.struct_stat = std.mem.zeroes(c.struct_stat);
+        s.st_mtim.tv_sec = b.mtime_sec;
+        s.st_mtim.tv_nsec = b.mtime_nsec;
+        s.st_ino = @intCast(b.ino);
+        break :blk s;
+    };
+    const a_newer_b = a.newerThanMtime(st_b);
+    const b_newer_a = b.newerThanMtime(st_a);
+    try std.testing.expectEqual(refStampNewer(a, b), a_newer_b);
+    try std.testing.expectEqual(refStampNewer(b, a), b_newer_a);
+    if (a.mtime_sec != b.mtime_sec or a.mtime_nsec != b.mtime_nsec) {
+        try std.testing.expect(a_newer_b != b_newer_a);
+    }
+
+    // eql agrees with the ordering: the same object at the same stamp is
+    // neither changed nor strictly newer, in either direction.
+    if (OriginId.eql(a, b)) {
+        try std.testing.expect(!a_newer_b);
+        try std.testing.expect(!b_newer_a);
+        try std.testing.expect(!OriginId.contentChanged(a, b));
+        try std.testing.expect(!OriginId.contentChanged(b, a));
+    }
+
+    // An unknown identity opts out of every check, so a sidecar written
+    // before the trailer existed keeps loading.
+    const unknown = OriginId{};
+    try std.testing.expect(!OriginId.eql(unknown, a));
+    try std.testing.expect(!OriginId.eql(a, unknown));
+    try std.testing.expect(!OriginId.contentChanged(unknown, a));
+    try std.testing.expect(!OriginId.contentChanged(a, unknown));
+    try std.testing.expect(!unknown.newerThanMtime(st_a));
+}
+
+test "fuzz origin identity trailer decodes, round-trips, and orders the way the loaders assume" {
+    try std.testing.fuzz({}, fuzzOriginIdOne, .{ .corpus = &fuzz_oid_corpus });
+}
+
 test "store get file size update and pin" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
