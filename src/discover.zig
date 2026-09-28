@@ -3076,6 +3076,9 @@ test "sweepLeases unlinks abandoned manifest staging files and keeps published o
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
         "deadbeef01234567.tmp.4242.0",
         "cafebabe89abcdef.tmp.99",
+        // A published manifest is a blake3, so a real staging prefix is hex
+        // with digits in it: an all-letter name does not stand in for one.
+        "0123abcd.tmp.31337.2",
     }) |leaf| {
         const p = try sys.joinZ(&fb, std.mem.span(mdir), leaf);
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(p, "MFS1"));
@@ -3090,7 +3093,7 @@ test "sweepLeases unlinks abandoned manifest staging files and keeps published o
     var want: c.struct_stat = undefined;
     const kept = try sys.joinZ(&sb, std.mem.span(mdir), hex);
     try std.testing.expectEqual(@as(i32, 0), sys.lstatPath(kept, &want));
-    for ([_][]const u8{ "deadbeef01234567.tmp.4242.0", "cafebabe89abcdef.tmp.99" }) |leaf| {
+    for ([_][]const u8{ "deadbeef01234567.tmp.4242.0", "cafebabe89abcdef.tmp.99", "0123abcd.tmp.31337.2" }) |leaf| {
         const p = try sys.joinZ(&sb, std.mem.span(mdir), leaf);
         try std.testing.expectEqual(@as(i32, -sys.c.ENOENT), sys.lstatPath(p, &want));
     }
