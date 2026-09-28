@@ -248,9 +248,10 @@ When `serve_verify_fail` moves on the tick line:
 2. The serving node already healed the marked pieces (a subsequent serve of
    the same piece re-hydrates and re-verifies from origin). If the counter
    keeps climbing, the corruption is ongoing (failing disk, or a hostile
-   local writer): run `modelfs verify <rel> --origin <origin>` for the
-   affected files to audit the whole cache and clear every mismatched mark
-   in one pass.
+   local writer): run `modelfs verify <rel> --origin <origin>` on each
+   affected file to clear every mismatched mark on it in one pass.
+   `verify` takes one path and audits that file's marked pieces;
+   `modelfs dupes --all --origin <origin>` is the whole-cache sweep.
 3. Local reads are not verified per-read (only peer serves are), so a piece
    that is corrupt but never served to a peer is not auto-detected: cron
    `modelfs verify` for the files that matter, or after any disk event.

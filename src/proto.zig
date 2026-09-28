@@ -404,16 +404,18 @@ pub const HaveBits = struct {
     }
 };
 
-/// Upper bound on a bearer token in bytes: main.zig's loadPsk reads at most
-/// this much and trims it, so it is also the token budget every request
-/// builder and request-head buffer must reserve beyond the encoded path.
+/// Upper bound on a bearer token in bytes: no secret longer than this rides
+/// the wire, so it is the token budget every request builder and request-head
+/// buffer must reserve beyond the encoded path. The file form reads up to
+/// this plus a trailing CRLF and trims; the inline form trims then caps.
 /// One constant here keeps the loader's cap and the wire budgets from
 /// drifting apart (a longer legal secret would otherwise overflow
 /// sendRequest's frame and silently disable the peer tier for that node).
 pub const max_psk_bytes: usize = 4096;
 
-/// Default TCP port of the peer HTTP protocol; every --listen/--advertise/
-/// --seed address without an explicit ":PORT" resolves to it.
+/// Default TCP port of the peer HTTP protocol; every --advertise/--seed
+/// address without an explicit ":PORT" resolves to it. --listen does not: a
+/// bare word there is error.BadListen, never a silent fallback to this.
 pub const default_port: u16 = 18080;
 
 pub const LeaseAddr = struct {

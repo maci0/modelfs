@@ -112,7 +112,8 @@ Secrets never take a flag, because argv is world-readable through `/proc`:
 
 `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID`, and `MODELFS_LOG` set the same
 values as their flags; an explicit flag wins, values are whitespace-trimmed, and an empty one
-counts as unset. Any other `MODELFS_*` name is refused as a typo. Full rules, including the
+counts as unset. `MODELFS_ID` is read for `mount` only, like `--id`. Any other `MODELFS_*` name
+is refused as a typo. Full rules, including the
 `MODELFS_PSK_VALUE` exclusivity and the address gates, are in
 [docs/architecture.md](docs/architecture.md).
 

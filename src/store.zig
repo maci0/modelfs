@@ -388,7 +388,7 @@ pub const Store = struct {
         cache_fd: c_int = -1,
         last_access: std.atomic.Value(i64) = .init(0),
         /// Serializes write-through pwrite+mark with completeFill pwrite+mark,
-        /// punchPiece, and size-changing ftruncate (reconcileSize, mf_truncate,
+        /// punchPiece, and size-changing ftruncate (reconcile, mf_truncate,
         /// cacheFill shrink). Without it the two pwrites race on the cache
         /// fd: a fill that claimed before the write can overwrite the
         /// write-through bytes and then mark them filled. punchPiece or
@@ -1099,7 +1099,7 @@ pub const Store = struct {
             // before the caller's use, so the entry must be born with refs=1.
             _ = f.refs.fetchAdd(1, .monotonic);
             self.mu.unlock(self.io);
-            // Same persist-the-wipe contract as reconcileSize on the hit
+            // Same persist-the-wipe contract as reconcile on the hit
             // path: a discarded sidecar left on disk would decode cleanly
             // at its recorded size after a crash, serving pre-wipe marks
             // over post-wipe content. First-touch (no sidecar) does not
@@ -1789,7 +1789,7 @@ pub const Store = struct {
     }
 
     /// Drops every trusted hash and the manifest-load state: a size change
-    /// (reconcileSize, cacheFill shrink), distrust, or forget means the old
+    /// (reconcile, cacheFill shrink), distrust, or forget means the old
     /// digests describe bytes that no longer exist and would reject the
     /// origin's current ones. Sets manifest_dirty so the next release
     /// republishes a manifest matching the new state (or drops stale
@@ -2108,7 +2108,7 @@ pub const Store = struct {
         };
         defer self.releaseFile(file);
 
-        // Size mutation takes content_mu then file.mu, matching reconcileSize
+        // Size mutation takes content_mu then file.mu, matching reconcile
         // and mf_truncate, then drops both before copyIntoCache (which takes
         // the same pair). A shrink that took only file.mu let completeFill
         // pwrite between the bit swap and the copy, then mark pre-shrink
@@ -2135,19 +2135,19 @@ pub const Store = struct {
                 file.size = end;
             } else if (end < file.size) {
                 // Entry is longer than the observed origin: someone truncated
-                // externally. Reset like reconcileSize instead of keeping marks
+                // externally. Reset like reconcile instead of keeping marks
                 // for bytes past the new end, and persist the reset like it does:
                 // the old sidecar's recorded size decodes cleanly again once the
                 // file is back at that length, which would resurrect pre-shrink
                 // marks over new content after a crash. writes++ invalidates a
                 // fill claimed against the old generation; truncateCacheFd
-                // cuts the tail the same way reconcileSize does.
+                // cuts the tail the same way reconcile does.
                 if (piece.Bitfield.init(self.gpa, piece.count(end, self.piece_size))) |nb| {
                     dropped = file.bits;
                     file.bits = nb;
                     file.size = end;
                     file.writes += 1;
-                    // Same digest wipe as reconcileSize: the shrink invalidates
+                    // Same digest wipe as reconcile: the shrink invalidates
                     // every expectation, not just the tail's.
                     self.clearHashes(file);
                     truncateCacheFd(file, end);
@@ -3025,7 +3025,7 @@ test "cacheFill grows entry preserving earlier piece marks" {
 
     // Piece size 16: a sequential ingest of three chunks must keep every
     // fully-written piece marked. Regression: the write path went through
-    // reconcileSize on each growth, wiping all marks but the last chunk's.
+    // reconcile on each growth, wiping all marks but the last chunk's.
     var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
     defer st.deinit();
     try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
@@ -3292,7 +3292,7 @@ test "cacheFill resets every mark when an external truncate shrinks the file" {
         try std.testing.expectEqual(@as(u64, 32), f.size);
         try std.testing.expectEqual(@as(u32, 2), f.bits.nbits);
         try std.testing.expect(!f.bits.get(2));
-        // ...and the reset is conservative like reconcileSize's: even piece
+        // ...and the reset is conservative like reconcile's: even piece
         // 0, whose bytes the truncate did not touch, refills rather than
         // trusting pre-shrink marks. Only the post-shrink write's own fully
         // covered piece is marked.
@@ -3300,7 +3300,7 @@ test "cacheFill resets every mark when an external truncate shrinks the file" {
         try std.testing.expect(f.bits.get(1));
         try std.testing.expectEqual(@as(u32, 1), f.bits.filled());
         f.mu.unlock(std.testing.io);
-        // Same fd cut reconcileSize makes: the tail the truncator removed
+        // Same fd cut reconcile makes: the tail the truncator removed
         // must not remain readable on the live cache descriptor.
         var post: c.struct_stat = undefined;
         try std.testing.expect(f.cache_fd >= 0);
@@ -3349,7 +3349,7 @@ test "get reconciles an externally shrunken origin by wiping marks and truncatin
 
     // The sibling grow case (32 -> 64) is covered above; this is the other
     // direction, as mf_read observes after a co-writer truncated the shared
-    // origin: the hit path must reconcile DOWN too. reconcileSize's contract
+    // origin: the hit path must reconcile DOWN too. reconcile's contract
     // is an empty field sized for the new length plus an fd truncate, so no
     // stale piece can serve bytes past (or underneath) the new end.
     const f2 = try st.get("shrunk.bin", 32, sys.monoSec(std.testing.io));
@@ -3403,7 +3403,7 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
     }
 
     // The create-truncate shape (mf_create stats a zero-length file through
-    // get): reconcileSize wipes the marks in memory, and the wipe must reach
+    // get): reconcile wipes the marks in memory, and the wipe must reach
     // the sidecar before returning. Regression: the reset lived only in RAM,
     // so a crash here let the next daemon load decode the old sidecar
     // cleanly against a file back at 64 bytes -- pre-truncate marks served
@@ -3488,7 +3488,7 @@ test "cacheFillIdentified invalidates stale content when shrink allocation fails
 }
 
 test "cold get persists a stale-sidecar wipe so a restart cannot reload stale marks" {
-    // The live-entry shape is covered above (reconcileSize). After a
+    // The live-entry shape is covered above (reconcile). After a
     // restart there is no map hit: loadBits returns an empty field sized
     // for the new length and used to leave the old sidecar on disk, so a
     // crash plus a same-size restore decoded the pre-wipe marks over new
@@ -6307,7 +6307,7 @@ test "beginFill answers filled and raced without claiming or marking" {
 
     // The raced piece stays fillable once it is in range again: the drop
     // must not poison later claims. Growing size and bitfield together under
-    // file.mu is the same move reconcileSize and truncate make.
+    // file.mu is the same move reconcile and truncate make.
     f.mu.lockUncancelable(std.testing.io);
     f.bits.deinit(gpa);
     f.bits = try piece.Bitfield.init(gpa, piece.count(112, st.piece_size));
@@ -7017,7 +7017,7 @@ test "manifest publish then load: a fresh store verifies peer expectations from 
     try std.testing.expect(other.expectedHash(of, 0, 0) == null);
 }
 
-test "reconcileSize drops every trusted hash with the old marks" {
+test "reconcile drops every trusted hash with the old marks" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;

@@ -605,7 +605,8 @@ fn resolveOriginDir(io: std.Io, gpa: std.mem.Allocator, origin: []const u8) ![]u
 }
 
 /// Refuses mount-only knobs on the other commands, as the help text promises
-/// ("status/peers/pin/unpin take only the flags shown on their Usage line"):
+/// (the non-mount commands "take only the flags shown on their Usage line
+/// plus the shared --origin/--cache/--psk/--log values"):
 /// accepted-and-ignored they would silently do nothing (a `status --detach`,
 /// a `pin --piece 4M` that changes no piece grid), leaving the caller to
 /// believe an option took effect.

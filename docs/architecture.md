@@ -64,7 +64,7 @@ New code goes in the module that already owns that concern.
 | File | Role |
 |---|---|
 | `c.h`, `c.zig` | Sole door to libfuse3 and libc |
-| `sys.zig` | Syscall wrappers: EINTR retry, CLOEXEC, nofollow/owner-only writes, process liveness (`pidAlive`); IPv4 `bind`/`accept`/`connect`/`listen`/`getsockname` and socket options through `std.c`; shared IPv4 text rendering (`dottedQuad` takes network-order `s_addr`, returns a slice of the caller's buffer or null when too small) |
+| `sys.zig` | Syscall wrappers: EINTR retry, CLOEXEC, nofollow/owner-only writes, process liveness (`pidAlive`); IPv4 `bind`/`accept`/`connectIn`/`listen`/`getsockname` and socket options through `std.c`; shared IPv4 text rendering (`dottedQuad` takes network-order `s_addr`, returns a slice of the caller's buffer or null when too small) |
 | `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`), the persisted bitfield codec, and piece-hash manifest overlap (`manifestOverlapPrepared`) |
 | `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`) |
 | `cull.zig` | Free-space watermark policy |
@@ -233,7 +233,7 @@ and a dead preferred NIC falls through to that node's remaining interfaces rathe
 the whole node.
 
 Among paths whose bit is set, fetch from the max-score address (`pickBest`). Ties break by ip
-bytes then port (`pathTieLess`), never by lease-file or `getifaddrs` order: cold clusters start
+bytes then port (`candTieLess`, delegating to `addrTieLess`), never by lease-file or `getifaddrs` order: cold clusters start
 every path at the same prior, so an unspecified tie would let environment enumeration pick the
 winner. `Catalog.refresh` sorts the live path list by (peer id, ip, port) and
 `groupPathsByPeerId` sorts the outer probe-group list by peer id, so lease-directory readdir

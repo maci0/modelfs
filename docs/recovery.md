@@ -171,8 +171,8 @@ These four are alarms, not log noise:
 |---|---|---|
 | No new snapshot on the NAS | 25 h (`MF_DRILL_MAX_SNAP_AGE`) | `modelfs-snap-age.timer`. The monthly clone is the restore proof, not the schedule watchdog |
 | Replica newest snapshot stale | 36 h, a daily pull plus slack (`MF_DRILL_MAX_REPLICA_AGE`) | the drill, with `MF_DRILL_REPLICA` set on the replica host |
-| Drill log missing, empty, or stale | 35 days | `modelfs-check-drill-log` |
-| Offsite newest snapshot stale | 8 days, weekly rotation plus slack | `modelfs-check-offsite` |
+| Drill log missing, empty, or stale | 35 days | `modelfs-check-drill-log` (installed by `scripts/install_nas_backup.sh`) |
+| Offsite newest snapshot stale | 8 days, weekly rotation plus slack | `modelfs-check-offsite` (installed by `scripts/install_nas_backup.sh`) |
 
 Before risky bulk work (`rm -rf` of an old model, big re-download with overwrite, moving datasets), take a named snapshot; it is the pre-run safety net POSIX does not give you:
 

@@ -1135,10 +1135,10 @@ fn serveHydrated(
 /// returned without restatting origin: open and getattr already sampled it,
 /// and a getattr RTT on every 128 KiB read would make the warm NVMe path
 /// pay NFS. Size changes through the mount update the entry in place
-/// (`cacheFill`, `mf_truncate`); an external origin rewrite is visible on
-/// the next open, matching NFS close-to-open. A cold path (no live entry)
-/// still stats origin so the first read of an unopened file, and every
-/// read after reapIdle dropped the entry, keep their previous errno.
+/// (`Store.cacheFillIdentified`, `mf_truncate`); an external origin rewrite
+/// is visible on the next open, matching NFS close-to-open. A cold path (no
+/// live entry) still stats origin so the first read of an unopened file, and
+/// every read after reapIdle dropped the entry, keep their previous errno.
 fn fileForRead(st: *State, rel: []const u8) union(enum) { err: c_int, file: *store_mod.Store.Cached } {
     if (st.store.lookupRef(rel)) |file| return .{ .file = file };
     // Report the real origin failure (EIO on NFS, ENOENT, ...): collapsing it
@@ -1199,7 +1199,7 @@ fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*
     // the cache fd while this is nonzero.
     st.store.beginXfer(file);
     defer st.store.endXfer(file);
-    // One size sample under file.mu: truncate/reconcileSize shrink it
+    // One size sample under file.mu: truncate/reconcile shrink it
     // concurrently, and reading it twice unlocked can pass the bounds check
     // on the old value then underflow the subtraction on the new one.
     file.mu.lockUncancelable(st.io);
@@ -1258,7 +1258,7 @@ fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse.off_t,
     const end = uoff + @as(u64, @intCast(n));
 
     // Cache fill. Statting through get() after every write would trip
-    // reconcileSize's wipe-on-size-change reset: an append is our own work,
+    // reconcile's wipe-on-size-change reset: an append is our own work,
     // but it changes the origin size exactly like an external rewrite, so a
     // sequential ingest would discard every earlier chunk's cached pieces.
     // When the observed size matches what we just wrote, fill through
@@ -1775,9 +1775,11 @@ fn formatStatsTick(d: store_mod.Stats.Snap, buf: []u8) ![]const u8 {
     // Format into a buffer then log one string: std.log.info is capped at
     // 32 format args, and the tick already named more Snap fields than that.
     var w = std.Io.Writer.fixed(buf);
-    // Field names mirror Stats.Snap's (what status.json publishes), so
-    // the journal line and the machine artifact share one vocabulary and
-    // no key collides ("err" used to name both read and write failures).
+    // Every key here comes from Stats.Snap, the set status.json publishes,
+    // so the journal line and the machine artifact name the same counter.
+    // The line shortens the byte, nanosecond, and http_ fields to keep the
+    // tick readable; no key names two different counters ("err" once named
+    // both read and write failures).
     try w.print(
         "tick: reads_ok={d} reads_err={d} reads_warm={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d} wr_us={d}" ++
             " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache/verify={d}/{d}/{d}/{d}",

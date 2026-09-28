@@ -18,6 +18,14 @@
 - **`dr_pool_restore.sh` rejects dataset arguments starting with `-`.** `DEST`, `FROM`, and `LOCAL_FROM` reach `zfs recv` and `syncoid` as positional arguments in a script that runs as root with `--force-delete`, and `syncoid` uses `Getopt::Long`. The CLI parser already refused a dash-leading operand, but the `MF_RESTORE_*` environment path did not, so a value was read as an option rather than a dataset. Startup now refuses them by name.
 - **The `ar`-and-`zstd` `.deb` extract path matches `dpkg-deb -x`.** `scripts/extract_fuse3_arm64.sh` unpacked the vendored arm64 libfuse3 `.deb` with `tar -xf` honoring archive uid, gid, and mode bits, so the two extract paths disagreed about what ends up in the tree. The manual path now passes `--no-same-owner --no-same-permissions`. The digest check ahead of it is unchanged.
 
+### Documentation - 2026-09-28
+- **Comments and docs name the code that exists.** `reconcileSize` was replaced
+  by `Store.reconcile` everywhere it was cited, and `cacheFill` by
+  `Store.cacheFillIdentified`. `docs/architecture.md` cites `candTieLess` and
+  `connectIn`, the stats tick comment describes the abbreviations it actually
+  prints, the `proto.default_port` comment no longer claims `--listen` falls back
+  to it, and the README records that `MODELFS_ID` is read for `mount` only.
+
 ## [0.17.0] - 2026-09-28
 
 Minor bump with no behavior changes since 0.16.0.
