@@ -114,6 +114,30 @@ involved: `/net/...` is just a directory name.
 The mount options are chosen so boot cannot hang: `soft` plus `nofail` plus automount. `hard`
 would wait forever, and `timeo` is in tenths of a second.
 
+### Hot update
+
+`modelfs update` replaces a running daemon in place: the new binary is exec'd over it,
+so the FUSE connection, the open handles, and the mount knobs (origin, cache, id, piece
+size, water marks, listen port, advertise, seeds, and the PSK) carry over on a sealed
+memfd. Nothing is remounted and no cache is dropped.
+
+Two consequences to plan for before running it on a fleet:
+
+* The knobs are validated **after** the exec, not before. An inherited value the new
+  binary refuses, a `--piece` that no longer aligns to the cache filesystem's block size
+  as of `0.15.0`, terminates the mount rather than leaving the old image running. The
+  line naming the rejected value is on stderr. Check a custom piece grid before
+  updating, and keep a way to remount by hand. `update` cannot change the grid.
+* The state blob carries only fields the running image wrote, and a field an older image
+  did not write takes its default (an absent log level is `info`). A hot update from an
+  older image into a newer binary is therefore supported in one step; a blob the new
+  binary cannot parse, or one naming a different mountpoint, aborts the handover with a
+  named line on stderr.
+
+Per-release breaking changes and the knob each one moved are in
+[CHANGELOG.md](../CHANGELOG.md) under `### Upgrade from <version>`; read those for the
+version you are leaving before you update a node.
+
 ### Origin directory layout
 
 On the **origin** (desktop `/models`, spark `/net/.../models`), after it is mounted:

@@ -242,9 +242,8 @@ candidate locally the same way CI does:
 That covers all four recipes a release ships: the host glibc build, both musl
 static targets, and the `aarch64-linux-gnu` spark binary, whose flags come from
 `cross_aarch64_flags` in `scripts/lib.sh` so the proof cannot drift onto a
-near-miss of what `scripts/cross_aarch64.sh` builds.
-
-or by hand by building twice from two different paths and comparing
+near-miss of what `scripts/cross_aarch64.sh` builds. To check one recipe by
+hand, build it twice from two different paths and compare
 `sha256sum zig-out/bin/modelfs` output.
 
 Publishing is the tag itself: pushing `v<version>` runs the `release`
