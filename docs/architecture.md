@@ -487,6 +487,15 @@ conservative:
   (`Store.tryLoadManifest`). The blob still names the previous object's digests at the same
   `file_size`, and admitting them would let a peer fill resurrect pre-rewrite bytes.
 
+The load is singleflighted per entry: the retry gate alone does not serialize it, because the
+origin read sits off `file.mu` and the gate is re-armed only after that read returns. The entry
+carries a load claim sampled under the same lock (`Cached.manifest_loading`, the shape
+`beginFill` and `Catalog.probeTryClaim` use for the fill and probe walks), so concurrent
+hydrations of one file produce one origin read rather than one per inflight worker. Losers skip
+the load, miss the lookup, and hydrate from origin, which is the answer a node with no manifest
+already gets. The claim clears on every exit of the load, so a transient failure cannot leave
+the entry permanently unverified.
+
 A file with no manifest anywhere has no trust reference, so its fills stay origin-only. That is
 the cost of never serving unverified bytes (threat-model.md, former gap R2).
 

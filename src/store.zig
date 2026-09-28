@@ -451,6 +451,17 @@ pub const Store = struct {
         /// lifetime: the writer publishes at close, which can be moments
         /// after this node's first fill. Read/written under file.mu.
         manifest_retry_at: i64 = 0,
+        /// One manifest load in flight for this entry. The retry gate alone
+        /// is not a singleflight: the origin read sits outside file.mu, so
+        /// every FUSE worker hydrating a piece of the same cold file sees
+        /// the same (manifest_size, manifest_retry_at) and starts its own
+        /// read of an artifact that reaches max_manifest_bytes, turning one
+        /// NFS read into one per worker. The winner loads; the losers fall
+        /// through to the hash lookup and take the origin for their piece
+        /// (the same answer a node with no manifest gets), rather than
+        /// waiting. Read/written under file.mu; cleared by tryLoadManifest
+        /// on every exit, including its early returns.
+        manifest_loading: bool = false,
         /// Trusted hashes changed since the last origin publish (admit,
         /// write-through, or a size-change wipe). mf_release publishes when
         /// set. Read/written under file.mu.
@@ -1493,10 +1504,14 @@ pub const Store = struct {
         }
         // A failed load is retried after manifest_retry_ms: the writer
         // publishes the manifest at close, which may land after this node's
-        // first fill (and an NFS negative cache can hide it briefly).
-        const due = file.manifest_retry_at <= now_ms;
+        // first fill (and an NFS negative cache can hide it briefly). The
+        // claim is the singleflight half: `due` alone lets every concurrent
+        // hydrator of this file start its own origin read, and the retry
+        // stamp it would write lands only after that read returns.
+        const claim = file.manifest_retry_at <= now_ms and !file.manifest_loading;
+        if (claim) file.manifest_loading = true;
         file.mu.unlock(self.io);
-        if (due) self.tryLoadManifest(file, now_ms);
+        if (claim) self.tryLoadManifest(file, now_ms);
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
         return file.hashes.get(idx);
@@ -1516,6 +1531,15 @@ pub const Store = struct {
     /// manifest whose mtime predates `Cached.origin_id` is treated as
     /// transient (the writer has not republished for this identity yet).
     fn tryLoadManifest(self: *Store, file: *Cached, now_ms: i64) void {
+        // Releases the expectedHash claim on every exit, the early
+        // path-too-long and transient-failure returns included. Registered
+        // first so it runs last: the body ends holding file.mu, and this
+        // takes it again.
+        defer {
+            file.mu.lockUncancelable(self.io);
+            file.manifest_loading = false;
+            file.mu.unlock(self.io);
+        }
         file.mu.lockUncancelable(self.io);
         const gen0 = file.writes;
         file.mu.unlock(self.io);
@@ -7090,6 +7114,46 @@ test "a transient manifest absence is retried and picked up after publication" {
     try std.testing.expect(reader.expectedHash(rf, 0, t0 + 4) == null);
     const got = reader.expectedHash(rf, 0, t0 + 5).?;
     try std.testing.expectEqualSlices(u8, &h0, &got);
+}
+
+test "a manifest load in flight singleflights the other hydrators" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-manifest-sf");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-manifest-sf");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+    const f = try st.get("m.bin", 32, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    const t0: i64 = 1000;
+
+    // No manifest exists, so every load misses. With the claim held (one
+    // hydrator is inside the origin read), a second caller must not start
+    // its own read of an artifact that reaches max_manifest_bytes: it
+    // falls through to the hash lookup and misses, which is the same
+    // answer a node with no manifest gets, and the piece origin-fills.
+    f.mu.lockUncancelable(std.testing.io);
+    f.manifest_loading = true;
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(st.expectedHash(f, 0, t0) == null);
+    f.mu.lockUncancelable(std.testing.io);
+    try std.testing.expect(f.manifest_loading);
+    f.mu.unlock(std.testing.io);
+
+    // The claim is released once the in-flight load returns, so the entry
+    // is not wedged into permanent unverified peer fills.
+    f.mu.lockUncancelable(std.testing.io);
+    f.manifest_loading = false;
+    f.mu.unlock(std.testing.io);
+    try std.testing.expect(st.expectedHash(f, 0, t0) == null);
+    f.mu.lockUncancelable(std.testing.io);
+    try std.testing.expect(!f.manifest_loading);
+    f.mu.unlock(std.testing.io);
 }
 
 test "OriginId.contentChanged is newer mtime or ino, never older mtime" {

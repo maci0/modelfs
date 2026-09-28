@@ -1036,6 +1036,10 @@ pub const Catalog = struct {
         const prefix = name[0..mark];
         if (prefix.len == 0) return false;
         for (prefix) |ch| {
+            // Hex, and no uppercase letters: manifestName is a flat
+            // lowercase blake3 hex stamp, so its digits must pass too.
+            // Gating on isLower instead rejected every name carrying a
+            // digit, and the staging sweep collected nothing.
             if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return false;
         }
         const tail = name[mark + ".tmp".len ..];
