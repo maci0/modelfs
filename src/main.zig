@@ -526,18 +526,42 @@ fn unknownEnvLine(buf: []u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "unknown environment variable {s} (see 'modelfs help')\n", .{proto.displayName(name)}) catch "unknown environment variable (see 'modelfs help')\n";
 }
 
+/// Which `Opts` field an environment knob feeds.
+const EnvField = enum { origin, cache, psk_file, psk_value, id, log };
+
+/// The whole `MODELFS_` namespace, in one list. `checkKnownEnv` refuses
+/// every name outside it and `parseArgs` applies every name in it, so an
+/// accepted variable can never go unread: a name listed but never applied
+/// would be silently ignored, which is the misspelling failure the refusal
+/// exists to prevent. Adding a knob is one entry here plus one switch arm.
+const env_knobs = [_]struct { name: []const u8, field: EnvField }{
+    .{ .name = "MODELFS_ORIGIN", .field = .origin },
+    .{ .name = "MODELFS_CACHE", .field = .cache },
+    .{ .name = "MODELFS_PSK", .field = .psk_file },
+    .{ .name = "MODELFS_PSK_VALUE", .field = .psk_value },
+    .{ .name = "MODELFS_ID", .field = .id },
+    .{ .name = "MODELFS_LOG", .field = .log },
+};
+
+/// The environment variable feeding `field`.
+fn envName(field: EnvField) []const u8 {
+    for (env_knobs) |k| {
+        if (k.field == field) return k.name;
+    }
+    unreachable;
+}
+
 /// First unknown `MODELFS_*` name in the environment, or null. The name
 /// aliases the map. HashMap iteration must not choose which typo is
 /// reported when several exist: the refusal is a function of the name set.
 fn unknownEnvName(environ: *const std.process.Environ.Map) ?[]const u8 {
-    const known = [_][]const u8{ "MODELFS_ORIGIN", "MODELFS_CACHE", "MODELFS_PSK", "MODELFS_PSK_VALUE", "MODELFS_ID", "MODELFS_LOG" };
     var best: ?[]const u8 = null;
     var it = environ.iterator();
     while (it.next()) |e| {
         const name = e.key_ptr.*;
         if (!std.mem.startsWith(u8, name, "MODELFS_")) continue;
-        for (known) |k| {
-            if (std.mem.eql(u8, name, k)) break;
+        for (env_knobs) |k| {
+            if (std.mem.eql(u8, name, k.name)) break;
         } else {
             if (best == null or std.mem.order(u8, name, best.?) == .lt) best = name;
         }
@@ -772,41 +796,59 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     try checkKnownEnv(environ);
     // 0.16: environment variables are only reachable via the main function's
     // process.Init; the map is threaded in instead of reading global environ.
-    if (envValue(environ, "MODELFS_ORIGIN")) |v| opts.origin = v;
-    if (envValue(environ, "MODELFS_CACHE")) |v| opts.cache = v;
+    // Every knob comes from env_knobs, the same list checkKnownEnv accepts
+    // above, so a name inside the namespace can neither be refused as a typo
+    // nor accepted and left unread.
+    //
     // An explicit file source (env or --psk) plus MODELFS_PSK_VALUE would
     // otherwise silently prefer the inline secret in loadPsk; tracked so
     // mount can refuse the pair instead of picking one.
     var psk_file_set = false;
-    if (envValue(environ, "MODELFS_PSK")) |v| {
-        opts.psk_file = v;
-        psk_file_set = true;
+    for (env_knobs) |knob| {
+        switch (knob.field) {
+            .origin => if (envValue(environ, knob.name)) |v| {
+                opts.origin = v;
+            },
+            .cache => if (envValue(environ, knob.name)) |v| {
+                opts.cache = v;
+            },
+            .psk_file => if (envValue(environ, knob.name)) |v| {
+                opts.psk_file = v;
+                psk_file_set = true;
+            },
+            // The only inline-secret spelling: no flag carries the secret,
+            // because argv is world-readable through /proc/<pid>/cmdline
+            // while the environment block is readable only by the process
+            // owner and root. For scripted mounts that cannot place a PSK
+            // file. Trimmed like the file form, but a whitespace-only value
+            // stays set so loadPsk can refuse EmptyPsk instead of envValue
+            // treating it as unset and falling through to /etc/modelfs.psk.
+            .psk_value => if (environ.get(knob.name)) |raw| {
+                if (raw.len != 0) opts.psk_value = std.mem.trim(u8, raw, " \t\r\n");
+            },
+            // MODELFS_ID follows the --id flag's mount-only scope:
+            // status/peers/pin/unpin never read the id, so an ambient
+            // shell-wide variable must neither leak into them nor fail them
+            // with BadId the way the explicit flag is refused by
+            // rejectOutsideMount.
+            .id => if (std.mem.eql(u8, cmd, "mount")) {
+                if (envValue(environ, knob.name)) |v| {
+                    opts.id = v;
+                }
+            },
+            // The journal is the only configuration observability this
+            // daemon has, so the ceiling is movable per environment:
+            // MODELFS_LOG=err quiets a cron'd status loop, debug aids a
+            // misbehaving mount. Applied after the flag scan below, on every
+            // command, so an explicit --log wins even over an invalid
+            // environment value; a value outside the documented set is
+            // refused there like any other malformed knob, because silently
+            // keeping the default would leave the operator believing
+            // verbosity changed.
+            .log => {},
+        }
     }
-    // The only inline-secret spelling: no flag carries the secret, because
-    // argv is world-readable through /proc/<pid>/cmdline while the
-    // environment block is readable only by the process owner and root.
-    // For scripted mounts that cannot place a PSK file. Trimmed like the
-    // file form, but a whitespace-only value stays set so loadPsk can
-    // refuse EmptyPsk instead of envValue treating it as unset and
-    // falling through to /etc/modelfs.psk.
-    if (environ.get("MODELFS_PSK_VALUE")) |raw| {
-        if (raw.len != 0) opts.psk_value = std.mem.trim(u8, raw, " \t\r\n");
-    }
-    // The journal is the only configuration observability this daemon has,
-    // so the ceiling is movable per environment: MODELFS_LOG=err quiets a
-    // cron'd status loop, debug aids a misbehaving mount. Applied for every
-    // command -- status/peers/pin/unpin log warnings too. A value outside the
-    // documented set is refused like any other malformed knob: silently
-    // keeping the default would leave the operator believing verbosity
-    // changed. --log overwrites this below (explicit flag wins).
     var log_set = false;
-    // MODELFS_ID follows the --id flag's mount-only scope: status/peers/pin/unpin
-    // never read the id, so an ambient shell-wide variable must neither leak
-    // into them nor fail them with BadId the way the explicit flag is
-    // refused by rejectOutsideMount.
-    if (std.mem.eql(u8, cmd, "mount")) {
-        if (envValue(environ, "MODELFS_ID")) |v| opts.id = v;
-    }
 
     var i: usize = 1;
     var rest: std.ArrayList([]const u8) = .empty;
@@ -996,8 +1038,8 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         }
     }
     if (!log_set) {
-        if (envValue(environ, "MODELFS_LOG")) |v| {
-            opts.log_level = try takeLogLevel("MODELFS_LOG", v);
+        if (envValue(environ, envName(.log))) |v| {
+            opts.log_level = try takeLogLevel(envName(.log), v);
         }
     }
     // Flag and env sources share one gate: an empty id makes this node
@@ -2481,6 +2523,37 @@ test "parseArgs refuses unknown MODELFS_ variables as typos" {
         const parsed = try parseArgs(gpa, &environ, &.{ "mount", "--origin", "/o" });
         defer freeParsed(parsed, gpa);
         try std.testing.expectEqualStrings("/env/cache", parsed.opts.cache);
+    }
+}
+
+test "every name in the MODELFS_ namespace applies to its option" {
+    const gpa = std.testing.allocator;
+    // env_knobs is the single list checkKnownEnv accepts against. A name in
+    // it that parseArgs never reads would be accepted and silently ignored,
+    // the same failure the typo refusal exists to prevent, one directory of
+    // trouble further away. This walks the list and asserts the effect.
+    for (env_knobs) |knob| {
+        var environ = std.process.Environ.Map.init(gpa);
+        defer environ.deinit();
+        try environ.put("PATH", "/usr/bin");
+        try environ.put(knob.name, switch (knob.field) {
+            .origin => "/env/origin",
+            .cache => "/env/cache",
+            .psk_file => "/env/psk",
+            .psk_value => "envsecret",
+            .id => "env-node",
+            .log => "err",
+        });
+        const parsed = try parseArgs(gpa, &environ, &.{"mount"});
+        defer freeParsed(parsed, gpa);
+        switch (knob.field) {
+            .origin => try std.testing.expectEqualStrings("/env/origin", parsed.opts.origin.?),
+            .cache => try std.testing.expectEqualStrings("/env/cache", parsed.opts.cache),
+            .psk_file => try std.testing.expectEqualStrings("/env/psk", parsed.opts.psk_file),
+            .psk_value => try std.testing.expectEqualStrings("envsecret", parsed.opts.psk_value.?),
+            .id => try std.testing.expectEqualStrings("env-node", parsed.opts.id.?),
+            .log => try std.testing.expectEqual(std.log.Level.err, parsed.opts.log_level),
+        }
     }
 }
 

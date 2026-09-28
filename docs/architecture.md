@@ -741,7 +741,9 @@ the file form, so an EnvironmentFile newline cannot start a node that then 401s 
 otherwise silently prefer the inline secret.
 
 Any other `MODELFS_*` name is refused as a typo'd knob on every command. That is why the harness
-and drill scripts keep their knobs outside this namespace (`MF_TEST_*`, `MF_DRILL_*`).
+and drill scripts keep their knobs outside this namespace (`MF_TEST_*`, `MF_DRILL_*`). The
+namespace is the `env_knobs` table in src/main.zig: `checkKnownEnv` refuses every name outside
+it and `parseArgs` applies every name in it, so an accepted variable can never go unread.
 
 ### Addresses and paths
 
