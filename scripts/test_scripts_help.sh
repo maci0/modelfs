@@ -94,7 +94,7 @@ expect_release_tag() {
 }
 zon_pin="$(zon_version)"
 expect_release_tag "v${zon_pin}" 0
-expect_release_tag "0.18.0-is-not-the-tag" 1
+expect_release_tag "0.19.0-is-not-the-tag" 1
 expect_release_tag "v${zon_pin}-rc1" 1
 expect_release_tag "release-${zon_pin}" 1
 
