@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Dependency inventory - 2026-09-28
+- **The CycloneDX inventory now covers the vendored libfuse3 static source.** `sbom.cdx.json` listed the arm64 `.deb` files, the Python tool lock, the SHA-pinned actions, and the Zig pin, but not `.deps/libfuse3-3.16.2/`, which `-Dfuse-static` compiles into every shipped release binary. A consumer or scanner reading the record could not see the largest third-party code input in the release, nor its license. `scripts/sbom.py` now discovers each `.deps/libfuse3-<version>/` tree, lists it as a required component with the purl of the upstream tag it was vendored from, its SPDX id, and every digest from that tree's `SHA256SUMS`, and fails generation when the sums miss a file present on disk or list one that is gone. Self-tests cover the parser, the coverage checks, and the generated component.
+
 ### Security documentation - 2026-09-28
 - **`SECURITY.md` no longer promises backported fixes to an old line.** It claimed the `0.12.x` line received security fixes; the repository cuts every release from `main` and has no backport process, and `v0.12.0` predates the peer request-line and `Content-Length` validation, the cluster-id bound, and the secret-handling hardening of `0.14.1` and `0.15.0`. The policy now states that fixes ship as the next tag from `main` and that the remedy for a deployment is to move to the current tag. No code or release process changes.
 

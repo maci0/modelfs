@@ -2,7 +2,8 @@
 """Emit or verify the CycloneDX inventory of declared third-party inputs.
 
 Reads requirements-dev.txt, requirements-dev.lock.txt,
-.deps/fuse3-arm64/SHA256SUMS, .github/workflows/*.yml, and build.zig.zon.
+.deps/fuse3-arm64/SHA256SUMS, the vendored libfuse3 static source's
+SHA256SUMS, .github/workflows/*.yml, and build.zig.zon.
 No network. Stdlib only.
 """
 
@@ -12,6 +13,7 @@ import argparse
 import json
 import re
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, override
@@ -36,14 +38,24 @@ _ACTION = re.compile(
 )
 _LOCK_REL = "requirements-dev.lock.txt"
 _BOUNDS_REL = "requirements-dev.txt"
+# The static-build input: libfuse3 source vendored under .deps/, whose
+# SHA256SUMS covers every file (README.md in that directory says so).
+_DEPS_DIR = ".deps"
+_VENDORED_GLOB = "libfuse3-*"
+_VENDORED_NAME = "libfuse3"
+_VENDORED_VERSION = re.compile(r"^libfuse3-(\d+\.\d+\.\d+)$")
+_VENDORED_UPSTREAM = "libfuse/libfuse"
+_SUMS_NAME = "SHA256SUMS"
 
-# SPDX for every PyPI, deb, GitHub Action, and toolchain name this inventory
-# emits. A new lock package, vendored .deb, or uses: pin without an entry
-# fails generation instead of shipping an unlicensed component. PyPI ids are
-# License-Expression from the pinned wheel METADATA (pathspec: the Trove
-# classifier; it has no License-Expression). Deb ids follow
-# .deps/fuse3-arm64/NOTICE and copyright. Action ids are LICENSE at the
-# pinned commit. zig is MIT (ziglang/zig).
+# SPDX for every PyPI, deb, vendored source, GitHub Action, and toolchain
+# name this inventory emits. A new lock package, vendored .deb, vendored
+# source directory, or uses: pin without an entry fails generation instead of
+# shipping an unlicensed component. PyPI ids are License-Expression from the
+# pinned wheel METADATA (pathspec: the Trove classifier; it has no
+# License-Expression). Deb ids follow .deps/fuse3-arm64/NOTICE and
+# copyright. The vendored source id follows the license texts shipped beside
+# it (LGPL2.txt for lib/, GPL2.txt for the rest of the tree).
+# Action ids are LICENSE at the pinned commit. zig is MIT (ziglang/zig).
 _SPDX: dict[str, str] = {
     "ast-serialize": "MIT",
     "librt": "MIT",
@@ -52,6 +64,7 @@ _SPDX: dict[str, str] = {
     "pathspec": "MPL-2.0",
     "ruff": "MIT",
     "typing-extensions": "PSF-2.0",
+    "libfuse3": "GPL-2.0-only AND LGPL-2.1-or-later",
     "libfuse3-3": "LGPL-2.1-or-later",
     "libfuse3-dev": "GPL-2.0-only AND LGPL-2.1-or-later",
     "actions/checkout": "MIT",
@@ -74,6 +87,13 @@ class LockedPackage:
 class PinnedAction:
     name: str
     digest: str
+
+
+@dataclass(slots=True)
+class VendoredSource:
+    name: str
+    version: str
+    digests: list[str] = field(default_factory=list)
 
 
 def project_root() -> Path:
@@ -186,6 +206,80 @@ def parse_sha256sums(text: str) -> list[tuple[str, str]]:
     return entries
 
 
+def parse_tree_sums(text: str, source: str) -> list[tuple[str, str]]:
+    """SHA256SUMS of a vendored source tree: `./`-prefixed relative paths."""
+
+    def bad_line(name: str) -> bool:
+        parts = Path(name).parts
+        return not name or name.startswith("/") or ".." in parts or name == _SUMS_NAME
+
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        digest, sep, name = line.partition("  ")
+        name = name.removeprefix("./")
+        if not sep or _HEX64.fullmatch(digest) is None or bad_line(name):
+            sys.exit(f"malformed SHA256SUMS line in {source}: {line}")
+        if name in seen:
+            sys.exit(f"duplicate SHA256SUMS entry in {source}: {name}")
+        seen.add(name)
+        entries.append((name, digest))
+    if not entries:
+        sys.exit(f"{source} has no entries")
+    return entries
+
+
+def vendored_sources(root: Path) -> list[VendoredSource]:
+    """Vendored libfuse3 source trees, one per `.deps/libfuse3-<version>`.
+
+    This is the third-party code `-Dfuse-static` compiles into the shipped
+    binaries, so the inventory names it and carries its file digests. A tree
+    whose SHA256SUMS does not cover every file on disk fails instead of
+    describing only part of what ships.
+    """
+    deps = root / _DEPS_DIR
+    if not deps.is_dir():
+        sys.exit(f"missing {_DEPS_DIR}")
+    found: list[VendoredSource] = []
+    for path in sorted(deps.glob(_VENDORED_GLOB)):
+        match = _VENDORED_VERSION.fullmatch(path.name)
+        if not path.is_dir() or match is None:
+            sys.exit(f"{_DEPS_DIR}/{path.name} is not a libfuse3-<version> source tree")
+        source = f"{_DEPS_DIR}/{path.name}/{_SUMS_NAME}"
+        listed = parse_tree_sums((path / _SUMS_NAME).read_text(encoding="utf-8"), source)
+        on_disk = {f.relative_to(path).as_posix() for f in path.rglob("*") if f.is_file()}
+        missing = sorted((on_disk - {_SUMS_NAME}) - {name for name, _ in listed})
+        if missing:
+            sys.exit(
+                f"{source} does not list {missing}; regenerate per "
+                f"{_DEPS_DIR}/{path.name}/README.md"
+            )
+        for name, _ in listed:
+            if not (path / name).is_file():
+                sys.exit(f"{source} lists {name}, which is missing from the tree")
+        found.append(
+            VendoredSource(
+                name=_VENDORED_NAME,
+                version=match.group(1),
+                digests=[digest for _, digest in listed],
+            )
+        )
+    if not found:
+        sys.exit(f"no {_VENDORED_GLOB} source tree under {_DEPS_DIR}")
+    versions = {src.version for src in found}
+    if len(versions) > 1:
+        sys.exit(f"two {_VENDORED_NAME} source versions vendored: {sorted(versions)}")
+    return found
+
+
+def vendored_purl(version: str) -> str:
+    """Upstream tag the tree was vendored from, as a github purl version."""
+    return f"pkg:github/{_VENDORED_UPSTREAM}@fuse-{version}"
+
+
 def parse_actions(text: str, source: str) -> list[PinnedAction]:
     """Every `uses:` in a workflow file; a moving tag is a hard error."""
     found: list[PinnedAction] = []
@@ -296,6 +390,7 @@ def build_bom(root: Path) -> dict[str, object]:
     require_exact_pins(bounds_text, packages)
     deb_dir = root / ".deps" / "fuse3-arm64"
     debs = parse_sha256sums((deb_dir / "SHA256SUMS").read_text(encoding="utf-8"))
+    vendored = vendored_sources(root)
     actions = load_actions(root)
     components: list[dict[str, object]] = []
     for pkg in packages:
@@ -341,6 +436,18 @@ def build_bom(root: Path) -> dict[str, object]:
             "scope": "excluded",
         }
         for action in actions
+    )
+    components.extend(
+        {
+            "type": "library",
+            "name": src.name,
+            "version": src.version,
+            "purl": vendored_purl(src.version),
+            "hashes": hashes_cdx(src.digests),
+            "licenses": licenses_cdx(src.name, required=True),
+            "scope": "required",
+        }
+        for src in vendored
     )
     components.append(
         {
@@ -478,6 +585,56 @@ def _self_test_sums() -> None:
     _must_exit(lambda: parse_sha256sums("# none\n"), "SHA256SUMS has no entries")
 
 
+def _self_test_vendored(root: Path) -> None:
+    digest = "b" * _SHA256_HEX_LEN
+    line = f"{digest}  ./lib/fuse.c\n"
+    got = parse_tree_sums(f"# comment\n{line}", "x")
+    if got != [("lib/fuse.c", digest)]:
+        sys.exit(f"self-test failed: parse_tree_sums {got}")
+    _must_exit(
+        lambda: parse_tree_sums(digest + "  ../escape.c\n", "x"),
+        "malformed SHA256SUMS line in x",
+    )
+    _must_exit(
+        lambda: parse_tree_sums(digest + "  /abs.c\n", "x"),
+        "malformed SHA256SUMS line in x",
+    )
+    _must_exit(
+        lambda: parse_tree_sums(digest + "  ./SHA256SUMS\n", "x"),
+        "malformed SHA256SUMS line in x",
+    )
+    _must_exit(lambda: parse_tree_sums(line + line, "x"), "duplicate SHA256SUMS entry in x")
+    _must_exit(lambda: parse_tree_sums("# none\n", "x"), "x has no entries")
+    if vendored_purl("3.16.2") != "pkg:github/libfuse/libfuse@fuse-3.16.2":
+        sys.exit("self-test failed: vendored_purl")
+    # The repo's own tree, so the real vendored source is exercised end to end.
+    for src in vendored_sources(root):
+        if src.name != _VENDORED_NAME or not src.digests:
+            sys.exit(f"self-test failed: vendored_sources {src}")
+    scratch = root / ".scratch"
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch) as tmp:
+        fake = Path(tmp)
+        tree = fake / _DEPS_DIR / "libfuse3-9.9.9"
+        (tree / "lib").mkdir(parents=True)
+        (tree / "lib" / "fuse.c").write_text("int main(void){return 0;}\n", encoding="utf-8")
+        (tree / _SUMS_NAME).write_text(
+            f"{digest}  ./lib/fuse.c\n" + f"{'c' * _SHA256_HEX_LEN}  ./lib/extra.c\n",
+            encoding="utf-8",
+        )
+        _must_exit(lambda: vendored_sources(fake), "which is missing from the tree")
+        (tree / "lib" / "extra.c").write_text("/* listed */\n", encoding="utf-8")
+        (tree / "lib" / "unlisted.c").write_text("/* added after the sums */\n", encoding="utf-8")
+        _must_exit(lambda: vendored_sources(fake), "does not list")
+        (tree / "lib" / "unlisted.c").unlink()
+        found = vendored_sources(fake)
+        if len(found) != 1 or found[0].version != "9.9.9":
+            sys.exit(f"self-test failed: vendored_sources {found}")
+        if vendored_purl(found[0].version) != "pkg:github/libfuse/libfuse@fuse-9.9.9":
+            sys.exit("self-test failed: vendored_purl for a test version")
+    _must_exit(lambda: vendored_sources(scratch / "no-such-deps"), "missing .deps")
+
+
 def _self_test_actions() -> None:
     sha = "f" * _SHA1_HEX_LEN
     got = parse_actions(
@@ -558,6 +715,12 @@ def _self_test_bom_pins(root: Path, wanted: set[str]) -> None:
         sys.exit("self-test failed: BOM missing zig from minimum_zig_version")
     if "licenses" not in zig:
         sys.exit("self-test failed: zig component has no licenses")
+    vendored = by_name.get(_VENDORED_NAME)
+    versions = {src.version for src in vendored_sources(root)}
+    if vendored is None or vendored.get("version") not in versions:
+        sys.exit("self-test failed: BOM missing the vendored libfuse3 source")
+    if vendored.get("scope") != "required":
+        sys.exit("self-test failed: vendored libfuse3 source must be a required component")
     for name in wanted:
         entry = by_name.get(name)
         if entry is None:
@@ -589,6 +752,7 @@ def self_test(root: Path) -> None:
     _self_test_bounds()
     _self_test_zon()
     _self_test_sums()
+    _self_test_vendored(root)
     _self_test_actions()
     _self_test_spdx()
     _self_test_repo(root)
@@ -610,7 +774,8 @@ class _Parser(argparse.ArgumentParser):
 def main(argv: list[str]) -> int:
     parser = _Parser(
         description=(
-            "Generate or verify sbom.cdx.json from the in-tree lock, SHA256SUMS, and CI workflows."
+            "Generate or verify sbom.cdx.json from the in-tree lock, SHA256SUMS, "
+            "vendored source, and CI workflows."
         ),
     )
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -622,7 +787,10 @@ def main(argv: list[str]) -> int:
     mode.add_argument(
         "--check",
         action="store_true",
-        help="exit 1 if sbom.cdx.json does not match the lock, SHA256SUMS, and workflows",
+        help=(
+            "exit 1 if sbom.cdx.json does not match the lock, SHA256SUMS, "
+            "vendored source, and workflows"
+        ),
     )
     mode.add_argument(
         "--self-test",
@@ -650,7 +818,7 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"ok: {path} matches lock, SHA256SUMS, and workflows")
+    print(f"ok: {path} matches lock, SHA256SUMS, vendored source, and workflows")
     return 0
 
 

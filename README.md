@@ -149,7 +149,8 @@ contributor command, and each script answers `--help` itself.
 
 Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt) and installed from
 the hash-verified lock. [sbom.cdx.json](sbom.cdx.json) is the CycloneDX inventory of that
-lock, the vendored libfuse3 debs, the SHA-pinned GitHub Actions, and the Zig version pin;
+lock, the vendored libfuse3 debs, the vendored libfuse3 static source the release binaries
+compile in, the SHA-pinned GitHub Actions, and the Zig version pin;
 `python3 scripts/sbom.py --check` holds it to them in the gate.
 
 ## Documentation

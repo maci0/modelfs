@@ -185,6 +185,10 @@ the CycloneDX record and `python3 scripts/sbom.py --check` holds the tree to it:
 * Zig's `minimum_zig_version` and a refresh of the vendored arm64 libfuse3
   `.deb`s (which also regenerates `.deps/fuse3-arm64/SHA256SUMS`) go through
   the same `--write`.
+* The vendored static libfuse3 source under `.deps/libfuse3-<version>/` is a
+  required component: the release binaries compile it in, so its
+  `SHA256SUMS` digests are in the record and a file the sums do not list
+  fails generation.
 
 ## Cutting a release
 

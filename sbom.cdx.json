@@ -122,6 +122,144 @@
     {
       "hashes": [
         {
+          "alg": "SHA-256",
+          "content": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "8898c9f5375575852458718e35b54b2c45b14d43b91803195bf8f743ceb94959"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "3aa38a038646c63a65995f0dc62e003356a2c7a0580b3a0ba1a22129cc5e6e18"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "19b61e0fb7cc588c36a13df7f7c8eb16ac4c108687751f146b19ed6b7eb261e5"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "a2dd4c088dd44ebafe0b25827a272df537480aa1c098d255e8d8e6072c85729a"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "7f79a177c6ad78e0c5b5e3773c9e923286308c1dba1ece3a22cb278299d9bcdc"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "b53bfbea0e427b43b1c3170dc8ec20083016770d6f7517350c5f8eb2cafaeca2"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "4c58f417dec96aff4206271c3ccf68d88b0d8296deee22fa59ea4ada75b8c261"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "472c9ee7a84bb9c20e58957a3ff47f34c18b4a159ad63b4db7f90aad1e8ff4ce"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "7644c67fd25ca258c36eb7ffc42b2b1dc2628372fc6daf9995f04186536c0381"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "a3de0569fda7b925fd097a782c612c770b6283d5bda36a06bd4d62c92966e775"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "46c37aaf3f87c173374c8b546d98fcf8d21a64e24ab43187a070956d6feb35dd"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "e8438a694ef904915e61dfadf5cc9129221fc6332ed8fb0e9997b8c38b6ca3f2"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "2c3f6fad197ca202c5ee6dca749d02087450b9fa450274784004f88595737b4a"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "ab44ae63c034ce51ecec61f7fc5593d2efc0d6e4d265feb634e954dff0d5f770"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "46e9956749a615400dc6d9505b8f1bc7b1d4d20fb294a9efc4733920b5173413"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "440b0ca16191d84d0da3a3bdcb378a07fd76a689dfdc1d523d4e23b1b74ba051"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "2a60900a9bb0602fdad6eb3795f51d012746bf765b351b94a0ee8b9d1908c1cd"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "74c042da10432cb76cfd11a0dde9a81fcc5fabc7ccbaa8cf44bacc7a83bc171b"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "83d028b9af21678676129bcbeec680145986a7dcc859c5c0e112993e6dc44604"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "1fd5171637a280cca1b3e9e82cc0dd0eff00984db22f933c5991b7306a26fa4e"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "6d16382e0267b1eeb856eb16047022b0993af036f009c7f729a2e8a9e1247382"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "d28598979f50732cf82c84f035f84ede8618c62ca3580453d8c504eec1c053af"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "080137923af5f47ad82d6ffbc180aeba5650d1eb627f4b5814cb78cb878f0ec4"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "7e5fb5c53902f044f3169913482e9bd5c13b69e5b533a85eb590af78270737ca"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "dabd63d3e71166940aa52a06adad594bbb72508e446cf80098ef16fce78c9e1f"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "04552b6167e24865092472eb294322fc9d99f2bd320e64fcb0d09f9e0e0af509"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "805a1567cf18892ca282dfc7a82991832b3b6c1e908609cfab1378a7381d27f2"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "b8832d9caaa075bbbd2aef24efa09f8b7ab66a832812d88c602da0c7b4397fad"
+        },
+        {
+          "alg": "SHA-256",
+          "content": "23ea8b89fe90271306d31c81238047a858da2be01d85ac8a3ad895acd2e83825"
+        }
+      ],
+      "licenses": [
+        {
+          "expression": "GPL-2.0-only AND LGPL-2.1-or-later"
+        }
+      ],
+      "name": "libfuse3",
+      "purl": "pkg:github/libfuse/libfuse@fuse-3.16.2",
+      "scope": "required",
+      "type": "library",
+      "version": "3.16.2"
+    },
+    {
+      "hashes": [
+        {
           "alg": "SHA-1",
           "content": "d1434d08867e3ee9daa34448df10607b98908d29"
         }
