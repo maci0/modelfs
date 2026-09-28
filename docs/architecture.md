@@ -593,6 +593,14 @@ overlapping range is unmarked so readers refill from the origin.
   between the write-through pwrite and its mark.
 * `Store.truncateCacheFd` refuses to cut a live cache descriptor while a peer `/data` send
   (`Cached.xfer`) is streaming from it.
+* `Cached.xfer` also pins the bitfield's storage. `mf_read` and the `ensureRange` and
+  `hydratePiece` bit walks hold `xfer` while indexing `Cached.bits.bytes` without `file.mu`, so
+  a path that would replace the field (`reconcile`, `mf_write`'s grow, `mf_truncate`,
+  `cacheFillIdentified`) takes the in-place route while a transfer is claimed
+  (`Cached.xferBusy`): clear the bits of the current buffer rather than `resize` or swap it, since
+  both free the allocation the reader is walking. A grow defers the reallocation (appended pieces
+  refill); a shrink or rewrite still clears the marks, so nothing past the new end is served. The
+  deferred reallocation lands on the next size or identity change that finds no reader.
 
 Further misses on the writing node take the origin (`hydratePiece` in src/fuse_fs.zig). A fill
 discarded by a concurrent write-through retries once from the origin, then fails the read with

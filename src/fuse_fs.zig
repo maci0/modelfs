@@ -1306,11 +1306,19 @@ fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse.off_t,
             // non-piece-aligned old size makes the old last piece short:
             // drop its mark first, same contract as cacheFillIdentified's grow.
             st.store.dropWideningPieceMark(file);
-            file.bits.resize(st.gpa, piece.count(end, st.store.piece_size)) catch {
-                // Same policy as cacheFillIdentified's grow: undersized field means
-                // appended pieces stay unmarked and re-hydrate.
-                std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
-            };
+            if (file.xferBusy()) {
+                // A concurrent read is walking this bitfield without file.mu
+                // and resize would realloc the buffer under it. Defer the
+                // grow; the recorded size still moves, so the appended
+                // pieces re-hydrate instead of serving hole zeros.
+                std.log.warn("bitfield grow deferred for {s} while a read is in flight; appended pieces refill", .{rel});
+            } else {
+                file.bits.resize(st.gpa, piece.count(end, st.store.piece_size)) catch {
+                    // Same policy as cacheFillIdentified's grow: undersized field means
+                    // appended pieces stay unmarked and re-hydrate.
+                    std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
+                };
+            }
             file.size = end;
         }
         file.last_access.store(sys.monoSec(st.io), .monotonic);
@@ -1429,25 +1437,33 @@ fn truncateWithClose(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_
             store_mod.Store.truncateCacheFd(file, new_size);
             return cr;
         }
-        const nb = piece.Bitfield.init(st.gpa, piece.count(new_size, st.store.piece_size)) catch {
-            // Origin is already the new length. Leaving filled bits at the
-            // old size would let a concurrent read serve pre-truncate cache
-            // bytes past the new EOF. Wipe marks now; shrink the recorded
-            // size when we can do that without growing an undersized field.
-            // truncateCacheFd, not a raw ftruncate: a peer /data sendfile
-            // holds xfer and is reading this fd without file.mu.
+        // Origin is already the new length. Leaving filled bits at the old
+        // size would let a concurrent read serve pre-truncate cache bytes
+        // past the new EOF, so the marks go either way. A read holding xfer
+        // is walking this bitfield right now: the swap below and the realloc
+        // behind Bitfield.init both free the buffer it is indexing, so that
+        // case clears the same buffer in place and defers the realloc to the
+        // next truncate no reader is holding. truncateCacheFd, not a raw
+        // ftruncate: a peer /data sendfile holds xfer and is reading this fd
+        // without file.mu.
+        var ob: ?piece.Bitfield = null;
+        if (file.xferBusy()) {
+            @memset(file.bits.bytes, 0);
+            if (new_size < file.size) file.size = new_size;
+        } else if (piece.Bitfield.init(st.gpa, piece.count(new_size, st.store.piece_size))) |nb| {
+            ob = file.bits;
+            file.size = new_size;
+            file.bits = nb;
+        } else |err| {
             @memset(file.bits.bytes, 0);
             file.writes += 1;
             st.store.clearHashes(file);
             if (new_size < file.size) file.size = new_size;
             _ = st.store.saveBits(file, false);
             store_mod.Store.truncateCacheFd(file, file.size);
-            std.log.warn("bitfield alloc failed for {s} after truncate; cache marks dropped, pieces refill", .{rel});
+            std.log.warn("bitfield alloc failed for {s} after truncate ({t}); cache marks dropped, pieces refill", .{ rel, err });
             return -sys.c.ENOMEM;
-        };
-        var ob = file.bits;
-        file.size = new_size;
-        file.bits = nb;
+        }
         file.writes += 1;
         // Digests described the pre-truncate bytes; the refills that follow
         // record fresh ones against the new size.
@@ -1458,8 +1474,8 @@ fn truncateWithClose(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_
         // cache_fd cannot be closed between check and use. Best-effort save:
         // a lost sidecar here only costs refill, never stale bytes.
         _ = st.store.saveBits(file, false);
-        store_mod.Store.truncateCacheFd(file, new_size);
-        ob.deinit(st.gpa);
+        store_mod.Store.truncateCacheFd(file, file.size);
+        if (ob) |*old| old.deinit(st.gpa);
     } else {
         // No live entry: origin is already the new length, but a leftover
         // sidecar at the previous size would decode cleanly if the file is

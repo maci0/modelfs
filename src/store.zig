@@ -485,6 +485,20 @@ pub const Store = struct {
         /// get() or a sidecar trailer loads.
         origin_id: OriginId = .{},
 
+        /// True while a FUSE read or a peer /data send is walking this entry's
+        /// bitfield and cache fd without file.mu. Those walks hold a raw
+        /// pointer into `bits.bytes` for the length of the range, so a path
+        /// that replaces the field (reconcile, mf_write's grow, mf_truncate,
+        /// cacheFillIdentified) must answer true and invalidate in place
+        /// rather than swap the buffer: resize reallocs, and the swap frees
+        /// the old allocation under a reader still indexing it. punchPiece
+        /// and truncateCacheFd already refuse on this count; clearing a bit
+        /// in place is the one mutation they leave legal, since an unlocked
+        /// probe then sees a clear and refills.
+        pub fn xferBusy(self: *const Cached) bool {
+            return self.xfer.load(.monotonic) != 0;
+        }
+
         pub fn deinit(self: *Cached, gpa: std.mem.Allocator) void {
             if (self.cache_fd >= 0) sys.close(self.cache_fd);
             self.bits.deinit(gpa);
@@ -1035,8 +1049,22 @@ pub const Store = struct {
             nb.deinit(self.gpa);
             return f;
         }
-        var ob = f.bits;
-        f.bits = nb;
+        var ob: ?piece.Bitfield = null;
+        if (f.xferBusy()) {
+            // Wipe in place instead of swapping: a reader under xfer is
+            // indexing f.bits.bytes right now, and the swap would free that
+            // buffer (resize reallocs; the assignment drops the last
+            // reference a few lines below). Same invalidation, same
+            // persistence; the field is re-sized by the next reconcile that
+            // finds no reader, and until then it can only under-report marks
+            // (a grow) or over-report nothing (all bits cleared), both of
+            // which refill.
+            @memset(f.bits.bytes, 0);
+            nb.deinit(self.gpa);
+        } else {
+            ob = f.bits;
+            f.bits = nb;
+        }
         f.size = file_size;
         f.writes += 1;
         // Digests described the pre-resize / pre-rewrite bytes: they can
@@ -1048,7 +1076,7 @@ pub const Store = struct {
         // reset must outlive the process to count as an invalidation.
         _ = self.saveBits(f, false);
         f.mu.unlock(self.io);
-        ob.deinit(self.gpa);
+        if (ob) |*old| old.deinit(self.gpa);
         return f;
     }
 
@@ -2187,11 +2215,19 @@ pub const Store = struct {
                 // held -- carrying it across the grow would claim bytes the
                 // cache fd never wrote.
                 self.dropWideningPieceMark(file);
-                file.bits.resize(self.gpa, piece.count(end, self.piece_size)) catch {
-                    // OOM leaves the field undersized: appended pieces stay
-                    // unmarked and re-hydrate instead of serving hole zeros.
-                    std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
-                };
+                if (file.xferBusy()) {
+                    // Same skip as the OOM below, for the same safety reason:
+                    // resize reallocs the buffer a reader under xfer is
+                    // walking. The recorded size still moves, so the appended
+                    // bytes are tracked by the next open.
+                    std.log.warn("bitfield grow deferred for {s} while a read is in flight; appended pieces refill", .{rel});
+                } else {
+                    file.bits.resize(self.gpa, piece.count(end, self.piece_size)) catch {
+                        // OOM leaves the field undersized: appended pieces stay
+                        // unmarked and re-hydrate instead of serving hole zeros.
+                        std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
+                    };
+                }
                 file.size = end;
             } else if (end < file.size) {
                 // Entry is longer than the observed origin: someone truncated
@@ -2202,23 +2238,38 @@ pub const Store = struct {
                 // marks over new content after a crash. writes++ invalidates a
                 // fill claimed against the old generation; truncateCacheFd
                 // cuts the tail the same way reconcile does.
-                if (piece.Bitfield.init(self.gpa, piece.count(end, self.piece_size))) |nb| {
-                    dropped = file.bits;
-                    file.bits = nb;
+                if (!file.xferBusy()) {
+                    if (piece.Bitfield.init(self.gpa, piece.count(end, self.piece_size))) |nb| {
+                        dropped = file.bits;
+                        file.bits = nb;
+                        file.size = end;
+                        file.writes += 1;
+                        // Same digest wipe as reconcile: the shrink invalidates
+                        // every expectation, not just the tail's.
+                        self.clearHashes(file);
+                        truncateCacheFd(file, end);
+                        _ = self.saveBits(file, false);
+                    } else |err| {
+                        @memset(file.bits.bytes, 0);
+                        file.writes += 1;
+                        self.clearHashes(file);
+                        _ = self.saveBits(file, false);
+                        std.log.warn("bitfield shrink failed for {s}: {t}; cache invalidated and pieces refill", .{ rel, err });
+                        return;
+                    }
+                } else {
+                    // A read holds this entry's bitfield buffer; swapping it
+                    // would free storage that read is still indexing. Wipe
+                    // in place instead, exactly as the OOM branch above does:
+                    // marks cannot survive a shrink of the recorded size, and
+                    // clearing the same buffer is the one mutation an
+                    // unlocked probe tolerates (it sees a clear and refills).
+                    @memset(file.bits.bytes, 0);
                     file.size = end;
                     file.writes += 1;
-                    // Same digest wipe as reconcile: the shrink invalidates
-                    // every expectation, not just the tail's.
                     self.clearHashes(file);
                     truncateCacheFd(file, end);
                     _ = self.saveBits(file, false);
-                } else |err| {
-                    @memset(file.bits.bytes, 0);
-                    file.writes += 1;
-                    self.clearHashes(file);
-                    _ = self.saveBits(file, false);
-                    std.log.warn("bitfield shrink failed for {s}: {t}; cache invalidated and pieces refill", .{ rel, err });
-                    return;
                 }
             }
             file.last_access.store(now_sec, .monotonic);
@@ -3879,6 +3930,76 @@ test "completeFill does not overwrite a racing write-through" {
     var rd: [16]u8 = undefined;
     try std.testing.expectEqual(@as(isize, 16), st.readCache(f, &rd, 0, sys.monoSec(std.testing.io)));
     try std.testing.expectEqualSlices(u8, &fresh, &rd);
+}
+
+test "an in-flight read pins the bitfield buffer through every size change" {
+    // A FUSE reader holds xfer across its bit walk and pread without
+    // file.mu, indexing bits.bytes directly. Replacing that field under it
+    // (reconcile's swap, cacheFillIdentified's resize or shrink swap) frees
+    // the buffer mid-walk: a torn {ptr, len} pair, then reads of freed
+    // memory. Every size change must therefore take the in-place route while
+    // a transfer is claimed, and re-size only once none is.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-xfer-bits");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-xfer-bits");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st = Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
+
+    const f = try st.get("xfer.bin", 64, sys.monoSec(std.testing.io));
+    defer st.releaseFile(f);
+    try std.testing.expect((try st.beginFill(f, 0, sys.monoSec(std.testing.io))) == .len);
+    var data: [16]u8 = undefined;
+    @memset(&data, 0x5A);
+    try std.testing.expectEqual(@as(i32, 0), st.completeFill(f, 0, &data, null, sys.monoSec(std.testing.io)));
+
+    // Grow while claimed: the recorded size moves, the buffer does not.
+    st.beginXfer(f);
+    var grown: [64]u8 = undefined;
+    @memset(&grown, 0x11);
+    const ptr = f.bits.bytes.ptr;
+    st.cacheFillIdentified("xfer.bin", 1024, 64, &grown, OriginId{}, sys.monoSec(std.testing.io));
+    f.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 1024), f.size);
+    // Undersized on purpose: an appended index reads as uncached and refills.
+    try std.testing.expect(!f.bits.get(63));
+    f.mu.unlock(std.testing.io);
+    try std.testing.expectEqual(@as([*]u8, ptr), f.bits.bytes.ptr);
+    try std.testing.expectEqual(piece.count(64, st.piece_size), f.bits.nbits);
+
+    // Shrink while claimed: marks cannot survive the new size, so the same
+    // buffer is cleared in place rather than swapped.
+    st.cacheFillIdentified("xfer.bin", 32, 0, &data, OriginId{}, sys.monoSec(std.testing.io));
+    f.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(@as(u64, 32), f.size);
+    try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+    f.mu.unlock(std.testing.io);
+    try std.testing.expectEqual(@as([*]u8, ptr), f.bits.bytes.ptr);
+    try std.testing.expectEqual(piece.count(64, st.piece_size), f.bits.nbits);
+
+    // The same rule covers reconcile, which allocates a fresh field for a
+    // size or identity change and frees the old one after the unlock.
+    const f2 = st.getIdentified("xfer.bin", 4096, OriginId{ .ino = 7, .mtime_sec = 1, .known = true }, sys.monoSec(std.testing.io)) catch |err| return err;
+    defer st.releaseFile(f2);
+    try std.testing.expectEqual(@as([*]u8, ptr), f.bits.bytes.ptr);
+    try std.testing.expectEqual(piece.count(64, st.piece_size), f.bits.nbits);
+    try std.testing.expectEqual(@as(u32, 0), f.bits.filled());
+    st.endXfer(f);
+
+    // With no reader claimed, the next change swaps a correctly sized field
+    // in: marks stay tracked instead of refilling until the entry moves
+    // again.
+    const f3 = st.getIdentified("xfer.bin", 8192, OriginId{ .ino = 7, .mtime_sec = 1, .known = true }, sys.monoSec(std.testing.io)) catch |err| return err;
+    defer st.releaseFile(f3);
+    f.mu.lockUncancelable(std.testing.io);
+    try std.testing.expectEqual(piece.count(8192, st.piece_size), f.bits.nbits);
+    try std.testing.expectEqual(@as(u64, 8192), f.size);
+    f.mu.unlock(std.testing.io);
 }
 
 test "a retried fill leaves bits, bytes, and sidecar identical to one run" {
