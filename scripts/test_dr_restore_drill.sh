@@ -1821,10 +1821,15 @@ if ! cmp -s "${POINT_SNAP_TREE}/gguf/model.gguf" "${POINT_LIVE_TREE}/gguf/model.
 else
     pass "point restore replaced the corrupt live file"
 fi
-if cmp -s "${POINT_SNAP_TREE}/gguf/other.gguf" "${POINT_LIVE_TREE}/gguf/other.gguf"; then
+# The copy-back is scoped to --copy: other.gguf holds "untouched" live and
+# "good other" in the snapshot, so a blanket overwrite would replace it.
+# Both branches used to pass, which asserted nothing about a procedure whose
+# whole point is a narrow copy.
+if [[ "$(<"${POINT_LIVE_TREE}/gguf/other.gguf")" == "untouched" ]] \
+    && ! cmp -s "${POINT_SNAP_TREE}/gguf/other.gguf" "${POINT_LIVE_TREE}/gguf/other.gguf"; then
     pass "point restore left paths outside --copy alone"
 else
-    pass "point restore left paths outside --copy alone"
+    fail "point restore overwrote a path outside --copy: $(cat "${POINT_LIVE_TREE}/gguf/other.gguf" 2>/dev/null || true)"
 fi
 POINT_LOG="$(cat "${POINT_STATE}/commands.log")"
 POINT_SNAP_LINE="$(grep -n 'zfs snapshot' <<<"${POINT_LOG}" | head -1 | cut -d: -f1 || true)"

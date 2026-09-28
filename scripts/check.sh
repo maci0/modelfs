@@ -365,27 +365,77 @@ printf '%s\n' "${ci_shell}" | shellcheck -s bash -e SC2154,SC2312 - \
 # default instead of by a reviewer's memory.
 echo "=== harness policy ==="
 
-# Every mktemp template names the scratch dir. The two exceptions write
+# Every mktemp call lands in the scratch dir. The two exceptions write
 # outside the repo by design: install_nas_backup.sh stages the unit copy
 # beside its destination (an atomic rename needs the same filesystem) and
 # run_vm_cluster_e2e.sh puts qemu disk images under libvirt's own directory.
 # A bare mktemp template lands on tmpfs, where a multi-gigabyte piece cache
-# is charged to RAM. The pattern matches any mktemp call carrying an XXXXXX
-# template whatever the flags are and in whatever order they appear, so
-# `mktemp -p /var/lib/libvirt/images d-XXXXXX` and `mktemp "$tpl"` are
-# judged on their template too, not only the flag-then-template spelling.
+# is charged to RAM. The pattern matches any mktemp call whatever the flags
+# are and in whatever order they appear, so `mktemp -p /var/lib/libvirt/
+# images d-XXXXXX` and `mktemp "$tpl"` are judged on their template too,
+# not only the flag-then-template spelling, and a call carrying no
+# XXXXXX at all is judged as well: `mktemp -d` with no argument is the
+# shortest way to the same tmpfs payload and cannot be caught by a pattern
+# that requires a template. A `for tool in ... mktemp ...` list that builds
+# a PATH for a preflight is the one line that names mktemp without calling
+# it, and it is skipped as such.
 unscoped_mktemp=""
 for sh in "${sh_files[@]}"; do
     while IFS= read -r hit; do
         line="${hit#*:}"
+        if [[ "${line}" == for\ *\ in\ * ]]; then
+            continue
+        fi
         if [[ "${line}" != *SCRATCH_DIR* && "${line}" != *dest_path* \
             && "${line}" != */var/lib/libvirt/images/* ]]; then
             unscoped_mktemp="${unscoped_mktemp} ${hit}"
         fi
-    done < <(grep -nE '^[^#]*mktemp[^|;&]*XXXXXX' "${sh}" || true)
+    done < <(grep -nE '^[^#]*\bmktemp\b' "${sh}" || true)
 done
 [[ -z "${unscoped_mktemp}" ]] \
     || fail "mktemp without a SCRATCH_DIR template (tmpfs payload):${unscoped_mktemp//$'\n'/, }"
+
+# The Python side of the same rule. tempfile's default directory is
+# gettempdir(), which is /tmp on these hosts, so a mkdtemp or
+# TemporaryDirectory without dir= puts a piece cache or a FUSE origin on
+# tmpfs exactly as a bare `mktemp -d` does. run_benchmarks_and_plots.py
+# names _SCRATCH and sbom.py names the repo scratch; a third script has to
+# as well, and the check is what says so. A call split over several lines
+# is read to its closing paren, so `dir=` on a continuation line counts.
+unscoped_py_temp=""
+for py in "${SCRIPTS_DIR}"/*.py; do
+    [[ -e "${py}" ]] || continue
+    # A named rc, not a masked one: an awk that failed to parse would
+    # report nothing found, which is the same shape as a clean scan.
+    py_rc=0
+    py_hits="$(awk '
+        # Read the whole file once, then walk it with an index, so a
+        # multi-line call is read to its closing paren without consuming
+        # the lines after it: a getline lookahead would swallow the next
+        # tempfile call and miss it.
+        { line[FNR] = $0 }
+        END {
+            i = 1
+            while (i <= FNR) {
+                text = line[i]
+                if (text ~ /^[[:space:]]*#/) { i++; continue }
+                if (text !~ /(^|[^A-Za-z0-9_])(mkdtemp|mkstemp|TemporaryDirectory|NamedTemporaryFile)\(/) { i++; continue }
+                start = i
+                depth = opens(text) - closes(text)
+                while (depth > 0 && i < FNR) { i++; text = text " " line[i]; depth += opens(line[i]) - closes(line[i]) }
+                if (text !~ /dir=/) { print FILENAME ":" start ":" line[start] }
+                i++
+            }
+        }
+        function opens(s) { return gsub(/\(/, "(", s) }
+        function closes(s) { return gsub(/\)/, ")", s) }
+    ' "${py}")" || py_rc=$?
+    [[ "${py_rc}" -eq 0 ]] \
+        || fail "the tempfile scan of ${py##*/} failed (rc=${py_rc}); the tmpfs-payload check did not run"
+    [[ -z "${py_hits}" ]] || unscoped_py_temp="${unscoped_py_temp} ${py_hits}"
+done
+[[ -z "${unscoped_py_temp}" ]] \
+    || fail "tempfile call without dir= (tmpfs payload):${unscoped_py_temp//$'\n'/, }"
 
 # ROOT_DIR, SCRATCH_DIR, and SCRIPTS_DIR come from lib.sh and nowhere else,
 # so a script that reads one without sourcing it resolves them to nothing. A
