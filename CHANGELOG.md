@@ -30,6 +30,10 @@
 - **`build_static.sh` no longer needs GNU-only `stat` and `cp` flags.** The artifact size comes from `wc -c` and the copy from `rm -f` plus a plain `cp`, so the script that builds the musl binaries also runs on a non-GNU userland. Output paths and names are unchanged.
 - **`install_nas_backup.sh` fails by name on a host without GNU coreutils.** The atomic unit install needs `mv -T` and `install --owner/--group`; the script now checks for them up front and exits with the missing-tool message instead of failing partway through the copy. The dry-run plan is unchanged.
 
+### Fixed
+
+- **A mistyped command now names the command it was aiming at, and a mistyped flag in the command position says so.** `modelfs verifz` printed `unknown command "verifz"` with no closer; it now reads `unknown command "verifz" (did you mean verify? ...)`, matching truncated words (`stat`, `verif`) and plurals (`mounts`, `pins`) as well as single-edit slips. `modelfs --hepl` reported `unknown command "--hepl"` and now reports `unknown flag --hepl`, the same line the flag scan uses after a command word. `modelfs --` reports the missing command rather than an unknown one. Exit codes are unchanged: every one of these is still a usage error, exit 2, on stderr with nothing on stdout.
+
 ## [0.17.0] - 2026-09-28
 
 Minor bump with no behavior changes since 0.16.0.

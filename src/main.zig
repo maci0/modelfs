@@ -99,8 +99,9 @@ const usage =
     \\accepts -h/--help and -V/--version. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
     \\accept --name VALUE or --name=VALUE. Usage errors exit 2 with one
-    \\named line on stderr; other failures exit 1. Help, version, and
-    \\command results print on stdout.
+    \\named line on stderr; an unknown command names the closest one.
+    \\Other failures exit 1. Help, version, and command results print on
+    \\stdout.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID (mount only, like --id) MODELFS_LOG set the same values
@@ -140,7 +141,7 @@ pub fn main(init: std.process.Init) !u8 {
         // command: dumping the help blob here made `modelfs` with no args
         // the only usage error that printed the full text instead of
         // naming what was missing.
-        std.debug.print("missing command (want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)\n", .{});
+        std.debug.print("missing command (want {s})\n", .{commandList()});
         return 2;
     }
     // Bare global forms live at position 0, where parseArgs sees a command
@@ -655,15 +656,99 @@ fn parsePercent(flag: []const u8, raw: []const u8) !u32 {
     return pct;
 }
 
+/// The command words main() dispatches on, plus the two bare global forms,
+/// in the order the unknown-command diagnostic lists them. knownCommand reads
+/// the dispatched subset, and every "want ..." message renders this list, so
+/// one list keeps the refusal and its help text from drifting.
+const all_commands = [_][]const u8{
+    "mount", "status", "peers",  "pin",     "unpin", "verify",
+    "dupes", "pull",   "update", "version", "help",
+};
+
+const dispatched_commands = all_commands[0..9];
+
 /// The command words main() dispatches on; the bare help/version forms are
 /// answered before parseArgs ever runs. Keeping one list means a newly added
 /// command missing from it fails loudly everywhere instead of slipping past
 /// this gate into the help answer below.
 fn knownCommand(cmd: []const u8) bool {
-    inline for (.{ "mount", "status", "peers", "pin", "unpin", "verify", "dupes", "pull", "update" }) |c| {
+    for (dispatched_commands) |c| {
         if (std.mem.eql(u8, cmd, c)) return true;
     }
     return false;
+}
+
+/// The `want a, b, c ...` tail shared by every missing/unknown-command line.
+fn commandList() []const u8 {
+    return "mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help";
+}
+
+/// The one command word within a typo of `typed`, or null when nothing is
+/// close enough to be worth naming. A truncated word is a typo before an edit
+/// is: `modelfs stat` is two edits from `status` but unambiguously meant it,
+/// and edit distance alone answers neither it nor `modelfs verif`.
+fn closestCommand(typed: []const u8) ?[]const u8 {
+    if (typed.len == 0) return null;
+    // Three characters is the shortest prefix that cannot be a word of its
+    // own here, so a short word never drags the suggestion to one command.
+    if (typed.len >= 3) {
+        for (all_commands) |c| {
+            if (c.len > typed.len and std.mem.startsWith(u8, c, typed)) return c;
+        }
+    }
+    // One edit per three typed characters, floor 1: a short word needs an
+    // exact-length neighbour, a longer one still absorbs a slip.
+    const budget = @max(typed.len / 3, 1);
+    var best: ?[]const u8 = null;
+    var best_d: usize = std.math.maxInt(usize);
+    for (all_commands) |c| {
+        const d = editDistance(typed, c);
+        if (d <= budget and d < best_d) {
+            best = c;
+            best_d = d;
+        }
+    }
+    return best;
+}
+
+/// Levenshtein distance over bytes, with unit cost for insert, delete, and
+/// substitute. Two rows, so a long typo costs no more stack than a short one.
+fn editDistance(a: []const u8, b: []const u8) usize {
+    if (a.len == 0) return b.len;
+    if (b.len == 0) return a.len;
+    var prev: [64]usize = undefined;
+    var cur: [64]usize = undefined;
+    if (b.len + 1 > prev.len) return std.math.maxInt(usize);
+    for (0..b.len + 1) |j| prev[j] = j;
+    for (a, 0..) |ca, i| {
+        cur[0] = i + 1;
+        for (b, 0..) |cb, j| {
+            const cost: usize = if (ca == cb) 0 else 1;
+            cur[j + 1] = @min(@min(cur[j] + 1, prev[j + 1] + 1), prev[j] + cost);
+        }
+        @memcpy(prev[0 .. b.len + 1], cur[0 .. b.len + 1]);
+    }
+    return prev[b.len];
+}
+
+/// The unknown-command diagnostic. One line on stderr, exit 2, naming the
+/// word that was typed; a leading '-' means the operator typed a flag where
+/// the command goes, and saying "unknown flag" is what they can act on, and
+/// a bare "--" is the end-of-flags marker with no command behind it.
+fn reportUnknownCommand(cmd: []const u8) void {
+    if (std.mem.eql(u8, cmd, "--")) {
+        printErr("missing command (want {s})\n", .{commandList()});
+        return;
+    }
+    if (cmd.len > 1 and cmd[0] == '-') {
+        printErr("unknown flag {s} (see 'modelfs help')\n", .{cmd});
+        return;
+    }
+    if (closestCommand(cmd)) |near| {
+        printErr("unknown command \"{s}\" (did you mean {s}? want {s})\n", .{ cmd, near, commandList() });
+    } else {
+        printErr("unknown command \"{s}\" (want {s})\n", .{ cmd, commandList() });
+    }
 }
 
 fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, args: []const []const u8) !struct { cmd: []const u8, opts: Opts, rest: []const []const u8 } {
@@ -675,8 +760,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // success. Same verdict as the post-parse refusal this replaces, just
     // reached before -h/-V get their turn.
     if (!knownCommand(cmd)) {
-        if (!builtin.is_test)
-            std.debug.print("unknown command \"{s}\" (want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)\n", .{cmd});
+        reportUnknownCommand(cmd);
         return error.UnknownCommand;
     }
     var opts = Opts{};
@@ -4013,6 +4097,65 @@ test "parseArgs refuses unknown commands before flag scanning" {
     // A trailing -h must not turn a typo'd command into a successful help
     // request (regression: it printed the usage and exited 0).
     try std.testing.expectError(error.UnknownCommand, parseArgs(gpa, &environ, &.{ "frobnicate", "-h", "--origin", "/o" }));
+}
+
+test "closestCommand names the word a typo was aiming at" {
+    try std.testing.expectEqualStrings("verify", closestCommand("verifz").?);
+    // A truncated command is a typo before an edit-distance neighbour is:
+    // `ver` is one edit from `version` but a prefix of nothing but a slip.
+    try std.testing.expectEqualStrings("verify", closestCommand("verif").?);
+    try std.testing.expectEqualStrings("peers", closestCommand("peer").?);
+    try std.testing.expectEqualStrings("status", closestCommand("stat").?);
+    try std.testing.expectEqualStrings("unpin", closestCommand("unpi").?);
+    try std.testing.expectEqualStrings("pin", closestCommand("pins").?);
+    // A prefix too short to be a word on its own is scored like any other
+    // typo, so it answers only when the edit distance is within reach.
+    try std.testing.expectEqual(@as(?[]const u8, null), closestCommand("pe"));
+    // Nothing in the list is close to a word that is not a command.
+    try std.testing.expectEqual(@as(?[]const u8, null), closestCommand("frobnicate"));
+    // A plural or gerund of a command is a typo, not a separate verb.
+    try std.testing.expectEqualStrings("mount", closestCommand("mounts").?);
+    // A real command resolves to itself, so a suggestion is never a redirect.
+    for (all_commands) |c| try std.testing.expectEqualStrings(c, closestCommand(c).?);
+}
+
+test "editDistance counts the three single-character operations" {
+    try std.testing.expectEqual(@as(usize, 0), editDistance("pin", "pin"));
+    try std.testing.expectEqual(@as(usize, 1), editDistance("pin", "pins"));
+    try std.testing.expectEqual(@as(usize, 1), editDistance("pins", "pin"));
+    try std.testing.expectEqual(@as(usize, 1), editDistance("pin", "win"));
+    try std.testing.expectEqual(@as(usize, 1), editDistance("pin", "pie"));
+    try std.testing.expectEqual(@as(usize, 3), editDistance("", "abc"));
+    try std.testing.expectEqual(@as(usize, 3), editDistance("abc", ""));
+    try std.testing.expectEqual(@as(usize, 3), editDistance("abc", "xyz"));
+    try std.testing.expectEqual(@as(usize, 2), editDistance("flaw", "lawn"));
+    // A word longer than the row buffer is not scored, so it never wins a
+    // suggestion; a command word cannot be, which is the point.
+    try std.testing.expectEqual(std.math.maxInt(usize), editDistance("a" ** 80, "a" ** 80));
+}
+
+test "reportUnknownCommand separates a mistyped flag, a bare --, and a word" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stderr = &out;
+    defer captured_stderr = null;
+    // A flag in the command position is reported as the flag it is, with the
+    // same wording the flag loop uses after a command word.
+    reportUnknownCommand("--hepl");
+    // The end-of-flags marker carries no command behind it.
+    reportUnknownCommand("--");
+    // A near miss names the word it was aiming at.
+    reportUnknownCommand("verifz");
+    // A word nothing resembles falls back to the plain refusal.
+    reportUnknownCommand("frobnicate");
+    try std.testing.expectEqualStrings(
+        \\unknown flag --hepl (see 'modelfs help')
+        \\missing command (want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)
+        \\unknown command "verifz" (did you mean verify? want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)
+        \\unknown command "frobnicate" (want mount, status, peers, pin, unpin, verify, dupes, pull, update, version, help)
+        \\
+    , out.items);
 }
 
 test "parseArgs accepts update and honors --cache" {

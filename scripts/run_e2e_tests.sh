@@ -94,6 +94,23 @@ if [[ "${RC}" -ne 2 ]] || ! grep -q 'unknown command' "${HELP_ERR}" || [[ -s "${
 fi
 echo "✓ Unknown command exits 2"
 
+# A near miss names the command it was aiming at, so a mistyped subcommand is
+# actionable without a trip to the help text.
+"${MODELFS_BIN}" verifz >"${HELP_OUT}" 2>"${HELP_ERR}" && RC=0 || RC=$?
+if [[ "${RC}" -ne 2 ]] || ! grep -q 'did you mean verify' "${HELP_ERR}" || [[ -s "${HELP_OUT}" ]]; then
+    echo "Error: expected exit 2 + a 'did you mean verify' suggestion (got rc=${RC})" >&2
+    exit 1
+fi
+echo "✓ Mistyped command suggests the nearest one"
+
+# A flag in the command position is a mistyped flag, not a mistyped command.
+"${MODELFS_BIN}" --hepl >"${HELP_OUT}" 2>"${HELP_ERR}" && RC=0 || RC=$?
+if [[ "${RC}" -ne 2 ]] || ! grep -q 'unknown flag --hepl' "${HELP_ERR}" || [[ -s "${HELP_OUT}" ]]; then
+    echo "Error: expected exit 2 + 'unknown flag --hepl' (got rc=${RC})" >&2
+    exit 1
+fi
+echo "✓ Mistyped leading flag exits 2 as a flag error"
+
 # Status on uninitialized cache must report 'not running' AND exit nonzero.
 # NB: status intentionally exits 1 here; capture instead of piping because
 # `set -o pipefail` would turn that expected exit into a failed check.
