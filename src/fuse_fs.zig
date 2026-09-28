@@ -2037,7 +2037,12 @@ fn widestMember(name: []const u8, comptime T: type) usize {
 /// stops being rewritten, and the daemon reads as not running to every
 /// monitor keying on it. `status doc fits its buffer` fails if the two ever
 /// disagree.
-const status_doc_max_bytes: usize = blk: {
+///
+/// Also the cap every reader of the artifact uses (`liveDaemon` in
+/// src/main.zig), so a document the daemon can publish is one `modelfs
+/// status` and `modelfs update` can still read: a reader cap below this
+/// turns a healthy wide document into "not running" on a live mount.
+pub const status_doc_max_bytes: usize = blk: {
     var n: usize = 2; // the document's braces
     for (@typeInfo(StatusFields).@"struct".fields) |f| {
         if (std.mem.eql(u8, f.name, "id")) {

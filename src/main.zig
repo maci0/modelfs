@@ -1726,9 +1726,18 @@ fn liveDaemon(io: std.Io, gpa: std.mem.Allocator, cache: []const u8, blob_out: *
         return error.NotLive;
     };
     var open_errno: i32 = 0;
-    const blob = sys.readFileAllocNoFollowOpenErrno(gpa, p, 4096, &open_errno) catch |err| {
+    // The writer's derived widest-document bound, not a private guess: a cap
+    // below it rejects a healthy daemon's document as unreadable, and `status`
+    // would report a running mount as down.
+    const blob = sys.readFileAllocNoFollowOpenErrno(gpa, p, fuse_fs.status_doc_max_bytes, &open_errno) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        if (err == error.OpenFailed and open_errno != sys.c.ENOENT)
+        // A file past the widest document the daemon can publish is not the
+        // daemon's own output; saying "no status.json" sends the operator
+        // looking for a mount that never came up instead of for the file
+        // that is there.
+        if (err == error.FileTooBig)
+            printErr("modelfs: not running ({s}/{s} is larger than any document the daemon writes)\n", .{ cache, store_mod.status_file })
+        else if (err == error.OpenFailed and open_errno != sys.c.ENOENT)
             printErr("modelfs: cannot read {s}/{s} (errno {d}); cannot tell whether the daemon is running\n", .{ cache, store_mod.status_file, open_errno })
         else
             printErr("modelfs: not running (no {s}/{s})\n", .{ cache, store_mod.status_file });
@@ -3134,6 +3143,61 @@ test "cmdStatus retires a crashed daemon's status.json as not running" {
         // this cache's status; O_NOFOLLOW must fail the open instead.
         try std.testing.expectEqual(@as(i32, 0), sys.c.symlink("other.json", try sys.toZ(&sbuf, fp)));
         try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+    }
+}
+
+test "cmdStatus reads a document as wide as the daemon can publish" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-status-wide");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var zbuf: [192]u8 = undefined;
+    var pbuf: [160]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ cache_d, store_mod.status_file });
+
+    // The reader's cap is the writer's derived widest-document bound, so a
+    // document that fills it exactly (longest id discover.validId accepts,
+    // liveness stamps at their widest) is still served. A cap of its own
+    // below that bound reports a healthy wide daemon as not running.
+    const tail = try std.fmt.allocPrint(gpa, ",\"pid\":{d},\"boot_s\":{d}}}\n", .{ sys.pidSelf(), sys.bootSec(std.testing.io) });
+    defer gpa.free(tail);
+    const head = "{\"id\":\"";
+    // head, the id, its closing quote, and the tail: the id takes the rest.
+    const fixed = head.len + 1 + tail.len;
+    try std.testing.expect(fuse_fs.status_doc_max_bytes > fixed);
+    var doc: [fuse_fs.status_doc_max_bytes]u8 = undefined;
+    @memcpy(doc[0..head.len], head);
+    @memset(doc[head.len .. head.len + (doc.len - fixed)], 'i');
+    doc[head.len + (doc.len - fixed)] = '"';
+    @memcpy(doc[doc.len - tail.len ..], tail);
+    try std.testing.expectEqual(doc.len, fuse_fs.status_doc_max_bytes);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), &doc));
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        captured_stdout = &out;
+        defer captured_stdout = null;
+        try std.testing.expectEqual(@as(u8, 0), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expectEqualStrings(&doc, out.items);
+    }
+
+    // One byte past the widest publishable document is not a document this
+    // daemon can have written, and the failure says so instead of claiming
+    // there is no status.json.
+    {
+        var err: std.ArrayList(u8) = .empty;
+        defer err.deinit(gpa);
+        captured_stderr = &err;
+        defer captured_stderr = null;
+        var over: [fuse_fs.status_doc_max_bytes + 1]u8 = undefined;
+        @memset(&over, 'i');
+        try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), &over));
+        try std.testing.expectEqual(@as(u8, 1), try cmdStatus(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expect(std.mem.indexOf(u8, err.items, "larger than any document") != null);
+        var absent: [256]u8 = undefined;
+        const absent_msg = try std.fmt.bufPrint(&absent, "not running (no {s}/{s})", .{ cache_d, store_mod.status_file });
+        try std.testing.expect(std.mem.indexOf(u8, err.items, absent_msg) == null);
     }
 }
 

@@ -306,8 +306,15 @@ pub fn encodeReq(gpa: std.mem.Allocator, bin: []const u8, token: []const u8) ![]
 }
 
 /// Caller calls `.deinit()` on the parsed value; its strings are owned by it.
+/// Same leniency as `decodeAck` and `parseLease`: the writer is whatever
+/// `modelfs update` binary the operator just installed, and `modelfs update`
+/// is the one path where a request is written by a build the reading daemon
+/// predates. A field that build added must not turn a valid handshake into
+/// `error.BadRequest` and refuse the update. Unknown fields carry no meaning
+/// here, and every field that does is validated by the reader that acts on
+/// it (the binary path and the token).
 pub fn decodeReq(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Req) {
-    return std.json.parseFromSlice(Req, gpa, std.mem.trim(u8, blob, " \t\r\n"), .{});
+    return std.json.parseFromSlice(Req, gpa, std.mem.trim(u8, blob, " \t\r\n"), .{ .ignore_unknown_fields = true });
 }
 
 /// `update.ack` echoing the nonce back. Caller frees the result with `gpa`.
@@ -630,6 +637,28 @@ test "update req/ack carry a token the client can match" {
     const got_special = try decodeAck(gpa, ack_special);
     defer got_special.deinit();
     try std.testing.expectEqualStrings("tok\"0\\", got_special.value.token);
+}
+
+test "update req and ack survive a field the reading build does not know" {
+    const gpa = std.testing.allocator;
+    // `modelfs update` writes the request with the newly installed binary and
+    // the running daemon reads it, so either side may be the newer one. A
+    // strict parse on one direction only refuses the handshake on a routine
+    // upgrade.
+    const newer_req = "{\"bin\":\"/opt/modelfs\",\"token\":\"deadbeef\",\"require_seal\":true}\n";
+    const req = try decodeReq(gpa, newer_req);
+    defer req.deinit();
+    try std.testing.expectEqualStrings("/opt/modelfs", req.value.bin);
+    try std.testing.expectEqualStrings("deadbeef", req.value.token);
+
+    const newer_ack = "{\"token\":\"deadbeef\",\"pid\":42}\n";
+    const ack = try decodeAck(gpa, newer_ack);
+    defer ack.deinit();
+    try std.testing.expectEqualStrings("deadbeef", ack.value.token);
+
+    // The fields that carry the handshake are still required.
+    try std.testing.expectError(error.MissingField, decodeReq(gpa, "{\"token\":\"t\"}\n"));
+    try std.testing.expectError(error.MissingField, decodeReq(gpa, "{\"bin\":\"/b\"}\n"));
 }
 
 test "update tokens and request bytes replay from injected entropy" {
