@@ -149,24 +149,6 @@ pub fn relIsCluster(rel: []const u8) bool {
         std.mem.startsWith(u8, rel, cluster_dir ++ "/");
 }
 
-/// True when s carries no control character in its terminal-visible form
-/// (proto.containsControl's set). Lease file names come off shared NFS
-/// storage and lease ids out of other nodes' JSON, so neither is trustworthy
-/// for verbatim echo: a co-tenant planting ".cluster/<newline> forged
-/// line.json" would forge multi-line daemon log entries, an id holding ESC,
-/// its C1 spelling "\u{9d}0;pwned\u{9c}", "spark1\u{2028}ERROR forged",
-/// a bidi override that spoofs the displayed id, a zero-width space /
-/// variation selector that makes two ids render as one, or a soft hyphen /
-/// VS17 / tag character that does the same, would inject into the terminal
-/// running `modelfs peers`. Same policy store.relOk applies to paths; such
-/// entries are still swept, only their names are withheld from output.
-/// Bytes above that set (NFC/NFD spellings, astral emoji without a
-/// selector, bare high bytes) are display text, not controls, and stay
-/// echoable.
-pub fn printable(s: []const u8) bool {
-    return !proto.containsControl(s);
-}
-
 pub const max_id_bytes: usize = c.NAME_MAX - ".json.tmp".len;
 
 /// True when s is safe to publish as this node's cluster id. The id names
@@ -1586,56 +1568,56 @@ test "probeTryClaim cap overflow still lets the caller probe" {
     }
 }
 
-test "printable gates lease names and ids for log echo" {
-    try std.testing.expect(printable("spark1.json"));
-    try std.testing.expect(printable("spark9"));
+test "proto.containsControl gates lease names and ids for log echo" {
+    try std.testing.expect(!proto.containsControl("spark1.json"));
+    try std.testing.expect(!proto.containsControl("spark9"));
     // CR/LF would forge multi-line daemon log entries
-    try std.testing.expect(!printable("a\n2026-08-24 ERROR forged"));
-    try std.testing.expect(!printable("a\rb"));
+    try std.testing.expect(proto.containsControl("a\n2026-08-24 ERROR forged"));
+    try std.testing.expect(proto.containsControl("a\rb"));
     // ESC and other C0 bytes, plus DEL, would inject terminal escapes
-    try std.testing.expect(!printable("\x1b]0;pwned\x07"));
-    try std.testing.expect(!printable("\x7f"));
+    try std.testing.expect(proto.containsControl("\x1b]0;pwned\x07"));
+    try std.testing.expect(proto.containsControl("\x7f"));
     // C1 controls ride in as UTF-8 (0xC2 0x80..0xC2 0x9F), past a C0-only
     // byte gate: an id "\u{9d}0;pwned\u{9c}" is an 8-bit OSC sequence some
     // terminal families honor even in UTF-8 mode, and "\u{9b}31m" is CSI.
-    try std.testing.expect(!printable("a\xc2\x9bd"));
-    try std.testing.expect(!printable("\xc2\x9d0;pwned\xc2\x9c"));
-    try std.testing.expect(!printable("\xc2\x9b"));
+    try std.testing.expect(proto.containsControl("a\xc2\x9bd"));
+    try std.testing.expect(proto.containsControl("\xc2\x9d0;pwned\xc2\x9c"));
+    try std.testing.expect(proto.containsControl("\xc2\x9b"));
     // Unicode line/paragraph separators split log lines in Unicode-aware
     // terminals the same way CR/LF does; a C0/C1-only gate still echoes
     // "spark1\u{2028}ERROR forged" as two lines.
-    try std.testing.expect(!printable("spark1\u{2028}ERROR forged"));
-    try std.testing.expect(!printable("spark1\u{2029}p"));
-    try std.testing.expect(!printable("spark1\u{202e}gnp"));
-    try std.testing.expect(!printable("spark1\u{200f}"));
-    try std.testing.expect(!printable("spark1\u{2066}x"));
-    try std.testing.expect(!printable("spark1\u{061c}"));
-    try std.testing.expect(!printable("spark1\u{200b}"));
-    try std.testing.expect(!printable("spark1\u{2060}"));
-    try std.testing.expect(!printable("spark1\u{fe0f}"));
-    try std.testing.expect(!printable("\u{feff}spark1"));
-    try std.testing.expect(!printable("spark1\u{ad}"));
-    try std.testing.expect(!printable("spark1\u{180f}"));
-    try std.testing.expect(!printable("spark1\u{1bca0}"));
-    try std.testing.expect(!printable("spark1\u{e0100}"));
-    try std.testing.expect(!printable("spark1\u{e007f}"));
+    try std.testing.expect(proto.containsControl("spark1\u{2028}ERROR forged"));
+    try std.testing.expect(proto.containsControl("spark1\u{2029}p"));
+    try std.testing.expect(proto.containsControl("spark1\u{202e}gnp"));
+    try std.testing.expect(proto.containsControl("spark1\u{200f}"));
+    try std.testing.expect(proto.containsControl("spark1\u{2066}x"));
+    try std.testing.expect(proto.containsControl("spark1\u{061c}"));
+    try std.testing.expect(proto.containsControl("spark1\u{200b}"));
+    try std.testing.expect(proto.containsControl("spark1\u{2060}"));
+    try std.testing.expect(proto.containsControl("spark1\u{fe0f}"));
+    try std.testing.expect(proto.containsControl("\u{feff}spark1"));
+    try std.testing.expect(proto.containsControl("spark1\u{ad}"));
+    try std.testing.expect(proto.containsControl("spark1\u{180f}"));
+    try std.testing.expect(proto.containsControl("spark1\u{1bca0}"));
+    try std.testing.expect(proto.containsControl("spark1\u{e0100}"));
+    try std.testing.expect(proto.containsControl("spark1\u{e007f}"));
     // Display text above the C1 range stays echoable: NBSP (U+00A0) shares
     // the 0xC2 lead byte but is not a control, nor are accented names.
-    try std.testing.expect(printable("caf\xc3\xa9"));
-    try std.testing.expect(printable("\xc2\xa0"));
+    try std.testing.expect(!proto.containsControl("caf\xc3\xa9"));
+    try std.testing.expect(!proto.containsControl("\xc2\xa0"));
     // A trailing 0xC2 with no continuation byte is invalid UTF-8 display
     // noise, not an injectable control. Incomplete U+2028 encodings match.
-    try std.testing.expect(printable("a\xc2"));
-    try std.testing.expect(printable("a\xe2\x80"));
-    try std.testing.expect(printable("a\xe2"));
-    try std.testing.expect(printable("a\xef"));
-    try std.testing.expect(printable("a\xef\xb8"));
-    try std.testing.expect(printable("a\xf3"));
-    try std.testing.expect(printable("a\xf3\xa0\x84"));
-    try std.testing.expect(printable("a\xf0\x9b\xb2"));
-    try std.testing.expect(printable("a\u{ac}"));
-    try std.testing.expect(printable("a\u{1810}"));
-    try std.testing.expect(printable("a\u{1bc9f}"));
+    try std.testing.expect(!proto.containsControl("a\xc2"));
+    try std.testing.expect(!proto.containsControl("a\xe2\x80"));
+    try std.testing.expect(!proto.containsControl("a\xe2"));
+    try std.testing.expect(!proto.containsControl("a\xef"));
+    try std.testing.expect(!proto.containsControl("a\xef\xb8"));
+    try std.testing.expect(!proto.containsControl("a\xf3"));
+    try std.testing.expect(!proto.containsControl("a\xf3\xa0\x84"));
+    try std.testing.expect(!proto.containsControl("a\xf0\x9b\xb2"));
+    try std.testing.expect(!proto.containsControl("a\u{ac}"));
+    try std.testing.expect(!proto.containsControl("a\u{1810}"));
+    try std.testing.expect(!proto.containsControl("a\u{1bc9f}"));
 }
 
 test "relIsCluster matches the lease dir by prefix, not substring" {
@@ -1743,7 +1725,7 @@ fn fuzzIdGateOne(_: void, smith: *std.testing.Smith) anyerror!void {
     }
     try std.testing.expectEqual(ref, ok);
 
-    try std.testing.expectEqual(printable(id), std.mem.eql(u8, id, proto.displayName(id)));
+    try std.testing.expectEqual(!proto.containsControl(id), std.mem.eql(u8, id, proto.displayName(id)));
     if (!ok) return;
 
     var doc_buf: [512]u8 = undefined;

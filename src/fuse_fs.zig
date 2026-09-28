@@ -991,7 +991,7 @@ fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) c
 fn originFillBuf(st: *State, file: *store_mod.Store.Cached, idx: u32, buf: []u8) i32 {
     const n = st.store.originPread(file.rel, buf, piece.offset(idx, st.store.piece_size));
     if (n == @as(isize, @intCast(buf.len))) return 0;
-    st.store.finishPiece(file, idx, false, 0, null, sys.monoSec(st.io));
+    st.store.abortFill(file, idx, sys.monoSec(st.io));
     _ = st.store.stats.fill_err_origin.fetchAdd(1, .monotonic);
     // The reader sees EIO and nothing else names the cause; keep the
     // same sender-side trace serveData's hydration branch does,
@@ -1369,31 +1369,16 @@ fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse.off_t,
     };
     if (live) |file| {
         defer st.store.releaseFile(file);
-        file.mu.lockUncancelable(st.io);
-        const old_size = file.size;
-        if (end > old_size) {
-            // NFS attribute lag can report the pre-write size; grow the
-            // bitfield alongside so appended pieces stay markable. A
-            // non-piece-aligned old size makes the old last piece short:
-            // drop its mark first, same contract as cacheFillIdentified's grow.
-            st.store.dropWideningPieceMark(file);
-            if (file.xferBusy()) {
-                // A concurrent read is walking this bitfield without file.mu
-                // and resize would realloc the buffer under it. Defer the
-                // grow; the recorded size still moves, so the appended
-                // pieces re-hydrate instead of serving hole zeros.
-                std.log.warn("bitfield grow deferred for {s} while a read is in flight; appended pieces refill", .{rel});
-            } else {
-                file.bits.resize(st.gpa, piece.count(end, st.store.piece_size)) catch {
-                    // Same policy as cacheFillIdentified's grow: undersized field means
-                    // appended pieces stay unmarked and re-hydrate.
-                    std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
-                };
-            }
-            file.size = end;
+        {
+            // NFS attribute lag can report the pre-write size, so the size
+            // mutation runs under the content_mu-then-file.mu order every
+            // other size mutation uses, and growToLocked widens the bitfield
+            // alongside so appended pieces stay markable.
+            st.store.lockContentAndState(file);
+            st.store.growToLocked(file, end);
+            file.last_access.store(sys.monoSec(st.io), .monotonic);
+            st.store.unlockContentAndState(file);
         }
-        file.last_access.store(sys.monoSec(st.io), .monotonic);
-        file.mu.unlock(st.io);
         // The origin write already succeeded, so a failed cache copy only
         // costs re-hydration; the helper logs it and skips piece marking.
         _ = st.store.copyIntoCache(file, uoff, buf[0..@intCast(n)]);
@@ -1497,10 +1482,8 @@ fn truncateWithClose(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_
         // completeFill, and punchPiece use. Taking only file.mu let a
         // concurrent write-through pwrite land, then this ftruncate cut
         // those bytes, then the mark published the hole as cached data.
-        file.content_mu.lockUncancelable(st.io);
-        defer file.content_mu.unlock(st.io);
-        file.mu.lockUncancelable(st.io);
-        defer file.mu.unlock(st.io);
+        st.store.lockContentAndState(file);
+        defer st.store.unlockContentAndState(file);
         if (file.size == new_size) {
             // Already applied: a FUSE retry after a lost reply, or a no-op
             // truncate to the current size. Re-wiping bits would discard
@@ -3169,7 +3152,7 @@ fn execHandover(st: *State) !void {
         var waited: u32 = 0;
         while (true) {
             var open_errno: i32 = 0;
-            break :blk sys.readFileAllocNoFollowOpenErrno(gpa, req_path, 64 * 1024, &open_errno) catch |err| {
+            break :blk sys.readFileAllocNoFollowOpenErrno(gpa, req_path, handover.req_max_bytes, &open_errno) catch |err| {
                 if (err == error.OpenFailed and open_errno == sys.c.ENOENT and waited < 1000) {
                     sys.sleepMs(st.store.io, 50);
                     waited += 50;

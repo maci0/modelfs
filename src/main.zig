@@ -1755,7 +1755,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var waited: u32 = 0;
     while (waited < update_wait_ms) : (waited += update_poll_ms) {
         var open_errno: i32 = 0;
-        const ack_blob = sys.readFileAllocNoFollowOpenErrno(gpa, ack_path, 4096, &open_errno) catch {
+        const ack_blob = sys.readFileAllocNoFollowOpenErrno(gpa, ack_path, handover.req_max_bytes, &open_errno) catch {
             sys.sleepMs(io, update_poll_ms);
             continue;
         };
@@ -1937,21 +1937,26 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
     }
     // The request that triggered this exec carries the token the waiting
     // CLI matches against the ack. It is consumed here so a leftover cannot
-    // make a later SIGUSR2 replay an update nobody asked for. Every step is
-    // allowed to fail open with no token: the handover already succeeded,
-    // and the mount is better served by a SIGUSR2 that finds no matching
-    // request than by this image refusing to exec.
+    // make a later SIGUSR2 replay an update nobody asked for. A missing file
+    // is the SIGUSR2 replay case and stays quiet; a read or decode that
+    // fails on a file that is there leaves the CLI polling for an ack that
+    // will never come, so it is logged rather than swallowed.
     {
         var pbuf: [sys.c.PATH_MAX]u8 = undefined;
         if (sys.joinZ(&pbuf, owned.cache, handover.req_file)) |rp| {
             var open_errno: i32 = 0;
-            if (sys.readFileAllocNoFollowOpenErrno(gpa, rp, 4096, &open_errno)) |req_blob| {
+            if (sys.readFileAllocNoFollowOpenErrno(gpa, rp, handover.req_max_bytes, &open_errno)) |req_blob| {
                 defer gpa.free(req_blob);
                 if (handover.decodeReq(gpa, req_blob)) |parsed| {
                     defer parsed.deinit();
                     st.update_token = gpa.dupe(u8, parsed.value.token) catch null;
-                } else |_| {}
-            } else |_| {}
+                } else |err| {
+                    printErr("modelfs: cannot decode {s} ({t}); no update token, no ack\n", .{ rp, err });
+                }
+            } else |err| {
+                if (err != error.OpenFailed or open_errno != sys.c.ENOENT)
+                    printErr("modelfs: cannot read {s} ({t} errno {d}); no update token, no ack\n", .{ rp, err, open_errno });
+            }
             _ = sys.unlink(rp);
         } else |_| {}
     }
@@ -2104,10 +2109,10 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         // Lease ids and addresses come off shared storage as other nodes'
         // JSON; echo them only when free of control bytes so `modelfs peers`
         // cannot be turned into a terminal-injection vector.
-        const id_shown = if (!proto.containsControl(r.id)) r.id else "<id withheld: control bytes>";
+        const id_shown = proto.shownOr(r.id, "<id withheld: control bytes>");
         if (!printOut(io, gpa, "{s} (until={d}, {s})\n", .{ id_shown, r.until, status_str })) return 1;
         for (r.addrs) |a| {
-            const ip_shown = if (!proto.containsControl(a.ip)) a.ip else "<ip withheld>";
+            const ip_shown = proto.shownOr(a.ip, "<ip withheld>");
             if (!printOut(io, gpa, "  -> {s}:{d} (speed={d}mbps)\n", .{ ip_shown, a.port, a.mbps })) return 1;
         }
     }

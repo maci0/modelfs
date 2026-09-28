@@ -599,6 +599,10 @@ overlapping range is unmarked so readers refill from the origin.
 
 ### Lock ordering against culls and sends
 
+* Size mutation takes one pair, `Store.lockContentAndState` (`content_mu` then `file.mu`), and
+  the grow half of it is `Store.growToLocked`. A site that took `file.mu` alone could let a
+  `completeFill` land between the bitfield swap and the cache copy and mark pre-mutation
+  content on the new field.
 * `copyIntoCache` skips the pwrite while `Cached.xfer` is nonzero (a peer sendfile or FUSE read
   of the cache fd): mixing new write-through bytes into an in-flight copy would let the peer
   mark a torn piece filled.
@@ -737,6 +741,13 @@ Filesystem paths retain their exact bytes: the JSON codec writes valid UTF-8 as 
 non-UTF-8 paths as byte arrays, and accepts both on decode. This covers origin/cache/mount,
 cached inode and open-handle paths, and the replacement binary path in `update.req`.
 NFC and NFD spellings remain distinct.
+
+`update.req` and `update.ack` are read through one cap, `handover.req_max_bytes`, on both
+sides. The writer's binary path is a `PATH_MAX` string before JSON escaping, so a cap the
+replacement image reads under cannot be the one the CLI polls against: a read that stops short
+adopts no token, writes no ack, and turns a swap that already happened into a 30 s timeout
+report. A missing request file is the SIGUSR2 replay case and is quiet; a read or decode that
+fails on a file that is there names the path and the error.
 
 The swap is journaled from both sides, because an exec leaves no other trace: the outgoing
 image logs `handover: execing into <bin> to serve <mount> (listen :<port>)` as its last line

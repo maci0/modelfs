@@ -269,8 +269,15 @@ pub fn containsControl(s: []const u8) bool {
     return containsControlBytes(s[i..]);
 }
 
+/// The one echo gate: `s` when it is free of control bytes, else the
+/// caller's `withheld` label. Callers name the field so an address and a peer
+/// id do not both report themselves as a name.
+pub fn shownOr(s: []const u8, withheld: []const u8) []const u8 {
+    return if (!containsControl(s)) s else withheld;
+}
+
 pub fn displayName(name: []const u8) []const u8 {
-    return if (!containsControl(name)) name else "<name withheld: control bytes>";
+    return shownOr(name, "<name withheld: control bytes>");
 }
 
 test "displayName echoes printable names and withholds the rest" {

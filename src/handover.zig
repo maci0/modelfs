@@ -15,6 +15,14 @@ pub const req_file = "update.req";
 pub const ack_file = "update.ack";
 pub const token_bytes: usize = 16;
 
+/// Cap on `update.req` and `update.ack` as either side reads them. One
+/// binary path (PATH_MAX once JSON-escaped) plus the token, with room for
+/// the knobs the request carries. The writer and both readers use this one
+/// value: a reader with a smaller cap than the writer silently adopts no
+/// token, writes no ack, and leaves the CLI to report a timeout for an exec
+/// that already swapped the mount.
+pub const req_max_bytes: usize = 64 * 1024;
+
 /// Cap on the captured FUSE_INIT request. Today's wire form is a 40-byte
 /// header plus a 64-byte payload; the slack covers a protocol that grows
 /// the payload without needing a new handover format. Sized past one

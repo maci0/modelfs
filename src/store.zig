@@ -32,7 +32,7 @@ pub const status_file = "status.json";
 /// and UTF-8 Default_Ignorable_Code_Point including line separators, bidi
 /// and zero-width format controls, variation selectors, BOM, soft hyphen,
 /// CGJ, Hangul fillers, Mongolian FVS4, shorthand format controls, and tags),
-/// the same discover.printable applies
+/// the same proto.displayName applies
 /// before echoing a lease name. Non-control text above that set (NFC/NFD
 /// spellings, astral emoji without a selector, names that are not valid
 /// UTF-8 at all) passes byte-exact; identity is byte equality all the way
@@ -1261,7 +1261,7 @@ pub const Store = struct {
             // without holding a fill claim, and closing under it hands the
             // number to the next open -- bytes flowing to a different file.
             // The entry just stays pinned; the next round reaps it.
-            if (f.filling.count() == 0 and f.xfer.load(.monotonic) == 0 and
+            if (f.filling.count() == 0 and !f.xferBusy() and
                 now_sec -| f.last_access.load(.monotonic) >= min_idle_secs)
             {
                 if (f.cache_fd >= 0) {
@@ -1325,6 +1325,13 @@ pub const Store = struct {
         return self.openCacheUnlocked(file);
     }
 
+    /// Give up a claim taken by beginFill: the piece stays unmarked and
+    /// a later round refills it. This is the only abort entry point, so a
+    /// caller cannot publish a bit, a length, and a digest it never got.
+    pub fn abortFill(self: *Store, file: *Cached, idx: u32, now_sec: i64) void {
+        self.finishPiece(file, idx, false, 0, null, now_sec);
+    }
+
     /// `hash`, when set, is the digest of the bytes that just landed; it is
     /// recorded alongside the bit so the piece carries a trusted hash from
     /// birth (the fill paths hash the in-hand buffer, so a rehash of the
@@ -1332,8 +1339,10 @@ pub const Store = struct {
     /// file.mu keeps the digest tied to the admitted fill's generation and
     /// geometry. Content invalidation drops hashes through clearHashes;
     /// punching only clears the mark and retains the trusted digest for
-    /// refill verification.
-    pub fn finishPiece(self: *Store, file: *Cached, idx: u32, ok: bool, fill_len: u32, hash: ?[piece.digest_len]u8, now_sec: i64) void {
+    /// refill verification. Only the fill paths inside this file reach it:
+    /// an abort goes through abortFill, so the ok arm's file.mu
+    /// precondition cannot be skipped from outside.
+    fn finishPiece(self: *Store, file: *Cached, idx: u32, ok: bool, fill_len: u32, hash: ?[piece.digest_len]u8, now_sec: i64) void {
         file.mu.lockUncancelable(self.io);
         defer file.mu.unlock(self.io);
         // A forget that raced this fill removed the entry and unlinked its
@@ -2184,6 +2193,46 @@ pub const Store = struct {
         if (cleared) _ = self.saveBits(file, false);
     }
 
+    /// The one lock order for mutating a Cached's size: content_mu then
+    /// file.mu, taken and released as a pair. Every size mutation
+    /// (reconcile, cacheFillIdentified, mf_truncate, a write-through grow)
+    /// goes through here, so a site cannot take file.mu alone and let a
+    /// concurrent completeFill publish pre-mutation content.
+    pub fn lockContentAndState(self: *Store, file: *Cached) void {
+        file.content_mu.lockUncancelable(self.io);
+        file.mu.lockUncancelable(self.io);
+    }
+
+    pub fn unlockContentAndState(self: *Store, file: *Cached) void {
+        file.mu.unlock(self.io);
+        file.content_mu.unlock(self.io);
+    }
+
+    /// Record `end` as the entry's size and widen the bitfield to cover it.
+    /// The caller holds the lockContentAndState pair. Marks for bytes
+    /// below the old size stay valid, except the old last piece when the
+    /// old size was not piece-aligned: its mark only covered the bytes the
+    /// old size held, so carrying it across would claim bytes the cache fd
+    /// never wrote. A no-op when the entry is already at or past `end`.
+    pub fn growToLocked(self: *Store, file: *Cached, end: u64) void {
+        if (end <= file.size) return;
+        self.dropWideningPieceMark(file);
+        if (file.xferBusy()) {
+            // resize reallocs the buffer a reader under xfer is walking, so
+            // the realloc is deferred rather than done under it. The
+            // recorded size still moves, so the appended bytes are tracked
+            // by the next open.
+            std.log.warn("bitfield grow deferred for {s} while a read is in flight; appended pieces refill", .{file.rel});
+        } else {
+            file.bits.resize(self.gpa, piece.count(end, self.piece_size)) catch {
+                // OOM leaves the field undersized: appended pieces stay
+                // unmarked and re-hydrate instead of serving hole zeros.
+                std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{file.rel});
+            };
+        }
+        file.size = end;
+    }
+
     /// Copies bytes this node just wrote through the mount into the local
     /// cache and marks the pieces they fully span, recording the post-write
     /// origin identity so a later getIdentified does not treat this node's
@@ -2210,31 +2259,10 @@ pub const Store = struct {
         var dropped: ?piece.Bitfield = null;
         defer if (dropped) |*ob| ob.deinit(self.gpa);
         {
-            file.content_mu.lockUncancelable(self.io);
-            defer file.content_mu.unlock(self.io);
-            file.mu.lockUncancelable(self.io);
-            defer file.mu.unlock(self.io);
+            self.lockContentAndState(file);
+            defer self.unlockContentAndState(file);
             if (end > file.size) {
-                // Our own append: earlier piece marks stay valid. But when
-                // the old size was not piece-aligned, the old last piece is
-                // short and its mark only covered the bytes the old size
-                // held -- carrying it across the grow would claim bytes the
-                // cache fd never wrote.
-                self.dropWideningPieceMark(file);
-                if (file.xferBusy()) {
-                    // Same skip as the OOM below, for the same safety reason:
-                    // resize reallocs the buffer a reader under xfer is
-                    // walking. The recorded size still moves, so the appended
-                    // bytes are tracked by the next open.
-                    std.log.warn("bitfield grow deferred for {s} while a read is in flight; appended pieces refill", .{rel});
-                } else {
-                    file.bits.resize(self.gpa, piece.count(end, self.piece_size)) catch {
-                        // OOM leaves the field undersized: appended pieces stay
-                        // unmarked and re-hydrate instead of serving hole zeros.
-                        std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
-                    };
-                }
-                file.size = end;
+                self.growToLocked(file, end);
             } else if (end < file.size) {
                 // Entry is longer than the observed origin: someone truncated
                 // externally. Reset like reconcile instead of keeping marks
@@ -2324,7 +2352,7 @@ pub const Store = struct {
         file.content_mu.lockUncancelable(self.io);
         defer file.content_mu.unlock(self.io);
 
-        const busy = file.xfer.load(.monotonic) != 0;
+        const busy = file.xferBusy();
         var copied = false;
         if (!busy) {
             const cfd = self.openCache(file);
@@ -2473,7 +2501,7 @@ pub const Store = struct {
         // Bytes of this entry may be mid-send to a fetching peer (stalled
         // socket, multi-piece response): punching now ships hole zeros that
         // the peer cannot tell from real data and will mark filled.
-        if (file.xfer.load(.monotonic) != 0) return false;
+        if (file.xferBusy()) return false;
         if (!file.bits.get(idx)) return false;
         const fd = if (file.cache_fd >= 0) file.cache_fd else self.openCacheUnlocked(file);
         if (fd < 0) {
@@ -2504,7 +2532,7 @@ pub const Store = struct {
         // read landing during it would otherwise pread the hole about to be
         // cut here. The cut is deferred, not lost: the read's drop lets the
         // next cull round finish the job.
-        if (file.xfer.load(.monotonic) != 0) {
+        if (file.xferBusy()) {
             file.bits.set(idx);
             _ = self.saveBits(file, false);
             return false;
@@ -2531,7 +2559,7 @@ pub const Store = struct {
     /// filled. xfer is held across that send (serveData); a later truncate
     /// or a reopen after reapIdle closed the fd still applies the cut.
     pub fn truncateCacheFd(file: *Cached, new_size: u64) void {
-        if (file.cache_fd >= 0 and file.xfer.load(.monotonic) == 0) {
+        if (file.cache_fd >= 0 and !file.xferBusy()) {
             const tr = sys.ftruncate(file.cache_fd, new_size);
             if (tr != 0)
                 std.log.warn("cache truncate failed for {s} (errno {d}); unmarked pieces refill", .{ file.rel, -tr });

@@ -807,7 +807,7 @@ fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: p
                         _ = self.store.stats.bytes_from_origin.fetchAdd(ln, .monotonic);
                         _ = self.store.stats.fill_origin_nanos.fetchAdd(fill_dt, .monotonic);
                     } else {
-                        self.store.finishPiece(file, pi, false, 0, null, sys.monoSec(self.io));
+                        self.store.abortFill(file, pi, sys.monoSec(self.io));
                         // statOrigin passed, so the file exists: a failed or short
                         // read is an upstream (origin) failure. Reporting 404 here
                         // would make peers believe the path is gone. Log it too:
@@ -1193,6 +1193,10 @@ fn sendRequest(io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []co
     return fd;
 }
 
+/// Test-only: the one production fetch is fetchRangeInto, which streams into
+/// a caller buffer whose length must match the peer's Content-Length. This
+/// reads the body into a buffer sized from the bytes that actually arrive,
+/// so a peer that clamps an over-long request still reads back here.
 fn fetchRange(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8, start: u64, end: u64) ![]u8 {
     const fd = try sendRequest(io, psk, ip, port, rel, .{ .start = start, .end = end });
     defer sys.close(fd);
