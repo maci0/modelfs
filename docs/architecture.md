@@ -891,6 +891,16 @@ suspended) and `inflight` (peer HTTP handlers currently running, against the cap
 saturation `httpdrop` counts). A journal reader can therefore say whether reads slowed because
 the cache was full or the listener was saturated.
 
+Both gauges are levels, so they do not by themselves fire a tick: the line above prints only
+while some counter moved. Two lines cover the disk-pressure and saturation moves a quiet node
+makes on its own:
+
+| Line | When |
+|---|---|
+| `cache culling started at N% free on <cache> (brun B bcull C bstop S)` / `cache hard culling at N% free ... (bstop S)` / `cache culling stopped at N% free ... (brun B)` | one per `cull.phase` edge in `cullLoop` src/fuse_fs.zig, so a cache filling toward `bcull` is visible before anything is punchable. Hysteresis makes the edges rare |
+| `peer http: refused connection from <ip:port>; N handlers already inflight (cap 16)` | a connection closed unaccepted at `Server.max_inflight`, rate-limited to one per `auth_warn_min_gap_ms` on its own `claimDropWarn` slot, the same bound the 401 and 405 lines use. `httpdrop` keeps the exact count |
+
+
 And the counters worth knowing by name:
 
 | Counter | What it says |

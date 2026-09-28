@@ -423,7 +423,8 @@ declared request body is drained pre-auth under a second bounded hold (64 KiB / 
 Oversized and malformed heads are counted, not logged per event. 401 and 405 journal lines are
 capped to one per second, so a serial scanner cannot fill the journal. Connections refused at
 the cap are counted (`http_dropped`), so saturation is visible from status.json without
-per-drop logging. Server-side allocation is range-bounded: ranges clamp to file size, and
+per-drop logging, and their journal line is capped to one per second on its own slot
+(`claimDropWarn`), the same bound as the 401 and 405 lines. Server-side allocation is range-bounded: ranges clamp to file size, and
 hydration uses one reusable piece-sized buffer. Client-side `/have` bodies are refused above 16 MiB before
 allocation (`max_have_body_bytes`); other allocated bodies honor a 512 MiB cap
 (`max_alloc_body_bytes`). Remaining exposure: 16 slots is small enough to occupy with reconnect

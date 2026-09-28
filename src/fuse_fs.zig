@@ -1752,6 +1752,8 @@ fn cullLoop(st: *State) void {
     // Without this line a broken cache mount silently suspends culling until
     // the disk fills; log each failure run once instead of every 2s tick.
     var statfs_failing = false;
+    // Last phase a journal line named, so the driver logs each edge once.
+    var logged_phase: cull.Phase = .run;
     // In-memory per-file state (map entries, open cache fds) is reaped on a
     // slow cadence: entries idle this long with nothing cached are freed, so
     // nodes churning through many model paths stay bounded without unlinks.
@@ -1782,6 +1784,17 @@ fn cullLoop(st: *State) void {
         if (statfs_failing) std.log.info("cache statfs recovered on {s}; culling resumed", .{st.store.cache});
         statfs_failing = false;
         const ph = cull.phase(free_pct, st.store.water, culling);
+        // One line per phase edge, and this is the only journal signal for
+        // disk pressure: pieces_culled rides the tick line, but a cache
+        // filling toward bcull that has nothing punchable yet moves no
+        // counter at all, so the operator watching the journal sees nothing
+        // until the floor. cull.phase hysteresis keeps the edges rare.
+        if (ph != logged_phase) {
+            var lbuf: [256]u8 = undefined;
+            const line = formatCullPhase(ph, free_pct, st.store.water, st.store.cache, &lbuf);
+            if (ph == .run) std.log.info("{s}", .{line}) else std.log.warn("{s}", .{line});
+            logged_phase = ph;
+        }
         culling = ph != .run;
         if (culling) {
             var n: u32 = 0;
@@ -1793,6 +1806,41 @@ fn cullLoop(st: *State) void {
         }
         napMs(st, 2000);
     }
+}
+
+/// The journal line for one cull phase edge. The caller logs it at warn for
+/// .cull and .stop and at info for the .run recovery. Pure so the wording is
+/// pinned by a test instead of only reachable by filling a real cache to a
+/// watermark. A path too long for `buf` yields the truncated fallback rather
+/// than dropping the line.
+fn formatCullPhase(ph: cull.Phase, free_pct: u32, w: cull.Water, cache: []const u8, buf: []u8) []const u8 {
+    var out = std.Io.Writer.fixed(buf);
+    switch (ph) {
+        .cull => out.print("cache culling started at {d}% free on {s} (brun {d} bcull {d} bstop {d}); unpinned pieces are punched", .{
+            free_pct, cache, w.brun, w.bcull, w.bstop,
+        }) catch return "cache culling started (line truncated)",
+        .stop => out.print("cache hard culling at {d}% free on {s} (bstop {d}); punching to the floor", .{
+            free_pct, cache, w.bstop,
+        }) catch return "cache hard culling (line truncated)",
+        .run => out.print("cache culling stopped at {d}% free on {s} (brun {d})", .{
+            free_pct, cache, w.brun,
+        }) catch return "cache culling stopped (line truncated)",
+    }
+    return out.buffered();
+}
+
+test "cull phase edges name the free percentage and the watermarks" {
+    var buf: [256]u8 = undefined;
+    const w = cull.Water{};
+    try std.testing.expectEqualStrings("cache culling started at 7% free on /var/cache/modelfs (brun 10 bcull 7 bstop 3); unpinned pieces are punched", formatCullPhase(.cull, 7, w, "/var/cache/modelfs", &buf));
+    try std.testing.expectEqualStrings("cache hard culling at 3% free on /var/cache/modelfs (bstop 3); punching to the floor", formatCullPhase(.stop, 3, w, "/var/cache/modelfs", &buf));
+    // The recovery edge carries the level it recovered at, so a reader can
+    // tell a cache that climbed back to half empty from one that grazed brun.
+    try std.testing.expectEqualStrings("cache culling stopped at 12% free on /var/cache/modelfs (brun 10)", formatCullPhase(.run, 12, w, "/var/cache/modelfs", &buf));
+    // A path that cannot fit says so rather than leaving the operator with no
+    // line at all.
+    var tiny: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("cache culling started (line truncated)", formatCullPhase(.cull, 7, w, "/var/cache/modelfs", &tiny));
 }
 
 fn discLoop(st: *State) void {

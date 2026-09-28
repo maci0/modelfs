@@ -39,6 +39,12 @@ pub const Server = struct {
     /// auth_warn_min_gap_ms while http_unauthorized keeps the exact count.
     last_auth_warn_ms: std.atomic.Value(i64) = .init(0),
     last_method_warn_ms: std.atomic.Value(i64) = .init(0),
+    /// Monotonic ms of the last journal line for a connection refused at the
+    /// inflight cap. The cap is a self-inflicted refusal: fetchers on the
+    /// other end see a timeout, so the source address is the only way to
+    /// tell one peer flooding this node from a fleet-wide overload. The same
+    /// CAS gap caps the journal while http_dropped keeps the exact count.
+    last_drop_warn_ms: std.atomic.Value(i64) = .init(0),
 
     pub fn bindAll(self: *Server, specs: []const proto.LeaseAddr) !void {
         var seen_port: std.AutoHashMapUnmanaged(u16, void) = .empty;
@@ -177,13 +183,20 @@ fn acceptLoop(self: *Server, fd: c_int) void {
         // value, so exactly the claims beyond the cap undo themselves.
         if (self.http_inflight.fetchAdd(1, .monotonic) >= Server.max_inflight) {
             _ = self.http_inflight.fetchSub(1, .monotonic);
-            // Counted rather than logged: each drop is one close(2), and
-            // logging them would hand a connection storm the same
-            // log-flooding lever the malformed-head path refuses. The
-            // counter rides status.json and the tick line instead, so
-            // saturation is visible without giving up the cap's flood
-            // protection.
+            // Counted on every refusal; the line is rate-limited, not
+            // dropped. Logging nothing at all left the operator with
+            // `httpdrop=N` and no way to tell one peer opening connections
+            // faster than this node can drain them from a fleet-wide
+            // overload. The CAS in claimDropWarn keeps the same bound the
+            // 401 and 405 lines use, so a connection storm cannot buy a warn
+            // per accept; status.json keeps the exact count either way.
             _ = self.store.stats.http_dropped.fetchAdd(1, .monotonic);
+            if (claimDropWarn(self, sys.monoMs(self.io))) {
+                var abuf: [64]u8 = undefined;
+                std.log.warn("peer http: refused connection from {s}; {d} handlers already inflight (cap {d})", .{
+                    peerAddrText(peer, &abuf), self.http_inflight.load(.monotonic), Server.max_inflight,
+                });
+            }
             sys.close(cfd);
             continue;
         }
@@ -225,6 +238,20 @@ fn claimAuthWarn(self: *Server, now_ms: i64) bool {
 
 fn claimMethodWarn(self: *Server, now_ms: i64) bool {
     return claimWarn(&self.last_method_warn_ms, now_ms);
+}
+
+fn claimDropWarn(self: *Server, now_ms: i64) bool {
+    return claimWarn(&self.last_drop_warn_ms, now_ms);
+}
+
+test "claimDropWarn keeps its own window" {
+    var srv = Server{ .gpa = std.testing.allocator, .io = std.testing.io, .psk = "x", .store = undefined };
+    try std.testing.expect(claimDropWarn(&srv, 3_000));
+    try std.testing.expect(!claimDropWarn(&srv, 3_500));
+    // The cap refusal and the 401/405 lines share auth_warn_min_gap_ms but
+    // not the slot: a saturated listener must still name its source.
+    try std.testing.expect(claimAuthWarn(&srv, 3_000));
+    try std.testing.expect(!claimAuthWarn(&srv, 3_500));
 }
 
 test "claimAuthWarn allows one line per gap window" {
