@@ -54,7 +54,9 @@ ignore = [
     "repeated-append",
     "too-many-locals",
 ]
-# The benchmark-CLI main() takes 16 arguments by design.
+# The verifier sweeps every piece from one scope: the per-piece target node,
+# port, request, and bitfield checks are locals of main(), and splitting them
+# out would only move the same frame into helpers.
 "scripts/cluster_verify.py" = ["too-many-locals"]
 
 # Flag typing-only imports even when a runtime sibling from the same

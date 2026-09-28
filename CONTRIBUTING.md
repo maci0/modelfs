@@ -15,9 +15,16 @@ both at once:
 | Python | 3.12 | [.python-version](.python-version) (setup-uv reads it) |
 | uv | see manifest | `[tool.uv] required-version` in [pyproject.toml](pyproject.toml) |
 | ruff, mypy | exact | [requirements-dev.lock.txt](requirements-dev.lock.txt) |
+| shellcheck | any that defines every `enable=` in [.shellcheckrc](.shellcheckrc) | [.shellcheckrc](.shellcheckrc): `check.sh` compares those names against `shellcheck --list-optional` and fails on one it does not know |
+
+shellcheck has no version pin because it is a distribution package and CI
+reads whatever the runner image ships. The name check covers the same gap
+from the other side: an older shellcheck that never defined an optional
+check ignores the name in `.shellcheckrc` without a warning, so the gate
+would otherwise pass having run fewer rules than CI does.
 
 Also needed from the package manager: libfuse3 headers (`libfuse3-dev` /
-`fuse3-devel`) and shellcheck. The gate also extracts the vendored arm64
+`fuse3-devel`). The gate also extracts the vendored arm64
 packages on every host: install `dpkg-deb` (the `dpkg` package), or `binutils`
 (for `ar`), `tar`, and `zstd`. GNU tar's `--zstd` flag still requires the
 `zstd` executable. Then:

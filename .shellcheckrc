@@ -3,6 +3,11 @@
 # the same glob; without this file it would skip every optional check
 # and pass scripts the gate rejects.
 #
+# These are names, not numbers, and a shellcheck that never defined a name
+# drops it without a word, so scripts/check.sh requires every name below to
+# appear in `shellcheck --list-optional` before it lints anything. Adding a
+# name here means the local shellcheck must already know it.
+#
 # Defect-oriented extras this tree already passes: every case statement
 # must handle an unmatched input, bare [ $x ] conditions are ambiguous,
 # which(1) is not portable, variables stay quoted even where currently

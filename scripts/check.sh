@@ -98,6 +98,27 @@ if [[ -n "${missing}" ]]; then
     fail "required tools not found on PATH:${missing} -- see CONTRIBUTING.md (setup section)"
 fi
 
+# Shell lint is the one analyzer this gate cannot pin by version: the tool
+# comes from the package manager, and CI reads whatever the runner image
+# ships. Its optional checks are named, not numbered, in .shellcheckrc, and
+# a shellcheck that does not know a name ignores it: no warning, no error,
+# that rule simply stays off while the gate reports a pass. Require that
+# this shellcheck defines every name the config enables, so an older one
+# fails here instead of linting less than CI does.
+optional_checks="$(shellcheck --list-optional | sed -n 's/^name:[ \t]*//p')" \
+    || fail "shellcheck --list-optional failed; install a newer shellcheck (see CONTRIBUTING.md)"
+[[ -n "${optional_checks}" ]] \
+    || fail "shellcheck --list-optional listed no checks; install a newer shellcheck (see CONTRIBUTING.md)"
+enabled_optional="$(sed -n 's/^enable=//p' "${ROOT_DIR}/.shellcheckrc")" \
+    || fail "cannot read the enable= checks from .shellcheckrc"
+unknown_optional=""
+while IFS= read -r opt; do
+    [[ -n "${opt}" ]] || continue
+    grep -qxF -- "${opt}" <<<"${optional_checks}" || unknown_optional="${unknown_optional} ${opt}"
+done <<<"${enabled_optional}"
+[[ -z "${unknown_optional}" ]] \
+    || fail "shellcheck on PATH does not define the optional checks${unknown_optional} enabled in .shellcheckrc; install a newer shellcheck (see CONTRIBUTING.md)"
+
 # The venv on PATH must be the lockfile's ruff/mypy and the interpreter
 # .python-version names. ruff's required-version also refuses a mismatch,
 # but mypy has no equivalent, and a 3.13 venv would type-check a different

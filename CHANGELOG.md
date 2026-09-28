@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Gate hardening - 2026-09-28
+- **`scripts/check.sh` fails when the local shellcheck does not define an optional check named in `.shellcheckrc`.** Those checks are enabled by name, and a shellcheck that never had one ignores the name silently, so the gate could report a pass while running fewer rules than CI does. The gate now requires every `enable=` in `.shellcheckrc` to appear in `shellcheck --list-optional`. No shell changes: the same scripts lint clean, and the set of enabled rules is unchanged on a current shellcheck.
+
 ## [0.17.0] - 2026-09-28
 
 Minor bump with no behavior changes since 0.16.0.
