@@ -1909,6 +1909,21 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
             _ = sys.unlink(rp);
         } else |_| {}
     }
+    // The new image's counterpart to the outgoing one, and the first line it
+    // can write: attach() runs the session until the mount goes away, so
+    // anything logged after it is a shutdown line. Together the two lines
+    // are what makes an update readable in the journal, including the
+    // restored inode and open-handle counts a held fd across the swap.
+    std.log.info("handover: serving {s} origin={s} cache={s} id={s} piece={d} listen=:{d} nodes={d} opens={d}", .{
+        owned.mount,
+        owned.origin,
+        owned.cache,
+        owned.id,
+        owned.piece,
+        owned.listen,
+        owned.nodes.len,
+        owned.opens.len,
+    });
     const rc = fuse_fs.attach(st, owned.fuse_fd);
     teardownMount(st);
     return @intCast(@min(if (rc < 0) 1 else rc, 255));

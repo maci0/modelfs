@@ -701,6 +701,14 @@ non-UTF-8 paths as byte arrays, and accepts both on decode. This covers origin/c
 cached inode and open-handle paths, and the replacement binary path in `update.req`.
 NFC and NFD spellings remain distinct.
 
+The swap is journaled from both sides, because an exec leaves no other trace: the outgoing
+image logs `handover: execing into <bin> to serve <mount> (listen :<port>)` as its last line
+(the binary path through `proto.displayName`, since it came from the request file), and the
+replacement logs `handover: serving <mount> origin=... cache=... id=... piece=... listen=...
+nodes=N opens=M` before `attach`, which never returns while the mount is up. The pair is what
+distinguishes a handover in the journal from a daemon that died and was restarted, and the
+restored counts say how much of the previous image's state came across.
+
 Two things make that possible:
 
 * **The daemon speaks libfuse's low-level API.** The high-level API keeps the inode table
@@ -794,6 +802,7 @@ recurring logs its first failure and its recovery, and rides a counter in betwee
 | Condition | First failure | Recovery |
 |---|---|---|
 | Origin I/O outage (EIO/ESTALE/ETIMEDOUT on getattr/open/stat, write, or origin pread during fill, cache fallback, or peer `/data` hydration; not ENOENT) | path and errno | `origin recovered` |
+| Origin refusal (ENOSPC/EDQUOT/EROFS/EACCES/EPERM from any origin call, including the direct `create` and `truncate` opens) | path, syscall, and errno | `origin refusals recovered` |
 | Discovery-tick lease publish | `lease publish failed` | `lease publish recovered` |
 | `.cluster` walk unreadable | `cluster leases unreadable` | `cluster leases recovered` |
 | Accept loop | `accept failed` | `accept recovered` |
@@ -802,7 +811,9 @@ recurring logs its first failure and its recovery, and rides a counter in betwee
 
 The lease-publish and `.cluster`-walk failures feed the same `origin_down` flag as FUSE I/O
 (`tickCluster` in src/fuse_fs.zig), so an idle node with a dead origin is visible without
-waiting for a FUSE getattr.
+waiting for a FUSE getattr. A refusal is not an outage and leaves `origin_down` at 0: it gets
+its own edge-triggered line so `writes_err` climbing on the tick line can be traced to a full,
+quota-exhausted, read-only, or permission-denied origin instead of only to a counter.
 
 Unauthorized peer requests, failed piece fetches (with `ip:port` and the error), and cache
 errors log per event. `pin` and `unpin` each land one info line, so "why is this file never
@@ -824,6 +835,13 @@ The tick line carries the only latency signal there is:
 | `http_us` | average `/have`+`/data` handler time, over `http_completed`. Includes misses, invalid ranges, failures, and interrupted sends. `/ping` and requests rejected before entering a handler are neither timed nor counted |
 | `fill_ms peer/nfs` | average per-piece hydration stall by tier. A miss blocks the reader for one whole piece, so this is how "reads got slow" is diagnosed from the journal |
 | `md_us` | interval **total** (these handlers count wall time, not calls) of the getattr/open/statfs latency counters, so a metadata storm is visible in a window where no data read moved. The three publish separately in status.json |
+
+The line also carries the two saturation gauges, which are levels rather than interval deltas
+and are the same readings status.json publishes under the same names: `cache_free_pct` (the
+sample culling runs on, `-1` when the cache filesystem could not be stat'ed, so culling is
+suspended) and `inflight` (peer HTTP handlers currently running, against the cap whose
+saturation `httpdrop` counts). A journal reader can therefore say whether reads slowed because
+the cache was full or the listener was saturated.
 
 And the counters worth knowing by name:
 

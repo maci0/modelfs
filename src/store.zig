@@ -351,6 +351,18 @@ pub const Store = struct {
     /// or peer /data hydration that hits EIO after a successful stat is not
     /// silent in status.json.
     origin_io_down: std.atomic.Value(bool) = .init(false),
+    /// Edge-triggered origin refusal flag: the journal-only twin of
+    /// origin_io_down for a full or unwritable origin (ENOSPC, EDQUOT,
+    /// EROFS, EACCES, EPERM). Those errnos are not NFS outages, so they
+    /// deliberately leave origin_down at 0, but before this flag the whole
+    /// class was journal-silent: a client ingested into a full origin and
+    /// saw nothing but `writes_err` climbing on the tick line, with no
+    /// path, no errno, and no way to tell "disk full" from "permissions
+    /// changed". Same edge-triggered shape as origin_io_down (first
+    /// failure names what and where, the next success names recovery), and
+    /// not published in status.json: it describes a state of the origin,
+    /// not liveness of this daemon.
+    origin_refused: std.atomic.Value(bool) = .init(false),
     /// Publish ordinal for the manifest temp name (see publishManifest).
     /// A counter, not the OS thread id: the thread that wins a close is a
     /// scheduling outcome, so a name built from it left a differently named
@@ -513,26 +525,51 @@ pub const Store = struct {
     /// and stays counted in reads_err/writes_err without raising the flag --
     /// a planted-symlink write would otherwise look like the origin died,
     /// then log "origin recovered" on the next successful op of a different
-    /// file. replyOriginStat keeps its own 404/400/502 split: a peer fetch
+    /// file. A refusal still gets a journal line, on its own flag
+    /// (`originRefused`); only origin_down stays 0 for it. replyOriginStat
+    /// keeps its own 404/400/502 split: a peer fetch
     /// still needs to tell "nobody has this file" from "this node cannot
     /// stat the origin", including ELOOP through a looping parent.
     pub fn originIoOutage(e: i32) bool {
         return e == c.EIO or e == c.ESTALE or e == c.ETIMEDOUT;
     }
 
-    /// First infrastructure origin failure logs path and errno; later ones
-    /// stay counted-only until a success (rc >= 0) clears the flag. `what`
-    /// names the syscall ("stat", "write") so the line is greppable.
+    /// True when the origin answered but refused the operation for a reason
+    /// an operator has to act on: no space, no quota, a read-only export, or
+    /// a permissions change. Each names one fix, so the first one logs; the
+    /// rest stay counted in writes_err/reads_err like every other path-level
+    /// errno. ENOENT, EISDIR, ELOOP, and ENAMETOOLONG are excluded: they are
+    /// ordinary workload answers (a raced unlink, a planted symlink) and
+    /// logging them would bury the refusals that matter.
+    pub fn originRefused(e: i32) bool {
+        return e == c.ENOSPC or e == c.EDQUOT or e == c.EROFS or e == c.EACCES or e == c.EPERM;
+    }
+
+    /// First origin failure of a class logs path and errno; later ones of the
+    /// same class stay counted-only until a success (rc >= 0) clears the
+    /// flags. `what` names the syscall ("stat", "write") so the line is
+    /// greppable. Failure and recovery are class-specific because the fixes
+    /// differ: an NFS outage is `origin recovered`, a full origin is
+    /// `origin refusals recovered`. A success clears both, since the origin
+    /// answering at all is what each flag claims to be watching.
     pub fn noteOriginIo(self: *Store, rel: []const u8, rc: i32, what: []const u8) void {
         if (rc >= 0) {
             if (self.origin_io_down.swap(false, .monotonic))
                 std.log.info("origin recovered", .{});
+            if (self.origin_refused.swap(false, .monotonic))
+                std.log.info("origin refusals recovered", .{});
             return;
         }
         const e: i32 = -rc;
-        if (!originIoOutage(e)) return;
-        if (!self.origin_io_down.swap(true, .monotonic))
-            std.log.warn("origin {s} failed for {s} (errno {d})", .{ what, rel, e });
+        if (originIoOutage(e)) {
+            if (!self.origin_io_down.swap(true, .monotonic))
+                std.log.warn("origin {s} failed for {s} (errno {d})", .{ what, rel, e });
+            return;
+        }
+        if (originRefused(e)) {
+            if (!self.origin_refused.swap(true, .monotonic))
+                std.log.warn("origin {s} refused for {s} (errno {d})", .{ what, rel, e });
+        }
     }
 
     pub fn deinit(self: *Store) void {
@@ -2881,6 +2918,30 @@ test "noteOriginIo edge-triggers infrastructure origin failures" {
     try std.testing.expect(Store.originIoOutage(c.EIO));
     try std.testing.expect(Store.originIoOutage(c.ESTALE));
     try std.testing.expect(Store.originIoOutage(c.ETIMEDOUT));
+
+    // A refusal is not an outage, but it is journaled: the two classes carry
+    // separate flags, so the recovery line names the fix the operator needs.
+    try std.testing.expect(Store.originRefused(c.ENOSPC));
+    try std.testing.expect(Store.originRefused(c.EDQUOT));
+    try std.testing.expect(Store.originRefused(c.EROFS));
+    try std.testing.expect(Store.originRefused(c.EACCES));
+    try std.testing.expect(Store.originRefused(c.EPERM));
+    try std.testing.expect(!Store.originRefused(c.ENOENT));
+    try std.testing.expect(!Store.originRefused(c.EISDIR));
+    try std.testing.expect(!Store.originRefused(c.EIO));
+    try std.testing.expect(st.origin_refused.load(.monotonic));
+    st.noteOriginIo("full2.bin", -c.ENOSPC, "write");
+    try std.testing.expect(st.origin_refused.load(.monotonic));
+    st.noteOriginIo("ok.bin", 0, "write");
+    try std.testing.expect(!st.origin_refused.load(.monotonic));
+    // An outage failure never raises the refusal flag: origin_down answers
+    // the NFS question, and a second class would double the journal lines
+    // for one incident.
+    st.noteOriginIo("a.bin", -c.EIO, "stat");
+    try std.testing.expect(!st.origin_refused.load(.monotonic));
+    try std.testing.expect(st.origin_io_down.load(.monotonic));
+    st.noteOriginIo("a.bin", 0, "stat");
+    try std.testing.expect(!st.origin_io_down.load(.monotonic));
 
     // First infrastructure failure raises the flag; a second one stays quiet
     // so a busy FUSE read storm cannot flood the journal.

@@ -884,7 +884,16 @@ fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) c
     const cflags: c_int = sys.c.O_CREAT | sys.c.O_RDWR | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK |
         (if (excl) sys.c.O_EXCL else sys.c.O_TRUNC);
     const fd = sys.open(op, cflags, clientCreateMode(mode));
-    if (fd < 0) return sys.negErrno();
+    if (fd < 0) {
+        // A refusal here (no space, read-only export, permissions) is the
+        // only thing in the daemon that says the origin stopped accepting
+        // new model files; noteOriginIo names the path and errno once
+        // instead of leaving the client to carry it. ENOENT/EEXIST/EISDIR
+        // stay silent there, as every other path-level answer does.
+        const rc = sys.negErrno();
+        st.store.noteOriginIo(rel, rc, "create");
+        return rc;
+    }
     const cr = sys.closeWrite(fd);
     // O_TRUNC replaced the origin bytes at this path. Cache identity is the
     // path, so a leftover sidecar at the previous size would decode cleanly
@@ -1386,10 +1395,20 @@ fn truncateWithClose(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_
     // never on a planted symlink's target (arbitrary daemon-writable file).
     // O_NONBLOCK: a FIFO at the name must not hang this handler.
     const fd = sys.open(op, sys.c.O_WRONLY | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK, 0);
-    if (fd < 0) return sys.negErrno();
+    if (fd < 0) {
+        // Same reasoning as mf_create: an origin refusal on this direct
+        // open/truncate pair is journaled once with its errno, so a
+        // truncated write that the client cannot explain is answerable.
+        const rc = sys.negErrno();
+        st.store.noteOriginIo(rel, rc, "truncate");
+        return rc;
+    }
     const origin_tr = sys.ftruncate(fd, new_size);
     const cr = closeWrite(fd);
-    if (origin_tr != 0) return origin_tr;
+    if (origin_tr != 0) {
+        st.store.noteOriginIo(rel, origin_tr, "truncate");
+        return origin_tr;
+    }
     // Map lookup must take store.mu; lookupRef also pins the entry against
     // eviction for the duration of the truncate.
     const live = st.store.lookupRef(rel);
@@ -1747,7 +1766,12 @@ fn meanPerOp(total: u64, count: u64, unit: u64) u64 {
 /// immediate warns. Deltas name the last interval, so a stalled ingest or a
 /// read storm is visible straight from the journal; rd_us/wr_us and the
 /// fill_ms pair and http_us are per-op averages over those deltas, the
-/// latency signals this daemon publishes.
+/// latency signals this daemon publishes. The two gauges ride the same
+/// line: they are levels, not deltas, and status.json alone left a journal
+/// reader unable to say whether the cache was filling up or the peer
+/// listener was saturated. A node whose only activity is culling still
+/// moves `culled`, so the line keeps firing exactly when the free space
+/// matters.
 fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
     const cur = st.store.stats.snap();
     defer prev.* = cur;
@@ -1756,12 +1780,16 @@ fn logStatsTick(st: *State, prev: *store_mod.Stats.Snap) void {
         @field(d, f.name) = @field(cur, f.name) -| @field(prev.*, f.name);
     }
     if (std.meta.eql(d, store_mod.Stats.Snap{})) return;
+    // -1 is the same "cache filesystem could not be stat'ed" reading
+    // status.json publishes, so one number means the same thing in both.
+    const free_pct: i32 = if (st.store.freePercentChecked()) |pct| @intCast(pct) else -1;
+    const inflight = st.server.http_inflight.load(.monotonic);
     var line_buf: [1536]u8 = undefined;
-    const line = formatStatsTick(d, &line_buf) catch return;
+    const line = formatStatsTick(d, free_pct, inflight, &line_buf) catch return;
     std.log.info("{s}", .{line});
 }
 
-fn formatStatsTick(d: store_mod.Stats.Snap, buf: []u8) ![]const u8 {
+fn formatStatsTick(d: store_mod.Stats.Snap, free_pct: i32, inflight: u64, buf: []u8) ![]const u8 {
     const mib = 1024 * 1024;
     const rd_us = meanPerOp(d.read_nanos, d.reads_completed, std.time.ns_per_us);
     const wr_us = meanPerOp(d.write_nanos, d.writes_completed, std.time.ns_per_us);
@@ -1833,6 +1861,10 @@ fn formatStatsTick(d: store_mod.Stats.Snap, buf: []u8) ![]const u8 {
         d.fsync_completed,
         meanPerOp(d.fsync_nanos, d.fsync_completed, std.time.ns_per_us),
     });
+    // Saturation gauges, named as status.json names them: cache_free_pct is
+    // -1 when the cache filesystem could not be stat'ed (culling suspended),
+    // and inflight is the peer HTTP server's current handler count.
+    try w.print(" cache_free_pct={d} inflight={d}", .{ free_pct, inflight });
     return w.buffered();
 }
 
@@ -3008,6 +3040,18 @@ fn execHandover(st: *State) !void {
     const argv_z = try handover.execArgvZ(gpa, bin, state_fd, st.mountpoint);
     // Only reached when execve fails: on success this image is gone.
     defer handover.freeExecArgvZ(gpa, argv_z);
+    // The last line this image writes. An exec leaves no other trace in the
+    // journal, so without it an operator reading the log after `modelfs
+    // update` sees one mount line and a silent discontinuity with no way to
+    // tell a handover from a daemon that died and was restarted. The binary
+    // path comes from the request file and goes through proto.displayName,
+    // never verbatim, so it cannot forge a following line or inject
+    // terminal escapes.
+    std.log.info("handover: execing into {s} to serve {s} (listen :{d})", .{
+        proto.displayName(bin),
+        st.mountpoint,
+        st.listen_port,
+    });
     _ = sys.c.execve(bz, @ptrCast(argv_z.ptr), std.c.environ);
     return error.ExecFailed;
 }
@@ -3630,7 +3674,7 @@ test "FUSE fsync publishes origin outcomes and latency without counting rejected
     defer doc.deinit();
     try std.testing.expectEqualDeep(stats, doc.value.stats);
     var line_buf: [1536]u8 = undefined;
-    const line = try formatStatsTick(stats, &line_buf);
+    const line = try formatStatsTick(stats, 37, 2, &line_buf);
     try std.testing.expect(std.mem.find(u8, line, " fsync_ok=2 fsync_err=1 fsync_completed=3 fsync_us=") != null);
 }
 
@@ -3644,11 +3688,13 @@ test "formatStatsTick divides latency by all timed completions" {
         .write_nanos = 9000,
         .fsync_completed = 2,
         .fsync_nanos = 8000,
-    }, &buf);
+    }, -1, 0, &buf);
     try std.testing.expect(std.mem.find(u8, line, " rd_us=2 ") != null);
     try std.testing.expect(std.mem.find(u8, line, " wr_us=3 ") != null);
     try std.testing.expect(std.mem.find(u8, line, " reads_completed=4 writes_completed=3") != null);
-    try std.testing.expect(std.mem.endsWith(u8, line, " fsync_completed=2 fsync_us=4"));
+    // Saturation gauges close the line: the journal reader gets the cache
+    // free percentage and the peer listener depth, not just status.json.
+    try std.testing.expect(std.mem.endsWith(u8, line, " cache_free_pct=-1 inflight=0"));
 }
 
 test "meanPerOp does not overflow the per-op divisor" {
