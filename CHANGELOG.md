@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-28
+
 ### Added - 2026-09-28
 - **`modelfs config` reports the configuration a mount would run with.** Every other way to learn what a node was configured with is indirect: `status` answers from a live daemon (so it says nothing on a node whose daemon is down, which is when the question is asked), and the resolved value cannot say where it came from, so a node reading `origin = /net/192.168.0.100/models` cannot tell MODELFS_ORIGIN from `--origin` from the default and the documented "an explicit flag wins" could not be checked at all. The new command prints one `key = value (source)` line per knob, the source being the flag, the variable, or `(default)`, so two nodes are compared by `diff`ing two dumps and a wrong value names the knob that set it. `Opts` carries a `from_env` and a `from_flag` bit per knob (`KnobSet`), set where the value is set, and `knobSource` reports them in the order the parser applies them. `config` resolves the same mount options `mount` does (`mountScope` now covers both, and `MODELFS_ID` is read for it as it is for `mount`), so a value can be checked before a mount commits to it, and it reads neither the daemon nor the origin. The inline PSK is reported as set and never printed: a config dump lands in a terminal scrollback, a CI log, and a paste. Nothing else reads the new fields, and every value a mount would use is reported as it would be used.
 
@@ -1355,7 +1357,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/maci0/modelfs/releases/tag/v0.18.0
 [0.17.0]: https://github.com/maci0/modelfs/releases/tag/v0.17.0
 [0.16.0]: https://github.com/maci0/modelfs/releases/tag/v0.16.0
 [0.15.1]: https://github.com/maci0/modelfs/releases/tag/v0.15.1
