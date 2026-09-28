@@ -771,6 +771,19 @@ pub fn writeFileOwnerOnlyDurable(path: [*:0]const u8, data: []const u8) i32 {
     return writeFileFull(path, data, c.O_NOFOLLOW | c.O_NONBLOCK, true, 0o600);
 }
 
+/// writeFileExec plus fsync-before-close at 0755: for self-update binary
+/// replacements so the staged file is executable and durable before rename.
+pub fn writeFileExec(path: [*:0]const u8, data: []const u8) i32 {
+    return writeFileFull(path, data, c.O_NOFOLLOW | c.O_NONBLOCK, true, 0o755);
+}
+
+/// Resolves /proc/self/exe into buf; returns error.NoExe when unresolvable or truncated.
+pub fn selfExe(io: std.Io, buf: *[c.PATH_MAX]u8) ![]const u8 {
+    const n = try std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", buf);
+    if (n == 0 or n >= buf.len) return error.NoExe;
+    return buf[0..n];
+}
+
 pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![]u8 {
     return readFileAllocOpenErrno(gpa, path, max, null, null);
 }
@@ -1537,4 +1550,21 @@ test "chmod statfs and opendir NoFollow refuse a planted symlink" {
     try std.testing.expectEqual(@as(c.mode_t, 0o644), st.st_mode & 0o777);
     var rbuf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("s3cret", try readFileBuf(&rbuf, target_z));
+}
+
+test "writeFileExec sets 0755 permissions and selfExe resolves" {
+    var db: [128]u8 = undefined;
+    const scratch = try scratchDir(&db, "modelfs-test-exec");
+    defer deleteTree(std.testing.io, scratch);
+    var pb: [192]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&pb, "{s}/test_bin", .{scratch});
+
+    try std.testing.expectEqual(@as(i32, 0), writeFileExec(path, "#!/bin/sh\nexit 0\n"));
+    var st: c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), statPath(path, &st));
+    try std.testing.expectEqual(@as(c.mode_t, 0o755), st.st_mode & 0o777);
+
+    var exe_buf: [c.PATH_MAX]u8 = undefined;
+    const exe = try selfExe(std.testing.io, &exe_buf);
+    try std.testing.expect(exe.len > 0);
 }

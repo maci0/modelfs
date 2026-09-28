@@ -150,7 +150,7 @@ held_before="$(< "${W}/held.before")"
 want_before="$(< "${W}/want.before")"
 [[ "${held_before}" == "${want_before}" ]] || fail "read before the update returned the wrong bytes"
 
-"${BIN}" update --cache "${W}/cache" || fail "modelfs update exited nonzero"
+"${BIN}" update --reload --cache "${W}/cache" || fail "modelfs update exited nonzero"
 
 : > "${W}/held.go"
 wait "${holder}" || fail "the held reader exited nonzero across the update"
@@ -183,7 +183,7 @@ rmdir "${MNT}/after" || fail "rmdir failed after the update"
 # The second update runs against an image that was itself attached, so it
 # proves the captured FUSE_INIT survives the round trip through the state
 # blob rather than only the first exec.
-"${BIN}" update --cache "${W}/cache" || fail "second modelfs update exited nonzero"
+"${BIN}" update --reload --cache "${W}/cache" || fail "second modelfs update exited nonzero"
 note="$(< "${MNT}/sub/note.txt")"
 [[ "${note}" == "hello" ]] || fail "mount stopped serving after the second update"
 pid_after="$(status_pid)"

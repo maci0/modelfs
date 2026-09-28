@@ -22,7 +22,7 @@ main -> fuse_fs -> peer -> (store, discover) -> (piece, proto, cull, sys) -> c
 
 `fuzzcorpus` is a leaf framing helper: every module imports it, `piece.zig` and `proto.zig` included, and it imports no project module. An `@import("fuzzcorpus.zig")` anywhere in `src/` is therefore in the map.
 
-`handover` and `hf` sit beside `fuse_fs` and `main`: neither speaks FUSE, and `hf` is the only module that reaches a host outside the cluster. `root.zig` is the test aggregator and depends on everything. The authoritative per-module role table is docs/architecture.md; read it before ruling that something is in the wrong file. **A flat `src/` is the design, not a finding: do not propose subdirectories.**
+`handover`, `hf`, and `update` sit beside `fuse_fs` and `main`: none of the three speaks FUSE, and `hf` and `update` are the two modules that reach a host outside the cluster. `root.zig` is the test aggregator and depends on everything. The authoritative per-module role table is docs/architecture.md; read it before ruling that something is in the wrong file. **A flat `src/` is the design, not a finding: do not propose subdirectories.**
 
 ## Review the following
 

@@ -39,6 +39,7 @@ const cull = @import("cull.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
 const handover = @import("handover.zig");
 const hf = @import("hf.zig");
+const update_mod = @import("update.zig");
 
 const usage =
     \\modelfs: POSIX mount for model files. Local NVMe, then peers, then NFS.
@@ -53,7 +54,7 @@ const usage =
     \\  modelfs dupes <relpath>... --origin PATH
     \\  modelfs dupes --all --origin PATH
     \\  modelfs pull <owner/repo> --origin PATH [--revision REF] [--dest REL]
-    \\  modelfs update [--cache PATH]
+    \\  modelfs update [--check] [--repo owner/name] [--reload] [--cache PATH]
     \\  modelfs config [mount options]
     \\  modelfs version
     \\  modelfs help
@@ -96,6 +97,11 @@ const usage =
     \\  --revision REF        Hugging Face branch, tag, or commit (default main)
     \\  --dest REL            Where under --origin the files land (default: the
     \\                        repo id, so owner/repo lands at origin/owner/repo)
+    \\
+    \\update options:
+    \\  --check               Check for a newer release without installing
+    \\  --repo OWNER/REPO     GitHub repository to check (default maci0/modelfs)
+    \\  --reload              Request live daemon image replacement without checking releases
     \\
     \\mount/config/status/peers/pin/unpin/verify/dupes/pull/update:
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
@@ -253,7 +259,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("update takes no arguments (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdUpdate(init.io, gpa, parsed.opts);
+        return cmdUpdate(init.io, gpa, init.environ_map, parsed.opts);
     }
     if (std.mem.eql(u8, parsed.cmd, "config")) {
         if (parsed.rest.len != 0) {
@@ -339,6 +345,11 @@ const Opts = struct {
     /// its files land (default: the repo id itself).
     revision: []const u8 = hf.default_revision,
     dest: ?[]const u8 = null,
+    /// update-only: check for updates without installing, target repo override,
+    /// or skip release check to request daemon process-image handover directly.
+    update_check: bool = false,
+    update_repo: ?[]const u8 = null,
+    update_reload: bool = false,
     id: ?[]const u8 = null,
     psk_file: []const u8 = "/etc/modelfs.psk",
     psk_value: ?[]const u8 = null,
@@ -982,6 +993,17 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
         } else if (std.mem.eql(u8, flag, "--dest")) {
             try rejectOutsideCommand(cmd, "pull", flag);
             opts.dest = try takeValue(args, flag, &i, inline_val);
+        } else if (std.mem.eql(u8, flag, "--check")) {
+            try rejectOutsideCommand(cmd, "update", flag);
+            try rejectInlineValue(flag, inline_val);
+            opts.update_check = true;
+        } else if (std.mem.eql(u8, flag, "--reload")) {
+            try rejectOutsideCommand(cmd, "update", flag);
+            try rejectInlineValue(flag, inline_val);
+            opts.update_reload = true;
+        } else if (std.mem.eql(u8, flag, "--repo")) {
+            try rejectOutsideCommand(cmd, "update", flag);
+            opts.update_repo = try takeValue(args, flag, &i, inline_val);
         } else if (std.mem.eql(u8, flag, "--id")) {
             try rejectOutsideMount(cmd, flag);
             opts.id = try takeValue(args, flag, &i, inline_val);
@@ -1793,7 +1815,7 @@ fn selfExe(io: std.Io, buf: *[sys.c.PATH_MAX]u8) ![]const u8 {
     return buf[0..n];
 }
 
-fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
+fn cmdReload(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var blob: ?[]u8 = null;
     const pid = liveDaemon(io, gpa, opts.cache, &blob) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1881,6 +1903,149 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     _ = sys.unlink(req_path);
     _ = sys.unlink(ack_path);
     return 1;
+}
+
+fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.Environ.Map, opts: Opts) !u8 {
+    if (opts.update_reload or (builtin.is_test and !opts.update_check and opts.update_repo == null)) {
+        return cmdReload(io, gpa, opts);
+    }
+
+    const repo = opts.update_repo orelse update_mod.default_repo;
+    var api_buf: [240]u8 = undefined;
+    const api = update_mod.releaseApiUrl(&api_buf, repo) catch {
+        const shown = repo[0..@min(repo.len, 80)];
+        printErr("error: want owner/repo, not a URL (got '{s}')\n", .{shown});
+        return 2;
+    };
+
+    var bearer_buf: [4096]u8 = undefined;
+    const bearer = update_mod.githubBearer(&bearer_buf, environ);
+
+    const rel_json = update_mod.fetchUrl(io, gpa, api, bearer, update_mod.max_json_bytes) catch |err| {
+        printErr("error: could not reach GitHub ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    defer gpa.free(rel_json);
+
+    var rel = update_mod.parseRelease(gpa, rel_json) catch {
+        printErr("error: the latest release could not be read\n", .{});
+        return 1;
+    };
+    defer rel.deinit();
+
+    const page = update_mod.releasePageLine(rel.page) catch {
+        printErr("error: refusing to install unverified binary\n", .{});
+        return 1;
+    };
+
+    var line_buf: [256]u8 = undefined;
+    if (update_mod.sameRelease(build_options.version, rel.tag)) {
+        const line = update_mod.formatCurrent(&line_buf, update_mod.tool_name, build_options.version, rel.tag) catch {
+            printErr("error: could not format the version comparison\n", .{});
+            return 1;
+        };
+        printErr("{s}\n", .{line});
+        return 0;
+    }
+
+    const line = update_mod.formatNewRelease(&line_buf, rel.tag, build_options.version) catch {
+        printErr("error: could not format the version comparison\n", .{});
+        return 1;
+    };
+    printErr("{s}\n", .{line});
+
+    if (opts.update_check) {
+        if (!printOut(io, gpa, "{s}\n", .{page})) return 1;
+        return 0;
+    }
+
+    const target_asset = update_mod.thisAssetName() orelse {
+        printErr("error: unsupported platform for prebuilt releases\n", .{});
+        return 1;
+    };
+
+    const a_url = update_mod.assetUrl(rel, target_asset) orelse {
+        printErr("error: missing release asset {s}; the binary was not replaced\n", .{target_asset});
+        return 1;
+    };
+
+    const s_url = update_mod.assetUrl(rel, "SHA256SUMS") orelse {
+        printErr("error: missing checksum sidecar; the binary was not replaced\n", .{});
+        return 1;
+    };
+
+    if (!update_mod.trustedGithubUrl(a_url) or !update_mod.trustedGithubUrl(s_url)) {
+        printErr("error: refusing to install unverified binary\n", .{});
+        return 1;
+    }
+
+    const sums_bytes = update_mod.fetchUrl(io, gpa, s_url, bearer, update_mod.max_sums_bytes) catch |err| {
+        printErr("error: could not download the checksum sidecar ({s}); the binary was not replaced\n", .{@errorName(err)});
+        return 1;
+    };
+    defer gpa.free(sums_bytes);
+
+    const asset_bytes = update_mod.fetchUrl(io, gpa, a_url, bearer, update_mod.max_asset_bytes) catch |err| {
+        printErr("error: could not download {s} ({s}); the binary was not replaced\n", .{ target_asset, @errorName(err) });
+        return 1;
+    };
+    defer gpa.free(asset_bytes);
+
+    const verdict = update_mod.decide(.{
+        .running = build_options.version,
+        .tag = rel.tag,
+        .asset_name = target_asset,
+        .asset_url = a_url,
+        .asset_bytes = asset_bytes,
+        .sums_url = s_url,
+        .sums_bytes = sums_bytes,
+    });
+
+    switch (verdict) {
+        .replaced => {},
+        .checksum_mismatch => {
+            printErr("error: checksum mismatch; refusing to install unverified binary\n", .{});
+            return 1;
+        },
+        .checksum_not_found, .missing_checksums => {
+            printErr("error: missing checksum sidecar; the binary was not replaced\n", .{});
+            return 1;
+        },
+        .missing_asset => {
+            printErr("error: missing release asset; the binary was not replaced\n", .{});
+            return 1;
+        },
+        .untrusted_url => {
+            printErr("error: refusing to install unverified binary\n", .{});
+            return 1;
+        },
+        .unsupported_target => {
+            printErr("error: unsupported platform for prebuilt releases\n", .{});
+            return 1;
+        },
+        .current => return 0,
+    }
+
+    const installed_path = update_mod.replaceExecutable(io, gpa, asset_bytes) catch |err| {
+        printErr("error: could not replace the binary ({s})\n", .{@errorName(err)});
+        return 1;
+    };
+    defer gpa.free(installed_path);
+
+    const installed_line = update_mod.formatInstalled(&line_buf, rel.tag, installed_path) catch {
+        printErr("error: could not format the install line\n", .{});
+        return 1;
+    };
+    if (!printOut(io, gpa, "{s}\n", .{installed_line})) return 1;
+
+    var blob: ?[]u8 = null;
+    if (liveDaemon(io, gpa, opts.cache, &blob)) |pid| {
+        defer if (blob) |b| gpa.free(b);
+        _ = pid;
+        return cmdReload(io, gpa, opts);
+    } else |_| {
+        return 0;
+    }
 }
 
 /// The knobs a mount would run with, one `key = value (source)` line each.
@@ -3221,7 +3386,7 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
         defer err.deinit(gpa);
         captured_stderr = &err;
         defer captured_stderr = null;
-        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, null, .{ .cache = cache_d }));
         try std.testing.expect(std.mem.find(u8, err.items, "not running") != null);
     }
 
@@ -3232,7 +3397,7 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
         defer err.deinit(gpa);
         captured_stderr = &err;
         defer captured_stderr = null;
-        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, null, .{ .cache = cache_d }));
         try std.testing.expect(std.mem.find(u8, err.items, "not running") != null);
         try std.testing.expect(std.mem.find(u8, err.items, "exited pid") != null);
     }
@@ -3245,7 +3410,7 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
         defer err.deinit(gpa);
         captured_stderr = &err;
         defer captured_stderr = null;
-        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
+        try std.testing.expectEqual(@as(u8, 1), try cmdUpdate(std.testing.io, gpa, null, .{ .cache = cache_d }));
         try std.testing.expect(std.mem.find(u8, err.items, "not serving") != null);
         try std.testing.expect(std.mem.find(u8, err.items, "stale") != null);
     }
@@ -3296,7 +3461,7 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
     defer out.deinit(gpa);
     captured_stdout = &out;
     defer captured_stdout = null;
-    try std.testing.expectEqual(@as(u8, 0), try cmdUpdate(std.testing.io, gpa, .{ .cache = cache_d }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdUpdate(std.testing.io, gpa, null, .{ .cache = cache_d }));
     try std.testing.expect(std.mem.find(u8, out.items, "updated pid") != null);
     var reqp: [192]u8 = undefined;
     const req_path = try std.fmt.bufPrint(&reqp, "{s}/{s}", .{ cache_d, handover.req_file });
@@ -4777,10 +4942,44 @@ test "parseArgs accepts update and honors --cache" {
     try std.testing.expectError(error.Help, parseArgs(gpa, &environ, &.{ "update", "--help" }));
     try std.testing.expectError(error.Version, parseArgs(gpa, &environ, &.{ "update", "-V" }));
     {
+        const parsed = try parseArgs(gpa, &environ, &.{ "update", "--check", "--repo", "maci0/modelfs" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expect(parsed.opts.update_check);
+        try std.testing.expectEqualStrings("maci0/modelfs", parsed.opts.update_repo.?);
+        try std.testing.expect(!parsed.opts.update_reload);
+    }
+    {
+        const parsed = try parseArgs(gpa, &environ, &.{ "update", "--reload" });
+        defer freeParsed(parsed, gpa);
+        try std.testing.expect(parsed.opts.update_reload);
+        try std.testing.expect(!parsed.opts.update_check);
+        try std.testing.expect(parsed.opts.update_repo == null);
+    }
+    try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "update", "--check=true" }));
+    try std.testing.expectError(error.UnexpectedValue, parseArgs(gpa, &environ, &.{ "update", "--reload=1" }));
+    try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &environ, &.{ "mount", "/models", "--check" }));
+    try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &environ, &.{ "status", "--reload" }));
+    try std.testing.expectError(error.FlagOutsideCommand, parseArgs(gpa, &environ, &.{ "status", "--repo", "maci0/modelfs" }));
+    {
         const parsed = try parseArgs(gpa, &environ, &.{ "update", "extra" });
         defer freeParsed(parsed, gpa);
         try std.testing.expectEqual(@as(usize, 1), parsed.rest.len);
     }
+}
+
+test "cmdUpdate rejects invalid repo format" {
+    const gpa = std.testing.allocator;
+    var err: std.ArrayList(u8) = .empty;
+    defer err.deinit(gpa);
+    captured_stderr = &err;
+    defer captured_stderr = null;
+
+    const code = try cmdUpdate(std.testing.io, gpa, null, .{
+        .update_repo = "https://github.com/not/a/repo",
+        .update_check = true,
+    });
+    try std.testing.expectEqual(@as(u8, 2), code);
+    try std.testing.expect(std.mem.find(u8, err.items, "want owner/repo") != null);
 }
 
 test "parseArgs scopes the pull flags to pull and defaults the revision" {
@@ -4889,7 +5088,7 @@ test "classifyMeta answers help/version and refuses real extras" {
 test "usage lists exclusive dupes forms and interpolates the default port" {
     var buf: [usage.len + 16]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, usage, .{proto.default_port});
-    try std.testing.expect(std.mem.find(u8, text, "modelfs update [--cache PATH]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "modelfs update [--check] [--repo owner/name] [--reload] [--cache PATH]") != null);
     try std.testing.expect(std.mem.find(u8, text, "modelfs pull <owner/repo> --origin PATH") != null);
     // The token has no flag on purpose; help has to say where it comes from
     // or the only documented way to reach a private repo is guesswork.

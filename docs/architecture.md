@@ -75,6 +75,7 @@ New code goes in the module that already owns that concern.
 | `fuse_fs.zig` | FUSE handlers, daemon `State` (`init`/`spawnWorkers`/`deinit`/`run`/`attach`), discovery/cull loops, process-image handover |
 | `handover.zig` | Sealed-memfd knobs+PSK codec and `update` request/ack for `modelfs update` |
 | `hf.zig` | Hugging Face pulls: id and ref validation, listing/download endpoints, and the download loop for `modelfs pull` |
+| `update.zig` | Self-update from GitHub Releases: release check, asset selection, SHA256SUMS verification, and binary replacement |
 | `main.zig` | CLI and mount wiring into `State.init` / `State.deinit`; mount-time `disableCoreDumps` / `scrubPskEnv` |
 | `determinism.zig` | Test-only source guards: the wall clock and sleep are read only through `sys.zig`, and entropy only through `io.randomSecure` |
 | `root.zig` | Test aggregator for `zig build test` |
@@ -83,8 +84,8 @@ New code goes in the module that already owns that concern.
 a sibling of `store`: both name the origin's `.cluster` namespace through `proto`, so neither
 imports the other and the lease sweep reaches the manifest dir by appending `proto`'s leaf
 rather than spelling it again. `proto` and `piece` share the last group, not two levels of it:
-`proto` reads `piece`'s bitfield codec, and `store` needs both. `handover` and `hf` sit beside
-`fuse_fs`/`main`: neither speaks FUSE, and `hf` is the one place that reaches a host outside
+`proto` reads `piece`'s bitfield codec, and `store` needs both. `handover`, `hf`, and `update` sit beside
+`fuse_fs`/`main`: none of the three speaks FUSE, and `hf` and `update` are the two places that reach a host outside
 the cluster (HTTPS through `std.http.Client`, CLI only).
 
 Time and entropy are the two nondeterminism doors, and both are parameters rather than
@@ -787,6 +788,8 @@ Two things make that possible:
   replayed into the new session (`replayInit`) with the reply dropped. The kernel sends INIT
   once per connection and libfuse answers every request with EIO until it has seen one; nothing
   derived from that request round-trips, so it is kept as bytes.
+
+`modelfs update` checks GitHub Releases (`update.default_repo` or `--repo`), verifies the platform asset against `SHA256SUMS`, and atomically replaces `/proc/self/exe`. With `--check`, it reports whether an update is available without installing. With `--reload`, it skips the release check and directly triggers the daemon process-image handover below. When an update replaces the binary on a system running a live mount, it automatically proceeds to the process-image handover so the live daemon adopts the new binary without dropping the mount.
 
 ```mermaid
 sequenceDiagram

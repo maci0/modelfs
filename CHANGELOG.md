@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added - 2026-09-28
+- **`modelfs update` self-updates from GitHub Releases and hot-reloads live mounts.** The subcommand compares the running version with the latest release on GitHub (`maci0/modelfs` or `--repo`), downloads the architecture-appropriate release binary (`modelfs-x86_64-linux-musl`, `modelfs-aarch64-linux-gnu`, or `modelfs-aarch64-linux-musl`), verifies its SHA-256 against `SHA256SUMS`, and replaces `/proc/self/exe` atomically via a temporary file with executable permissions (`0o755`). `--check` queries releases and reports status without downloading or replacing. `--reload` requests process-image replacement on a running daemon without checking GitHub releases (preserving process-image handover for local builds). When a self-update replaces the binary on a machine with a running daemon, it triggers process-image handover so the live mount seamlessly adopts the new image without dropping the mount.
+
 ## [0.18.0] - 2026-09-28
 
 ### Added - 2026-09-28

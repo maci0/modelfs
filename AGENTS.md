@@ -87,8 +87,8 @@ Suites outside the gate (most need hardware CI lacks):
   `~/.cache/huggingface/token`. argv is world-readable through
   `/proc/<pid>/cmdline`. A handover passes both knobs and PSK on a sealed
   memfd for the same reason.
-- **Only `src/hf.zig` may contact hosts outside the cluster.** The daemon
-  talks to peers and the origin; `modelfs pull` is the one path that contacts
+- **Only `src/hf.zig` and `src/update.zig` may contact hosts outside the cluster.** The daemon
+  talks to peers and the origin; `modelfs pull` and `modelfs update` are the two paths that contact
   a host outside the cluster, from the CLI, never from the mount.
 - **Run artifacts go to the repo's `.scratch/`**, never `/tmp`: it is tmpfs here,
   and a piece cache written there is charged to RAM. Shell `mktemp` templates
