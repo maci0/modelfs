@@ -472,9 +472,14 @@ Verification happens twice:
   fill re-hydrates from the origin instead of failing every serve of that piece.
 
 `modelfs verify <rel>` rehashes a whole file's cached pieces against the manifest and clears
-mismatched marks the same way. Local FUSE reads are not re-verified per read, so a piece that is
-corrupt but never served to a peer waits for `modelfs verify` (operations.md, Integrity
-runbook).
+mismatched marks the same way. It takes the piece grid from the cache's own sidecar header rather
+than from `--piece`, because the daemon that wrote the marks chose the grid, and holds a recorded
+grid to the same rule `--piece` is held to at mount: a positive multiple of the cache filesystem
+block size. The header is eight bytes read off disk and everything downstream sizes itself from it
+(`piece.count` sizes the bitfield the open allocates, the verify buffer is a `piece_size`
+allocation), so a grid the mount path would have refused stops the run instead. Local FUSE reads
+are not re-verified per read, so a piece that is corrupt but never served to a peer waits for
+`modelfs verify` (operations.md, Integrity runbook).
 
 ### Where trusted digests come from
 

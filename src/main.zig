@@ -1332,7 +1332,11 @@ fn checkCachePieceSize(piece_size: u32, block_size: u64) !void {
         return error.BadCachePieceSize;
 }
 
-fn validateCachePieceSize(store: *const store_mod.Store, piece_size: u32) !void {
+/// `what` names where the grid came from, so a refusal reads as the
+/// operator's flag or as the artifact that recorded it. Every grid the
+/// daemon can write passes through here, whether the operator named it or a
+/// sidecar header did.
+fn validateCachePieceSize(store: *const store_mod.Store, piece_size: u32, what: []const u8) !void {
     var buf: [sys.c.PATH_MAX]u8 = undefined;
     const path = try store.cacheDataPath(&buf, "");
     var fs: sys.c.struct_statfs = undefined;
@@ -1343,7 +1347,7 @@ fn validateCachePieceSize(store: *const store_mod.Store, piece_size: u32) !void 
     }
     const block_size = std.math.cast(u64, fs.f_bsize) orelse 0;
     checkCachePieceSize(piece_size, block_size) catch |err| {
-        if (!builtin.is_test) std.log.err("--piece {d} must be a positive multiple of cache filesystem block size {d}", .{ piece_size, block_size });
+        if (!builtin.is_test) std.log.err("{s} {d} must be a positive multiple of cache filesystem block size {d}", .{ what, piece_size, block_size });
         return err;
     };
 }
@@ -1365,7 +1369,7 @@ test "cache piece size validation probes the data filesystem" {
     defer sys.deleteTree(std.testing.io, cache);
     var store = store_mod.Store.init(std.testing.allocator, std.testing.io, "/unused", cache, piece.default_size);
     defer store.deinit();
-    try std.testing.expectError(error.CacheStatfs, validateCachePieceSize(&store, piece.default_size));
+    try std.testing.expectError(error.CacheStatfs, validateCachePieceSize(&store, piece.default_size, "--piece"));
 
     try std.testing.expectEqual(@as(i32, 0), store.ensureLayout());
     var path_buf: [sys.c.PATH_MAX]u8 = undefined;
@@ -1374,9 +1378,9 @@ test "cache piece size validation probes the data filesystem" {
     try std.testing.expectEqual(@as(i32, 0), sys.statfsNoFollow(data, &fs));
     const block_size = std.math.cast(u32, fs.f_bsize) orelse return error.TestUnexpectedResult;
     try std.testing.expect(block_size > 1);
-    try validateCachePieceSize(&store, block_size);
-    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(&store, block_size - 1));
-    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(&store, block_size + 1));
+    try validateCachePieceSize(&store, block_size, "--piece");
+    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(&store, block_size - 1, "--piece"));
+    try std.testing.expectError(error.BadCachePieceSize, validateCachePieceSize(&store, block_size + 1, "--piece"));
 }
 
 fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
@@ -1488,7 +1492,7 @@ fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
         teardownMount(st);
         return 1;
     }
-    validateCachePieceSize(&st.store, opts.piece) catch {
+    validateCachePieceSize(&st.store, opts.piece, "--piece") catch {
         teardownMount(st);
         return 1;
     };
@@ -1920,7 +1924,7 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
         teardownMount(st);
         return 1;
     }
-    validateCachePieceSize(&st.store, owned.piece) catch {
+    validateCachePieceSize(&st.store, owned.piece, "--piece") catch {
         teardownMount(st);
         return 1;
     };
@@ -2211,19 +2215,35 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
     // recency stamps stay on the injected clock.
     var store = store_mod.Store.init(gpa, io, origin, cache, opts.piece);
     defer store.deinit();
-    // The piece grid comes from the cache's own sidecar header, not a flag:
-    // the daemon that wrote the marks chose the grid, and verifying against
-    // a different one would misread every mark (a mismatched grid decodes as
-    // an empty field, so verify would report nothing checked). A missing or
-    // unreadable sidecar falls back to the default grid -- there is nothing
-    // cached to verify anyway.
-    if (store.sidecarPieceSize(rel)) |ps| store.piece_size = ps;
-    const piece_size = store.piece_size;
     const layout_rc = store.ensureLayout();
     if (layout_rc != 0) {
         if (!builtin.is_test) std.log.err("cannot create cache dirs under {s} (errno {d})", .{ cache, -layout_rc });
         return 1;
     }
+    // The piece grid comes from the cache's own sidecar header, not a flag:
+    // the daemon that wrote the marks chose the grid, and verifying against
+    // a different one would misread every mark (a mismatched grid decodes as
+    // an empty field, so verify would report nothing checked). A missing or
+    // unreadable sidecar falls back to the flag's grid -- there is nothing
+    // cached to verify anyway.
+    //
+    // A recorded grid is eight bytes read off disk, and everything below
+    // sizes itself from it: `piece.count` sizes the bitfield the open
+    // allocates, and the verify buffer is a piece_size allocation. The
+    // daemon writes only grids that validateCachePieceSize accepted, so one
+    // that is not a positive multiple of the cache filesystem block size is
+    // not a grid this cache was written on. The sidecar decode cannot catch
+    // it: its length and geometry checks run on the bits that follow the
+    // header, and a header alone is a legal blob to the loader. Refuse the
+    // run rather than size an allocation off it, the same rule the mount
+    // path applies to `--piece` before it trusts the same value.
+    if (store.sidecarPieceSize(rel)) |ps| {
+        var what_buf: [256]u8 = undefined;
+        const what = std.fmt.bufPrint(&what_buf, "cache sidecar for {s}", .{proto.displayName(rel)}) catch "cache sidecar";
+        validateCachePieceSize(&store, ps, what) catch return 1;
+        store.piece_size = ps;
+    }
+    const piece_size = store.piece_size;
     // The piece grid and file size come from the same origin stat the daemon
     // reconciles against; a path that is not a regular origin file has no
     // cache identity to verify.
@@ -3333,6 +3353,21 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     try std.testing.expectEqual(@as(i32, 0), sys.statPath(try sys.toZ(&zb, remaining_pin), &stbuf));
 }
 
+/// Block size of the filesystem holding a store's cache data directory. It
+/// is the one grid a shipped daemon will have written there: `--piece` is
+/// validated against it at mount, and `cmdVerify` holds the grid a sidecar
+/// recorded to the same rule.
+fn cacheFsBlockSize(gpa: std.mem.Allocator, origin: []const u8, cache: []const u8) !u32 {
+    var store = store_mod.Store.init(gpa, std.testing.io, origin, cache, piece.default_size);
+    defer store.deinit();
+    try std.testing.expectEqual(@as(i32, 0), store.ensureLayout());
+    var buf: [sys.c.PATH_MAX]u8 = undefined;
+    const path = try store.cacheDataPath(&buf, "");
+    var fs: sys.c.struct_statfs = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.statfsNoFollow(path, &fs));
+    return std.math.cast(u32, fs.f_bsize) orelse error.TestUnexpectedResult;
+}
+
 test "cmdVerify checks cached pieces against the origin manifest and clears mismatches" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
@@ -3346,7 +3381,12 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     var pbuf: [256]u8 = undefined;
     const origin_fp = try std.fmt.bufPrint(&pbuf, "{s}/m.bin", .{origin_d});
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, origin_fp), "0123456789abcdef"));
-    const opts = Opts{ .origin = origin_d, .cache = cache_d, .piece = 16 };
+    // The sidecar this test builds records the grid, so it is written on a
+    // grid the mount path would have accepted: the cache filesystem's own
+    // block size, which is >= the 16-byte file and leaves it one piece.
+    const grid = try cacheFsBlockSize(gpa, origin_d, cache_d);
+    try std.testing.expect(grid >= 16);
+    const opts = Opts{ .origin = origin_d, .cache = cache_d, .piece = grid };
 
     // Without a manifest there is no trusted reference: nothing to clear,
     // and the summary reports zero checked pieces (exit 0).
@@ -3355,7 +3395,7 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     // Publish the manifest the way a writer's release does: fill the cache
     // from origin, then publish the learned hashes.
     {
-        var store = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, 16);
+        var store = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, grid);
         defer store.deinit();
         try std.testing.expectEqual(@as(i32, 0), store.ensureLayout());
         const f = try store.get("m.bin", 16, sys.monoSec(std.testing.io));
@@ -3373,7 +3413,8 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     // Corrupt the cached piece; verify must find the mismatch, clear the
     // mark, and exit 1 so scripts can react. A mismatched --piece must not
     // decode the sidecar as empty and skip the check: the grid is the
-    // daemon's recorded header, not the flag.
+    // daemon's recorded header, not the flag. The flag is still a legal grid
+    // here, so this stays the recorded-header case and not a refusal.
     var dpb: [256]u8 = undefined;
     const dp = try std.fmt.bufPrint(&dpb, "{s}/data/m.bin", .{cache_d});
     const cfd = sys.open(try sys.toZ(&zb, dp), sys.c.O_WRONLY, 0);
@@ -3384,7 +3425,7 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, .{
         .origin = origin_d,
         .cache = cache_d,
-        .piece = 4096,
+        .piece = grid * 2,
     }, "m.bin"));
 
     // The cleared mark persisted: a second verify finds nothing to check
@@ -3395,7 +3436,51 @@ test "cmdVerify checks cached pieces against the origin manifest and clears mism
     // before any cache or origin I/O.
     try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, opts, "../escape.bin"));
     try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, opts, ".cluster/spark1.json"));
-    try std.testing.expectEqual(@as(u8, 2), try cmdVerify(std.testing.io, gpa, .{ .cache = cache_d, .piece = 16 }, "m.bin"));
+    try std.testing.expectEqual(@as(u8, 2), try cmdVerify(std.testing.io, gpa, .{ .cache = cache_d, .piece = grid }, "m.bin"));
+}
+
+test "cmdVerify refuses a sidecar grid the cache filesystem cannot back" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-verify-grid");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-verify-grid");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var zb: [256]u8 = undefined;
+    var pbuf: [256]u8 = undefined;
+    const origin_fp = try std.fmt.bufPrint(&pbuf, "{s}/m.bin", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zb, origin_fp), "0123456789abcdef"));
+    const grid = try cacheFsBlockSize(gpa, origin_d, cache_d);
+
+    // A bare sidecar header, the shape a torn or hand-edited write leaves:
+    // eight bytes naming a grid, no bits behind them. The loader reads it
+    // happily (a header alone is a legal blob to the bitfield codec), and
+    // `piece.count` would size the bitfield the open allocates off the four
+    // bytes after the magic. 1000 is not a multiple of any block size a
+    // Linux filesystem reports, so no shipped daemon wrote this cache.
+    var mb: [sys.c.PATH_MAX]u8 = undefined;
+    const mp = blk: {
+        var store = store_mod.Store.init(gpa, std.testing.io, origin_d, cache_d, piece.default_size);
+        defer store.deinit();
+        try std.testing.expectEqual(@as(i32, 0), store.ensureLayout());
+        break :blk try store.cacheMetaPath(&mb, "m.bin");
+    };
+    var hdr: [8]u8 = undefined;
+    @memcpy(hdr[0..4], piece.magic);
+    std.mem.writeInt(u32, hdr[4..8], 1000, .little);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileOwnerOnly(mp, &hdr));
+
+    // Refused before anything is sized off it, and the refusal names the
+    // artifact rather than the flag: the operator passed none.
+    try std.testing.expectEqual(@as(u8, 1), try cmdVerify(std.testing.io, gpa, .{ .origin = origin_d, .cache = cache_d, .piece = piece.default_size }, "m.bin"));
+
+    // The same header recording the grid the cache was written on verifies
+    // as before, so the refusal reads the grid and not the artifact.
+    std.mem.writeInt(u32, hdr[4..8], grid, .little);
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFileOwnerOnly(mp, &hdr));
+    try std.testing.expectEqual(@as(u8, 0), try cmdVerify(std.testing.io, gpa, .{ .origin = origin_d, .cache = cache_d, .piece = grid }, "m.bin"));
 }
 
 /// Whole-store duplicate telemetry: scans every piece-hash manifest under
