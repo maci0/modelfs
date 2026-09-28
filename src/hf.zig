@@ -84,10 +84,13 @@ pub fn revisionOk(rev: []const u8) bool {
     return segmentsOk(rev);
 }
 
-fn appendEncoded(w: *std.ArrayList(u8), gpa: std.mem.Allocator, path: []const u8, preserve_slashes: bool) !void {
+/// Percent-encodes a repo file path, keeping '/' as the segment separator. A
+/// repo and a revision are never encoded: `idOk` already admits only
+/// unreserved bytes and '/', so encoding either would be the identity.
+fn appendEncoded(w: *std.ArrayList(u8), gpa: std.mem.Allocator, path: []const u8) !void {
     const hex = "0123456789ABCDEF";
     for (path) |ch| {
-        if (unreserved(ch) or (preserve_slashes and ch == '/')) {
+        if (unreserved(ch) or ch == '/') {
             try w.append(gpa, ch);
             continue;
         }
@@ -107,7 +110,7 @@ fn treeUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8) ![]u8
     try w.appendSlice(gpa, "https://" ++ host ++ "/api/models/");
     try w.appendSlice(gpa, repo);
     try w.appendSlice(gpa, "/tree/");
-    try appendEncoded(&w, gpa, revision, false);
+    try w.appendSlice(gpa, revision);
     try w.appendSlice(gpa, "?recursive=1");
     return w.toOwnedSlice(gpa);
 }
@@ -121,9 +124,9 @@ fn fileUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8, path:
     try w.appendSlice(gpa, "https://" ++ host ++ "/");
     try w.appendSlice(gpa, repo);
     try w.appendSlice(gpa, "/resolve/");
-    try appendEncoded(&w, gpa, revision, false);
+    try w.appendSlice(gpa, revision);
     try w.append(gpa, '/');
-    try appendEncoded(&w, gpa, path, true);
+    try appendEncoded(&w, gpa, path);
     return w.toOwnedSlice(gpa);
 }
 
