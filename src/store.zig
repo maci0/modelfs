@@ -2139,9 +2139,6 @@ pub const Store = struct {
             file.bits.clear(k);
             std.log.warn("growing {s} widens short piece {d}; its mark dropped and the piece refills", .{ file.rel, k });
         }
-        // Sidecar work only when a bit was actually cleared: the
-        // never-piece-aligned sequential ingest hits the grow on every
-        // chunk, and an unconditional save would double its sidecar writes.
         // A hash-only removal rides manifest_dirty and the next release's
         // manifest publish instead (the sidecar does not carry hashes).
         if (file.hashes.remove(k)) file.manifest_dirty = true;
