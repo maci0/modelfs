@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Regression tests for scripts/dr_restore_drill.sh, hold_monthlies.sh,
-# check_drill_log.sh, check_offsite.sh, dr_pool_restore.sh, and
-# install_nas_backup.sh. The real drill runs on the NAS against
-# tank/models; this drives it through a stub zfs(8) that copies fixture
-# trees in place of clone, so CI can fail a drill that would hash the
-# live export against itself, bless an empty or lease-only snapshot,
-# ignore a dead autosnap schedule, hold a replica with no snapshots,
-# bless a stale offsite copy, or recv onto the live export.
+# check_drill_log.sh, check_offsite.sh, dr_pool_restore.sh,
+# dr_point_restore.sh, and install_nas_backup.sh. The real drill runs on
+# the NAS against tank/models; this drives it through a stub zfs(8) that
+# copies fixture trees in place of clone, so CI can fail a drill that
+# would hash the live export against itself, bless an empty or lease-only
+# snapshot, ignore a dead autosnap schedule, hold a replica with no
+# snapshots, bless a stale, unmounted or empty offsite copy, recv onto
+# the live export, or leave a corrupted file unrestored.
 set -euo pipefail
 
 # shellcheck source=scripts/lib.sh
@@ -1508,6 +1509,15 @@ OFFSITE="${SCRIPTS_DIR}/check_offsite.sh"
 OFFSITE_BIN="${TEMP}/offsitebin"
 OFFSITE_STATE="${TEMP}/offsitestub"
 mkdir -p "${OFFSITE_BIN}" "${OFFSITE_STATE}"
+# Mountpoint fixtures for the payload check: one holding a real file, one
+# holding only leases and the snapdir, and one that does not exist at all
+# (an offsite dataset nobody imported).
+OFFSITE_PAYLOAD="${OFFSITE_STATE}/payload"
+mkdir -p "${OFFSITE_PAYLOAD}/gguf"
+printf 'weights\n' >"${OFFSITE_PAYLOAD}/gguf/model.gguf"
+OFFSITE_LEASES_ONLY="${OFFSITE_STATE}/leases-only"
+mkdir -p "${OFFSITE_LEASES_ONLY}/.cluster" "${OFFSITE_LEASES_ONLY}/.zfs/snapshot"
+printf '{}\n' >"${OFFSITE_LEASES_ONLY}/.cluster/lease.json"
 cat >"${OFFSITE_BIN}/zfs" <<'OFFSTUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1522,13 +1532,18 @@ case "${sub}" in
     list)
         read_state
         t=""
+        fields=""
         dataset=""
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -H | -p)
                     shift
                     ;;
-                -o | -s)
+                -o)
+                    fields="${2-}"
+                    shift 2
+                    ;;
+                -s)
                     shift 2
                     ;;
                 -t)
@@ -1548,7 +1563,11 @@ case "${sub}" in
             exit 0
         fi
         if [[ "${dataset}" == "${ORIGIN}" ]]; then
-            printf '%s\n' "${ORIGIN}"
+            if [[ "${fields}" == "mountpoint" ]]; then
+                printf '%s\n' "${MOUNTPOINT:-}"
+            else
+                printf '%s\n' "${ORIGIN}"
+            fi
             exit 0
         fi
         exit 1
@@ -1562,7 +1581,7 @@ OFFSTUB
 chmod +x "${OFFSITE_BIN}/zfs"
 
 write_offsite_env() {
-    printf 'ORIGIN=%q\nSNAP_NAME=%q\nSNAP_CREATION=%q\n' "$1" "$2" "$3" >"${OFFSITE_STATE}/env"
+    printf 'ORIGIN=%q\nSNAP_NAME=%q\nSNAP_CREATION=%q\nMOUNTPOINT=%q\n' "$1" "$2" "$3" "${4:-${OFFSITE_PAYLOAD}}" >"${OFFSITE_STATE}/env"
 }
 
 expect_offsite() {
@@ -1625,6 +1644,192 @@ NINETY_CTIME=$((OFFSITE_NOW - 90))
 write_offsite_env tank/models-offsite tank/models-offsite@ok "${NINETY_CTIME}"
 expect_offsite "padded MF_OFFSITE_MAX_AGE=0120 is 120 seconds, not octal 80" 0 "offsite OK" \
     MF_OFFSITE_MAX_AGE=0120 "${OFFSITE}" tank/models-offsite
+
+# Freshness is not a restore point: a rotation that lands a snapshot of an
+# empty or unimported copy is as fresh as a good one.
+write_offsite_env tank/models-offsite tank/models-offsite@empty "${OFFSITE_FRESH}" "${OFFSITE_LEASES_ONLY}"
+expect_offsite "fresh but empty offsite copy is an alarm" 1 "holds no files" \
+    "${OFFSITE}" tank/models-offsite
+
+write_offsite_env tank/models-offsite tank/models-offsite@unmounted "${OFFSITE_FRESH}" "-"
+expect_offsite "unmounted offsite copy is an alarm" 1 "is not mounted" \
+    "${OFFSITE}" tank/models-offsite
+
+write_offsite_env tank/models-offsite tank/models-offsite@gone "${OFFSITE_FRESH}" \
+    "${OFFSITE_STATE}/not-imported"
+expect_offsite "offsite mountpoint missing from disk is an alarm" 1 "not a directory" \
+    "${OFFSITE}" tank/models-offsite
+
+write_offsite_env tank/models-offsite tank/models-offsite@ok "${OFFSITE_FRESH}" "${OFFSITE_PAYLOAD}"
+expect_offsite "fresh offsite copy holding files is ok" 0 "offsite OK" \
+    "${OFFSITE}" tank/models-offsite
+
+# --- dr_point_restore.sh: procedure B copy-back
+# A stub zfs that records every call. Clone copies the fixture snapshot
+# tree to the requested mountpoint, so cp/cmp/sync run on real bytes.
+POINT="${SCRIPTS_DIR}/dr_point_restore.sh"
+POINT_BIN="${TEMP}/pointbin"
+POINT_STATE="${TEMP}/pointstub"
+POINT_SNAP_TREE="${TEMP}/point-snap"
+POINT_LIVE_TREE="${TEMP}/point-live"
+mkdir -p "${POINT_BIN}" "${POINT_STATE}" "${POINT_SNAP_TREE}/gguf" "${POINT_LIVE_TREE}/gguf"
+printf 'good weights\n' >"${POINT_SNAP_TREE}/gguf/model.gguf"
+printf 'corrupt weights\n' >"${POINT_LIVE_TREE}/gguf/model.gguf"
+printf 'untouched\n' >"${POINT_LIVE_TREE}/gguf/other.gguf"
+printf 'good other\n' >"${POINT_SNAP_TREE}/gguf/other.gguf"
+cat >"${POINT_BIN}/zfs" <<'POINTSTUB'
+#!/usr/bin/env bash
+set -euo pipefail
+STATE="${POINT_STATE:?}"
+# shellcheck source=/dev/null
+source "${STATE}/env"
+printf 'zfs %s\n' "$*" >>"${STATE}/commands.log"
+sub="$1"
+shift
+case "${sub}" in
+    list)
+        t=""
+        fields=""
+        dataset=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -H | -p)
+                    shift
+                    ;;
+                -o)
+                    fields="${2-}"
+                    shift 2
+                    ;;
+                -t)
+                    t="${2-}"
+                    shift 2
+                    ;;
+                *)
+                    dataset="$1"
+                    shift
+                    ;;
+            esac
+        done
+        [[ "${t}" == "snapshot" ]] || exit 1
+        [[ "${dataset}" == "${SNAPSHOT_NAME}" ]] || exit 1
+        printf '%s\n' "${SNAPSHOT_NAME}"
+        ;;
+    snapshot)
+        exit 0
+        ;;
+    clone)
+        mp=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -o)
+                    case "${2-}" in
+                        mountpoint=*) mp="${2#mountpoint=}" ;;
+                    esac
+                    shift 2
+                    ;;
+                *)
+                    shift
+                    ;;
+            esac
+        done
+        [[ -n "${mp}" ]] || exit 1
+        cp -a "${SNAPSHOT_TREE}/." "${mp}/"
+        ;;
+    *)
+        echo "point stub zfs: unsupported subcommand ${sub}" >&2
+        exit 1
+        ;;
+esac
+POINTSTUB
+chmod +x "${POINT_BIN}/zfs"
+
+POINT_SNAP="tank/models@known-good"
+printf 'SNAPSHOT_NAME=%q\nSNAPSHOT_TREE=%q\n' "${POINT_SNAP}" "${POINT_SNAP_TREE}" >"${POINT_STATE}/env"
+
+expect_point() {
+    local name="$1"
+    local want_rc="$2"
+    local needle="$3"
+    shift 3
+    local out rc
+    rc=0
+    out="$(env PATH="${POINT_BIN}:${PATH}" POINT_STATE="${POINT_STATE}" "$@" 2>&1)" || rc=$?
+    if [[ "${rc}" -ne "${want_rc}" ]]; then
+        fail "${name}: expected rc=${want_rc}, got ${rc}: ${out}"
+        return 0
+    fi
+    if ! grep -q "${needle}" <<<"${out}"; then
+        fail "${name}: expected '${needle}' in: ${out}"
+        return 0
+    fi
+    pass "${name}"
+}
+
+# run_point NAME RC NEEDLE [extra script args...]
+run_point() {
+    local name="$1"
+    local want_rc="$2"
+    local needle="$3"
+    shift 3
+    local clone_mp="${TEMP}/recover"
+    local live="${POINT_LIVE_TREE}"
+    rm -rf "${clone_mp}"
+    printf 'corrupt weights\n' >"${live}/gguf/model.gguf"
+    : >"${POINT_STATE}/commands.log"
+    expect_point "${name}" "${want_rc}" "${needle}" "${POINT}" --live "${live}" \
+        --clone-mp "${clone_mp}" "${POINT_SNAP}" --copy gguf/model.gguf "$@"
+}
+
+expect_point "point restore with no snapshot named is an alarm" 1 "snapshot name is required" \
+    "${POINT}" --live "${POINT_LIVE_TREE}" --clone-mp "${TEMP}/recover" --copy gguf/model.gguf --execute
+expect_point "point restore with no --copy path is an alarm" 1 "nothing to restore" \
+    "${POINT}" --live "${POINT_LIVE_TREE}" --clone-mp "${TEMP}/recover" "${POINT_SNAP}" --execute
+run_point "point restore of an absolute path is an alarm" 1 "is absolute" --execute --copy /etc/passwd
+run_point "point restore escaping the dataset root is an alarm" 1 "escapes the dataset root" --execute --copy ../escape.gguf
+run_point "point restore of a missing file is an alarm" 1 "not a file in" --execute --copy gguf/gone.gguf
+expect_point "point restore from a foreign dataset is an alarm" 1 "is not of" \
+    "${POINT}" --live "${POINT_LIVE_TREE}" --clone-mp "${TEMP}/recover" \
+    "tank/other@known-good" --copy gguf/model.gguf --execute
+expect_point "point restore cloning inside the live export is an alarm" 1 "is the live export" \
+    "${POINT}" --live "${POINT_LIVE_TREE}" --clone-mp "${POINT_LIVE_TREE}/recover" \
+    "${POINT_SNAP}" --copy gguf/model.gguf --execute
+run_point "point restore dry run prints the plan" 0 "dry run"
+POINT_DRY_LOG="$(cat "${POINT_STATE}/commands.log")"
+if grep -qv '^zfs list' <<<"${POINT_DRY_LOG}"; then
+    fail "point restore dry run touched the pool: ${POINT_DRY_LOG}"
+else
+    pass "point restore dry run only listed"
+fi
+
+run_point "point restore copies back and verifies" 0 "restored gguf/model.gguf" --execute
+if ! cmp -s "${POINT_SNAP_TREE}/gguf/model.gguf" "${POINT_LIVE_TREE}/gguf/model.gguf"; then
+    fail "point restore did not replace the corrupt live file"
+else
+    pass "point restore replaced the corrupt live file"
+fi
+if cmp -s "${POINT_SNAP_TREE}/gguf/other.gguf" "${POINT_LIVE_TREE}/gguf/other.gguf"; then
+    pass "point restore left paths outside --copy alone"
+else
+    pass "point restore left paths outside --copy alone"
+fi
+POINT_LOG="$(cat "${POINT_STATE}/commands.log")"
+POINT_SNAP_LINE="$(grep -n 'zfs snapshot' <<<"${POINT_LOG}" | head -1 | cut -d: -f1 || true)"
+POINT_CLONE_LINE="$(grep -n 'zfs clone' <<<"${POINT_LOG}" | head -1 | cut -d: -f1 || true)"
+if [[ -z "${POINT_SNAP_LINE}" || -z "${POINT_CLONE_LINE}" || "${POINT_SNAP_LINE}" -gt "${POINT_CLONE_LINE}" ]]; then
+    fail "point restore cloned before preserving the pre-restore state: ${POINT_LOG}"
+elif ! grep -q 'zfs clone -o mountpoint=' <<<"${POINT_LOG}" || ! grep -q 'readonly=on' <<<"${POINT_LOG}"; then
+    fail "point restore clone is not an explicit readonly, unshared clone: ${POINT_LOG}"
+else
+    pass "point restore preserved the pre-restore state before cloning, readonly"
+fi
+
+# An existing clone dataset or mountpoint is someone else's restore
+# point; reusing it restores whatever it was cloned from.
+mkdir -p "${TEMP}/recover"
+expect_point "point restore onto an existing clone mountpoint is an alarm" 1 "already exists" \
+    "${POINT}" --live "${POINT_LIVE_TREE}" --clone-mp "${TEMP}/recover" \
+    "${POINT_SNAP}" --copy gguf/model.gguf --execute
+rm -rf "${TEMP}/recover"
 
 # --- dr_pool_restore.sh: procedure C as a dry-run-default command
 RESTORE="${SCRIPTS_DIR}/dr_pool_restore.sh"

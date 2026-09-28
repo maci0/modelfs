@@ -17,8 +17,9 @@ print_usage() {
 Usage: ./scripts/check_offsite.sh [DATASET]
 
 Fail if the site-loss copy DATASET (or any child dataset) is missing,
-has no snapshots, or the newest is older than MF_OFFSITE_MAX_AGE
-seconds (default 691200 = 8 days, weekly rotation plus slack). DATASET
+has no snapshots, is older than MF_OFFSITE_MAX_AGE seconds (default
+691200 = 8 days, weekly rotation plus slack), is not mounted, or holds
+no files outside the .cluster lease dir and the .zfs snapdir. DATASET
 comes from the operand or MF_OFFSITE_DATASET; there is no live-NAS
 default, because checking tank/models on the NAS would bless production
 snapshots as the offsite copy. Exit 0 means the copy is a usable
@@ -115,6 +116,45 @@ while IFS= read -r child; do
         die "offsite child snapshot ${CHILD_SNAP} is ${CHILD_AGE}s old, past the ${MAX_AGE}s limit: the site-loss copy stopped keeping restore points for ${child} inside the claimed RPO (docs/recovery.md sections 3 and 5)"
     fi
     echo "offsite: child ${child} newest ${CHILD_SNAP} (age ${CHILD_AGE}s)"
+done <<<"${CHILD_LIST}"
+
+# Freshness is not a restore point. A rotation or hosted pull that fails
+# halfway, or that recvs an empty dataset, still leaves a snapshot behind,
+# and a snapshot of nothing ages exactly as fresh as a good one. The
+# monthly drill rejects an empty snapshot for the same reason
+# (scripts/dr_restore_drill.sh). The check is made on the mounted copy,
+# so it also fails an offsite dataset nobody mounted, which cannot be
+# read at restore time either.
+if ! find / -maxdepth 0 -quit >/dev/null 2>&1; then
+    # shellcheck disable=SC2185 # GNU find --version takes no path; error-path after -quit failed
+    find_ver="$(find --version 2>/dev/null | head -1 || echo non-GNU find)"
+    die "GNU find is required (need find -quit); this host has ${find_ver}"
+fi
+verify_payload() {
+    local ds="$1"
+    local mp
+    mp="$(zfs list -H -o mountpoint "${ds}")" \
+        || die "cannot read the mountpoint of offsite ${ds} (docs/recovery.md section 3)"
+    if [[ -z "${mp}" || "${mp}" == "-" ]]; then
+        die "offsite ${ds} is not mounted: a site-loss copy nobody can read is not a restore point"
+    fi
+    if [[ ! -d "${mp}" ]]; then
+        die "offsite mountpoint ${mp} for ${ds} is not a directory (import the pool before checking)"
+    fi
+    # .cluster leases republish every 10 s and are not the dataset; .zfs is
+    # the snapshot directory. Counting either would let a copy holding only
+    # leases pass as the site-loss restore.
+    local first
+    first="$(find "${mp}" \( -name .cluster -o -name .zfs \) -prune -o -type f -print -quit)" \
+        || die "find failed under ${mp}"
+    if [[ -z "${first}" ]]; then
+        die "offsite ${ds} holds no files outside .cluster and .zfs at ${mp}: the copy is empty, so restoring it recovers nothing (docs/recovery.md sections 3 and 4D)"
+    fi
+}
+verify_payload "${DATASET}"
+while IFS= read -r child; do
+    [[ -n "${child}" ]] || continue
+    verify_payload "${child}"
 done <<<"${CHILD_LIST}"
 
 echo "offsite OK: ${SNAP} age ${SNAP_AGE}s"

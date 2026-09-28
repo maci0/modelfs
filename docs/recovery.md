@@ -143,6 +143,11 @@ hosted box that always holds the copy, setting `MF_OFFSITE_DATASET` through
 older than `MF_OFFSITE_MAX_AGE` (default 8 days, weekly plus slack) is the alarm, so a stopped
 rotation is no longer silent until the next site-loss review.
 
+Freshness alone would still pass a rotation that failed halfway: the leftover snapshot ages
+exactly as fresh as a good one. The check therefore also requires the copy to be mounted and to
+hold at least one file outside `.cluster` and `.zfs`, the same zero-file rule the monthly drill
+applies locally. An unimported dataset, a `-` mountpoint, and a copy of only leases each fail.
+
 ### Failure visibility
 
 A green timer only proves it fired. `OnFailure=notify-admin@%n.service` therefore sits on the
@@ -172,7 +177,7 @@ These four are alarms, not log noise:
 | No new snapshot on the NAS | 25 h (`MF_DRILL_MAX_SNAP_AGE`) | `modelfs-snap-age.timer`. The monthly clone is the restore proof, not the schedule watchdog |
 | Replica newest snapshot stale | 36 h, a daily pull plus slack (`MF_DRILL_MAX_REPLICA_AGE`) | the drill, with `MF_DRILL_REPLICA` set on the replica host |
 | Drill log missing, empty, or stale | 35 days | `modelfs-check-drill-log` (installed by `scripts/install_nas_backup.sh`) |
-| Offsite newest snapshot stale | 8 days, weekly rotation plus slack | `modelfs-check-offsite` (installed by `scripts/install_nas_backup.sh`) |
+| Offsite newest snapshot stale, unmounted, or empty | 8 days, weekly rotation plus slack | `modelfs-check-offsite` (installed by `scripts/install_nas_backup.sh`) |
 
 Before risky bulk work (`rm -rf` of an old model, big re-download with overwrite, moving datasets), take a named snapshot; it is the pre-run safety net POSIX does not give you:
 
@@ -215,6 +220,24 @@ zfs list -r -t snapshot -o name,creation -s creation tank/models
 read -r -p 'Known-good snapshot name: ' SNAP
 zfs list -H -t snapshot -o name,creation "${SNAP}"
 ```
+
+[`scripts/dr_point_restore.sh`](../scripts/dr_point_restore.sh) (`modelfs-point-restore`) runs
+the copy-back below against that snapshot. It is dry-run by default, `--execute` restores. It
+refuses a snapshot of another dataset, a `--copy` path that is absolute or escapes the dataset
+root, a clone dataset or mountpoint that already exists, and a clone mountpoint equal to or
+inside the live export. It takes the pre-restore snapshot before it clones, so a failed run
+still leaves the current state preserved, and it leaves the clone mounted on success for
+inspection.
+
+```bash
+./scripts/dr_point_restore.sh "${SNAP}" --copy gguf/broken-model.gguf
+sudo ./scripts/dr_point_restore.sh --execute "${SNAP}" --copy gguf/broken-model.gguf
+```
+
+`--dataset`, `--live`, `--clone`, and `--clone-mp` override the defaults
+(`MF_POINT_DATASET`, `MF_POINT_LIVE`, `MF_POINT_CLONE`, `MF_POINT_CLONE_MP`). The script
+fences nothing: the paragraph above is its precondition, and it cannot tell whether a reader
+is still attached. The equivalent by hand:
 
 Clone onto a dedicated, unused mountpoint outside the live export. Refuse to reuse an
 existing `tank/recover` dataset or mounted recovery path. Explicit properties keep the clone
@@ -402,9 +425,10 @@ rather than a grep someone might remember to run.
 
 [`scripts/test_dr_restore_drill.sh`](../scripts/test_dr_restore_drill.sh), also run by
 `scripts/check.sh`, drives the drill, `--age-only`, `hold_monthlies.sh`, the log checker,
-`check_offsite.sh`, and `dr_pool_restore.sh` through a stub `zfs`, so a clone-onto-live,
-empty-snapshot, uncovered-child-dataset, stale-log, swallowed-hold, empty-replica,
-stale-offsite, or live-dataset-recv false pass cannot ship.
+`check_offsite.sh`, `dr_pool_restore.sh`, and `dr_point_restore.sh` through a stub `zfs`, so
+a clone-onto-live, empty-snapshot, uncovered-child-dataset, stale-log, swallowed-hold,
+empty-replica, stale-or-empty offsite, live-dataset-recv, or unrestored-corruption false pass
+cannot ship.
 
 ## 7. Incident access
 
