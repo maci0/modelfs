@@ -5,6 +5,7 @@ test {
     _ = @import("proto.zig");
     _ = @import("sys.zig");
     _ = @import("cull.zig");
+    _ = @import("determinism.zig");
     _ = @import("fuzzcorpus.zig");
     _ = @import("store.zig");
     _ = @import("discover.zig");

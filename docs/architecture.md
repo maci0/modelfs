@@ -76,6 +76,7 @@ New code goes in the module that already owns that concern.
 | `handover.zig` | Sealed-memfd knobs+PSK codec and `update` request/ack for `modelfs update` |
 | `hf.zig` | Hugging Face pulls: id and ref validation, listing/download endpoints, and the download loop for `modelfs pull` |
 | `main.zig` | CLI and mount wiring into `State.init` / `State.deinit`; mount-time `disableCoreDumps` / `scrubPskEnv` |
+| `determinism.zig` | Test-only source guards: the wall clock and sleep are read only through `sys.zig`, and entropy only through `io.randomSecure` |
 | `root.zig` | Test aggregator for `zig build test` |
 
 `main` → `fuse_fs` → `peer` → `store` → `discover` → (`piece`, `proto`, `cull`, `sys`) → `c`.
@@ -84,6 +85,16 @@ New code goes in the module that already owns that concern.
 last group, not two levels of it: `proto` reads `piece`'s bitfield codec, and `store` needs
 both. `handover` and `hf` sit beside `fuse_fs`/`main`: neither speaks FUSE, and `hf` is the one
 place that reaches a host outside the cluster (HTTPS through `std.http.Client`, CLI only).
+
+Time and entropy are the two nondeterminism doors, and both are parameters rather than
+globals. `sys.zig` holds the clock (`nowSec` for cross-host lease instants, `monoSec` /
+`monoMs` / `monoNs` for elapsed time, `bootSec` for the suspend-spanning stamps, `sleepMs`
+for waits); each samples `std.Io.Clock` through the injected `std.Io`, and the background
+loops in `fuse_fs.zig` take one sample per round so a round's decisions are a function of
+one instant rather than of four reads drifting across it. The handover token is the one
+security-sensitive random value and is read through `io.randomSecure`, so a test can seed it
+and production keeps the kernel CSPRNG. `determinism.zig` fails the build if either door
+gains a second, uninjected entrance.
 
 `@cImport` is deprecated in Zig 0.16, so C declarations are translated once from `src/c.h` by
 `build.zig` (musl targets translate `src/c_musl.h`, which includes `c.h` after working around

@@ -1325,7 +1325,7 @@ fn dial(io: std.Io, ip: []const u8, port: u16, deadline_ms: ?i64) !c_int {
     sys.setSockBuffers(fd, sock_buf_bytes);
     // Bounded connect: SO_RCVTIMEO does not cover the dial itself, and a
     // blocking connect to a dead address stalls the fill path for minutes.
-    const rc = sys.connectInWithIo(io, fd, &addr, budget_ms);
+    const rc = sys.connectIn(io, fd, &addr, budget_ms);
     if (rc != 0) {
         sys.close(fd);
         // Same split as readHeadFullDeadline: a spent or elapsed budget is
@@ -2969,7 +2969,7 @@ fn roundTrip(port: u16, req: []const u8) !std.ArrayList(u8) {
     try std.testing.expect(fd >= 0);
     defer sys.close(fd);
     sys.setSockTimeout(fd, 5000);
-    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(fd, &addr, 5000));
+    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(std.testing.io, fd, &addr, 5000));
     try std.testing.expect(sys.writeAll(fd, req) == @as(isize, @intCast(req.len)));
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -3003,7 +3003,7 @@ test "handleConn counts a targetless request line as malformed" {
     try std.testing.expect(fd >= 0);
     defer sys.close(fd);
     sys.setSockTimeout(fd, 5000);
-    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(fd, &addr, 5000));
+    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(std.testing.io, fd, &addr, 5000));
     const before = srv.store.stats.http_malformed.load(.monotonic);
     _ = try std.testing.expectEqual(@as(isize, 8), sys.writeAll(fd, "HELP\r\n\r\n"));
     // The handler replies nothing and closes; EOF is the signal it finished
@@ -3026,7 +3026,7 @@ test "handleConn counts a targetless request line as malformed" {
     try std.testing.expect(cfd2 >= 0);
     defer sys.close(cfd2);
     sys.setSockTimeout(cfd2, 5000);
-    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(cfd2, &addr, 5000));
+    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(std.testing.io, cfd2, &addr, 5000));
     var flood: [max_head_bytes]u8 = undefined;
     @memset(&flood, 'A');
     _ = try std.testing.expectEqual(@as(isize, @intCast(flood.len)), sys.writeAll(cfd2, &flood));
@@ -3641,7 +3641,7 @@ test "acceptLoop closes connections beyond the inflight handler cap" {
     for (&fds) |*fd| {
         fd.* = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
         try std.testing.expect(fd.* >= 0);
-        try std.testing.expectEqual(@as(i32, 0), sys.connectIn(fd.*, &addr, 5000));
+        try std.testing.expectEqual(@as(i32, 0), sys.connectIn(std.testing.io, fd.*, &addr, 5000));
     }
     defer for (&fds) |fd| sys.close(fd);
 
@@ -3787,7 +3787,7 @@ test "serveData answers an open-ended range with the file tail" {
     const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(fd >= 0);
     defer sys.close(fd);
-    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(fd, &addr, 5000));
+    try std.testing.expectEqual(@as(i32, 0), sys.connectIn(std.testing.io, fd, &addr, 5000));
     var req_buf: [256]u8 = undefined;
     const req = try std.fmt.bufPrint(&req_buf, "GET /data?path=open.bin HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer secret\r\nRange: bytes=16-\r\nConnection: close\r\n\r\n", .{});
     try std.testing.expectEqual(@as(isize, @intCast(req.len)), sys.writeAll(fd, req));

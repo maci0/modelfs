@@ -873,11 +873,11 @@ pub fn setSockTimeout(fd: c_int, ms: u32) void {
 /// a blackholed peer address; SO_RCVTIMEO/SO_SNDTIMEO do not cover it. The
 /// socket is flipped non-blocking for the dial and restored afterwards.
 /// Returns 0 on success or a negative errno (-ETIMEDOUT when ms elapses).
-pub fn connectIn(fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
-    return connectInWithIo(std.testing.io, fd, addr, ms);
-}
-
-pub fn connectInWithIo(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
+/// The deadline is sampled through `io` (monoMs), so there is no io-less
+/// spelling of this call: a form that defaulted to std.testing.io would put
+/// the peer dial's budget on a test clock that production wiring never
+/// supplies.
+pub fn connectIn(io: std.Io, fd: c_int, addr: *const c.struct_sockaddr_in, ms: u32) i32 {
     const fl = std.c.fcntl(fd, c.F_GETFL);
     if (fl < 0) return negErrno();
     if (std.c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK) < 0) return negErrno();
@@ -1230,7 +1230,7 @@ test "open, socket, and accept are close-on-exec" {
     try std.testing.expect(cfd >= 0);
     defer close(cfd);
     try std.testing.expect(fdIsCloexec(cfd));
-    try std.testing.expectEqual(@as(i32, 0), connectIn(cfd, &got, 5000));
+    try std.testing.expectEqual(@as(i32, 0), connectIn(std.testing.io, cfd, &got, 5000));
 
     var peer = std.mem.zeroes(c.struct_sockaddr_in);
     const afd = accept(lfd, &peer);
@@ -1290,7 +1290,7 @@ test "connectIn succeeds against a local listener" {
     const cfd = socket(c.AF_INET, c.SOCK_STREAM, 0);
     try std.testing.expect(cfd >= 0);
     defer close(cfd);
-    try std.testing.expectEqual(@as(i32, 0), connectIn(cfd, &got, 5000));
+    try std.testing.expectEqual(@as(i32, 0), connectIn(std.testing.io, cfd, &got, 5000));
     const fl = std.c.fcntl(cfd, c.F_GETFL);
     try std.testing.expect(fl >= 0);
     try std.testing.expectEqual(@as(c_int, 0), fl & c.O_NONBLOCK);
@@ -1329,7 +1329,7 @@ test "connectIn bounds a dead dial" {
     // also satisfies rc != 0, so sandboxed environments pass either way.
     addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x0AFFFFFF); // 10.255.255.255
     const t0 = monoSec(std.testing.io);
-    const rc = connectIn(fd, &addr, 250);
+    const rc = connectIn(std.testing.io, fd, &addr, 250);
     try std.testing.expect(rc != 0);
     try std.testing.expect(monoSec(std.testing.io) - t0 <= 5);
     // Failure must still restore the caller's flags: leaving O_NONBLOCK
