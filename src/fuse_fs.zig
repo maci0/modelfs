@@ -1262,7 +1262,7 @@ fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse.off_t,
     // but it changes the origin size exactly like an external rewrite, so a
     // sequential ingest would discard every earlier chunk's cached pieces.
     // When the observed size matches what we just wrote, fill through
-    // cacheFill (marks preserved); any divergence keeps the conservative
+    // cacheFillIdentified (marks preserved); any divergence keeps the conservative
     // reset below.
     var ost: sys.c.struct_stat = undefined;
     const rc = st.store.statOrigin(rel, &ost);
@@ -1295,10 +1295,10 @@ fn mf_write(path: [*c]const u8, buf: [*c]const u8, size: usize, off: fuse.off_t,
             // NFS attribute lag can report the pre-write size; grow the
             // bitfield alongside so appended pieces stay markable. A
             // non-piece-aligned old size makes the old last piece short:
-            // drop its mark first, same contract as cacheFill's grow.
+            // drop its mark first, same contract as cacheFillIdentified's grow.
             st.store.dropWideningPieceMark(file);
             file.bits.resize(st.gpa, piece.count(end, st.store.piece_size)) catch {
-                // Same policy as cacheFill's grow: undersized field means
+                // Same policy as cacheFillIdentified's grow: undersized field means
                 // appended pieces stay unmarked and re-hydrate.
                 std.log.warn("bitfield grow failed for {s}; appended pieces refill", .{rel});
             };

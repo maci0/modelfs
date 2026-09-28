@@ -9,10 +9,10 @@ Fixes land on `main` only. One concerning a released line is noted in
 [CHANGELOG.md](CHANGELOG.md) with the affected and fixed versions named, and ships
 as the next `v<version>` tag per the release procedure in
 [CONTRIBUTING.md](CONTRIBUTING.md). No older line receives backported fixes, so the
-remedy for a deployment is to move to the current tag; the oldest release,
-`v0.12.0`, predates the peer request-line and `Content-Length` validation, the
-cluster-id bound, and the secret-handling hardening recorded under `## [0.15.0]`
-and `## [0.14.1]` in [CHANGELOG.md](CHANGELOG.md).
+remedy for a deployment is to move to the current tag; every release before
+`v0.14.1`, `v0.1.0` included, predates the peer request-line and `Content-Length`
+validation, the cluster-id bound, and the secret-handling hardening recorded under
+`## [0.15.0]` and `## [0.14.1]` in [CHANGELOG.md](CHANGELOG.md).
 
 If you build from an intermediate revision rather than a tag, pin the commit hash it
 came from, so you know exactly what you are running and can rebuild from a fixed

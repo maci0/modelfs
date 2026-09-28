@@ -157,7 +157,7 @@ compile in, the SHA-pinned GitHub Actions, and the Zig version pin;
 
 Start at [docs/architecture.md](docs/architecture.md) for how it actually behaves.
 [docs/](docs/) has the full index, including operations, disaster recovery, benchmarks,
-the threat model, and the original design sketch.
+and the threat model.
 
 Source is a flat `src/*.zig`; the module map is in
 [docs/architecture.md](docs/architecture.md#modules). `build.zig.zon` declares no package

@@ -431,9 +431,11 @@ flowchart TD
 below `--bstop`, the wait between rounds drops from 1 s to 500 ms.
 
 `pin` is a marker under `pin/`. Culling itself never unlinks: after every piece is punched,
-`reapIdle` (every 30 s, 300 s idle) unlinks empty unpinned data and meta artifacts so the
-in-memory map stays bounded on nodes that churn paths. `Store.forget` unlinks cache artifacts
-when the origin name goes away through unlink or rename.
+`reapIdle` (every 30 s, 300 s idle) closes the fd of an idle unpinned entry and unlinks the
+artifacts of entries that are still fully empty. That bounds per-path bookkeeping, not the map
+itself: an entry that has cached a piece is never evicted before `Store.forget`, so the files map
+still grows with the number of distinct model paths this node has ever read. `Store.forget`
+unlinks cache artifacts when the origin name goes away through unlink or rename.
 
 ---
 

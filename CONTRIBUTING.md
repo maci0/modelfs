@@ -158,11 +158,11 @@ is the runbook they belong to.
 ## PR expectations
 
 The only blocking requirement is green CI: `./scripts/check.sh`, the
-`cross-aarch64` compile job, the two `static-linux` musl builds (test recipe
-above), and the `reproducibility` job. `./scripts/ci.sh` runs the gate, the
-cross-compile, and the reproducibility rebuild locally. Run the static checks
-separately as shown above; the native aarch64 gate requires an aarch64 host.
-There is no sign-off gate.
+native `check-aarch64` gate, the `cross-aarch64` compile job, the two
+`static-linux` musl builds (test recipe above), and the `reproducibility` job.
+`./scripts/ci.sh` runs the gate, the cross-compile, and the reproducibility
+rebuild locally. Run the static checks separately as shown above; the native
+aarch64 gate requires an aarch64 host. There is no sign-off gate.
 
 **Behavior changes belong in [CHANGELOG.md](CHANGELOG.md)**, as a dated `###`
 section under `[Unreleased]`. Adding one is not itself gated, but the file's

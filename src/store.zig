@@ -389,7 +389,7 @@ pub const Store = struct {
         last_access: std.atomic.Value(i64) = .init(0),
         /// Serializes write-through pwrite+mark with completeFill pwrite+mark,
         /// punchPiece, and size-changing ftruncate (reconcile, mf_truncate,
-        /// cacheFill shrink). Without it the two pwrites race on the cache
+        /// cacheFillIdentified shrink). Without it the two pwrites race on the cache
         /// fd: a fill that claimed before the write can overwrite the
         /// write-through bytes and then mark them filled. punchPiece or
         /// ftruncate taking only file.mu could hole a piece between
@@ -1789,7 +1789,7 @@ pub const Store = struct {
     }
 
     /// Drops every trusted hash and the manifest-load state: a size change
-    /// (reconcile, cacheFill shrink), distrust, or forget means the old
+    /// (reconcile, cacheFillIdentified shrink), distrust, or forget means the old
     /// digests describe bytes that no longer exist and would reject the
     /// origin's current ones. Sets manifest_dirty so the next release
     /// republishes a manifest matching the new state (or drops stale
@@ -3014,7 +3014,7 @@ test "rangeFilled is true only when every covered piece is marked" {
     try std.testing.expect(!Store.rangeFilled(&file, .{ .off = tail_off - 10, .len = 20 }, tail_off + 100, 1));
 }
 
-test "cacheFill grows entry preserving earlier piece marks" {
+test "cacheFillIdentified grows entry preserving earlier piece marks" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;
@@ -3161,7 +3161,7 @@ test "a fill claimed at the old short geometry cannot mark the widened piece" {
     try std.testing.expect(f.bits.get(2));
 }
 
-test "cacheFill grow drops a hydrated short tail's mark instead of widening it" {
+test "cacheFillIdentified grow drops a hydrated short tail's mark instead of widening it" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;
@@ -3211,7 +3211,7 @@ test "cacheFill grow drops a hydrated short tail's mark instead of widening it" 
 
     // A co-writer appended [40,44) on another node; this node's next chunk
     // lands at [44,48) with the observed origin size == end, the shape
-    // mf_write fills through cacheFill.
+    // mf_write fills through cacheFillIdentified.
     var w2: [4]u8 = undefined;
     @memset(&w2, 0xBB);
     try std.testing.expectEqual(@as(isize, 4), st.originPwrite("grow.bin", &w2, 44));
@@ -3235,7 +3235,7 @@ test "cacheFill grow drops a hydrated short tail's mark instead of widening it" 
     }
 }
 
-test "cacheFill resets every mark when an external truncate shrinks the file" {
+test "cacheFillIdentified resets every mark when an external truncate shrinks the file" {
     const gpa = std.testing.allocator;
     var ob: [128]u8 = undefined;
     var cb: [128]u8 = undefined;
@@ -3423,7 +3423,7 @@ test "size reconciliation persists the wipe so a restart cannot reload stale mar
         try std.testing.expectEqual(@as(u32, 0), side.filled());
     }
 
-    // The cacheFill shrink branch (an externally truncated file observed on
+    // The cacheFillIdentified shrink branch (an externally truncated file observed on
     // the write path) carries the same contract.
     {
         var zb: [160]u8 = undefined;
@@ -3563,7 +3563,7 @@ test "copyIntoCache never shrinks bytes a concurrent fill already landed" {
     defer st.deinit();
     try std.testing.expectEqual(@as(i32, 0), st.ensureLayout());
 
-    // Two writers appending through mf_write/cacheFill concurrently. Writer 1
+    // Two writers appending through mf_write/cacheFillIdentified concurrently. Writer 1
     // grows the entry to its end (16) under file.mu; writer 2 then appends
     // past it (end 40) and its copy lands fully; writer 1's copy lands last.
     // Regression: copyIntoCache ran an absolute ftruncate(truncate_to) before
@@ -3695,7 +3695,7 @@ test "size reconciliation does not cut a cache fd under an in-flight peer send" 
     _ = f.xfer.fetchSub(1, .monotonic);
 }
 
-test "cacheFill shrink drops an in-flight fill of a surviving piece" {
+test "cacheFillIdentified shrink drops an in-flight fill of a surviving piece" {
     // beginFill samples writes, then completeFill pwrites without file.mu.
     // A shrink that did not bump writes left that claim valid against the
     // new (empty) field, so the filler marked pre-shrink bytes as current

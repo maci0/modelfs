@@ -77,8 +77,8 @@ nothing; tune the counts to spare capacity. The installer preserves an existing
 Recursive is a no-op while `tank/models` has only directories underneath
 ([operations.md](operations.md)). It is there so a later `zfs create tank/models/gguf` is
 snapshotted without rewriting the backup job. The replica pull (`syncoid --recursive`) and
-`hold_monthlies.sh -r` follow the same growth, and the restore drill age-checks each child, so a
-dataset the job never copied cannot look green.
+`hold_monthlies.sh` (which lists with `zfs list -r`) follow the same growth, and the restore drill
+age-checks each child, so a dataset the job never copied cannot look green.
 
 ### Layer 2: the replica (covers pool loss)
 
@@ -187,8 +187,9 @@ In order of likelihood.
 ### A. A spark or its NVMe died
 
 Nothing to restore. Rebuild the node per the [README](../README.md) quickstart, remount the
-origin per [operations.md](operations.md), and start `modelfs`. The cache warms on demand and
-leases republish themselves; `--seed` bootstraps `.cluster` if it is empty.
+origin per [operations.md](operations.md), and start `modelfs`. The cache warms on demand; the
+first lease publish creates `.cluster` on the origin, and `--seed` only adds bootstrap dial
+addresses for the ticks before a peer lease is visible.
 
 Re-apply any pins. The markers lived under `/var/cache/modelfs/pin/`, so without them the cull
 treats every previously pinned file as an ordinary LRU candidate. Before a *planned* cache wipe,
