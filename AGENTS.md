@@ -3,7 +3,11 @@
 Single Zig binary: a FUSE mount at `/models` backed by a local NVMe piece
 cache, peer-to-peer piece transfers over plaintext HTTP with one shared PSK,
 and an NFS origin as the write authority. Linux only. A correct change
-respects this tree's layout, gates, and constraints.
+respects this tree's layout, gates, and constraints, and is finished when
+`./scripts/check.sh` passes with the change in it: a test beside the code
+for every `src/` behavior added or changed, a `###` entry under
+`## [Unreleased]` in `CHANGELOG.md` for a behavior change, and the same
+edit to `docs/architecture.md` when shipped behavior moves.
 
 ## Layout
 
@@ -11,10 +15,10 @@ respects this tree's layout, gates, and constraints.
 |---|---|
 | `src/*.zig` | The daemon. Tests live beside the code they cover; a new file is invisible to `zig build test` until `root.zig` imports it. `-Dtest-filter=` matches test names, not files |
 | `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once (through `src/c_musl.h` for musl). Change the maintained headers or `build.zig`, never the generated bindings; `src/c.zig` is a maintained re-export. Import via `c.zig` / `sys.zig`, never `@cImport` |
-| `scripts/` | Gates and harnesses. `lib.sh` defines `ROOT_DIR`/`SCRATCH_DIR`/`SCRIPTS_DIR`; shell scripts source it before using those variables; scripts using none of them are exempt |
-| `docs/` | `README.md` indexes them. `architecture.md` is shipped behavior |
-| `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files, `SHA256SUMS`, NOTICE, and copyright. `build.zig` and `scripts/extract_fuse3_arm64.sh` verify the digests; extract writes under `.scratch/fuse3-arm64/`; `check.sh` checks them too |
-| `.deps/libfuse3-3.16.2/` | Vendored libfuse3 3.16.2 source for the static single-file release builds (`-Dfuse-static` compiles it in; `scripts/build_static.sh` drives it, `.github/workflows/release.yml` publishes the artifacts). `build.zig` and `check.sh` verify its `SHA256SUMS` too |
+| `scripts/` | Gates and harnesses. `lib.sh` defines `ROOT_DIR`/`SCRATCH_DIR`/`SCRIPTS_DIR`; shell scripts source it before using those variables; scripts using none of them are exempt. `SCRIPTS_DIR` is the on-disk name; leave the spelling alone: every suite that sources `lib.sh` reads it |
+| `docs/` | `README.md` indexes them. `architecture.md` is shipped behavior. `review-guides/` holds the per-subject review prompts, each with its own applicability gate |
+| `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files, `SHA256SUMS`, NOTICE, and copyright. `build.zig` and `scripts/extract_fuse3_arm64.sh` verify the digests; extract writes under `.scratch/fuse3-arm64/`; `check.sh` checks them too. Pinned input, not a place to patch: a fix goes in `build.zig`, `src/c.h`, or a version bump, and an edit here fails the digest checks |
+| `.deps/libfuse3-3.16.2/` | Vendored libfuse3 3.16.2 source for the static single-file release builds (`-Dfuse-static` compiles it in; `scripts/build_static.sh` drives it, `.github/workflows/release.yml` publishes the artifacts). `build.zig` and `check.sh` verify its `SHA256SUMS` too, including that the sums list every file present. Pinned input, not a place to patch: same rule as `.deps/fuse3-arm64/` |
 
 ## Gates
 
@@ -67,7 +71,10 @@ Suites outside the gate (most need hardware CI lacks):
   and a piece cache written there is charged to RAM. Shell `mktemp` templates
   use `SCRATCH_DIR` from `scripts/lib.sh`; Python temporary caches, mounts,
   origins, and logs set `dir=` to the repo's `.scratch/`, not the system default.
-  The NAS drill uses `/var/tmp/modelfs-drill` via `MF_DRILL_SCRATCH` without a checkout.
+  `dr_restore_drill.sh` resolves its scratch in that order: `MF_DRILL_SCRATCH`
+  when set, else the repo `.scratch/` while `lib.sh` sits beside it, else
+  `/var/tmp/modelfs-drill` for the copy `install_nas_backup.sh` plants on
+  the NAS, which has no checkout above it.
 - **Harness knobs use `MF_`, never `MODELFS_`.** The daemon refuses unknown
   `MODELFS_*` as typo'd knobs.
 - **Every external path is untrusted.** Request heads, lease JSON, and encoded
