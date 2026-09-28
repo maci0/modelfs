@@ -254,6 +254,23 @@ pub fn walkLeases(gpa: std.mem.Allocator, origin: []const u8, visitor: anytype) 
     return .ok;
 }
 
+/// Slack allowed when reading another node's lease `until`, which is stamped
+/// from that node's wall clock and compared against ours. Without it an NTP
+/// step, a VM restored from a snapshot, or a box whose RTC drifted expires
+/// live peers (publisher ahead of us) or pins dead ones indefinitely
+/// (publisher behind us). Half `Catalog.lease_ttl_secs`: wide enough for any
+/// step a synchronized cluster can take, narrow enough that a truly dead
+/// node still disappears at one TTL plus this margin.
+const lease_skew_tolerance_secs: i64 = 15;
+
+/// Whether a lease stamped `until` is still live at this node's
+/// `now_sec`, with the cross-machine skew allowance. Every reader of a lease
+/// `until` goes through here, so `modelfs peers` and discovery cannot
+/// disagree about the same document.
+pub fn leaseLive(until: i64, now_sec: i64) bool {
+    return until +| lease_skew_tolerance_secs > now_sec;
+}
+
 pub const Catalog = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -854,7 +871,8 @@ pub const Catalog = struct {
     }
 
     /// Rebuilds the peer list from origin/.cluster, dropping leases expired
-    /// at `now_sec` (the caller's wall-clock instant, as in publish). One
+    /// at `now_sec` per leaseLive (the caller's wall-clock instant, as in
+    /// publish). One
     /// sample per tick: every expiry decision below sees the same instant
     /// instead of drifting across the directory walk.
     pub fn refresh(self: *Catalog, now_sec: i64) void {
@@ -867,7 +885,7 @@ pub const Catalog = struct {
             pub fn visit(acc: *@This(), name: []const u8, parsed: std.json.Parsed(proto.Lease)) void {
                 _ = name;
                 const lease = parsed.value;
-                if (lease.until <= acc.now_sec) return;
+                if (!leaseLive(lease.until, acc.now_sec)) return;
                 if (std.mem.eql(u8, lease.id, acc.cat.self_id)) return;
                 // Publish-side validId is ASCII without quote/slash/controls;
                 // incoming JSON is not. A planted document with
@@ -2445,13 +2463,56 @@ test "refresh expires a published lease at its deadline" {
 
     const published_at: i64 = 1_709_251_170;
     publisher.publish(published_at);
-    const expires_at = published_at + Catalog.lease_ttl_secs;
+    // The deadline is the published `until` plus the skew allowance: a
+    // reader whose clock trails the publisher's still calls the lease live
+    // until both clocks pass it.
+    const expires_at = published_at + Catalog.lease_ttl_secs + lease_skew_tolerance_secs;
     reader.refresh(expires_at - 1);
     try std.testing.expectEqual(@as(u32, 1), reader.peerCount());
     reader.refresh(expires_at);
     try std.testing.expectEqual(@as(u32, 0), reader.peerCount());
     reader.refresh(expires_at + 1);
     try std.testing.expectEqual(@as(u32, 0), reader.peerCount());
+}
+
+test "a lease stays live through cross-machine clock skew" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-disc-skew");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const addrs = [_]proto.LeaseAddr{
+        .{ .ip = "10.0.0.1", .port = 18080 },
+    };
+    var publisher = Catalog.init(gpa, std.testing.io, origin_d, "other", &addrs, &.{}, &.{});
+    defer publisher.deinit();
+    var reader = Catalog.init(gpa, std.testing.io, origin_d, "me", &.{}, &.{}, &.{});
+    defer reader.deinit();
+
+    // A publisher whose clock runs ahead of ours: its `until` is already in
+    // our past the moment it lands, and without the allowance the node would
+    // drop out of the cluster for as long as the skew lasts. Skew inside the
+    // margin keeps it listed.
+    const published_at: i64 = 1_709_251_170;
+    const skew = lease_skew_tolerance_secs - 5;
+    publisher.publish(published_at);
+    reader.refresh(published_at + skew);
+    try std.testing.expectEqual(@as(u32, 1), reader.peerCount());
+
+    // The mirror case: a publisher whose clock trails ours stamps an `until`
+    // that runs early, which without the allowance would pin a dead peer
+    // around for as long as the skew lasts. Republish from that trailing
+    // clock, then read past its deadline plus the margin.
+    const behind_at: i64 = published_at - 300;
+    publisher.publish(behind_at);
+    const behind_until = behind_at + Catalog.lease_ttl_secs;
+    reader.refresh(behind_until + lease_skew_tolerance_secs - 1);
+    try std.testing.expectEqual(@as(u32, 1), reader.peerCount());
+    reader.refresh(behind_until + lease_skew_tolerance_secs);
+    try std.testing.expectEqual(@as(u32, 0), reader.peerCount());
+
+    // Saturating add: a hostile near-max `until` stays live, never wraps
+    // negative into an expired verdict.
+    try std.testing.expect(leaseLive(std.math.maxInt(i64), 0));
 }
 
 test "refresh drops undialable lease addresses" {

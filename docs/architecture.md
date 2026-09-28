@@ -187,7 +187,11 @@ on the **origin** (not through FUSE):
 ```
 
 Refresh every 10 s, `until` = now + 30 s in Unix epoch seconds. A lease expires at
-`now >= until`, both in discovery and `modelfs peers`. Expired leases are dropped and a node
+`now >= until + 15 s`, both in discovery and `modelfs peers` (`leaseLive` in src/discover.zig).
+The 15 s margin covers cross-machine clock skew: `until` is stamped from the publisher's
+`CLOCK_REALTIME` and compared against the reader's, so an NTP step, a VM restored from a
+snapshot, or a drifted RTC would otherwise evict a live peer (publisher ahead) or pin a dead
+one (publisher behind). A dead node still disappears at one TTL plus the margin. Expired leases are dropped and a node
 skips its own `id`. No PSK in the JSON. A failed write or rename of `<id>.json.tmp` unlinks the staging file
 in `Catalog.publish`, so a retrying tick cannot keep it alive by refreshing its mtime.
 
