@@ -708,7 +708,28 @@ fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
 /// alloc/free pair per piece, allocated only when a covered piece
 /// actually lacks its bit: fully-cached ranges skip the allocation.
 /// Sends the error reply itself; false means streaming cannot proceed.
-fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
+/// One reusable piece-sized buffer per /data response, shared by hydration
+/// and at-rest verification. Each used to allocate and free its own, so a
+/// single piece transfer paid two alloc/free pairs of the full piece size
+/// (an mmap plus its page faults at 8 MiB) for a buffer that is never live
+/// at the same time. Allocated on first use, so a response whose pieces are
+/// all cached still allocates nothing.
+const RangeScratch = struct {
+    gpa: std.mem.Allocator,
+    piece_size: u32,
+    buf: ?[]u8 = null,
+
+    fn get(self: *RangeScratch) ?[]u8 {
+        if (self.buf == null) self.buf = self.gpa.alloc(u8, self.piece_size) catch return null;
+        return self.buf;
+    }
+
+    fn deinit(self: *RangeScratch) void {
+        if (self.buf) |b| self.gpa.free(b);
+    }
+};
+
+fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64, scratch: *RangeScratch) bool {
     const cov = piece.cover(span, file_size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
     // Caller (serveData) already holds xfer: one stamp + allSet covers the
@@ -716,8 +737,6 @@ fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: p
     // while xfer is nonzero.
     if (self.store.touchRangeFilled(file, span, file_size, sys.monoSec(self.io))) return true;
     const piece_size = self.store.piece_size;
-    var pbuf: ?[]u8 = null;
-    defer if (pbuf) |b| self.gpa.free(b);
     var pi = cov.start;
     while (pi < cov.end) : (pi += 1) {
         if (!file.bits.get(pi)) {
@@ -725,12 +744,11 @@ fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: p
             // filling entry, so an allocation failure after the claim would
             // leave the piece claimed forever and wedge every later filler
             // of it into the claim's retry spin.
-            if (pbuf == null)
-                pbuf = self.gpa.alloc(u8, piece_size) catch {
-                    std.log.warn("hydration buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, pi });
-                    replyStatus(self, fd, "500 Internal Server Error");
-                    return false;
-                };
+            const buf = scratch.get() orelse {
+                std.log.warn("hydration buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, pi });
+                replyStatus(self, fd, "500 Internal Server Error");
+                return false;
+            };
             // Claim and completion take separate samples, like the FUSE
             // hydration path: a fill that streamed for minutes must land a
             // fresh recency stamp at completion, not the claim's.
@@ -753,14 +771,14 @@ fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: p
                     // leave fills_origin and fill_err_* flat while this node
                     // hammered NFS on behalf of the fleet.
                     const fill_t0 = sys.monoNs(self.io);
-                    const got = self.store.originPread(file.rel, pbuf.?[0..ln], piece.offset(pi, piece_size));
+                    const got = self.store.originPread(file.rel, buf[0..ln], piece.offset(pi, piece_size));
                     if (got == @as(isize, @intCast(ln))) {
                         // Origin bytes are the trust root: record their digest
                         // at admit so this node can verify later refills and
                         // its own at-rest bytes before serving them.
                         var h: [piece.digest_len]u8 = undefined;
-                        piece.digest(pbuf.?[0..ln], &h);
-                        const w = self.store.completeFill(file, pi, pbuf.?[0..ln], h, sys.monoSec(self.io));
+                        piece.digest(buf[0..ln], &h);
+                        const w = self.store.completeFill(file, pi, buf[0..ln], h, sys.monoSec(self.io));
                         if (w != 0) {
                             // The bytes are in hand but the cache fs refused them
                             // (full or failing disk). Falling through to the
@@ -929,12 +947,10 @@ fn streamRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: pi
 /// entries that predate hashing, or files with no manifest and no origin
 /// fill this session) stream as before: their provenance cannot be proven,
 /// and refusing them would turn every pre-upgrade cache into a full refill.
-fn verifyRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64) bool {
+fn verifyRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: piece.Span, file_size: u64, scratch: *RangeScratch) bool {
     const cov = piece.cover(span, file_size, self.store.piece_size);
     if (cov.start >= cov.end) return true;
     const piece_size = self.store.piece_size;
-    var pbuf: ?[]u8 = null;
-    defer if (pbuf) |b| self.gpa.free(b);
     // One monotonic-ms sample for every piece in the range: retry due/not
     // is a function of that instant, not of how long each piece took.
     const now_ms = sys.monoMs(self.io);
@@ -946,20 +962,19 @@ fn verifyRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: pi
         const expect = self.store.expectedHash(file, pi, now_ms) orelse continue;
         const ln = piece.len(file_size, pi, piece_size);
         if (ln == 0) continue;
-        if (pbuf == null)
-            pbuf = self.gpa.alloc(u8, piece_size) catch {
-                std.log.warn("verify buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, pi });
-                replyStatus(self, fd, "500 Internal Server Error");
-                return false;
-            };
-        const n = self.store.readCache(file, pbuf.?[0..ln], piece.offset(pi, piece_size), sys.monoSec(self.io));
+        const buf = scratch.get() orelse {
+            std.log.warn("verify buffer alloc failed for {s} piece {d}; replying 500", .{ file.rel, pi });
+            replyStatus(self, fd, "500 Internal Server Error");
+            return false;
+        };
+        const n = self.store.readCache(file, buf[0..ln], piece.offset(pi, piece_size), sys.monoSec(self.io));
         if (n < 0 or @as(u64, @intCast(n)) != ln) {
             std.log.warn("verify read failed for {s} piece {d}; replying 500", .{ file.rel, pi });
             replyStatus(self, fd, "500 Internal Server Error");
             return false;
         }
         var h: [piece.digest_len]u8 = undefined;
-        piece.digest(pbuf.?[0..ln], &h);
+        piece.digest(buf[0..ln], &h);
         if (!std.mem.eql(u8, &h, &expect)) {
             _ = self.store.stats.serve_verify_fail.fetchAdd(1, .monotonic);
             std.log.warn("piece {s} {d} failed at-rest verification; refusing to serve and healing", .{ file.rel, pi });
@@ -1006,11 +1021,16 @@ fn serveData(self: *Server, fd: c_int, rel: []const u8, rg: proto.Range) void {
     defer self.store.endXfer(file);
     const want = rg_end -| rg.start +| 1;
 
-    if (!hydrateRange(self, fd, file, .{ .off = rg.start, .len = want }, size)) return;
+    // One piece-sized buffer for the whole response, shared by the two
+    // passes below: hydration and at-rest verification never hold it at the
+    // same time, and streamRange sends from the cache fd without one.
+    var scratch: RangeScratch = .{ .gpa = self.gpa, .piece_size = self.store.piece_size };
+    defer scratch.deinit();
+    if (!hydrateRange(self, fd, file, .{ .off = rg.start, .len = want }, size, &scratch)) return;
     // At-rest verification before the 206 goes on the wire: hydrated pieces
     // were verified at admit, and cached pieces must still match their
     // trusted digest or they are not served (verifyRange replies 500).
-    if (!verifyRange(self, fd, file, .{ .off = rg.start, .len = want }, size)) return;
+    if (!verifyRange(self, fd, file, .{ .off = rg.start, .len = want }, size, &scratch)) return;
 
     var hdr: [220]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {d}-{d}/{d}\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{
