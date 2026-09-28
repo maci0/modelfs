@@ -2039,11 +2039,24 @@ fn statusJson(st: *State) !void {
 // makes the handover possible. The path handlers above stay unchanged and
 // are reached through the ino/fh resolution here.
 
-/// libfuse's `struct fuse_file_info` carries bitfields, so translate-c
-/// renders it opaque and the daemon reaches its head by offset. That head
-/// is identical on libfuse 3.14 (the vendored arm64 build) and 3.18: int32
-/// `flags` at 0, the bitfield word at 4 with `direct_io` at bit 1 and
-/// `keep_cache` at bit 2, then the 8-byte-aligned uint64 `fh` at 16.
+// libfuse's `struct fuse_file_info` carries bitfields, so translate-c
+// renders it opaque and the daemon reaches its head by offset. That head
+// is identical on libfuse 3.14 (the vendored arm64 build) and 3.18: int32
+// `flags` at 0, the bitfield word at 4 with `direct_io` at bit 1 and
+// `keep_cache` at bit 2, then the 8-byte-aligned uint64 `fh` at 16.
+// The offsets and the accessors below hold that head only where the layout
+// is LP64 little-endian. A 32-bit ABI aligns the uint64 `fh` on 4 bytes,
+// landing it at 12, and a big-endian target stores the int32 head
+// byte-swapped, so on either the accessors would hand back another open's
+// flags and handle without failing anything. Refuse the build instead, the
+// same way src/c_musl.h refuses a musl target whose struct timespec it
+// cannot reproduce.
+comptime {
+    if (@import("builtin").target.cpu.arch.endian() != .little or @sizeOf(usize) != 8) {
+        @compileError("fuse_file_info is reached by LP64 little-endian offset; " ++
+            "derive the head layout for this target before touching fi_bits_off/fi_fh_off");
+    }
+}
 const fi_bits_off: usize = 4;
 const fi_fh_off: usize = 16;
 const fi_direct_io_bit: u5 = 1;

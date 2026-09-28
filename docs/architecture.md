@@ -87,6 +87,14 @@ that reaches a host outside the cluster (HTTPS through `std.http.Client`, CLI on
 translate-c's musl timespec demotion, with `src/c-musl-shim/` first on the include path);
 `c.zig` re-exports that module and every other module goes through it.
 
+One libfuse struct is still reached by hand: `fuse_file_info` carries bitfields, so
+translate-c renders it opaque and `fuse_fs.zig` reads its head by offset (`flags` at 0, the
+bitfield word at 4, `fh` at 16). That layout, and the explicit `.little` every accessor uses,
+is an LP64 little-endian property; a `comptime` guard beside the offsets refuses any other
+target the way `c_musl.h` refuses one whose `struct timespec` it cannot reproduce. The
+statfs-to-statvfs copy in `mf_statfs` is the mirror-image case: both libcs spell `f_fsid` in
+four different types, and the same 8 bytes move either way on LP64.
+
 The commands that skip FUSE (`status`, `peers`, `pin`, `verify`, `dupes`, `pull`, `update`)
 import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster` and
 name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`,
