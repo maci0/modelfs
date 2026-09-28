@@ -369,6 +369,7 @@ no_lib_sh=(
     check_drill_log.sh
     check_offsite.sh
     check_release_tag.sh
+    dr_point_restore.sh
     dr_pool_restore.sh
     hold_monthlies.sh
     install_libfuse3_dev.sh

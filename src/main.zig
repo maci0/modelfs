@@ -3411,7 +3411,14 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         };
         total_pieces += m.entries.len;
         manifests.append(gpa, m) catch return 1;
-        sorted.append(gpa, piece.digestSorted(gpa, m.entries) catch return 1) catch return 1;
+        // Same ownership hazard as cmdDupes: the copy is unreachable from
+        // `sorted` until the append lands, and m is already owned by
+        // `manifests` either way.
+        const s = piece.digestSorted(gpa, m.entries) catch return 1;
+        sorted.append(gpa, s) catch {
+            gpa.free(s);
+            return 1;
+        };
     }
 
     if (skipped > 0) return 1;
@@ -3514,11 +3521,22 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
             failed = true;
             continue;
         };
+        // Own m.entries and the sorted copy before the append: once the
+        // struct literal is evaluated neither is reachable from `files`,
+        // so a failure here would orphan both to the exit below.
+        const by_digest = piece.digestSorted(gpa, m.entries) catch {
+            gpa.free(m.entries);
+            return 1;
+        };
         files.append(gpa, .{
             .rel = rel,
             .manifest = m,
-            .by_digest = piece.digestSorted(gpa, m.entries) catch return 1,
-        }) catch return 1;
+            .by_digest = by_digest,
+        }) catch {
+            gpa.free(by_digest);
+            gpa.free(m.entries);
+            return 1;
+        };
     }
 
     if (failed) return 1;

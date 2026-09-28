@@ -130,7 +130,7 @@ fn hexInit(gpa: std.mem.Allocator, init: []const u8) ![]u8 {
 }
 
 /// JSON knobs plus a trailing raw PSK. The secret is never UTF-8 JSON and
-/// never appears in exec argv.
+/// never appears in exec argv. Caller frees the returned blob with `gpa`.
 pub fn encode(gpa: std.mem.Allocator, k: Knobs) ![]u8 {
     if (!cull.ordered(k.water)) return error.BadWatermarks;
     const init_hex = try hexInit(gpa, k.init);
@@ -176,6 +176,8 @@ pub fn encode(gpa: std.mem.Allocator, k: Knobs) ![]u8 {
     return w.toOwnedSlice(gpa);
 }
 
+/// Reads a blob written by `encode`. Caller calls `Owned.deinit` on the
+/// result, which releases the PSK and every string decoded into it.
 pub fn decode(gpa: std.mem.Allocator, blob: []const u8) !Owned {
     if (!std.mem.startsWith(u8, blob, magic)) return error.BadMagic;
     const rest = blob[magic.len..];
@@ -242,7 +244,7 @@ pub fn decode(gpa: std.mem.Allocator, blob: []const u8) !Owned {
 /// number names, because argv is world-readable through /proc. The
 /// mountpoint is repeated from the state blob so `ps` keeps naming the
 /// mount this process serves, and `cmdHandover` refuses a pair that
-/// disagrees.
+/// disagrees. Caller releases the result with `freeExecArgvZ`.
 pub fn execArgvZ(gpa: std.mem.Allocator, bin: []const u8, state_fd: i32, mount: []const u8) ![:null]?[*:0]const u8 {
     const fd_tmp = try std.fmt.allocPrint(gpa, "{d}", .{state_fd});
     defer gpa.free(fd_tmp);
@@ -257,17 +259,21 @@ pub fn execArgvZ(gpa: std.mem.Allocator, bin: []const u8, state_fd: i32, mount: 
     return argv;
 }
 
+/// Releases an argv built by `execArgvZ`: every word and the array itself.
 pub fn freeExecArgvZ(gpa: std.mem.Allocator, argv: [:null]?[*:0]const u8) void {
     var i: usize = 0;
     while (argv[i]) |a| : (i += 1) gpa.free(std.mem.span(a));
     gpa.free(argv);
 }
 
+/// The sealed memfd `execArgvZ` names: caller closes it.
 pub fn writeStateFd(blob: []const u8) !c_int {
     const fd = try sys.memfdSealed(blob);
     return fd;
 }
 
+/// Reads and wipes the state memfd, then decodes it. Caller calls
+/// `Owned.deinit` on the result. Does not close `fd`.
 pub fn readStateFd(gpa: std.mem.Allocator, fd: c_int) !Owned {
     const blob = try sys.readAllFdAlloc(gpa, fd, max_state_bytes);
     // The blob's tail is the raw PSK: wipe before the free so the secret
@@ -282,16 +288,21 @@ pub fn readStateFd(gpa: std.mem.Allocator, fd: c_int) !Owned {
 pub const Req = struct { bin: []const u8, token: []const u8 };
 pub const Ack = struct { token: []const u8 };
 
+/// `update.req` carrying the replacement binary path and the handshake
+/// nonce. Caller frees the result with `gpa`.
 pub fn encodeReq(gpa: std.mem.Allocator, bin: []const u8, token: []const u8) ![]u8 {
     try utf8Knob(token);
     const json = try std.json.Stringify.valueAlloc(gpa, Req{ .bin = bin, .token = token }, .{});
     defer gpa.free(json);
     return std.fmt.allocPrint(gpa, "{s}\n", .{json});
 }
+
+/// Caller calls `.deinit()` on the parsed value; its strings are owned by it.
 pub fn decodeReq(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Req) {
     return std.json.parseFromSlice(Req, gpa, std.mem.trim(u8, blob, " \t\r\n"), .{});
 }
 
+/// `update.ack` echoing the nonce back. Caller frees the result with `gpa`.
 pub fn encodeAck(gpa: std.mem.Allocator, token: []const u8) ![]u8 {
     try utf8Knob(token);
     const json = try std.json.Stringify.valueAlloc(gpa, Ack{ .token = token }, .{});
@@ -299,6 +310,7 @@ pub fn encodeAck(gpa: std.mem.Allocator, token: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "{s}\n", .{json});
 }
 
+/// Caller calls `.deinit()` on the parsed value.
 pub fn decodeAck(gpa: std.mem.Allocator, blob: []const u8) !std.json.Parsed(Ack) {
     return std.json.parseFromSlice(Ack, gpa, std.mem.trim(u8, blob, " \t\r\n"), .{ .ignore_unknown_fields = true });
 }

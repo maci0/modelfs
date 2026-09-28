@@ -1633,15 +1633,14 @@ pub const Store = struct {
             file.mu.unlock(self.io);
             return;
         };
-        if (m == null) {
-            // The name exists but is not a manifest; retry in case a real
-            // manifest lands on the next publish.
+        // The name exists but is not a manifest; retry in case a real
+        // manifest lands on the next publish.
+        const mf = m orelse {
             file.mu.lockUncancelable(self.io);
             file.manifest_retry_at = now_ms +| self.manifest_retry_ms;
             file.mu.unlock(self.io);
             return;
-        }
-        const mf = m.?;
+        };
         defer self.gpa.free(mf.entries);
         var mst: c.struct_stat = undefined;
         const have_mtime = sys.lstatPath(p, &mst) == 0;
@@ -1686,7 +1685,10 @@ pub const Store = struct {
         // load (or a stale same-size manifest) must not replace it.
         // They must not mark the entry dirty (they already exist on origin).
         // Reserve once: a 70 GiB file is thousands of puts, and each
-        // grow would realloc the map under file.mu.
+        // grow would realloc the map under file.mu. A failed reservation
+        // is not fatal: the per-entry put below still grows the map on
+        // demand, and that path is already warned on, so there is nothing
+        // to recover here and nothing to say.
         const extra: u32 = @intCast(@min(mf.entries.len, std.math.maxInt(u32)));
         file.hashes.ensureTotalCapacity(self.gpa, file.hashes.count() +| extra) catch {};
         for (mf.entries) |e| {

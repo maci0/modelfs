@@ -390,6 +390,11 @@ pub fn utf8FormatControlAt(s: []const u8, i: usize) bool {
 /// size its bits are indexed against. piece_size 0 means the peer did not
 /// advertise one (an older build); consumers assume alignment for those.
 /// A present X-Piece-Size of 0 is rejected at parse, not stored here.
+///
+/// bits is borrowed: a producer may hand back a view into a live catalog
+/// cache entry, so this type carries no deinit. The one producer that
+/// allocates, `peer.fetchHave`, frees it at its call site with the `gpa` it
+/// was given; see its doc comment.
 pub const HaveBits = struct {
     bits: []u8,
     piece_size: u32,

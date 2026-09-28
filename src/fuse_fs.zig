@@ -2983,6 +2983,9 @@ test "removeHandoverSignal clears live_* and restores SIGUSR2 to SIG_DFL" {
 /// iteration order must not leak into the blob: two images with the same
 /// tables should produce byte-identical state, so a replay or digest
 /// comparison of two runs is not confounded by Zig's per-process hash seed.
+/// Caller frees the returned slice with `gpa`. The `path` fields are
+/// borrowed from the inode table and stay valid only until it is torn down,
+/// so the caller must encode them before releasing the mount.
 fn snapNodes(st: *State, gpa: std.mem.Allocator) ![]handover.NodeSnap {
     st.nodes_mu.lockUncancelable(st.io);
     defer st.nodes_mu.unlock(st.io);
@@ -3002,6 +3005,7 @@ fn snapNodes(st: *State, gpa: std.mem.Allocator) ![]handover.NodeSnap {
 
 /// Snapshot the open-handle table for the handover blob, sorted by fh for
 /// the same byte-for-byte determinism snapNodes gives the inode table.
+/// Caller frees the returned slice with `gpa`.
 fn snapOpens(st: *State, gpa: std.mem.Allocator) ![]handover.OpenSnap {
     st.nodes_mu.lockUncancelable(st.io);
     defer st.nodes_mu.unlock(st.io);

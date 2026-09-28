@@ -1111,6 +1111,9 @@ fn replyOriginStat(self: *Server, fd: c_int, rel: []const u8, rc: i32) void {
 /// advertised 0 is not unknown: no legal --piece is zero, so it fails the
 /// probe like any other malformed grid. A malformed header fails the probe
 /// like any other bad reply so failures stay uncached and retried.
+///
+/// The returned bits are a fresh `gpa` allocation the caller must free with
+/// the same `gpa`; the other producers of this type hand back borrowed views.
 fn fetchHave(gpa: std.mem.Allocator, io: std.Io, psk: []const u8, ip: []const u8, port: u16, rel: []const u8) !proto.HaveBits {
     const fd = try sendRequest(io, psk, ip, port, rel, null);
     defer sys.close(fd);
@@ -1318,7 +1321,9 @@ fn readFlexBodyAllocDeadline(gpa: std.mem.Allocator, io: std.Io, fd: c_int, out:
 /// Content-Length against out (or allocates), and streams to the deadline.
 /// The one body reader every fetch path shares, so the length-matching
 /// contract cannot drift between them. head_buf must stay alive for the
-/// call; the returned slice never aliases it.
+/// call; the returned slice never aliases it. Returns `out` when one is
+/// supplied (the caller keeps owning it); otherwise a fresh `gpa`
+/// allocation the caller frees with the same `gpa`.
 fn finishBodyAlloc(gpa: std.mem.Allocator, io: std.Io, fd: c_int, head_buf: []const u8, head_len: usize, total_read: usize, out: ?[]u8, deadline_ms: ?i64) ![]u8 {
     const head = head_buf[0..head_len];
     const status_end = std.mem.find(u8, head, "\r\n") orelse return error.BadHttp;

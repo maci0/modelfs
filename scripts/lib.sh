@@ -42,7 +42,9 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # MF_NAS_DEST (install_nas_backup.sh), MF_OFFSITE_DATASET,
 # MF_OFFSITE_MAX_AGE (check_offsite.sh), MF_RESTORE_FROM,
 # MF_RESTORE_LOCAL_FROM, MF_RESTORE_MOUNTPOINT, MF_RESTORE_SHARENFS,
-# MF_RESTORE_LOG (dr_pool_restore.sh), MF_HOTRELOAD_PORT
+# MF_RESTORE_LOG (dr_pool_restore.sh), MF_POINT_DATASET, MF_POINT_LIVE,
+# MF_POINT_CLONE, MF_POINT_CLONE_MP (dr_point_restore.sh),
+# MF_HOTRELOAD_PORT
 # (test_hot_reload.sh), MF_SYNCOID_SRC, MF_SYNCOID_DEST
 # (nas/syncoid-models.service), MF_DRILL_DATASET (nas/modelfs-drill.service,
 # nas/modelfs-snap-age.service), MF_STUB_CLONE_RACE, MF_STUB_DESTROY_FAIL,
