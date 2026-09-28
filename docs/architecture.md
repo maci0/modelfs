@@ -758,7 +758,7 @@ sequenceDiagram
     participant D as live daemon
     participant N as replacement image
     CLI->>CLI: /proc/self/exe + random handshake token
-    CLI->>D: write update.req (token) under --cache
+    CLI->>D: stage update.req.tmp.<pid>, rename onto update.req (token) under --cache
     CLI->>D: SIGUSR2
     Note over D: session exits; state is captured, not re-read
     D->>D: knobs, PSK, inode/fh tables, captured FUSE_INIT -> sealed memfd

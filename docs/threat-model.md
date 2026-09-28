@@ -237,9 +237,11 @@ that then receives the PSK in a Bearer header: the same handoff as a forged leas
 Local authority transition and IPC entry point: `modelfs update` asks the running daemon to
 replace its process image without unmounting (`cmdUpdate` src/main.zig, src/handover.zig).
 
-* **Trigger**: The CLI writes `<cache>/update.req` (mode 0600 durable via
+* **Trigger**: The CLI writes `<cache>/update.req.tmp.<pid>` (mode 0600 durable via
   `writeFileOwnerOnlyDurable` src/sys.zig, opened `O_NOFOLLOW`) containing an absolute binary path
-  and a random 16-byte hex handshake token, then sends `SIGUSR2` to the daemon PID.
+  and a random 16-byte hex handshake token, renames it onto `<cache>/update.req`, then sends
+  `SIGUSR2` to the daemon PID. The rename publishes the request whole, so a second `modelfs update`
+  against the same cache cannot truncate the request the replacement image is reading.
 * **Daemon verification**: In `onUsr2` (src/fuse_fs.zig), the signal is ignored if no `FUSE_INIT`
   was captured (`st.init_len == 0`) or if `update.req` cannot be opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`.
   The event loop is awakened via a non-blocking internal pipe (`wakeup_w`).
@@ -443,7 +445,7 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 
 | Threat | State |
 |---|---|
-| **S** spoofing an update request | Gated by filesystem write access and signal permission: the CLI writes `<cache>/update.req` mode 0600 (`writeFileOwnerOnlyDurable` src/sys.zig); the daemon opens it `O_NOFOLLOW \| O_NONBLOCK` but does not validate its owner or mode. The cache root is operator-controlled, not forced to 0700. The kernel enforces `SIGUSR2` delivery permissions. A process running with the daemon's uid or root can plant a request naming an arbitrary binary |
+| **S** spoofing an update request | Gated by filesystem write access and signal permission: the CLI writes `<cache>/update.req.tmp.<pid>` mode 0600 and renames it onto `<cache>/update.req` (`writeFileOwnerOnlyDurable` src/sys.zig); the daemon opens it `O_NOFOLLOW \| O_NONBLOCK` but does not validate its owner or mode. The cache root is operator-controlled, not forced to 0700. The kernel enforces `SIGUSR2` delivery permissions. A process running with the daemon's uid or root can plant a request naming an arbitrary binary |
 | **T** tampering with handover state | Tampering in transit across exec is mitigated: the live state blob is encoded into a sealed memfd (`sys.memfdSealed` src/sys.zig, setting `F_SEAL_SEAL \| F_SEAL_SHRINK \| F_SEAL_GROW \| F_SEAL_WRITE`) before `execve`. JSON parsing validates request structure, not authenticity. The random token correlates the CLI request with its acknowledgement; it does not authenticate a request to the daemon (`decodeReq` / `randomToken` src/handover.zig, `cmdUpdate` src/main.zig) |
 | **R** repudiation of updates | Handover completion logs to stdout (`updated pid {d}`) and daemon logs record handover steps and errors, but no cryptographic audit trail or signing of the replacement binary exists. `update.req` is unlinked after consumption or timeout |
 | **I** disclosure of secrets across handover | Mitigated: the cluster PSK travels exclusively on the sealed memfd descriptor, never on argv or disk (`cmdUpdate` src/main.zig, src/handover.zig). `readStateFd` zeroes the buffer with `secureZero` before free. The state fd is closed immediately (`sys.close` src/main.zig) so it does not sit in `/proc/<pid>/fd`. Core dumps are disabled (`disableCoreDumps`) and environment is scrubbed (`scrubPskEnv`) in `cmdHandover` |

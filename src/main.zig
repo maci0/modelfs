@@ -1709,8 +1709,26 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         printErr("modelfs: cache path too long to name {s}/{s}\n", .{ opts.cache, handover.req_file });
         return 1;
     };
-    if (sys.writeFileOwnerOnlyDurable(req_path, req) != 0) {
+    // Staged, not written onto the name: the exec'd image reads update.req
+    // after the SIGUSR2, and a second `modelfs update` running against the
+    // same cache opened the fixed name O_TRUNC, so that read could land on
+    // a truncated blob. decodeReq then fails, the session has already been
+    // exited, and the mount is gone. A rename publishes the request whole,
+    // so the daemon reads either the previous request or this one.
+    var sbuf: [32]u8 = undefined;
+    const ext = std.fmt.bufPrint(&sbuf, ".tmp.{d}", .{sys.pidSelf()}) catch return 1;
+    var tbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const staged = sys.appendExt(&tbuf, req_path, ext) catch {
+        printErr("modelfs: cache path too long to stage {s}/{s}\n", .{ opts.cache, handover.req_file });
+        return 1;
+    };
+    if (sys.writeFileOwnerOnlyDurable(staged, req) != 0) {
         printErr("modelfs: cannot write {s}/{s}\n", .{ opts.cache, handover.req_file });
+        return 1;
+    }
+    if (sys.rename(staged, req_path) != 0) {
+        _ = sys.unlink(staged);
+        printErr("modelfs: cannot publish {s}/{s}\n", .{ opts.cache, handover.req_file });
         return 1;
     }
     std.posix.kill(@intCast(pid), .USR2) catch {

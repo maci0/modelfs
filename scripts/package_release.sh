@@ -31,7 +31,9 @@ Usage: ./scripts/package_release.sh --dist DIR
 Flatten the rel-<target>/ artifact directories into DIR under their release
 names, write DIR/modelfs-licenses.tar.gz with normalized metadata, and
 write DIR/SHA256SUMS over every asset in a fixed order. Deterministic: two
-runs over the same inputs produce byte-identical outputs.
+runs over the same inputs produce byte-identical outputs, and a rerun over
+a dist an earlier pass already flattened converges on the same digests
+instead of failing on the moved artifacts.
 
 Called by .github/workflows/release.yml. Run it after the build jobs have
 uploaded their artifacts, before `gh release create`.
@@ -61,14 +63,30 @@ DIST="$2"
 # here too.
 mv_dist() {
     local from="$1" to="$2"
-    [[ -e "${from}" ]] || fail "missing release artifact ${from}"
+    if [[ ! -e "${from}" ]]; then
+        # A rerun over an already-flattened dist: the artifact was moved by
+        # an earlier pass that then failed before publishing, and the
+        # destination it produced is the one this run would have written.
+        # Treating the missing source as fatal would make the step
+        # un-rerunnable, which is the case the release job hits when a
+        # re-run resumes after the upload step succeeded.
+        [[ -e "${to}" ]] || fail "missing release artifact ${from}"
+        echo "already flattened ${to}"
+        return 0
+    fi
     mv -f -- "${from}" "${to}"
 }
 mv_dist "${DIST}/rel-x86_64-linux-musl/modelfs-x86_64-linux-musl" "${DIST}/modelfs-x86_64-linux-musl"
 mv_dist "${DIST}/rel-aarch64-linux-musl/modelfs-aarch64-linux-musl" "${DIST}/modelfs-aarch64-linux-musl"
 mv_dist "${DIST}/rel-sparks/modelfs" "${DIST}/modelfs-aarch64-linux-gnu"
-rmdir "${DIST}/rel-x86_64-linux-musl" "${DIST}/rel-aarch64-linux-musl" "${DIST}/rel-sparks" \
-    || fail "could not remove the emptied rel-* directories under ${DIST}"
+for rel_dir in rel-x86_64-linux-musl rel-aarch64-linux-musl rel-sparks; do
+    # Only the directories this run emptied: a rerun over a dist whose
+    # rel-* directories an earlier pass already removed has nothing to
+    # remove, and rmdir on a missing path is an error under set -e.
+    [[ -d "${DIST}/${rel_dir}" ]] || continue
+    rmdir "${DIST}/${rel_dir}" \
+        || fail "could not remove the emptied ${rel_dir} directory under ${DIST}"
+done
 
 # Every third-party license the shipped binary and its static inputs carry.
 # A path added here is bundled; a license added to the tree is not, so this

@@ -484,6 +484,10 @@ echo "=== restore drill (stub zfs) ==="
 echo "=== vendored libfuse3 extract ==="
 "${SCRIPTS_DIR}/test_extract_fuse3_arm64.sh" || fail "vendored libfuse3 extract tests failed"
 
+# The release job is re-runnable, so the packaging step has to be too.
+echo "=== release packaging rerun ==="
+"${SCRIPTS_DIR}/test_package_release.sh" || fail "release packaging rerun tests failed"
+
 echo "=== ruff ==="
 # No path: pyproject.toml is in ruff's default set, and a Python file
 # outside scripts/ cannot skip the gate. Matches a bare `ruff check`.
