@@ -22,10 +22,8 @@
 # follow those conventions (require-double-brackets / require-variable-braces).
 enable=add-default-case
 enable=avoid-nullary-conditions
-enable=avoid-negated-conditions
 enable=deprecate-which
 enable=quote-safe-variables
 enable=check-set-e-suppressed
 enable=check-unassigned-uppercase
 enable=check-extra-masked-returns
-enable=useless-use-of-cat
