@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-28
+
+Minor bump with no behavior changes since 0.15.1.
+
 ## [0.15.1] - 2026-09-18
 
 Peer HTTP request heads parse Authorization, Range, and Content-Length in one
@@ -1206,7 +1210,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/maci0/modelfs/releases/tag/v0.16.0
 [0.15.1]: https://github.com/maci0/modelfs/releases/tag/v0.15.1
 [0.15.0]: https://github.com/maci0/modelfs/releases/tag/v0.15.0
 [0.14.1]: https://github.com/maci0/modelfs/releases/tag/v0.14.1
