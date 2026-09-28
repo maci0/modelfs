@@ -390,7 +390,7 @@ const KnobSet = packed struct {
 fn knobSource(from_env: bool, from_flag: bool, env_name: []const u8, flag_name: []const u8) []const u8 {
     if (from_flag) return flag_name;
     if (from_env) return env_name;
-    return "(default)";
+    return "default";
 }
 
 fn parseHostPort(s: []const u8) !proto.LeaseAddr {
@@ -1937,7 +1937,12 @@ fn cmdConfig(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     if (opts.seed.items.len == 0) {
         try w.print("seed = (none) (default)\n", .{});
     } else {
-        try w.print("seed = {s} ({s})\n", .{ opts.seed.items, knobSource(false, opts.from_flag.seed, "", "--seed") });
+        try w.print("seed = ", .{});
+        for (opts.seed.items, 0..) |s, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.print("{s}", .{s});
+        }
+        try w.print(" ({s})\n", .{knobSource(false, opts.from_flag.seed, "", "--seed")});
     }
     try w.print("direct_io = {s} ({s})\n", .{ if (opts.direct_io) "on" else "off", knobSource(false, opts.from_flag.direct_io, "", "--direct-io/--kernel-cache") });
     try w.print("allow_other = {s} ({s})\n", .{ if (opts.allow_other) "on" else "off", knobSource(false, opts.from_flag.allow_other, "", "--allow-other") });
