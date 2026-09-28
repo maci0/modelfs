@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Security documentation - 2026-09-28
+- **`SECURITY.md` no longer promises backported fixes to an old line.** It claimed the `0.12.x` line received security fixes; the repository cuts every release from `main` and has no backport process, and `v0.12.0` predates the peer request-line and `Content-Length` validation, the cluster-id bound, and the secret-handling hardening of `0.14.1` and `0.15.0`. The policy now states that fixes ship as the next tag from `main` and that the remedy for a deployment is to move to the current tag. No code or release process changes.
+
 ### Gate hardening - 2026-09-28
 - **`scripts/check.sh` fails when the local shellcheck does not define an optional check named in `.shellcheckrc`.** Those checks are enabled by name, and a shellcheck that never had one ignores the name silently, so the gate could report a pass while running fewer rules than CI does. The gate now requires every `enable=` in `.shellcheckrc` to appear in `shellcheck --list-optional`. No shell changes: the same scripts lint clean, and the set of enabled rules is unchanged on a current shellcheck.
 

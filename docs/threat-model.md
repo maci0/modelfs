@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Living document; describes `src/` as of the date below |
-| Last reviewed | 2026-09-13 |
+| Last reviewed | 2026-09-28 |
 | Covers | modelfs daemon (`mount`) and CLI as of `v0.17.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
@@ -31,6 +31,7 @@ trusting the row.
 | [R7](#r7-cache-artifacts-trusted-without-verification) | Cache bitfields trusted at load, so a tampered sidecar serves hole zeros as data | local user to cache | **Not prevented** |
 | [R8](#r8-crash-time-psk-spill-mitigated) | A crash dumping process memory that holds the secret | secrets to code | Mitigated: `RLIMIT_CORE` zeroed at mount |
 | [R9](#r9-rejected-request-anonymity-mitigated) | Rejected peer requests leaving no attributable trace | network to peer server | Mitigated: source-attributed 401/405 logging |
+| [R10](#r10-pulled-origin-artifacts-land-world-readable) | `modelfs pull` writes weights 0644 on the shared origin, unlike the 0600 cache | local uid / NFS export reader to origin | **Not prevented** |
 
 ---
 
@@ -38,7 +39,7 @@ trusting the row.
 
 | Asset | Where it lives | Impact if lost |
 |---|---|---|
-| LLM weights | origin tree (authoritative copy), per-node piece caches (`data/`) | Exfiltration of valuable or licensed models; silent corruption poisons training and serving runs |
+| LLM weights | origin tree (authoritative copy), per-node piece caches (`data/`) | Exfiltration of valuable or licensed models; silent corruption poisons training and serving runs. The origin copy's mode is whatever published it, and `modelfs pull` sets 0644 itself (R10) |
 | Cluster PSK | `/etc/modelfs.psk` or `MODELFS_PSK_VALUE`, process memory, and every request's `Authorization` header (src/main.zig, src/peer.zig) | Full impersonation of any node: read every weight, serve poisoned pieces |
 | Availability of the read path | `/models` mount, peer port, NFS origin | Reads block until a piece fills; stalled peers degrade the cluster to origin-tier throughput |
 | Cache integrity | `data/` sparse files, `meta/*.pieces` bitfields, and per-piece blake3 digests in memory and in the origin manifest (`Store.hashes`/`expectedHash` src/store.zig) | Punched holes read as zeros. Peer fills are verified against a trusted digest before admit and serves before streaming, and `modelfs verify` rehashes against the manifest; the sidecars themselves are still trusted at load (R7) |
@@ -111,8 +112,10 @@ a redirect to a signed CDN host.
 Every listed path is refused unless it passes `relOk` and, joined onto `--dest`, `relOk` again
 plus `relIsCluster`, so a listing cannot write outside the destination or plant a lease file.
 Names are percent-encoded into the download URL. Bodies stream to `<name>.part` opened
-`O_NOFOLLOW` and are renamed only when complete. Transport is HTTPS with the platform trust
-store, and the `HF_TOKEN` bearer travels as a privileged header so it is stripped on the
+`O_NOFOLLOW` at mode 0644 and are renamed only when complete, so the staging file and the
+weight it becomes are world-readable on the shared origin, unlike the 0600 cache path
+([R10](#r10-pulled-origin-artifacts-land-world-readable)). Transport is HTTPS with the platform
+trust store, and the `HF_TOKEN` bearer travels as a privileged header so it is stripped on the
 cross-host redirect.
 
 ### `modelfs dupes` manifest telemetry
@@ -288,8 +291,12 @@ over HTTPS to fetch model file trees and weights into the origin directory (`src
   - Fixed-size 8 MiB writer for tree listings (`max_listing_bytes`) preventing unbounded allocation from a hostile endpoint.
   - JSON tree parsing (`parseTree` `src/hf.zig`) validates every listed path against `relOk` and `relIsCluster`,
     both bare and joined with `--dest`, preventing path escape or planting files inside `.cluster/`.
-  - Staged download: streams to `<name>.part` opened `O_NOFOLLOW` with owner-only/clean permissions,
-    and atomic rename to real name only upon complete download (`fetchOne` `src/hf.zig`).
+  - Staged download: streams to `<name>.part` opened `O_NOFOLLOW` and atomically renamed to the
+    real name only upon complete download (`fetchOne` `src/hf.zig`). Neither the `.part` file nor
+    the renamed weight is owner-only: both are created 0644 under the caller's umask, and
+    destination directories are requested 0755, so a pull's output is readable by every local
+    uid on the node and by every host that can read the NFS export
+    ([R10](#r10-pulled-origin-artifacts-land-world-readable)).
   - Credential containment: `HF_TOKEN` travels only to the primary host (`huggingface.co`) as a privileged
     header and is stripped by `std.http.Client` on cross-host redirects to CDNs. The token is bounded to
     4096 bytes (`max_token_bytes`), core dumps are disabled during execution (`disableCoreDumps` `src/main.zig`),
@@ -470,15 +477,15 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 | **S** spoofing the model hub or CDN | Mitigated by HTTPS and TLS certificate verification using the platform system trust store |
 | **T** tampering with origin tree via malicious listing or redirect | Mitigated: listing paths must pass `relOk` and `relIsCluster` both individually and joined under `--dest`, blocking path traversal and `.cluster` overwrites; downloads stream to `.part` files opened `O_NOFOLLOW` and atomically rename on complete (`parseTree`/`fetchOne` src/hf.zig) |
 | **R** repudiation of downloaded files | The CLI logs pulled and skipped file counts to stdout; no cryptographic commit signature verification is performed beyond TLS transport integrity |
-| **I** disclosure of Hugging Face access token | Mitigated: token is sent as a privileged header to `huggingface.co` and stripped on cross-host CDN redirects; core dumps disabled during pull when token is present; token buffer wiped with `secureZero` on exit (src/hf.zig, src/main.zig) |
+| **I** disclosure of Hugging Face access token | Mitigated: token is sent as a privileged header to `huggingface.co` and stripped on cross-host CDN redirects; core dumps disabled during pull when token is present; token buffer wiped with `secureZero` on exit (src/hf.zig, src/main.zig). The weights the pull writes are not contained: they land 0644 on the shared origin ([R10](#r10-pulled-origin-artifacts-land-world-readable)) |
 | **D** denial of service via huge listing or stall | Mitigated: JSON listing is capped at 8 MiB (`max_listing_bytes`) via fixed-size writer; aborted/stalled downloads leave `.part` files without corrupting existing destination files; streaming uses 1 MiB chunk buffers |
-| **E** elevation of privilege on origin filesystem | Mitigated: paths cannot escape `--dest` or write into `.cluster` (`relOk`, `relIsCluster`); created files take standard user umask and cannot set setuid/setgid bits |
+| **E** elevation of privilege on origin filesystem | Mitigated: paths cannot escape `--dest` or write into `.cluster` (`relOk`, `relIsCluster`); created files take mode 0644 under the caller's umask and cannot carry setuid/setgid bits |
 
 **Input containment and validation.** Model IDs and revisions are validated against strict character sets and bounded lengths before URL construction (`repoOk`, `revisionOk` src/hf.zig). Repository tree listings are parsed by `parseTree` (src/hf.zig), which refuses any entry that violates `relOk` or names `.cluster`, ensuring upstream JSON cannot escape destination directories or plant discovery leases.
 
 **Transport and credential protection.** Network communication uses platform TLS. Bearer tokens travel exclusively to `huggingface.co` and are stripped on cross-host redirects to download CDNs. Core dumps are disabled while tokens reside in memory (`disableCoreDumps` src/main.zig), and token allocations are zeroed with `secureZero` upon deinitialization.
 
-**Staged downloads.** Downloads stream into temporary `.part` files created with `O_NOFOLLOW`. Files are atomically renamed into place only after the payload completes, preventing interrupted downloads from leaving partial models that could be mistaken for valid weights.
+**Staged downloads.** Downloads stream into temporary `.part` files created with `O_NOFOLLOW` and mode 0644, and are atomically renamed into place only after the body lands at exactly the listed size, preventing interrupted downloads from leaving partial models that could be mistaken for valid weights. The rename preserves that mode, so the finished weight is 0644 on the shared origin as well; see [R10](#r10-pulled-origin-artifacts-land-world-readable).
 
 ---
 
@@ -758,6 +765,27 @@ Residual: the secret still lives in process memory for the mount's lifetime.
 Residuals: successful requests still carry no per-source audit trail, and a multi-source flood
 names at most one source per window.
 
+### R10: pulled origin artifacts land world-readable
+
+**Not prevented.** `fetchOne` (src/hf.zig) opens `<name>.part` with
+`O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW | O_NONBLOCK` at mode 0644, `sys.mkdirAll` requests
+0755 for destination directories, and the completing `rename` keeps that mode, so every model
+`modelfs pull` fetches lands on the shared origin readable by any local uid on the node and by
+any host that can read the NFS export. The in-progress `.part` file is readable at the same mode
+for the whole download, so a partially fetched multi-gigabyte model is exposed before it has a
+complete body.
+
+This is the opposite of the cache path, which holds weights 0600 in 0700 directories
+(`cache_data_mode` / `cache_dir_mode` src/store.zig), and of `status.json`, sidecars, and pin
+markers at 0600 (`writeFileOwnerOnly` src/sys.zig). Weights already published to the origin by
+an operator's own copy step carry whatever mode that step chose, so the exposure exists
+regardless; `modelfs pull` is the path that sets the mode itself rather than inheriting one.
+
+The blast radius is the origin tree's own mode discipline, not a traversal: paths are gated by
+`relOk` and `relIsCluster` in both `parseTree` and `cmdPull`, so a hostile listing cannot place
+these files. The fix belongs to a sec-review pass, and the choice is the operator's (restrict
+the NFS export, or have pull create 0600).
+
 ### Closed: `status.json` world-readable at the cache root
 
 The file is created 0600 (`writeFileOwnerOnly` src/sys.zig) and leftover 0644 files are tightened
@@ -771,7 +799,9 @@ document.
 
 What a hostile actor can do, with the enabling path named. Cases 1 to 5 need the PSK: a
 legitimate but curious node, a compromised spark, or anyone who captured it off the wire per R1.
-Case 6 needs write access to the cache directory; Case 7 needs daemon uid access (cache directory write plus signal permission).
+Case 6 needs write access to the cache directory; Case 7 needs daemon uid access (cache directory
+write plus signal permission); Case 8 needs only a local uid on a node that pulls, or read access
+to the export.
 
 1. **Bulk weight exfiltration.** Enumerate paths (any `relOk`-clean string; `replyOriginStat`
    src/peer.zig distinguishes 404 absent from 400 over-long from 502 origin-broken), then
@@ -812,10 +842,16 @@ Case 6 needs write access to the cache directory; Case 7 needs daemon uid access
    src/handover.zig) and inherits the FUSE session and peer HTTP listen sockets. This enables
    credential extraction and execution persistence even on systems with `ptrace` restricted
    (`kernel.yama.ptrace_scope`).
+8. **Reading a pull in flight, locally.** Any uid on a node where an operator runs `modelfs pull`
+   can open the growing `<name>.part` at its 0644 mode, and the finished weight after the rename,
+   with no PSK and no mount access ([R10](#r10-pulled-origin-artifacts-land-world-readable)). Over
+   NFS the same files are reachable by every host the export admits, so a pull into a
+   broadly-shared export publishes licensed weights to all of its readers.
 
-**Closed:** reading `status.json` as another uid. The artifact is 0600. Cross-uid weight theft
-stays closed by 0600 files and 0700 dirs; leftover 0755 `data/`/`meta/`/`pin/`, which listed
-cached and pinned names, are tightened on `ensureLayout`.
+**Closed:** reading `status.json` as another uid. The artifact is 0600. Cross-uid theft from the
+per-node cache stays closed by 0600 files and 0700 dirs; leftover 0755 `data/`/`meta/`/`pin/`,
+which listed cached and pinned names, are tightened on `ensureLayout`. The origin copy is a
+separate exposure with its own mode discipline, and `modelfs pull` sets that mode itself (R10).
 
 **Trust placed in client-side enforcement: none found.** The server validates path, method,
 range, and auth independently. Clients trust peer-supplied bitmaps only for routing
@@ -842,7 +878,8 @@ the status write, src/fuse_fs.zig). Still missing: a persistent, centralized rec
 per-client attribution of successful requests.
 
 **Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.17.0`
-is current; the `0.12.x` line receives security fixes) and the route from report to shipped fix.
+is current, and fixes land on `main` and ship as the next tag, with no backport line) and the
+route from report to shipped fix.
 GitHub private vulnerability reporting is not enabled on the repository, so that route has no
 intake until a repository admin turns the feature on, and there is no other disclosed contact.
 
