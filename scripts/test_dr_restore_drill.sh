@@ -150,10 +150,6 @@ case "${sub}" in
                 printf '%s\n' "${CHILD}"
                 exit 0
             fi
-            if [[ -n "${REPLICA:-}" && "${dataset}" == "${REPLICA}" ]]; then
-                printf '%s\n' "${REPLICA}"
-                exit 0
-            fi
             exit 1
         fi
         if [[ "${dataset}" == "${ORIGIN}" ]]; then
@@ -344,6 +340,17 @@ CHILD_SNAP_CREATION=$(printf '%q' "${CHILD_CREATION:-}")
 EOF
 }
 
+# The drill knobs every assertion below pins to their defaults. live and log
+# vary per case and its own assignments ride in after these, so they win.
+DRILL_DEFAULTS=(
+    MF_DRILL_KEEP=
+    MF_DRILL_CLONE_MP=
+    "MF_DRILL_SCRATCH=${TEMP}/scratch"
+    MF_DRILL_REPLICA=
+    MF_DRILL_MAX_SNAP_AGE=
+    MF_DRILL_MAX_REPLICA_AGE=
+)
+
 # env + the drill binary, not a function: a function inside $(...) or ||
 # disables set -e (SC2310) and would hide a crash inside the helper.
 expect_ok() {
@@ -353,15 +360,8 @@ expect_ok() {
     shift 3
     local out rc
     rc=0
-    out="$(env \
-        MF_DRILL_LIVE="${live}" \
-        MF_DRILL_LOG="${log}" \
-        MF_DRILL_KEEP="" \
-        MF_DRILL_CLONE_MP="" \
-        MF_DRILL_SCRATCH="${TEMP}/scratch" \
-        MF_DRILL_REPLICA="" \
-        MF_DRILL_MAX_SNAP_AGE="" \
-        MF_DRILL_MAX_REPLICA_AGE="" \
+    out="$(env "MF_DRILL_LIVE=${live}" "MF_DRILL_LOG=${log}" \
+        "${DRILL_DEFAULTS[@]}" \
         "$@" \
         "${DRILL}" tank/models 2>&1)" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
@@ -383,15 +383,8 @@ expect_fail() {
     shift 4
     local out rc
     rc=0
-    out="$(env \
-        MF_DRILL_LIVE="${live}" \
-        MF_DRILL_LOG="${log}" \
-        MF_DRILL_KEEP="" \
-        MF_DRILL_CLONE_MP="" \
-        MF_DRILL_SCRATCH="${TEMP}/scratch" \
-        MF_DRILL_REPLICA="" \
-        MF_DRILL_MAX_SNAP_AGE="" \
-        MF_DRILL_MAX_REPLICA_AGE="" \
+    out="$(env "MF_DRILL_LIVE=${live}" "MF_DRILL_LOG=${log}" \
+        "${DRILL_DEFAULTS[@]}" \
         "$@" \
         "${DRILL}" tank/models 2>&1)" || rc=$?
     if [[ "${rc}" -eq 0 ]]; then
@@ -772,15 +765,8 @@ expect_age_ok() {
     shift 3
     local out rc
     rc=0
-    out="$(env \
-        MF_DRILL_LIVE="${live}" \
-        MF_DRILL_LOG="${log}" \
-        MF_DRILL_KEEP="" \
-        MF_DRILL_CLONE_MP="" \
-        MF_DRILL_SCRATCH="${TEMP}/scratch" \
-        MF_DRILL_REPLICA="" \
-        MF_DRILL_MAX_SNAP_AGE="" \
-        MF_DRILL_MAX_REPLICA_AGE="" \
+    out="$(env "MF_DRILL_LIVE=${live}" "MF_DRILL_LOG=${log}" \
+        "${DRILL_DEFAULTS[@]}" \
         "$@" \
         "${DRILL}" --age-only tank/models 2>&1)" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
@@ -806,15 +792,8 @@ expect_age_fail() {
     shift 4
     local out rc
     rc=0
-    out="$(env \
-        MF_DRILL_LIVE="${live}" \
-        MF_DRILL_LOG="${log}" \
-        MF_DRILL_KEEP="" \
-        MF_DRILL_CLONE_MP="" \
-        MF_DRILL_SCRATCH="${TEMP}/scratch" \
-        MF_DRILL_REPLICA="" \
-        MF_DRILL_MAX_SNAP_AGE="" \
-        MF_DRILL_MAX_REPLICA_AGE="" \
+    out="$(env "MF_DRILL_LIVE=${live}" "MF_DRILL_LOG=${log}" \
+        "${DRILL_DEFAULTS[@]}" \
         "$@" \
         "${DRILL}" --age-only tank/models 2>&1)" || rc=$?
     if [[ "${rc}" -eq 0 ]]; then
