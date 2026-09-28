@@ -309,7 +309,16 @@ pub fn build(b: *std.Build) void {
     const tc = b.addTranslateC(.{
         .root_source_file = b.path(c_root),
         .target = target,
-        .optimize = optimize,
+        // Always Debug, never the mode being built: this step translates
+        // headers and compiles no C, so its optimization level only decides
+        // which glibc declarations are visible. At -OReleaseSafe the driver
+        // defines _FORTIFY_SOURCE, so bits/fcntl-linux-fortify.h contributes
+        // __openat2_invalid_size and friends, whose diagnose_if bodies
+        // translate-c reports as ten hard errors -- a host
+        // `zig build test -Doptimize=ReleaseSafe` dies in the header step
+        // before compiling a line of the project. Pinning Debug makes every
+        // mode translate the same headers.
+        .optimize = .Debug,
         .link_libc = true,
     });
     if (target.result.abi == .musl) {
@@ -327,8 +336,8 @@ pub fn build(b: *std.Build) void {
     // No _FORTIFY_SOURCE here: this step only translates headers to Zig, it
     // compiles no C, so the fortify wrappers guard nothing. Defining it makes
     // glibc expose __builtin_object_size overloads whose diagnose_if bodies
-    // translate-c reports as errors, and only at -O1 and above -- a Debug
-    // `zig build test` passes while every release build fails.
+    // translate-c reports as errors, and only at -O1 and above; the .Debug
+    // optimize above is what keeps those wrappers out in every mode.
     tc.addIncludePath(.{ .cwd_relative = fuse_inc });
     const c_mod = tc.createModule();
 
