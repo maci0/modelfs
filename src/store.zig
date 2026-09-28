@@ -351,6 +351,12 @@ pub const Store = struct {
     /// or peer /data hydration that hits EIO after a successful stat is not
     /// silent in status.json.
     origin_io_down: std.atomic.Value(bool) = .init(false),
+    /// Publish ordinal for the manifest temp name (see publishManifest).
+    /// A counter, not the OS thread id: the thread that wins a close is a
+    /// scheduling outcome, so a name built from it left a differently named
+    /// `.tmp.*` behind on every crash of the same run, and nothing replayed
+    /// to the same names.
+    manifest_seq: std.atomic.Value(u32) = .init(0),
     mu: std.Io.Mutex = .init,
     files: std.StringHashMapUnmanaged(*Cached) = .empty,
     /// Bumped under mu after every mutation of on-disk cache artifacts
@@ -1705,10 +1711,17 @@ pub const Store = struct {
         // Temp name unique per publish: libfuse runs releases on a thread
         // pool, so two closes of one entry can publish concurrently, and a
         // shared .tmp let the second O_TRUNC open tear the first's
-        // half-written temp before its rename landed.
+        // half-written temp before its rename landed. The pid keeps two
+        // nodes publishing the same origin-side manifest apart (a manifest
+        // name is the file's blake3, not the node's), and the store's
+        // publish ordinal separates concurrent closes within one node
+        // without naming a thread.
         const ztmp = blk: {
-            var sbuf: [24]u8 = undefined;
-            const ext = std.fmt.bufPrint(&sbuf, ".tmp.{x}", .{std.Thread.getCurrentId()}) catch ".tmp";
+            var sbuf: [32]u8 = undefined;
+            const ext = std.fmt.bufPrint(&sbuf, ".tmp.{d}.{d}", .{
+                sys.pidSelf(),
+                self.manifest_seq.fetchAdd(1, .monotonic),
+            }) catch ".tmp";
             break :blk sys.appendExt(&tbuf, p, ext) catch {
                 std.log.warn("piece manifest publish failed for {s}; temp path does not fit; retried on next close", .{file.rel});
                 return;

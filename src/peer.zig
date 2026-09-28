@@ -1490,16 +1490,21 @@ fn probeSlots(
     };
     // Cap at the server's own inflight limit: probing harder than a peer
     // accepts would only buy rejections. Run one worker on this thread so
-    // a spawn is not paid for the last slot.
-    const nthreads = @min(todo.items.len, Server.max_inflight);
-    var workers: [Server.max_inflight]?std.Thread = .{null} ** Server.max_inflight;
-    var spawned: usize = 0;
-    const spawn_n = nthreads - 1;
-    while (spawned < spawn_n) : (spawned += 1) {
-        workers[spawned] = std.Thread.spawn(.{}, probeWorker, .{&ctx}) catch break;
-    }
+    // a task is not paid for the last slot.
+    //
+    // The fan-out goes through the injected Io (std.Io.Group) rather than
+    // std.Thread: which peers a fill probes, and in what order their
+    // answers land in the have cache, is then decided by the Io's
+    // scheduler, so a simulator driving a virtual clock interleaves this
+    // walk instead of leaving it to OS thread timing. The daemon's Threaded
+    // Io runs the same tasks on its pool.
+    const nworkers = @min(todo.items.len, Server.max_inflight);
+    var group: std.Io.Group = .init;
+    for (0..nworkers -| 1) |_| group.async(cat.io, probeWorker, .{&ctx});
     probeWorker(&ctx);
-    for (workers[0..spawned]) |w| w.?.join();
+    // Every task has run by the time await returns, canceled or not, and
+    // nothing here requests cancelation: the group is drained, not abandoned.
+    group.await(cat.io) catch {};
 }
 
 /// Total order for the probe walk inside one peer-id group: higher lease
