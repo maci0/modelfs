@@ -1,0 +1,14 @@
+# The workflows pin every action to a full commit SHA, so nothing in the
+# tree upgrades them: a pin ages until the action's runtime is retired and
+# the job starts failing for a reason no commit here explains. Dependabot
+# proposes the bump instead of applying it, as a reviewable PR that carries
+# the new SHA and its tag. scripts/sbom.py reads the pins out of
+# .github/workflows and .github/actions, so a merged bump fails
+# `sbom.py --check` until sbom.cdx.json is regenerated: a rotated action pin
+# is a recorded change, not a silent one.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: weekly

@@ -66,6 +66,26 @@ expect_zig_version 999.0.0 1
 expect_zig_version "${zig_pin}-dev.1" 1
 expect_zig_version "" 1
 
+expect_release_tag() {
+    local tag="$1" want="$2" output rc=0
+    # The 2>&1 belongs inside the substitution: a redirection on the
+    # assignment itself is applied after the command substitution has
+    # already run, so its stderr would go to the gate's own stderr.
+    output="$(GITHUB_REF_NAME="${tag}" "${SCRIPTS_DIR}/check_release_tag.sh" 2>&1)" || rc=$?
+    if [[ "${want}" -eq 0 ]]; then
+        [[ "${rc}" -eq 0 ]] || fail "check_release_tag.sh ${tag} exited ${rc}, want 0: ${output}"
+        [[ "${output}" == "${zon_pin}" ]] || fail "check_release_tag.sh ${tag} printed '${output}', want ${zon_pin}"
+    else
+        [[ "${rc}" -ne 0 ]] || fail "check_release_tag.sh accepted ${tag}"
+        [[ "${output}" == *"${zon_pin}"* ]] || fail "check_release_tag.sh ${tag} omitted the manifest version: ${output}"
+    fi
+}
+zon_pin="$(zon_version)"
+expect_release_tag "v${zon_pin}" 0
+expect_release_tag "0.17.0-is-not-the-tag" 1
+expect_release_tag "v${zon_pin}-rc1" 1
+expect_release_tag "release-${zon_pin}" 1
+
 expect_fuse_helper() {
     local helper="$1" output rc=0 bin
     mkdir -p "${SCRATCH_DIR}"

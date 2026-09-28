@@ -3,7 +3,8 @@
 
 Reads requirements-dev.txt, requirements-dev.lock.txt,
 .deps/fuse3-arm64/SHA256SUMS, the vendored libfuse3 static source's
-SHA256SUMS, .github/workflows/*.yml, and build.zig.zon.
+SHA256SUMS, the SHA-pinned `uses:` in .github/workflows and
+.github/actions, and build.zig.zon.
 No network. Stdlib only.
 """
 
@@ -317,6 +318,12 @@ def load_actions(root: Path) -> list[PinnedAction]:
     files = sorted(wf_dir.glob("*.yml")) + sorted(wf_dir.glob("*.yaml"))
     if not files:
         sys.exit("no GitHub Actions workflow files")
+    # A composite action pins third-party actions too, and a job that runs
+    # `uses: ./...` executes exactly what that file pins. Skip the local
+    # reference itself (parse_actions drops it) and read the file behind it,
+    # so moving a step into .github/actions does not drop it from the record.
+    action_dir = root / ".github" / "actions"
+    files += sorted(action_dir.glob("*/action.yml")) + sorted(action_dir.glob("*/action.yaml"))
     actions: list[PinnedAction] = []
     seen: set[str] = set()
     for path in files:
@@ -327,7 +334,7 @@ def load_actions(root: Path) -> list[PinnedAction]:
             seen.add(key)
             actions.append(action)
     if not actions:
-        sys.exit("no GitHub Actions uses: pins in .github/workflows")
+        sys.exit("no GitHub Actions uses: pins in .github/workflows and .github/actions")
     return actions
 
 
@@ -673,6 +680,33 @@ def _self_test_actions() -> None:
     _must_exit(lambda: commit_hashes("abc"), "unsupported commit digest length")
 
 
+def _self_test_load_actions(root: Path) -> None:
+    """A composite action's pins reach the record; a local `uses:` does not."""
+    scratch = root / ".scratch"
+    scratch.mkdir(exist_ok=True)
+    sha_a, sha_b = "a" * _SHA1_HEX_LEN, "b" * _SHA1_HEX_LEN
+    with tempfile.TemporaryDirectory(dir=scratch) as tmp:
+        fake = Path(tmp)
+        (fake / ".github" / "workflows").mkdir(parents=True)
+        (fake / ".github" / "workflows" / "ci.yml").write_text(
+            "    steps:\n"
+            "      - uses: ./.github/actions/checkout-zig\n"
+            f"      - uses: actions/checkout@{sha_a}\n",
+            encoding="utf-8",
+        )
+        composite = fake / ".github" / "actions" / "checkout-zig"
+        composite.mkdir(parents=True)
+        (composite / "action.yml").write_text(
+            f"    steps:\n"
+            f"      - uses: actions/checkout@{sha_a}\n"
+            f"      - uses: astral-sh/setup-uv@{sha_b}\n",
+            encoding="utf-8",
+        )
+        found = [(a.name, a.digest) for a in load_actions(fake)]
+        if found != [("actions/checkout", sha_a), ("astral-sh/setup-uv", sha_b)]:
+            sys.exit(f"self-test failed: load_actions {found}")
+
+
 def _self_test_spdx() -> None:
     mit = licenses_cdx("mypy", required=True)
     if mit != [{"license": {"id": "MIT"}}]:
@@ -754,6 +788,7 @@ def self_test(root: Path) -> None:
     _self_test_sums()
     _self_test_vendored(root)
     _self_test_actions()
+    _self_test_load_actions(root)
     _self_test_spdx()
     _self_test_repo(root)
     print("ok: sbom self-test")

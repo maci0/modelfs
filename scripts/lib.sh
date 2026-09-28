@@ -65,6 +65,20 @@ version_ge() {
     }'
 }
 
+# The released version, as the changelog gate, the docs gate, and
+# scripts/check_release_tag.sh read it. A manifest that names no version, or
+# more than one, is a manifest the checks cannot reason about: fail by name
+# rather than let a caller compare an empty string.
+zon_version() {
+    local v
+    v="$(sed -n 's/^[[:space:]]*\.version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
+    [[ -n "${v}" && "${v}" != *$'\n'* ]] || {
+        echo "cannot read a single .version from ${ROOT_DIR}/build.zig.zon" >&2
+        return 1
+    }
+    printf '%s' "${v}"
+}
+
 # The spark-node deploy ABI and the one place its cross-build flags live.
 # scripts/cross_aarch64.sh builds the binary and scripts/repro_check.sh
 # proves it byte-identical; both take the flags from here so the two cannot

@@ -32,17 +32,9 @@ jobs:
           - target: aarch64-linux-musl
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - uses: ./.github/actions/checkout-zig
       - name: tag names the build.zig.zon version
-        run: |
-          zon="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
-          if [ "${GITHUB_REF_NAME}" != "v${zon}" ]; then
-            echo "tag ${GITHUB_REF_NAME} does not name build.zig.zon version v${zon}" >&2
-            exit 1
-          fi
+        run: ./scripts/check_release_tag.sh
       - name: test native static release build
         run: zig build test -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dfuse-static
       - name: build static single-file binary
@@ -61,17 +53,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - uses: ./.github/actions/checkout-zig
       - name: tag names the build.zig.zon version
-        run: |
-          zon="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
-          if [ "${GITHUB_REF_NAME}" != "v${zon}" ]; then
-            echo "tag ${GITHUB_REF_NAME} does not name build.zig.zon version v${zon}" >&2
-            exit 1
-          fi
+        run: ./scripts/check_release_tag.sh
       - name: cross-compile the spark binary
         run: ./scripts/cross_aarch64.sh --prefix .scratch/release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -102,8 +86,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          zon="$(sed -n 's/^[[:space:]]*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)"
-          test "${TAG}" = "v${zon}"
+          zon="$(./scripts/check_release_tag.sh "${TAG}")"
           awk -v heading="## [${zon}] - " '
             index($0, heading) == 1 { found = 1; next }
             found && /^## / { exit }

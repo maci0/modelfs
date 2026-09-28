@@ -251,7 +251,7 @@ workflow (`.github/workflows/release.yml`), which builds the static
 single-file binaries for `x86_64-linux-musl` and `aarch64-linux-musl`
 (`scripts/build_static.sh`: vendored libfuse3 compiled in, no interpreter,
 no shared libraries), refuses a tag that does not name `build.zig.zon`'s
-version, and attaches the two musl static binaries, the
+version (`scripts/check_release_tag.sh`), and attaches the two musl static binaries, the
 `aarch64-linux-gnu` spark build (from `scripts/cross_aarch64.sh`), and
 `modelfs-licenses.tar.gz` containing the project license and both vendored
 libfuse variants' license texts and provenance. The asset arrangement, the

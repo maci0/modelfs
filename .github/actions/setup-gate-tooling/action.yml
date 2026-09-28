@@ -1,0 +1,58 @@
+# The toolchain scripts/check.sh needs, in the order it needs it. Both gate
+# jobs (x86_64 and native aarch64) run this instead of repeating the recipe,
+# which is how a step could be added to one job's gate and not the other.
+#
+# The checkout and the Zig toolchain come from the checkout-zig action the
+# job runs first. Run steps need an explicit `shell`: a composite action has
+# no workflow-level default.
+name: setup-gate-tooling
+description: Install the libfuse3 headers and the hash-pinned .venv that scripts/check.sh refuses to run without.
+runs:
+  using: composite
+  steps:
+    # check.sh compiles against libfuse3, whose headers the runner image
+    # does not preinstall. Same script the reproducibility job runs, so the
+    # retry recipe cannot drift.
+    - name: Install libfuse3 development files
+      run: ./scripts/install_libfuse3_dev.sh
+      shell: bash
+
+    # Python interpreter: .python-version is the single knob (local uv and
+    # this input). setup-uv v7 has no python-version-file input, so read the
+    # file here rather than hardcoding the series a second time. uv itself:
+    # [tool.uv] required-version in pyproject.toml, the field setup-uv
+    # already reads when `version` is empty.
+    - name: Read Python version pin
+      id: py
+      run: |
+        version="$(tr -d '[:space:]' < .python-version)"
+        if [[ -z "${version}" ]]; then
+          echo "empty .python-version" >&2
+          exit 1
+        fi
+        echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      shell: bash
+
+    # Python tooling exactly as pinned in requirements-dev.lock.txt
+    # (hash-verified install, per README). activate-environment creates a
+    # venv and puts it on PATH. venv-path is explicit: check.sh requires
+    # ROOT_DIR/.venv/bin (a setup-uv default change would otherwise pass
+    # PATH but fail the existence check). The cache key includes
+    # .python-version so a pin bump cannot restore a venv built for the
+    # previous interpreter; requirements*.txt is the lock plus the
+    # un-hashed bounds file (the action's default also lists **/uv.lock,
+    # which this repo does not have, and pyproject.toml, whose tool-config
+    # edits must not bust the package cache).
+    - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      with:
+        activate-environment: true
+        venv-path: .venv
+        python-version: ${{ steps.py.outputs.version }}
+        cache-dependency-glob: |
+          requirements*.txt
+          .python-version
+
+    - name: Install pinned Python tooling
+      # check.sh invokes ruff/mypy by name from the activated venv.
+      run: uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt
+      shell: bash

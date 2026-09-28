@@ -47,6 +47,7 @@ answers --help):
   ./scripts/repro_check.sh                  two ReleaseFast builds, compare bytes
   ./scripts/build_static.sh <target>        static musl release build (also run by release.yml)
   ./scripts/package_release.sh --dist DIR   flatten, bundle licenses, checksum release assets
+  ./scripts/check_release_tag.sh [TAG]      assert the tag names build.zig.zon's version (release.yml)
 
 Setup, once per clone: see CONTRIBUTING.md.
 EOF
@@ -167,8 +168,7 @@ zig fmt --check src/ build.zig build.zig.zon || fail "zig fmt --check reported u
 # README/SECURITY.md/threat-model.md name the current tag so a cut cannot
 # leave those sentences on the previous release.
 echo "=== changelog headings ==="
-zon_ver="$(sed -n 's/^[[:space:]]*\.version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
-[[ -n "${zon_ver}" ]] || fail "cannot read .version from build.zig.zon"
+zon_ver="$(zon_version)"
 saw_unreleased=0
 saw_current=0
 first_h2=""
