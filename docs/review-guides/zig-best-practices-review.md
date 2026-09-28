@@ -20,11 +20,13 @@ Your goal is the layer above idiom: module layering and import direction, filena
 main -> fuse_fs -> peer -> (store, discover) -> (piece, proto, cull, sys) -> c
 ```
 
+`fuzzcorpus` is a leaf framing helper: every module imports it, `piece.zig` and `proto.zig` included, and it imports no project module. An `@import("fuzzcorpus.zig")` anywhere in `src/` is therefore in the map.
+
 `handover` and `hf` sit beside `fuse_fs` and `main`: neither speaks FUSE, and `hf` is the only module that reaches a host outside the cluster. `root.zig` is the test aggregator and depends on everything. The authoritative per-module role table is docs/architecture.md; read it before ruling that something is in the wrong file. **A flat `src/` is the design, not a finding: do not propose subdirectories.**
 
 ## Review the following
 
-**A. Import direction.** Every `@import` must point down the chain above or sideways to a leaf. A `store.zig` that imports `peer.zig`, or a `piece.zig` that imports `store.zig`, is P0: it makes the low layer untestable alone and invites a cycle. Verify by reading the import block of each file, not by counting.
+**A. Import direction.** Every `@import` must point down the chain above, to the `fuzzcorpus` leaf, or sideways to a leaf. A `store.zig` that imports `peer.zig`, or a `piece.zig` that imports `store.zig`, is P0: it makes the low layer untestable alone and invites a cycle. Verify by reading the import block of each file, not by counting.
 
 **B. Concern ownership.** New code goes in the module that already owns that concern. The recurring drift: path gating outside `store.relOk`/`discover.relIsCluster`, cache-artifact path construction outside `Store` (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`, `manifestsDirPath`), wire helpers outside `proto.zig`, and syscalls outside `sys.zig`. A second copy of any of those is P1 even when byte-correct, because the two copies will drift.
 

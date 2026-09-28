@@ -18,7 +18,7 @@ applicability gate, a checklist naming real symbols in this tree, and a severity
 
 | Guide | Subject | Owns the verdict on |
 |---|---|---|
-| [zig-src-review.md](review-guides/zig-src-review.md) | `src/` defects | auth escapes, path escapes, crashes, leaks, cache poisoning |
+| [zig-src-review.md](review-guides/zig-src-review.md) | `src/` defects | auth escapes, path escapes, crashes, leaks, cache poisoning, egress to a host outside the cluster |
 | [net-send-review.md](review-guides/net-send-review.md) | the peer transfer path | source selection, the fallback ladder, deadlines, saturation, counter coverage |
 | [abstractions-review.md](review-guides/abstractions-review.md) | whether a type earns its keep | delete, inline, move layer, or introduce |
 | [zig-idiomatic-review.md](review-guides/zig-idiomatic-review.md) | code shape inside a function | allocators, ownership, error sets, comptime, slices |
