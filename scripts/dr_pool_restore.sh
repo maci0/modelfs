@@ -117,6 +117,18 @@ PARENT="${DEST%/*}"
 if [[ "${PARENT}" == "${DEST}" || -z "${PARENT}" ]]; then
     die "destination must be nested (pool/data), got ${DEST}"
 fi
+# These three land as positional arguments to zfs recv and syncoid (syncoid
+# uses Getopt::Long) in a script that runs as root with --force-delete, so a
+# leading '-' is read as an option, not a dataset. The CLI parser above
+# already rejects a dash-leading operand; the MF_RESTORE_* environment path
+# did not, and the failure would be a remote, destructive one.
+for v in "${DEST}" "${FROM}" "${LOCAL_FROM}"; do
+    case "${v}" in
+        -*) die "dataset arguments must not start with '-', got ${v}" ;;
+        *) ;;
+    esac
+done
+
 case "${MOUNTPOINT}" in
     none | legacy | '-' | '')
         die "MF_RESTORE_MOUNTPOINT '${MOUNTPOINT}' is not a usable path"

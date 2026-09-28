@@ -439,6 +439,16 @@ pick_sample() {
         sz="${candidate%%$'\t'*}"
         f="${candidate#*$'\t'}"
         [[ -n "${f}" ]] || continue
+        # The name comes out of the origin, which this project treats as
+        # untrusted. LF or CR cannot be written to the one-line drill log: the
+        # break would split the record, and check_drill_log.sh reads only the
+        # last non-empty line, so one such file would fail the staleness alarm
+        # on every later run. Tabs stay allowed, as an origin filename may
+        # legitimately carry one. Skip only as a sample; such a file is still
+        # counted in FILE_COUNT and diffed above.
+        if [[ "${f}" == *$'\n'* || "${f}" == *$'\r'* ]]; then
+            continue
+        fi
         SAMPLE_LIVE_SZ="$(stat -c %s "${LIVE}${f#"${CLONE_MP}"}" 2>/dev/null || echo -1)"
         if [[ "${sz}" == "${SAMPLE_LIVE_SZ}" && "${sz}" -gt 0 ]]; then
             SAMPLE_PATH="${f}"

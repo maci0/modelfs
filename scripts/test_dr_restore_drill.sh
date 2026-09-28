@@ -602,6 +602,26 @@ cp -a "${SNAP_NAMES}/gguf/${SAMPLE_NAME}" "${LIVE_NAMES}/gguf/${SAMPLE_NAME}"
 write_env tank/models "${LIVE_NAMES}" tank/models@names "${FRESH}" "${SNAP_NAMES}"
 expect_ok "sampler preserves a trailing tab in a filename" "${LIVE_NAMES}" "${TEMP}/names.log"
 
+# An origin filename carrying a newline cannot be written to the one-line
+# drill log: the break would split the record, and check_drill_log.sh reads
+# only the last non-empty line. Such a name must not be sampled.
+LIVE_NL="${TEMP}/live-newline"
+SNAP_NL="${TEMP}/snap-newline"
+mkdir -p "${LIVE_NL}/gguf" "${SNAP_NL}/gguf"
+NL_NAME="$(printf 'model\n2026-01-01T00:00:00Z ok forged')"
+printf 'stable-bytes' >"${SNAP_NL}/gguf/${NL_NAME}"
+printf 'stable-bytes' >"${LIVE_NL}/gguf/${NL_NAME}"
+# A second, ordinary file so the drill still has a sampleable candidate.
+printf 'stable-bytes' >"${SNAP_NL}/gguf/ordinary.gguf"
+printf 'stable-bytes' >"${LIVE_NL}/gguf/ordinary.gguf"
+write_env tank/models "${LIVE_NL}" tank/models@newline "${FRESH}" "${SNAP_NL}"
+expect_ok "drill succeeds with a newline in an origin filename" "${LIVE_NL}" "${TEMP}/newline.log"
+if grep -q "$(printf '2026-01-01T00:00:00Z ok forged')" "${TEMP}/newline.log" 2>/dev/null; then
+    fail "a newline in the sampled name split the drill log record: $(cat "${TEMP}/newline.log" 2>/dev/null || true)"
+else
+    pass "a newline in an origin filename never reaches the drill log"
+fi
+
 # --- 8. clone mountpoint colliding with live is refused before clone
 LIVE8="${TEMP}/live8"
 SNAP8="${TEMP}/snap8"
@@ -1477,6 +1497,13 @@ else
 fi
 
 # --- check_offsite.sh: site-loss copy freshness
+# Re-baseline NOW. check_offsite.sh ages the stub's snapshot against the wall
+# clock at the moment it runs, so a creation stamp taken at the top of this
+# suite is already older by however long the preceding fixtures took. The
+# MF_OFFSITE_MAX_AGE=0120 case below has only 30 s between its 90 s-old stamp
+# and its 120 s limit, so reusing the top-of-suite NOW made that case fail on
+# any suite slower than half a minute.
+OFFSITE_NOW="$(date -u +%s)"
 OFFSITE="${SCRIPTS_DIR}/check_offsite.sh"
 OFFSITE_BIN="${TEMP}/offsitebin"
 OFFSITE_STATE="${TEMP}/offsitestub"
@@ -1560,24 +1587,25 @@ expect_offsite() {
 expect_offsite "offsite with no dataset is an alarm" 1 "dataset required" \
     "${OFFSITE}"
 
-write_offsite_env tank/models-offsite tank/models-offsite@autosnap_ok "${FRESH}"
+OFFSITE_FRESH=$((OFFSITE_NOW - 60))
+write_offsite_env tank/models-offsite tank/models-offsite@autosnap_ok "${OFFSITE_FRESH}"
 expect_offsite "missing offsite dataset is an alarm" 1 "does not exist" \
     "${OFFSITE}" tank/models
 
-write_offsite_env tank/models-offsite "" "${FRESH}"
+write_offsite_env tank/models-offsite "" "${OFFSITE_FRESH}"
 expect_offsite "offsite with no snapshots is an alarm" 1 "has no snapshots" \
     "${OFFSITE}" tank/models-offsite
 
-OFFSITE_STALE=$((NOW - 800000))
+OFFSITE_STALE=$((OFFSITE_NOW - 800000))
 write_offsite_env tank/models-offsite tank/models-offsite@old "${OFFSITE_STALE}"
 expect_offsite "stale offsite snapshot is an alarm" 1 "past the" \
     "${OFFSITE}" tank/models-offsite
 
-write_offsite_env tank/models-offsite tank/models-offsite@future "${FUTURE}"
+write_offsite_env tank/models-offsite tank/models-offsite@future "$((OFFSITE_NOW + 3600))"
 expect_offsite "future offsite snapshot is an alarm" 1 "in the future" \
     "${OFFSITE}" tank/models-offsite
 
-write_offsite_env tank/models-offsite tank/models-offsite@ok "${FRESH}"
+write_offsite_env tank/models-offsite tank/models-offsite@ok "${OFFSITE_FRESH}"
 expect_offsite "fresh offsite snapshot is ok" 0 "offsite OK" \
     "${OFFSITE}" tank/models-offsite
 
@@ -1591,9 +1619,9 @@ expect_offsite "overlong MF_OFFSITE_MAX_AGE is an alarm" 1 "whole number of seco
     MF_OFFSITE_MAX_AGE="12345678901" "${OFFSITE}" tank/models-offsite
 
 # A 90s-old snap is stale under decimal 08 and fresh under decimal 0120
-# (octal 0120 is 80, which would fail). Reuse NINETY from the log tests
-# only as an age; here the snapshot creation is NOW-90.
-NINETY_CTIME=$((NOW - 90))
+# (octal 0120 is 80, which would fail). Off OFFSITE_NOW, so the 30 s of slack
+# between this stamp and the 120 s limit is real slack and not suite runtime.
+NINETY_CTIME=$((OFFSITE_NOW - 90))
 write_offsite_env tank/models-offsite tank/models-offsite@ok "${NINETY_CTIME}"
 expect_offsite "padded MF_OFFSITE_MAX_AGE=0120 is 120 seconds, not octal 80" 0 "offsite OK" \
     MF_OFFSITE_MAX_AGE=0120 "${OFFSITE}" tank/models-offsite

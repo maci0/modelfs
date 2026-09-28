@@ -82,10 +82,13 @@ extract_one() {
         local data_tar="data.tar.zst" tmp
         mkdir -p "${SCRATCH_DIR}"
         tmp="$(mktemp -d "${SCRATCH_DIR}/deb-XXXXXX")"
+        # --no-same-owner/-permissions: dpkg-deb -x above already drops
+        # archive uid/gid and mode bits, so tar honoring them here would make
+        # the two extract paths disagree. No member may escape ${OUT}/root.
         if ! (
             cd "${tmp}"
             ar x "${deb_path}" "${data_tar}"
-            zstd -dc "${data_tar}" | tar -xf - -C "${OUT}/root/"
+            zstd -dc "${data_tar}" | tar -xf - -C "${OUT}/root/" --no-same-owner --no-same-permissions --warning=no-unknown-keyword
         ); then
             rm -rf "${tmp}"
             fail "failed to extract $1 via ar and zstd"
