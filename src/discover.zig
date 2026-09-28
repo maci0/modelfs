@@ -1036,10 +1036,11 @@ pub const Catalog = struct {
         const prefix = name[0..mark];
         if (prefix.len == 0) return false;
         for (prefix) |ch| {
-            // Hex, and no uppercase letters: manifestName is a flat
-            // lowercase blake3 hex stamp, so its digits must pass too.
-            // Gating on isLower instead rejected every name carrying a
-            // digit, and the staging sweep collected nothing.
+            // Hex, not lowercase letters, and no uppercase: a manifest name is
+            // a 64-char lowercase blake3 hex digest, so ten of its sixteen
+            // symbols are digits. Testing isLower alone rejected every real
+            // staging name and the sweep collected nothing, which is the
+            // failure this predicate exists to prevent.
             if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return false;
         }
         const tail = name[mark + ".tmp".len ..];
@@ -3037,6 +3038,14 @@ test "isStagingName matches the manifest publish temp and nothing else" {
     try std.testing.expect(!Catalog.isStagingName("ab12cd34.tmp.evil"));
     try std.testing.expect(!Catalog.isStagingName("ab12cd34.tmpx.1"));
     try std.testing.expect(!Catalog.isStagingName("ab12cd34.tmp."));
+    // The real shape: a manifest name is the 64-char lowercase hex of a
+    // blake3 digest, so ten of its sixteen symbols are digits. Shorter
+    // digit-free names never exercised that and let a lowercase-letters-only
+    // prefix test pass while every real staging name was rejected.
+    const real_hex = "a0b1c2d3e4f5061728394a5b6c7d8e9f00112233445566778899aabbccddeeff";
+    try std.testing.expectEqual(@as(usize, 64), real_hex.len);
+    try std.testing.expect(Catalog.isStagingName(real_hex ++ ".tmp.4242.0"));
+    try std.testing.expect(Catalog.isStagingName(real_hex ++ ".tmp"));
 }
 
 test "sweepLeases unlinks abandoned manifest staging files and keeps published ones" {
@@ -3065,8 +3074,8 @@ test "sweepLeases unlinks abandoned manifest staging files and keeps published o
     for ([_][]const u8{
         hex,
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd",
-        "deadbeef.tmp.4242.0",
-        "cafebabe.tmp.99",
+        "deadbeef01234567.tmp.4242.0",
+        "cafebabe89abcdef.tmp.99",
     }) |leaf| {
         const p = try sys.joinZ(&fb, std.mem.span(mdir), leaf);
         try std.testing.expectEqual(@as(i32, 0), sys.writeFile(p, "MFS1"));
@@ -3081,7 +3090,7 @@ test "sweepLeases unlinks abandoned manifest staging files and keeps published o
     var want: c.struct_stat = undefined;
     const kept = try sys.joinZ(&sb, std.mem.span(mdir), hex);
     try std.testing.expectEqual(@as(i32, 0), sys.lstatPath(kept, &want));
-    for ([_][]const u8{ "deadbeef.tmp.4242.0", "cafebabe.tmp.99" }) |leaf| {
+    for ([_][]const u8{ "deadbeef01234567.tmp.4242.0", "cafebabe89abcdef.tmp.99" }) |leaf| {
         const p = try sys.joinZ(&sb, std.mem.span(mdir), leaf);
         try std.testing.expectEqual(@as(i32, -sys.c.ENOENT), sys.lstatPath(p, &want));
     }

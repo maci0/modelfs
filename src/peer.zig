@@ -2813,10 +2813,24 @@ const TestServer = struct {
         // inside serveData/serveHave would otherwise touch State, Store,
         // and Server through the TestServer struct the destroy below
         // frees. Bounded so a wedged handler cannot hang the runner.
-        var waited: u32 = 0;
-        while (self.server.http_inflight.load(.monotonic) != 0 and waited < 300) : (waited += 1)
+        //
+        // The bound is a real deadline, not a retry count, and on expiry the
+        // whole struct is leaked rather than freed. A 3 s cap here was
+        // shorter than a legitimate handler: a /data serve of a large range
+        // hydrates its pieces from the origin first, and under a loaded test
+        // runner that outlived the cap, so the destroy below handed a running
+        // thread a freed Store. That is the segfault State.deinit already
+        // refuses to commit, and the leak is the same policy: process exit
+        // reclaims it, and a leaked struct cannot corrupt the next test.
+        const deadline = sys.monoMs(self.server.io) +| 30_000;
+        while (self.server.http_inflight.load(.monotonic) != 0 and sys.monoMs(self.server.io) < deadline) {
             sys.sleepMs(self.server.io, 10);
+        }
         self.server.stop();
+        if (self.server.http_inflight.load(.monotonic) != 0) {
+            std.debug.print("TestServer: peer handler still inflight after drain; leaking server\n", .{});
+            return;
+        }
         self.store.deinit();
         self.gpa.destroy(self);
     }

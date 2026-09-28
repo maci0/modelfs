@@ -3853,7 +3853,14 @@ test "hydratePiece fails closed when write generation keeps discarding fills" {
     // and read a lost race as a missing claim.
     var gen: u64 = 0;
     while (gen < 2) {
-        var spins: u32 = 0;
+        // Bounded by wall clock, not by an iteration count: the wait is a
+        // two-thread handshake, and a spin budget measures how fast the
+        // scheduler retires sched_yield on this box rather than whether the
+        // hydrator made progress. Under load the old counter expired while
+        // the hydrator was still parked, failing on timing alone. A 30 s
+        // deadline is the same "the test is wedged" signal, expressed in
+        // the unit the failure actually is.
+        const deadline = sys.monoNs(st.io) + 30 * std.time.ns_per_s;
         while (true) {
             file.mu.lockUncancelable(st.io);
             const claim = file.filling.get(0);
@@ -3873,8 +3880,10 @@ test "hydratePiece fails closed when write generation keeps discarding fills" {
                 // content_mu so the retry parks instead of filling.
                 std.Thread.yield() catch {};
             }
-            spins += 1;
-            try std.testing.expect(spins < 1_000_000);
+            if (sys.monoNs(st.io) > deadline) {
+                std.debug.print("hydratePiece discard test: claim generation {d} never appeared\n", .{gen});
+                return error.TestTimedOut;
+            }
         }
         file.mu.lockUncancelable(st.io);
         file.writes +%= 1;
