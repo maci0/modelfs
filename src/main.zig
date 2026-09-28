@@ -1581,7 +1581,7 @@ fn scrubPskEnv() void {
 /// ignored (and validated by whoever consumes the full document). now_s and
 /// mono_s are optional so artifacts from older builds keep parsing: without
 /// a stamp the staleness gate below simply cannot fire.
-const StatusLiveness = struct { pid: i64, now_s: ?i64 = null, mono_s: ?i64 = null };
+const StatusLiveness = struct { pid: i64, now_s: ?i64 = null, mono_s: ?i64 = null, boot_s: ?i64 = null };
 
 /// How long a status.json may go unrefreshed before `status` stops serving
 /// it as evidence of a working mount. The discovery tick rewrites the
@@ -1591,17 +1591,22 @@ const StatusLiveness = struct { pid: i64, now_s: ?i64 = null, mono_s: ?i64 = nul
 /// the pid check alone cannot catch.
 const max_status_age_secs: i64 = 120;
 
-/// Seconds since the heartbeat was written. Prefer `mono_s` (CLOCK_MONOTONIC,
-/// comparable across processes on this machine) so an NTP step or admin
-/// clock set cannot make a wedged daemon look fresh or a healthy one look
-/// dead. Fall back to wall-clock `now_s` for artifacts from older builds.
-/// Saturating subtract so a hostile i64-min stamp cannot overflow the
-/// subtraction in safe builds. A `mono_s` ahead of now is a previous-boot
-/// leftover or a hostile future stamp: CLOCK_MONOTONIC resets on reboot,
-/// and `now -| stamp` would read as age 0, so the gap is taken the other
-/// way. Wall-clock `now_s` still treats a backward step as fresh (NTP noise
-/// on older artifacts).
+/// Seconds since the heartbeat was written. Prefer `boot_s` (CLOCK_BOOTTIME,
+/// comparable across processes on this machine and still advancing across a
+/// suspend), then `mono_s` for artifacts from builds that predate it, so an
+/// NTP step or admin clock set cannot make a wedged daemon look fresh or a
+/// healthy one look dead. Fall back to wall-clock `now_s` for artifacts from
+/// older builds. Saturating subtract so a hostile i64-min stamp cannot
+/// overflow the subtraction in safe builds. A monotonic stamp ahead of now is
+/// a previous-boot leftover or a hostile future stamp: both clocks reset on
+/// reboot, and `now -| stamp` would read as age 0, so the gap is taken the
+/// other way. Wall-clock `now_s` still treats a backward step as fresh (NTP
+/// noise on older artifacts).
 fn statusAgeSecs(io: std.Io, doc: StatusLiveness) ?i64 {
+    if (doc.boot_s) |stamp| {
+        const now = sys.bootSec(io);
+        return if (stamp > now) stamp -| now else now -| stamp;
+    }
     if (doc.mono_s) |stamp| {
         const now = sys.monoSec(io);
         return if (stamp > now) stamp -| now else now -| stamp;
@@ -1641,7 +1646,15 @@ fn liveDaemon(io: std.Io, gpa: std.mem.Allocator, cache: []const u8, blob_out: *
         return error.NotLive;
     }
     if (statusAgeSecs(io, doc.value)) |age| {
-        const future_mono = if (doc.value.mono_s) |stamp| stamp > sys.monoSec(io) else false;
+        // A monotonic stamp ahead of the reader's is a pre-reboot leftover
+        // or a hostile future stamp; statusAgeSecs reports its size as an
+        // age, so the same value has to fail the gate here.
+        const future_mono = if (doc.value.boot_s) |stamp|
+            stamp > sys.bootSec(io)
+        else if (doc.value.mono_s) |stamp|
+            stamp > sys.monoSec(io)
+        else
+            false;
         if (age > max_status_age_secs or future_mono) {
             printErr("modelfs: not serving ({s}/{s} is {d}s stale; the daemon stopped ticking)\n", .{ cache, store_mod.status_file, age });
             gpa.free(blob);
@@ -2668,6 +2681,25 @@ test "cmdStatus rejects a future monotonic stamp inside the heartbeat grace peri
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
+test "status age prefers the suspend-inclusive stamp" {
+    // The heartbeat age is read off the suspend-inclusive clock. A host
+    // that suspends leaves boot_s behind mono_s by the slept time, so a
+    // document stamped with the awake clock alone would keep reading
+    // fresh after the resume and hide a wedged daemon.
+    const io = std.testing.io;
+    const boot = sys.bootSec(io);
+    const mono = sys.monoSec(io);
+    try std.testing.expect(boot >= mono);
+    // Aged on the boot clock, but the mono stamp is hours old: an
+    // age computed from mono_s would call this wedged.
+    const doc: StatusLiveness = .{ .pid = 1, .mono_s = mono - 7200, .boot_s = boot - 5 };
+    const age = statusAgeSecs(io, doc).?;
+    try std.testing.expect(age >= 0 and age <= max_status_age_secs);
+    // Without boot_s the older document still ages on the awake clock.
+    const legacy: StatusLiveness = .{ .pid = 1, .mono_s = mono - 7200 };
+    try std.testing.expect(statusAgeSecs(io, legacy).? >= 7200);
+}
+
 test "cmdStatus retires a crashed daemon's status.json as not running" {
     const gpa = std.testing.allocator;
     var cb: [128]u8 = undefined;
@@ -2919,6 +2951,8 @@ const seed_status_truncated = fuzzcorpus.entry("{\"pid\":");
 const seed_status_not_json = fuzzcorpus.entry("not json at all");
 const seed_status_now_min = fuzzcorpus.entry("{\"pid\":1,\"now_s\":-9223372036854775808}");
 const seed_status_mono_max = fuzzcorpus.entry("{\"pid\":1,\"now_s\":1,\"mono_s\":9223372036854775807}");
+const seed_status_boot_min = fuzzcorpus.entry("{\"pid\":1,\"now_s\":1,\"mono_s\":1,\"boot_s\":-9223372036854775808}");
+const seed_status_boot_live = fuzzcorpus.entry("{\"pid\":1,\"now_s\":1710000060,\"mono_s\":100,\"boot_s\":100,\"stats\":{}}\n");
 const seed_status_dup_pid = fuzzcorpus.entry("{\"pid\":1,\"pid\":2,\"now_s\":0}");
 const seed_status_float_pid = fuzzcorpus.entry("{\"pid\":1.5}");
 const seed_status_string_pid = fuzzcorpus.entry("{\"pid\":\"1\"}");
@@ -2935,6 +2969,8 @@ const fuzz_status_corpus = [_][]const u8{
     &seed_status_not_json,
     &seed_status_now_min,
     &seed_status_mono_max,
+    &seed_status_boot_min,
+    &seed_status_boot_live,
     &seed_status_dup_pid,
     &seed_status_float_pid,
     &seed_status_string_pid,
@@ -2949,7 +2985,8 @@ const fuzz_status_corpus = [_][]const u8{
 /// is not a liveness object, and statusAgeSecs must not overflow on a
 /// hostile i64 stamp. The harness asserts fail-closed parsing, determinism
 /// across re-reads, and that age is the absolute monotonic gap when
-/// mono_s is present (the reboot leftover / future-stamp case).
+/// boot_s (or mono_s on an older document) is present (the reboot leftover /
+/// future-stamp case).
 fn fuzzStatusLivenessOne(_: void, smith: *std.testing.Smith) anyerror!void {
     const gpa = std.testing.allocator;
     var doc_buf: [512]u8 = undefined;
@@ -2964,10 +3001,16 @@ fn fuzzStatusLivenessOne(_: void, smith: *std.testing.Smith) anyerror!void {
         try std.testing.expectEqual(live.pid, again.value.pid);
         try std.testing.expectEqual(live.now_s, again.value.now_s);
         try std.testing.expectEqual(live.mono_s, again.value.mono_s);
+        try std.testing.expectEqual(live.boot_s, again.value.boot_s);
     }
 
     const age = statusAgeSecs(std.testing.io, live);
-    if (live.mono_s) |stamp| {
+    if (live.boot_s) |stamp| {
+        const now = sys.bootSec(std.testing.io);
+        const want = if (stamp > now) stamp -| now else now -| stamp;
+        try std.testing.expectEqual(want, age.?);
+        try std.testing.expect(age.? >= 0);
+    } else if (live.mono_s) |stamp| {
         const now = sys.monoSec(std.testing.io);
         const want = if (stamp > now) stamp -| now else now -| stamp;
         try std.testing.expectEqual(want, age.?);

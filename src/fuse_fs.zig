@@ -20,7 +20,9 @@ pub const State = struct {
     catalog: discover.Catalog,
     server: peer.Server,
     direct_io: bool,
-    /// monotonic-seconds stamp of daemon start; uptime_s in status.json.
+    /// suspend-inclusive monotonic stamp of daemon start; uptime_s in
+    /// status.json. Not the awake clock: a suspended host resumes with
+    /// uptime_s unchanged, which is not what an operator reads it as.
     start_secs: i64,
     running: std.atomic.Value(bool) = .init(true),
     /// Background workers, spawned by mf_init: libfuse daemonizes with fork()
@@ -109,7 +111,7 @@ pub const State = struct {
                 .store = &self.store,
             },
             .direct_io = direct_io,
-            .start_secs = sys.monoSec(io),
+            .start_secs = sys.bootSec(io),
         };
         self.store.water = water;
     }
@@ -1905,6 +1907,7 @@ const StatusFields = struct {
     origin_down: i32,
     now_s: i64,
     mono_s: i64,
+    boot_s: i64,
     stats: store_mod.Stats.Snap,
 };
 
@@ -1956,7 +1959,7 @@ const status_doc_max_bytes: usize = blk: {
 /// publishes here by construction instead of by remembering to edit this
 /// document's format string.
 fn writeStatusDoc(w: *std.Io.Writer, f: StatusFields) !void {
-    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"origin_down\":{d},\"now_s\":{d},\"mono_s\":{d},\"stats\":{{", .{
+    try w.print("{{\"id\":\"{s}\",\"pid\":{d},\"uptime_s\":{d},\"peers\":{d},\"piece\":{d},\"inflight\":{d},\"cache_free_pct\":{d},\"origin_down\":{d},\"now_s\":{d},\"mono_s\":{d},\"boot_s\":{d},\"stats\":{{", .{
         f.id,
         f.pid,
         f.uptime_s,
@@ -1967,6 +1970,7 @@ fn writeStatusDoc(w: *std.Io.Writer, f: StatusFields) !void {
         f.origin_down,
         f.now_s,
         f.mono_s,
+        f.boot_s,
     });
     inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields, 0..) |sf, i| {
         if (i != 0) try w.writeByte(',');
@@ -1984,16 +1988,20 @@ fn statusJson(st: *State) !void {
     // Single line like every other machine-read artifact here: consumers
     // tail/grep it and a multi-line document would break line-oriented
     // parsing (journalctl, jq -line, watch loops).
-    // One pair of samples for the whole document: uptime_s and mono_s share
-    // the monotonic instant, and now_s is the matching wall-clock read.
-    // mono_s is the wedge gate (same-machine CLOCK_MONOTONIC, immune to NTP
-    // steps); now_s stays the human/monitor wall stamp.
+    // One pair of samples for the whole document: uptime_s and boot_s share
+    // the suspend-inclusive monotonic instant, mono_s is the awake one, and
+    // now_s is the matching wall-clock read.
+    // boot_s is the wedge gate (same-machine CLOCK_BOOTTIME, immune to NTP
+    // steps and to a host that spent an hour suspended); mono_s keeps the
+    // awake clock for readers that already key on it; now_s stays the
+    // human/monitor wall stamp.
     const now_mono = sys.monoSec(st.io);
+    const now_boot = sys.bootSec(st.io);
     var w = std.Io.Writer.fixed(&buf);
     try writeStatusDoc(&w, .{
         .id = st.catalog.self_id,
         .pid = sys.pidSelf(),
-        .uptime_s = now_mono -| st.start_secs,
+        .uptime_s = now_boot -| st.start_secs,
         .peers = st.catalog.peerCount(),
         .piece = st.store.piece_size,
         .inflight = st.server.http_inflight.load(.monotonic),
@@ -2001,6 +2009,7 @@ fn statusJson(st: *State) !void {
         .origin_down = origin_down,
         .now_s = sys.nowSec(st.io),
         .mono_s = now_mono,
+        .boot_s = now_boot,
         .stats = st.store.stats.snap(),
     });
     const json = w.buffered();
@@ -3591,6 +3600,7 @@ test "status doc fits its buffer at the widest id and every counter" {
         .origin_down = std.math.minInt(i32),
         .now_s = std.math.minInt(i64),
         .mono_s = std.math.minInt(i64),
+        .boot_s = std.math.minInt(i64),
         .stats = stats,
     });
     const doc = w.buffered();
@@ -3655,6 +3665,7 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
         origin_down: i32,
         now_s: i64,
         mono_s: i64,
+        boot_s: i64,
         stats: StatsDoc,
     };
     const doc = try std.json.parseFromSlice(StatusDoc, gpa, blob, .{});
@@ -3673,10 +3684,17 @@ test "statusJson publishes parseable liveness atomically and replaces in place" 
     try std.testing.expectEqual(@as(u64, 0), doc.value.stats.lease_err);
     try std.testing.expectEqual(@as(u64, 0), doc.value.stats.meta_err);
     // now_s is a current epoch second (operators/monitors); mono_s is the
-    // same-machine monotonic instant the wedge gate compares against. Zero
-    // or a swapped pair would make `status` misread a live node.
+    // same-machine monotonic instant and boot_s the suspend-inclusive one
+    // the wedge gate compares against. Zero or a swapped pair would make
+    // `status` misread a live node.
     try std.testing.expect(doc.value.now_s >= sys.nowSec(st.io) - 5);
     try std.testing.expect(doc.value.mono_s >= sys.monoSec(st.io) - 5);
+    try std.testing.expect(doc.value.boot_s >= sys.bootSec(st.io) - 5);
+    // CLOCK_BOOTTIME never runs behind CLOCK_MONOTONIC: they coincide
+    // while the host stays awake and boottime accumulates the suspend time
+    // the awake clock skips. A boot_s below mono_s means the two samples
+    // came from different clocks.
+    try std.testing.expect(doc.value.boot_s >= doc.value.mono_s);
     // Counters ride along with the liveness fields: an operator answers
     // "is it serving, from where, is it failing" from one artifact.
     try std.testing.expectEqual(@as(u64, 0), doc.value.stats.reads_ok);

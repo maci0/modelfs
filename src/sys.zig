@@ -65,6 +65,17 @@ pub fn monoSec(io: std.Io) i64 {
     return std.Io.Clock.now(.awake, io).toSeconds();
 }
 
+/// Monotonic seconds that include time the system spent suspended
+/// (CLOCK_BOOTTIME on Linux). The awake clock stops during suspend, so a
+/// host that suspends for an hour advances monoSec by nothing: elapsed-time
+/// checks whose subject is "how long since this artifact was written" then
+/// read the artifact as fresh after the resume. That is the shape of a
+/// missed alarm, so the status heartbeat gate and uptime_s use this clock.
+/// Still meaningless across reboots or hosts, like monoSec.
+pub fn bootSec(io: std.Io) i64 {
+    return std.Io.Clock.now(.boot, io).toSeconds();
+}
+
 /// Monotonic milliseconds: elapsed-time comparisons within this process
 /// where second resolution is too coarse (short-lived cache TTLs, peer
 /// transfer budgets). Same injected clock as monoSec.

@@ -634,14 +634,16 @@ code cannot be lied to:
 * **Wedged.** A live pid whose heartbeat is more than 120 s old: a hung daemon keeps its pid but
   stops rewriting the artifact. 120 s covers twelve 10 s ticks.
 
-Age prefers `mono_s` (CLOCK_MONOTONIC, comparable across processes on this machine) so an NTP
-step or admin clock set cannot flip the verdict. A leftover from the previous boot (`mono_s`
-ahead of now, CLOCK_MONOTONIC having reset) is stale even when pid reuse keeps the pid check
-green. Artifacts from older builds fall back to wall-clock `now_s`.
+Age prefers `boot_s` (CLOCK_BOOTTIME, comparable across processes on this machine and still
+advancing across a suspend) so an NTP step or admin clock set cannot flip the verdict and a
+host that slept cannot leave a wedged daemon's artifact reading fresh. A leftover from the
+previous boot (`boot_s` ahead of now, that clock having reset) is stale even when pid reuse
+keeps the pid check green. Artifacts from builds before `boot_s` age on `mono_s`
+(CLOCK_MONOTONIC), and older ones on wall-clock `now_s`.
 
 | Group | Fields |
 |---|---|
-| Liveness | `id`, `pid`, `uptime_s`, `now_s`, `mono_s` |
+| Liveness | `id`, `pid`, `uptime_s`, `now_s`, `mono_s`, `boot_s` |
 | Topology | `peers`, `piece`, `inflight` (HTTP handlers) |
 | Saturation | `cache_free_pct`, the same sample culling runs on; `-1` when statfs fails, i.e. culling suspended |
 | Origin health | `origin_down`, 1 while an EIO/ESTALE/ETIMEDOUT getattr/open/stat, write, origin pread, lease publish, or `.cluster` walk has not yet recovered |
