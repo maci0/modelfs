@@ -370,7 +370,10 @@ echo "=== harness policy ==="
 # beside its destination (an atomic rename needs the same filesystem) and
 # run_vm_cluster_e2e.sh puts qemu disk images under libvirt's own directory.
 # A bare mktemp template lands on tmpfs, where a multi-gigabyte piece cache
-# is charged to RAM.
+# is charged to RAM. The pattern matches any mktemp call carrying an XXXXXX
+# template whatever the flags are and in whatever order they appear, so
+# `mktemp -p /var/lib/libvirt/images d-XXXXXX` and `mktemp "$tpl"` are
+# judged on their template too, not only the flag-then-template spelling.
 unscoped_mktemp=""
 for sh in "${sh_files[@]}"; do
     while IFS= read -r hit; do
@@ -379,7 +382,7 @@ for sh in "${sh_files[@]}"; do
             && "${line}" != */var/lib/libvirt/images/* ]]; then
             unscoped_mktemp="${unscoped_mktemp} ${hit}"
         fi
-    done < <(grep -nE '^[^#]*mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+[^[:space:]]*XXXXXX' "${sh}" || true)
+    done < <(grep -nE '^[^#]*mktemp[^|;&]*XXXXXX' "${sh}" || true)
 done
 [[ -z "${unscoped_mktemp}" ]] \
     || fail "mktemp without a SCRATCH_DIR template (tmpfs payload):${unscoped_mktemp//$'\n'/, }"
@@ -464,7 +467,7 @@ done
 # nobody has checked against the daemon, so fail until the list catches up.
 documented_mf="$(sed -n '/^# Environment namespaces/,/^$/p' "${SCRIPTS_DIR}/lib.sh" \
     | grep -oE 'MF_[A-Z0-9_]+' | sort -u)"
-read_mf="$({ grep -rhoE '\$\{MF_[A-Z0-9_]+[:}]' "${sh_files[@]}" || true; grep -rhoE 'MF_[A-Z0-9_]+=' "${sh_files[@]}" || true; } \
+read_mf="$({ grep -rhoE '\$\{?MF_[A-Z0-9_]+' "${sh_files[@]}" || true; grep -rhoE 'MF_[A-Z0-9_]+=' "${sh_files[@]}" || true; } \
     | grep -oE 'MF_[A-Z0-9_]+' | sort -u)"
 undocumented_mf="$(comm -23 <(printf '%s\n' "${read_mf}") <(printf '%s\n' "${documented_mf}") | tr '\n' ' ')"
 [[ -z "${undocumented_mf}" ]] \

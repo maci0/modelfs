@@ -2075,6 +2075,10 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 fn mountRel(path: []const u8) []const u8 {
     var rel = path;
     if (std.mem.startsWith(u8, rel, "/models/")) rel = rel["/models/".len..];
+    // The bare mountpoint, not a sibling: "/models" is the root refuseCliRel
+    // names, and without this case the leading-slash strip turned it into
+    // the origin-root file "models", which relOk accepts.
+    if (std.mem.eql(u8, rel, "/models")) rel = "";
     if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
     return rel;
 }
@@ -3193,6 +3197,8 @@ test "mountRel strips the default mount prefix" {
     try std.testing.expectEqualStrings("gguf/a.gguf", mountRel("gguf/a.gguf"));
     try std.testing.expectEqualStrings("a.bin", mountRel("/a.bin"));
     try std.testing.expectEqualStrings("", mountRel("/models/"));
+    try std.testing.expectEqualStrings("", mountRel("/models"));
+    try std.testing.expectEqualStrings("models", mountRel("models"));
     try std.testing.expectEqualStrings(".cluster/spark1.json", mountRel("/models/.cluster/spark1.json"));
 }
 

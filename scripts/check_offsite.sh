@@ -132,7 +132,17 @@ if ! find / -maxdepth 0 -quit >/dev/null 2>&1; then
 fi
 verify_payload() {
     local ds="$1"
-    local mp
+    local mp mounted
+    # The mounted property, not `zfs list -o mountpoint`: the mountpoint
+    # property is set at import whether or not the filesystem is mounted,
+    # so a pool nobody brought up (or one unmounted since) answered with a
+    # plausible path and the scan below read whatever the host had there.
+    # Same query scripts/dr_pool_restore.sh gates on.
+    mounted="$(zfs get -H -o value mounted "${ds}")" \
+        || die "cannot read the mount state of offsite ${ds} (docs/recovery.md section 3)"
+    if [[ "${mounted}" != "yes" ]]; then
+        die "offsite ${ds} is not mounted: a site-loss copy nobody can read is not a restore point"
+    fi
     mp="$(zfs list -H -o mountpoint "${ds}")" \
         || die "cannot read the mountpoint of offsite ${ds} (docs/recovery.md section 3)"
     if [[ -z "${mp}" || "${mp}" == "-" ]]; then

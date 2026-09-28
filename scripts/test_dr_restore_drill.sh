@@ -1529,6 +1529,32 @@ read_state() {
 sub="$1"
 shift
 case "${sub}" in
+    get)
+        # `zfs get -H -o value mounted <ds>`: the mounted property, which
+        # is what says the copy can be read, and is set independently of
+        # the mountpoint property the list branch answers.
+        read_state
+        dataset=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -H | -p)
+                    shift
+                    ;;
+                -o)
+                    shift 2
+                    ;;
+                *)
+                    dataset="$1"
+                    shift
+                    ;;
+            esac
+        done
+        if [[ "${dataset}" == "${ORIGIN}" ]]; then
+            printf '%s\n' "${MOUNTED:-yes}"
+            exit 0
+        fi
+        exit 1
+        ;;
     list)
         read_state
         t=""
@@ -1581,7 +1607,8 @@ OFFSTUB
 chmod +x "${OFFSITE_BIN}/zfs"
 
 write_offsite_env() {
-    printf 'ORIGIN=%q\nSNAP_NAME=%q\nSNAP_CREATION=%q\nMOUNTPOINT=%q\n' "$1" "$2" "$3" "${4:-${OFFSITE_PAYLOAD}}" >"${OFFSITE_STATE}/env"
+    printf 'ORIGIN=%q\nSNAP_NAME=%q\nSNAP_CREATION=%q\nMOUNTPOINT=%q\nMOUNTED=%q\n' \
+        "$1" "$2" "$3" "${4:-${OFFSITE_PAYLOAD}}" "${5:-yes}" >"${OFFSITE_STATE}/env"
 }
 
 expect_offsite() {
@@ -1653,6 +1680,14 @@ expect_offsite "fresh but empty offsite copy is an alarm" 1 "holds no files" \
 
 write_offsite_env tank/models-offsite tank/models-offsite@unmounted "${OFFSITE_FRESH}" "-"
 expect_offsite "unmounted offsite copy is an alarm" 1 "is not mounted" \
+    "${OFFSITE}" tank/models-offsite
+
+# Mountpoint property set but the filesystem never mounted: the pool was
+# imported and nothing mounted it, so the path holds host content, not the
+# copy. Reading the mountpoint property alone called this offsite OK.
+write_offsite_env tank/models-offsite tank/models-offsite@notmounted "${OFFSITE_FRESH}" \
+    "${OFFSITE_PAYLOAD}" "no"
+expect_offsite "imported but not mounted offsite copy is an alarm" 1 "is not mounted" \
     "${OFFSITE}" tank/models-offsite
 
 write_offsite_env tank/models-offsite tank/models-offsite@gone "${OFFSITE_FRESH}" \

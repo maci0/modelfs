@@ -67,11 +67,23 @@ expect_zig_version "${zig_pin}-dev.1" 1
 expect_zig_version "" 1
 
 expect_release_tag() {
-    local tag="$1" want="$2" output rc=0
+    local tag="$1" want="$2" output rc=0 operand_rc=0 operand_output
+    # The operand form is the one release.yml runs
+    # (`check_release_tag.sh "${TAG}"`) and the one the environment form
+    # below cannot stand in for: an operand-taking script that refused its
+    # own documented operand passed every case here.
+    operand_output="$("${SCRIPTS_DIR}/check_release_tag.sh" "${tag}" 2>&1)" || operand_rc=$?
     # The 2>&1 belongs inside the substitution: a redirection on the
     # assignment itself is applied after the command substitution has
     # already run, so its stderr would go to the gate's own stderr.
     output="$(GITHUB_REF_NAME="${tag}" "${SCRIPTS_DIR}/check_release_tag.sh" 2>&1)" || rc=$?
+    if [[ "${want}" -eq 0 ]]; then
+        [[ "${operand_rc}" -eq 0 ]] || fail "check_release_tag.sh ${tag} (operand) exited ${operand_rc}, want 0: ${operand_output}"
+        [[ "${operand_output}" == "${zon_pin}" ]] || fail "check_release_tag.sh ${tag} (operand) printed '${operand_output}', want ${zon_pin}"
+    else
+        [[ "${operand_rc}" -ne 0 ]] || fail "check_release_tag.sh ${tag} (operand) was accepted"
+        [[ "${operand_output}" == *"${zon_pin}"* ]] || fail "check_release_tag.sh ${tag} (operand) omitted the manifest version: ${operand_output}"
+    fi
     if [[ "${want}" -eq 0 ]]; then
         [[ "${rc}" -eq 0 ]] || fail "check_release_tag.sh ${tag} exited ${rc}, want 0: ${output}"
         [[ "${output}" == "${zon_pin}" ]] || fail "check_release_tag.sh ${tag} printed '${output}', want ${zon_pin}"
