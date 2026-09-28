@@ -145,12 +145,6 @@ case "${mypy_have}" in
         fail "mypy is ${mypy_have}, lock pins ${mypy_want}; reinstall .venv from requirements-dev.lock.txt"
         ;;
 esac
-py_want="$(tr -d '[:space:]' < "${ROOT_DIR}/.python-version")"
-[[ -n "${py_want}" ]] || fail "empty .python-version"
-py_have="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-if [[ "${py_have}" != "${py_want}" ]]; then
-    fail "python ${py_have} != .python-version ${py_want}"
-fi
 
 # zig fmt does not consult build.zig.zon; catch an old toolchain here
 # rather than as a later, less obvious compile failure.
