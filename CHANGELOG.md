@@ -26,6 +26,10 @@
   prints, the `proto.default_port` comment no longer claims `--listen` falls back
   to it, and the README records that `MODELFS_ID` is read for `mount` only.
 
+### Portable release and NAS install scripts - 2026-09-28
+- **`build_static.sh` no longer needs GNU-only `stat` and `cp` flags.** The artifact size comes from `wc -c` and the copy from `rm -f` plus a plain `cp`, so the script that builds the musl binaries also runs on a non-GNU userland. Output paths and names are unchanged.
+- **`install_nas_backup.sh` fails by name on a host without GNU coreutils.** The atomic unit install needs `mv -T` and `install --owner/--group`; the script now checks for them up front and exits with the missing-tool message instead of failing partway through the copy. The dry-run plan is unchanged.
+
 ## [0.17.0] - 2026-09-28
 
 Minor bump with no behavior changes since 0.16.0.

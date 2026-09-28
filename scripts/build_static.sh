@@ -92,9 +92,15 @@ if [[ ${elf_rc} -ne 0 ]]; then
     fail "static ELF verification failed for ${target}"
 fi
 
-size="$(stat -c%s "${bin}")"
+# wc and a plain cp, not `stat -c%s` and `cp -T --remove-destination`: this
+# script builds the binaries that run on a musl host, so it has to be runnable
+# on one. rm -f before cp is what --remove-destination did, and works
+# everywhere.
+size="$(wc -c <"${bin}" | tr -d '[:space:]')"
 echo "static binary: ${bin} (${size} bytes)"
 if [[ -n "${prefix}" ]]; then
-    cp -T --remove-destination -- "${bin}" "${prefix}/modelfs-${arch}-linux-musl"
-    echo "release artifact: ${prefix}/modelfs-${arch}-linux-musl"
+    artifact="${prefix}/modelfs-${arch}-linux-musl"
+    rm -f "${artifact}"
+    cp -- "${bin}" "${artifact}"
+    echo "release artifact: ${artifact}"
 fi

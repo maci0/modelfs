@@ -91,6 +91,20 @@ copy_one() (
     exit 1
 }
 
+# The atomic install below needs GNU coreutils: `mv -T` (replace the
+# destination itself, never a directory to move into) and `install
+# --owner/--group` have no POSIX spelling, and BusyBox mv has no -T at
+# all. Probing mv by running it is not an option (any invocation that
+# reaches the filesystem writes, and this script is dry-run by default),
+# so read its version banner; BusyBox and BSD mv have no --version and
+# fall through to the named failure below, the way dr_restore_drill.sh
+# fails by name on a missing find -printf rather than mid-copy.
+mv_version="$(mv --version 2>/dev/null | head -1 || true)"
+if [[ "${mv_version}" != "mv (GNU coreutils)"* ]]; then
+    echo "install FAIL: GNU coreutils are required (need mv -T, install --owner/--group); this host has ${mv_version:-a mv without --version}" >&2
+    exit 1
+fi
+
 copy_one "${NAS_DIR}/sanoid.conf" "etc/sanoid/sanoid.conf"
 copy_one "${NAS_DIR}/notify-admin@.service" "etc/systemd/system/notify-admin@.service"
 copy_one "${NAS_DIR}/drop-ins/sanoid.service.d/fail.conf" "etc/systemd/system/sanoid.service.d/fail.conf"
