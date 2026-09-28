@@ -9,8 +9,9 @@ pub const Water = struct {
     bstop: u32 = 3,
 };
 
-/// True when the watermarks are strictly ordered brun > bcull > bstop, the
-/// only arrangement phase() hysteresis works for. Out of order, the failure
+/// True when `brun` is a usable percentage and the watermarks are strictly
+/// ordered brun > bcull > bstop, the only arrangement phase() hysteresis
+/// works for. Out of order, the failure
 /// is deterministic, not merely suboptimal:
 ///   * bstop >= bcull makes .stop win on every sample at or below bstop, so
 ///     hard culling runs far above the intended floor and keeps the cache

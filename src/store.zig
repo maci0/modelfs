@@ -1001,21 +1001,23 @@ pub const Store = struct {
         return true;
     }
 
-    /// Brings a live entry in line with a freshly observed origin size:
-    /// swaps in an empty bitfield sized for the new length, truncates the
-    /// cache fd so stale pieces cannot serve the new inode, and persists the
-    /// emptied field best-effort. The save closes the crash window decode
-    /// cannot: a sidecar whose recorded size equals the loader's decodes
-    /// cleanly, so an unsaved wipe let a crash here reload the pre-reset
-    /// marks as soon as the file was back at the last-saved length, serving
-    /// old bytes or hole zeros as current. Must be called WITHOUT store.mu
-    /// held (it takes content_mu then file.mu internally).
     /// Brings a live entry in line with a freshly observed origin size and
     /// identity. Size mismatch is the existing wipe; a same-size rewrite
     /// (newer mtime or different ino) is the same wipe, because the bits
     /// still name the previous object's pieces. An unknown identity is
     /// adopted without wiping so the next rewrite is visible. Callers that
     /// have no origin stat pass OriginId{} and keep size-only behavior.
+    /// The wipe empties the bitfield and truncates the cache fd so stale
+    /// pieces cannot serve the new inode, and persists the emptied field
+    /// best-effort. The save closes the crash window decode cannot: a
+    /// sidecar whose recorded size equals the loader's decodes cleanly, so
+    /// an unsaved wipe let a crash here reload the pre-reset marks as soon
+    /// as the file was back at the last-saved length, serving old bytes or
+    /// hole zeros as current. A transfer in flight (Cached.xferBusy) takes
+    /// the in-place route: the bits are cleared in the current buffer and
+    /// the field is re-sized by the next reconcile that finds no reader.
+    /// Must be called WITHOUT store.mu held (it takes content_mu then
+    /// file.mu internally).
     fn reconcile(self: *Store, f: *Cached, file_size: u64, origin_id: OriginId) !*Cached {
         // Size and identity are mutated under file.mu; an unlocked compare
         // races a concurrent truncate and can skip a needed wipe, or two
@@ -1388,7 +1390,8 @@ pub const Store = struct {
         /// Already filled, including by a concurrent filler that finished
         /// while we waited on its claim.
         filled,
-        /// A truncate shrank the file below this piece: the caller moves on
+        /// The entry died under the claim (`forget` raced this fill), or a
+        /// truncate shrank the file below this piece: the caller moves on
         /// without treating it as an error or as data; the piece stays
         /// unmarked (a later grow preserves marks, so a bogus bit would
         /// survive).
@@ -1519,8 +1522,9 @@ pub const Store = struct {
     /// Origin-side manifest directory: `<origin>/.cluster/manifests/`. Flat
     /// hex names (piece.manifestName), so no nested directories and no
     /// traversal risk; walkLeases only parses .json files and so never
-    /// descends here. `modelfs dupes` and the lease sweep reach it by
-    /// appending `manifests_dir_leaf` to a path they already hold.
+    /// descends here. The lease sweep reaches it by appending
+    /// `manifests_dir_leaf` to the `.cluster` path it already holds;
+    /// `manifestsDirPath` is the accessor for callers holding an origin.
     pub const manifests_dir = ".cluster/" ++ manifests_dir_leaf;
 
     /// Last component of `manifests_dir`, for callers that already hold

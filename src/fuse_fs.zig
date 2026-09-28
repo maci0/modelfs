@@ -964,8 +964,9 @@ fn hydratePiece(st: *State, file: *store_mod.Store.Cached, idx: u32, scratch: []
             return -sys.c.ENOMEM;
         };
         piece_len = switch (cl) {
-            // Filled by someone else, or a truncate shrank the file below the
-            // piece between claim and sample (the claim was dropped unmarked):
+            // Filled by someone else; the entry was forgotten, or a truncate
+            // shrank the file below the piece between claim and sample (the
+            // claim was dropped unmarked):
             // report success either way -- the bounds-checked read below then
             // returns a short count against the new size. Passing an empty
             // buffer onward would underflow fillFromPeers' range end computation

@@ -632,7 +632,7 @@ code cannot be lied to:
 
 * **Crashed.** A missing file, or a leftover naming an exited pid.
 * **Wedged.** A live pid whose heartbeat is more than 120 s old: a hung daemon keeps its pid but
-  stops rewriting the artifact. 120 s tolerates eleven missed 10 s ticks.
+  stops rewriting the artifact. 120 s covers twelve 10 s ticks.
 
 Age prefers `mono_s` (CLOCK_MONOTONIC, comparable across processes on this machine) so an NTP
 step or admin clock set cannot flip the verdict. A leftover from the previous boot (`mono_s`

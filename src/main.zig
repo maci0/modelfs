@@ -1,5 +1,6 @@
 //! CLI entry point: argument parsing, command dispatch (mount/status/peers/
-//! pin/unpin/verify/dupes/update), and mount wiring into State.init / fuse_fs.run.
+//! pin/unpin/verify/dupes/pull/update, plus help and version), and mount wiring
+//! into State.init / fuse_fs.run.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -1584,9 +1585,10 @@ const StatusLiveness = struct { pid: i64, now_s: ?i64 = null, mono_s: ?i64 = nul
 
 /// How long a status.json may go unrefreshed before `status` stops serving
 /// it as evidence of a working mount. The discovery tick rewrites the
-/// artifact every 10s, so this tolerates eleven missed ticks; a daemon
-/// wedged inside a hung origin call or a stuck worker leaves the file aging
-/// past it while its pid lives on, which the pid check alone cannot catch.
+/// artifact every 10s, so a daemon that stops after writing it is still
+/// served for twelve ticks; a daemon wedged inside a hung origin call or a
+/// stuck worker leaves the file aging past it while its pid lives on, which
+/// the pid check alone cannot catch.
 const max_status_age_secs: i64 = 120;
 
 /// Seconds since the heartbeat was written. Prefer `mono_s` (CLOCK_MONOTONIC,

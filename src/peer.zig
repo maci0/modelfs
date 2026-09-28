@@ -639,10 +639,11 @@ fn cacheEntry(self: *Server, fd: c_int, rel: []const u8, orig: OriginReg) ?*stor
 
 fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
     const orig = originRegular(self, fd, rel) orelse return;
-    // Fetchers refuse a /have body above max_have_body_bytes. Serving one
-    // would still open a cache entry (Bitfield.init of up to 512 MiB at
-    // --piece 1 on a large sparse file) and dupe it for a reply no peer
-    // would accept. Refuse before get() so the snapshot cannot land.
+    // Fetchers refuse a /have body above max_have_body_bytes, so serving
+    // one would open a cache entry, materialize a bitmap past the cap
+    // (max_alloc_body_bytes at --piece 1 on a large sparse file), and dupe
+    // it for a reply no peer would accept. Refuse before get() so the
+    // snapshot cannot land.
     const nbits = piece.count(orig.size, self.store.piece_size);
     if (piece.Bitfield.bytesLen(nbits) > max_have_body_bytes) {
         std.log.warn("have bitmap for {s} exceeds {d} bytes; replying 500", .{ rel, max_have_body_bytes });
@@ -772,9 +773,10 @@ fn hydrateRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: p
                 // A concurrent filler finished while we waited on its claim:
                 // the hasPiece gate below re-checks the bit before streaming.
                 .filled => {},
-                // Truncate raced the claim and shrank the file below this
-                // piece; the claim was dropped unmarked. Move on: replying
-                // 404 would tell the peer the path is gone over a size race.
+                // The entry was forgotten, or a truncate raced the claim and
+                // shrank the file below this piece; the claim was dropped
+                // unmarked. Move on: replying 404 would tell the peer the
+                // path is gone over a size race.
                 .raced => continue,
                 .len => |ln| {
                     // Same fill accounting as FUSE hydratePiece: a peer-serving

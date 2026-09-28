@@ -153,6 +153,7 @@ is the runbook they belong to.
 ./scripts/check_drill_log.sh           # fail if the monthly drill log is missing or stale
 ./scripts/check_offsite.sh             # fail if the site-loss copy is missing or older than 8 days
 ./scripts/dr_pool_restore.sh           # pool-loss recv (dry-run; --execute pulls from the replica)
+./scripts/dr_point_restore.sh          # point-in-time copy-back from a named snapshot (dry-run; --execute copies)
 ./scripts/hold_monthlies.sh            # hold monthly snapshots on the replica (syncoid ExecStartPost)
 ./scripts/test_dr_restore_drill.sh     # all of the above against a stub zfs; also run by check.sh
 ```
