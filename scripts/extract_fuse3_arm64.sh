@@ -9,6 +9,8 @@
 # an ar archive whose data.tar.zst holds the filesystem, unpacked with
 # binutils ar plus tar and zstd.
 set -euo pipefail
+export LC_ALL=C
+export TZ=UTC
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -120,6 +122,9 @@ done <<<"${names}"
 # existing link, so a re-run after a refresh cannot fail on it). The
 # soname target is whatever the .deb unpacked, not a version string
 # copied here: a SHA256SUMS bump used to leave libfuse3.so.3 dangling.
+# The loop takes the first match of a shell glob, so the LC_ALL=C export
+# above is what makes the choice a byte-order one rather than a function
+# of the extracting user's collation; the .deb ships exactly one.
 ln -sfn libfuse3.so.3 "${OUT}/lib/libfuse3.so"
 so_real=""
 for cand in "${OUT}/root/lib/aarch64-linux-gnu"/libfuse3.so.3.*; do

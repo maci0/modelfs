@@ -10,10 +10,11 @@
 #      files, with normalized archive metadata
 #   3. write SHA256SUMS over every asset, in a fixed order
 #
-# The tarball is deterministic: entries sorted by name, mtime pinned,
-# uid/gid 0, and a gzip stream carrying no name or timestamp. SOURCE_DATE_EPOCH
-# is honored when set (reproducible-builds.org) and falls back to 0, so the
-# archive is byte-identical either way rather than tracking checkout mtimes.
+# The tarball is deterministic: entries in the fixed order of the licenses
+# list below, mtime pinned, uid/gid 0, mode 0644, and a gzip stream
+# carrying no name or timestamp. SOURCE_DATE_EPOCH is honored when set
+# (reproducible-builds.org) and falls back to 0, so the archive is
+# byte-identical either way rather than tracking checkout mtimes.
 # The binary step does not touch the binaries themselves; the release
 # workflow runs the host-arch one as a smoke test after this.
 set -euo pipefail
