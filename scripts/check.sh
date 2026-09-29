@@ -41,6 +41,8 @@ answers --help):
   ./scripts/check_drill_log.sh              alarm if the monthly drill log is stale
   ./scripts/check_offsite.sh                alarm if the site-loss copy is missing or older than 8 days
   ./scripts/dr_pool_restore.sh              pool-loss recv (dry-run; --execute pulls from the replica)
+  ./scripts/dr_point_restore.sh SNAP --copy REL
+                                           copy one path back from a known-good snapshot (--execute)
   ./scripts/dr_restore_drill.sh --age-only  alarm if newest snapshot is older than 25 h
   ./scripts/hold_monthlies.sh               hold monthly snapshots (syncoid ExecStartPost)
   ./scripts/install_nas_backup.sh           copy NAS snapshot/replica/drill units (dry-run by default)

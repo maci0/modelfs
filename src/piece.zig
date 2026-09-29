@@ -87,7 +87,7 @@ fn tailValidBits(lo: u32, span: u32, nbits: u32) ?u6 {
 
 /// Exclusive end of the byte range the bitfield can name. `count` clamps at
 /// maxInt(u32), so a file whose true piece count would exceed that (piece
-/// size 1 past 4 GiB, or a sparse truncate near i64 max with a small piece)
+/// size 1 past 4 GiB at piece size 1, or a sparse truncate near i64 max)
 /// has a tail no sidecar bit can mark. `cover` of that tail collapses to an
 /// empty span; callers must not treat that as "already filled".
 pub fn trackedEnd(file_size: u64, piece_size: u32) u64 {

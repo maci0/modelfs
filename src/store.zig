@@ -4599,7 +4599,7 @@ fn fuzzOriginIdOne(_: void, smith: *std.testing.Smith) anyerror!void {
         );
     }
 
-    // An identity is never a newer write than its own mtime: readBits and
+    // An identity is never a newer write than its own mtime: loadBits and
     // the manifest load both ask that question about a stamp that may have
     // come off shared storage, and a true answer there discards a manifest
     // this node published itself.

@@ -25,7 +25,7 @@ pub const State = struct {
     /// uptime_s unchanged, which is not what an operator reads it as.
     start_secs: i64,
     running: std.atomic.Value(bool) = .init(true),
-    /// Background workers, spawned by mf_init: libfuse daemonizes with fork()
+    /// Background workers, spawned by ll_init: libfuse daemonizes with fork()
     /// before init runs, and fork keeps only the calling thread, so anything
     /// spawned earlier dies with the parent and a detached mount would
     /// silently lose its peer server, discovery, and culling.
@@ -1637,7 +1637,7 @@ fn readdirResume(names: anytype, emit: anytype, off: fuse.off_t) void {
     }
 }
 
-/// The origin-side entry stream of an mf_readdir walk: everything invisible
+/// The origin-side entry stream of an ll_readdir walk: everything invisible
 /// to the mount (dot entries, the control dir at the root, and names
 /// `store.relOk` would refuse) is filtered here, so the resume ordinals
 /// count only emittable names. A planted origin file `a\nERROR.bin` or

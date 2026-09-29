@@ -1364,6 +1364,8 @@ else
         fail "installer --install hold wrapper is not executable"
     elif ! grep -q "recursive = yes" "${INSTALL_DEST}/etc/sanoid/sanoid.conf"; then
         fail "installer --install sanoid.conf lost recursive = yes"
+    elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-point-restore" ]]; then
+        fail "installer --install point-restore wrapper is not executable"
     elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-pool-restore" ]]; then
         fail "installer --install pool-restore wrapper is not executable"
     elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-point-restore" ]]; then

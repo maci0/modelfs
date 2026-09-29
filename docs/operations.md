@@ -117,8 +117,9 @@ would wait forever, and `timeo` is in tenths of a second.
 ### Hot update
 
 `modelfs update` replaces a running daemon in place: the new binary is exec'd over it,
-so the FUSE connection, the open handles, and the mount knobs (origin, cache, id, piece
-size, water marks, listen port, advertise, seeds, and the PSK) carry over on a sealed
+so the FUSE connection, the open handles, and the mount knobs (origin, cache, id, mount
+path, piece size, water marks, listen port, advertise, seeds, the PSK, `--direct-io` /
+`--allow-other`, and the log level) carry over on a sealed
 memfd. Nothing is remounted and no cache is dropped.
 
 Three consequences to plan for before running it on a fleet:

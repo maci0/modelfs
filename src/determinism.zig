@@ -33,6 +33,7 @@ const modules = [_][]const u8{
     "fuse_fs.zig",
     "handover.zig",
     "hf.zig",
+    "update.zig",
     "main.zig",
 };
 

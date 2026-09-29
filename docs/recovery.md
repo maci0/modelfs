@@ -20,7 +20,7 @@ The origin (`tank/models` on the NAS) holds the **only copy** of every weight fi
 | `/var/cache/fscache` (desktop) | FS-Cache pages | derived | no |
 | `/etc/modelfs.psk` (every node) | peer auth secret | regenerable | only with total site loss; regenerate with `openssl rand -hex 32` and redistribute to all nodes |
 | `$HOME` HF token | hub auth | not on the origin | re-login |
-| `/etc/systemd/system/*.d/` drop-ins on the NAS and replica hosts | the dataset each unit runs against (`MF_SYNCOID_SRC`, `MF_DRILL_REPLICA`, `MF_OFFSITE_DATASET`) | **site configuration, not in this repo** | yes (per host). `install_nas_backup.sh --install` never touches a drop-in, so a reinstall keeps it; a rebuilt host comes back with the shipped placeholders. Capture with `modelfs-backup-config` (section 3) |
+| `/etc/systemd/system/*.d/` drop-ins on the NAS and replica hosts | the dataset each unit runs against (`MF_SYNCOID_SRC`, `MF_DRILL_REPLICA`, `MF_OFFSITE_DATASET`) | **site configuration, not in this repo** | yes (per host). `install_nas_backup.sh --install` writes no drop-in for these three units, so a reinstall keeps yours; it does replace the two shipped `sanoid.service.d` drop-ins. A rebuilt host comes back with the shipped placeholders. Capture with `modelfs-backup-config` (section 3) |
 
 Verifiably safe to ignore in any backup plan: caches (next read re-hydrates; culling punches holes, and `reapIdle` unlinks empty unpinned artifacts) and leases (swept after 300 s regardless). Everything else in this doc exists to protect row 1.
 
@@ -179,8 +179,11 @@ from this document and `install_nas_backup.sh`, which restores the
 placeholder rather than the choice. `modelfs-backup-config`
 ([`scripts/backup_config.sh`](../scripts/backup_config.sh)) prints the
 `Environment=` lines each installed unit would run with, unit file then
-drop-ins, flags a value still sitting at the shipped placeholder, and
-prints the retention policy the host's snapshots are taken under. It
+drop-ins, and prints the retention policy the host's snapshots are taken
+under. A value still sitting at the placeholder `syncoid-models.service`
+ships (`nas:tank/models`) is flagged as such; `MF_DRILL_REPLICA` and
+`MF_OFFSITE_DATASET` ship commented out, so an unset one shows as no
+`Environment=` at all rather than as a flagged placeholder. It
 reads files only: no pool, no unit, nothing written. Run it after the
 drop-in edits above and keep the output with the drill log, which is
 already checked for staleness.

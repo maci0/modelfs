@@ -1,6 +1,6 @@
 //! CLI entry point: argument parsing, command dispatch (mount/status/peers/
-//! pin/unpin/verify/dupes/pull/update, plus help and version), and mount wiring
-//! into State.init / fuse_fs.run.
+//! pin/unpin/verify/dupes/config/pull/update, plus help and version), and
+//! mount wiring into State.init / fuse_fs.run.
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
