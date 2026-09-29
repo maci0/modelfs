@@ -3,8 +3,8 @@
 | Field | Value |
 |---|---|
 | Status | Living document; describes `src/` as of the date below |
-| Last reviewed | 2026-09-28 |
-| Covers | modelfs daemon (`mount`) and CLI as of `v0.19.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull |
+| Last reviewed | 2026-09-29 |
+| Covers | modelfs daemon (`mount`) and CLI as of `v0.19.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull, GitHub release self-update |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
 
@@ -32,6 +32,11 @@ trusting the row.
 | [R8](#r8-crash-time-psk-spill-mitigated) | A crash dumping process memory that holds the secret | secrets to code | Mitigated: `RLIMIT_CORE` zeroed at mount |
 | [R9](#r9-rejected-request-anonymity-mitigated) | Rejected peer requests leaving no attributable trace | network to peer server | Mitigated: source-attributed 401/405 logging |
 | [R10](#r10-pulled-origin-artifacts-land-world-readable) | `modelfs pull` writes weights 0644 on the shared origin, unlike the 0600 cache | local uid / NFS export reader to origin | **Not prevented** |
+| [R11](#r11-self-update-trusts-the-publisher-not-just-the-bytes) | `modelfs update` checks the digest against a sidecar fetched from the same release, so publisher identity is never established | CLI to GitHub Releases | **Not mitigated**: SHA-256 only, no signature, no pinned digest |
+| [R12](#r12-self-update-replaces-the-installed-binary-and-triggers-handover) | The same command rewrites the on-disk binary and then drives the live daemon's image replacement | CLI to local filesystem / B4 handover | **No mitigation**: write access to the binary's directory is the only gate |
+
+`#` is a stable identifier, not a position: rows are appended as the model grows rather than
+renumbered, so a citation stays valid across passes.
 
 ---
 
@@ -47,9 +52,12 @@ trusting the row.
 | Operational state (`status.json`) | cache root, created 0600 (`writeFileOwnerOnly` src/sys.zig) | The daemon's uid and root can read pid, peer count, cache fill, and `origin_down`; not weights, not the PSK |
 | Cluster topology | `<origin>/.cluster/<id>.json`, `.cluster` created 0755 and lease documents written 0644 (`Catalog.publish` src/discover.zig, `sys.writeFileNoFollow` src/sys.zig) | Node ids, IPv4 addresses, and advertised ports are readable by any local uid and any host the NFS export admits, with no PSK. Useful for targeting (R5) and for finding the plaintext peer port, not a credential |
 | Hugging Face Hub token | `HF_TOKEN`, `$HF_HOME/token`, or `~/.cache/huggingface/token`, CLI memory during `modelfs pull` (src/hf.zig, src/main.zig) | Unauthorized read/write access to user's private models and gated repositories on huggingface.co |
+| The installed binary | `/proc/self/exe`, rewritten in place by `modelfs update` (`update.replaceVerifiedPath` src/update.zig) | Whoever replaces it owns the daemon's next start and, through the handover, the running mount's FUSE session, peer sockets, and PSK (R12) |
+| GitHub API token | `GITHUB_TOKEN`, read into the `Authorization` header by `update.githubBearer` src/update.zig, sent only to hosts passing `trustedGithubUrl` | Whatever read or write access that token carries on `api.github.com`: private repo metadata, release contents, or the ability to publish a release (R11) |
 
-The daemon handles no credential but the cluster PSK; `modelfs pull` is the only command that
-reads a Hugging Face token, and only from the environment or token file.
+The daemon handles no credential but the cluster PSK. Two CLI commands read an outbound token
+from the environment: `modelfs pull` reads the Hugging Face token (environment or token file)
+and `modelfs update` reads `GITHUB_TOKEN`. Neither token is ever used by the mount.
 
 ---
 
@@ -94,8 +102,9 @@ Dispatch and `parseArgs`, src/main.zig. Accepts paths, addresses, sizes, waterma
 ceiling (`--log`), and the PSK **file path**, never the secret: `--psk-value` is gone.
 
 `--seed HOST[:PORT]` hostnames are DNS-resolved once at mount (`buildSeeds` src/main.zig).
-`modelfs update` locates the daemon via `status.json` (same pid and age gates as `status`) and
-asks that process to replace its image; the PSK travels on a sealed memfd, not argv (`cmdUpdate`
+`modelfs update --reload` (and the automatic handover after a self-update) locates the daemon via
+`status.json` (same pid and age gates as `status`) and
+asks that process to replace its image; the PSK travels on a sealed memfd, not argv (`cmdReload`
 src/main.zig, src/handover.zig). The replacement image enters via internal subcommand
 `_handover --state-fd <fd>` (`cmdHandover` src/main.zig), which decodes the state blob from the
 sealed memfd (`handover.decode`, capped at `max_state_bytes`), inherits the FUSE session and
@@ -103,6 +112,38 @@ peer listen descriptors, replays `FUSE_INIT`, writes `update.ack`, and unlinks `
 `modelfs pull` takes a Hugging Face `owner/repo` and a ref,
 both held to a URL-safe charset with no `.`/`..` segments before being spliced into an endpoint
 URL (`repoOk`/`revisionOk` src/hf.zig).
+
+### GitHub release API and release assets (`modelfs update`)
+
+Added with `v0.19.0`. `cmdUpdate` src/main.zig is the only command besides `pull` that opens a
+socket to a host outside the cluster, and it accepts the most consequential untrusted input in the
+tree: bytes that become the installed executable.
+
+* **Request.** `https://api.github.com/repos/{repo}/releases/latest` (`releaseApiUrl`
+  src/update.zig). `--repo` overrides the default `maci0/modelfs` and is held to `owner/name`
+  with a per-side 100-byte limit and no `://`, no second slash, and no `.`/`..` side
+  (`validRepo`/`repoPartOk`), so a URL pasted into the flag fails rather than being fetched.
+  The response is read into a 1 MiB fixed buffer (`max_json_bytes`) and parsed by `parseRelease`
+  with unknown fields ignored, yielding the tag, the release page URL, and the asset list.
+* **Assets.** Two asset names are taken from that JSON, never constructed locally: the
+  architecture's binary (`thisAssetName`, e.g. `modelfs-x86_64-linux-musl`) and `SHA256SUMS`.
+  Both `browser_download_url` values must pass `trustedGithubUrl` before either is fetched: the
+  scheme must be `https`, the URL may carry no userinfo or whitespace, and the host must be
+  `github.com`, `*.github.com`, or `*.githubusercontent.com`, so `github.com.evil.com` and
+  `evil@github.com` are refused. Bodies are capped per request (`max_sums_bytes` 64 KiB,
+  `max_asset_bytes` 100 MiB) with `WriteFailed` past the cap reported as `BodyTooLarge`.
+* **Outbound credential.** `GITHUB_TOKEN` (`githubBearer` src/update.zig) is trimmed, refused if
+  empty or if it contains CR or LF, and sent as a privileged header, so the HTTP client drops it
+  on any cross-host redirect. The token is only needed for private repositories or for rate
+  limits on api.github.com; anonymous use is the default.
+* **Decision.** `decide` src/update.zig is pure and refuses, in order: a target with no release
+  asset (`unsupported_target`), a missing asset or checksum sidecar, an untrusted asset or sums
+  URL, a sidecar with no line for the asset name (`parseChecksum` requires 64 hex characters and
+  the `  ` or ` *` separator that `sha256sum` writes), and a digest mismatch. Only
+  `.replaced` reaches the filesystem.
+* **What the digest proves.** The asset and the sidecar come from the same release document on the
+  same host, so SHA-256 establishes that the two downloads agree and that nothing changed in
+  transit. It does not establish who published them ([R11](#r11-self-update-trusts-the-publisher-not-just-the-bytes)).
 
 ### Hugging Face API responses (`modelfs pull`)
 
@@ -138,6 +179,7 @@ or inject terminal escapes. Origin-write precondition, CLI-triggered (B3).
 |---|---|---|
 | PSK file (`--psk`, default `/etc/modelfs.psk`) or `MODELFS_PSK_VALUE` | `loadPsk` src/main.zig | Up to 4096 bytes after surrounding-whitespace trim. Files may contain at most 4098 raw bytes, allowing a maximum-length secret with LF or CRLF. A whitespace-only value is empty and refused; interior CR/LF is refused |
 | Hugging Face token: `HF_TOKEN`, else `$HF_HOME/token`, else `~/.cache/huggingface/token` | `loadToken` src/hf.zig | Up to 4096 bytes after trimming for `HF_TOKEN`; files are capped at 4096 raw bytes, including whitespace. Whitespace-only counts as unset. No flag carries it, and `cmdPull` disables core dumps for the run when one is loaded |
+| `GITHUB_TOKEN` (outbound, `modelfs update` only) | `githubBearer` src/update.zig | Trimmed of surrounding whitespace; empty is treated as unset and no bearer is sent; interior CR/LF is refused so the header cannot be split. Bounded by the caller's 4096-byte buffer. No flag carries it |
 | `MODELFS_ORIGIN/CACHE/PSK/PSK_VALUE/ID/LOG` | src/main.zig | Same values as their flags; an explicit flag wins. Whitespace-trimmed (`envValue`), empty counts as unset, except a whitespace-only `MODELFS_PSK_VALUE` which is refused as empty. Any other `MODELFS_*` name is refused as a typo (`checkKnownEnv` over the `env_knobs` table) |
 
 `modelfs config` prints the resolved value and source of every knob except the inline PSK,
@@ -180,6 +222,8 @@ local engines/processes ⇄ [FUSE/kernel] ⇄ modelfs daemon ⇄ [TCP :18080, pl
                        modelfs update / _handover (CLI)
                                                                 ⇣ (HTTPS)
                        modelfs pull (CLI) ⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄ Hugging Face API & CDNs
+                       modelfs update (CLI) ⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄ GitHub release API & assets
+                            ⇣ (writes /proc/self/exe, then may drive the handover above)
 ```
 
 ### B1: local processes to daemon (FUSE)
@@ -238,8 +282,9 @@ that then receives the PSK in a Bearer header: the same handoff as a forged leas
 
 ### B4: local process to daemon update (handover IPC)
 
-Local authority transition and IPC entry point: `modelfs update` asks the running daemon to
-replace its process image without unmounting (`cmdUpdate` src/main.zig, src/handover.zig).
+Local authority transition and IPC entry point: `modelfs update --reload`, and any
+`modelfs update` that replaced the binary on a host with a live mount, asks the running daemon to
+replace its process image without unmounting (`cmdReload` src/main.zig, src/handover.zig).
 
 * **Trigger**: The CLI writes `<cache>/update.req.tmp.<pid>` (mode 0600 durable via
   `writeFileOwnerOnlyDurable` src/sys.zig, opened `O_NOFOLLOW`) containing an absolute binary path
@@ -263,8 +308,11 @@ replace its process image without unmounting (`cmdUpdate` src/main.zig, src/hand
 ### B5: build to runtime
 
 A single Zig binary: no Zig package dependencies, no plugins, and no config fetched at runtime
-beyond the PSK file and the environment variables above. The one compiled-in third-party surface
-is libfuse3.
+by the daemon beyond the PSK file and the environment variables above. The one compiled-in
+third-party surface is libfuse3. The CLI does fetch at runtime, from the two hosts named in B6
+and B7, and `modelfs update` writes what it fetches over the installed binary, so the
+build-to-runtime boundary is not closed for that command: the running image and the bytes that
+replace it can differ by a whole release ([R12](#r12-self-update-replaces-the-installed-binary-and-triggers-handover)).
 
 The static release builds vendor static libfuse3 C source in `.deps/libfuse3-3.16.2/`, and the
 cross-aarch64 build vendors two libfuse3 `.deb`s in `.deps/fuse3-arm64/`. Both directory
@@ -312,6 +360,38 @@ over HTTPS to fetch model file trees and weights into the origin directory (`src
     4096 bytes (`max_token_bytes`), core dumps are disabled during execution (`disableCoreDumps` `src/main.zig`),
     and memory is zeroed on exit (`std.crypto.secureZero`).
 
+### B7: CLI to GitHub Releases (self-update)
+
+`modelfs update` (src/main.zig `cmdUpdate`, src/update.zig) asks api.github.com for the latest
+release, downloads the architecture's binary and the release's `SHA256SUMS`, and, on a digest
+match, overwrites the file `/proc/self/exe` resolves to and, if a daemon is live, drives the B4
+handover so the running mount adopts the new image without unmounting. `--check` stops after the
+version comparison and prints the release page. `--reload` skips the network entirely and is the
+B4 path.
+
+* **Untrusted data**: the release JSON, the two asset bodies, and the release page URL echoed by
+  `--check`. All are attacker-controlled if the repository, the release, or the account publishing
+  it is.
+* **Outbound credentials**: `GITHUB_TOKEN`, when the operator has one in the environment.
+* **Authority transition**: the strongest one outside the origin. The downloaded bytes become the
+  executable the daemon (and the operator's next `modelfs` invocation) runs, and the same command
+  then asks a live daemon to `execve` them while it holds the FUSE session, the peer listen
+  sockets, and the PSK. There is no separate confirmation and no `--no-handover` flag, and there
+  is no rollback: the rename unlinks the previous image, and [recovery.md](recovery.md) covers PSK
+  regeneration and cache wipes, not restoring a replaced binary. Getting back means reinstalling a
+  known-good release artifact by hand and, if the handover already ran, restarting the mount.
+* **Controls**: `validRepo` on the repo name, `trustedGithubUrl` on both asset URLs and the page
+  URL, per-request byte caps, and SHA-256 equality against the sidecar line for the exact asset
+  name before any write. The verified bytes are written to `<exe>.tmp.<pid>` with
+  `sys.writeFileExec` (`O_NOFOLLOW | O_NONBLOCK`, mode 0755) and renamed onto the destination, so
+  a failed write leaves the installed binary intact and a staged file is dropped on both failure
+  arms.
+* **Not verified**: who published the release. The digest and the sidecar come from the same
+  release on the same host, so a publisher account, a release edit, or a GitHub-side compromise
+  that serves both consistently passes ([R11](#r11-self-update-trusts-the-publisher-not-just-the-bytes)).
+  Nor is the running binary checked before it is replaced, so an already-modified `modelfs` is
+  silently upgraded over.
+
 ### Secrets flow
 
 The PSK enters through a file read at startup (world-readable refused, group-readable warned) or
@@ -345,6 +425,16 @@ Hugging Face tokens enter via `HF_TOKEN` in the environment, `$HF_HOME/token`, o
 capped at 4096 bytes (`max_token_bytes`), core dumps are disabled during execution (`disableCoreDumps`
 src/main.zig), and the memory buffer is wiped with `secureZero` on exit. The token leaves the host
 over HTTPS only to `huggingface.co` and is stripped on redirects to CDN hosts (`pull` src/hf.zig).
+
+`GITHUB_TOKEN` enters the same way for `modelfs update` (`githubBearer` src/update.zig): the
+environment only, no flag, no file fallback, and it is never read by the mount. It travels as a
+privileged `Authorization` header to api.github.com and to the release asset URLs, which must
+pass `trustedGithubUrl`, so a redirect or a JSON entry naming another host cannot receive it. The
+buffer lives only for the request and is stack memory in the CLI process. It is not zeroed
+explicitly, unlike the PSK and the Hugging Face token, which is a real difference in residual
+exposure: a core dump or a swap-resident page of a `modelfs update` run can hold it. Core dumps
+are not disabled for this command either (`cmdUpdate` never calls `disableCoreDumps`, which
+`cmdMount` and `cmdPull` both do).
 
 Accepted residual exposures: plaintext wire transmission of the PSK, `MODELFS_PSK_VALUE` in the process
 environment until mount scrubs it (readable by the owner and root), ptrace or
@@ -454,13 +544,13 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 | Threat | State |
 |---|---|
 | **S** spoofing an update request | Gated by filesystem write access, the request's owner, and signal permission: the CLI writes `<cache>/update.req.tmp.<pid>` mode 0600 and renames it onto `<cache>/update.req` (`writeFileOwnerOnlyDurable` src/sys.zig); the daemon opens it `O_NOFOLLOW \| O_NONBLOCK` and refuses a request the daemon's uid or root does not own (`handover.reqOwnerOk`, `execHandover` src/fuse_fs.zig), so a co-tenant that can write a group- or world-writable cache root is refused. The cache root is operator-controlled, not forced to 0700, and a process running with the daemon's uid can still plant a request naming an arbitrary binary |
-| **T** tampering with handover state | Tampering in transit across exec is mitigated: the live state blob is encoded into a sealed memfd (`sys.memfdSealed` src/sys.zig, setting `F_SEAL_SEAL \| F_SEAL_SHRINK \| F_SEAL_GROW \| F_SEAL_WRITE`) before `execve`. JSON parsing validates request structure, not authenticity. The random token correlates the CLI request with its acknowledgement; it does not authenticate a request to the daemon (`decodeReq` / `randomToken` src/handover.zig, `cmdUpdate` src/main.zig) |
+| **T** tampering with handover state | Tampering in transit across exec is mitigated: the live state blob is encoded into a sealed memfd (`sys.memfdSealed` src/sys.zig, setting `F_SEAL_SEAL \| F_SEAL_SHRINK \| F_SEAL_GROW \| F_SEAL_WRITE`) before `execve`. JSON parsing validates request structure, not authenticity. The random token correlates the CLI request with its acknowledgement; it does not authenticate a request to the daemon (`decodeReq` / `randomToken` src/handover.zig, `cmdReload` src/main.zig) |
 | **R** repudiation of updates | Handover completion logs to stdout (`updated pid {d}`) and daemon logs record handover steps and errors, but no cryptographic audit trail or signing of the replacement binary exists. `update.req` is unlinked after consumption or timeout |
-| **I** disclosure of secrets across handover | Mitigated: the cluster PSK travels exclusively on the sealed memfd descriptor, never on argv or disk (`cmdUpdate` src/main.zig, src/handover.zig). `readStateFd` zeroes the buffer with `secureZero` before free. The state fd is closed immediately (`sys.close` src/main.zig) so it does not sit in `/proc/<pid>/fd`. Core dumps are disabled (`disableCoreDumps`) and environment is scrubbed (`scrubPskEnv`) in `cmdHandover` |
+| **I** disclosure of secrets across handover | Mitigated: the cluster PSK travels exclusively on the sealed memfd descriptor, never on argv or disk (`cmdReload` src/main.zig, src/handover.zig). `readStateFd` zeroes the buffer with `secureZero` before free. The state fd is closed immediately (`sys.close` src/main.zig) so it does not sit in `/proc/<pid>/fd`. Core dumps are disabled (`disableCoreDumps`) and environment is scrubbed (`scrubPskEnv`) in `cmdHandover` |
 | **D** denial of service via signal or corrupt state | Unsolicited `SIGUSR2` before `FUSE_INIT` is ignored (`st.init_len == 0` src/fuse_fs.zig). A missing or unopenable `update.req` ignores the signal without leaving the FUSE loop (`onUsr2`). State decode enforces bounds (`max_state_bytes` 1 MiB cap, `init_max` 4096 cap, fuzz-covered `decode` in src/handover.zig) and validates watermark ordering via `cull.ordered` (src/handover.zig) to reject corrupted or disordered eviction thresholds. After the FUSE loop stops, any `execHandover` failure (including malformed request JSON or failed exec) exits the daemon, leaving the mount unserved |
 | **E** elevation of privilege | Handover does not elevate OS privileges (the replacement binary executes with the same UID/GID as the daemon). However, a process with the daemon's UID can plant an arbitrary executable path, taking over the live FUSE mount session fd, peer HTTP listen sockets, and acquiring the cluster PSK from the sealed memfd without ptrace |
 
-**Authentication and gating.** Handover requests require write access to the cache root, ownership of the request by the daemon's uid or root, and the ability to send `SIGUSR2` to the daemon PID. The cache root's permissions are operator-controlled: `ensureDirReal` (src/main.zig) creates it with mode 0755, subject to umask; `Store.ensureLayout` (src/store.zig) tightens only `data/`, `meta/`, and `pin/` to 0700. The request is read via `O_NOFOLLOW | O_NONBLOCK` and parsed by `decodeReq` (src/handover.zig). A random 16-byte hex token (`randomToken`) lets `cmdUpdate` match `update.ack` to its request. Unlinking `update.req` upon consumption or timeout removes accidental leftovers, but there is no daemon-side nonce history or authentication of a request planted by a process with the same uid.
+**Authentication and gating.** Handover requests require write access to the cache root, ownership of the request by the daemon's uid or root, and the ability to send `SIGUSR2` to the daemon PID. The cache root's permissions are operator-controlled: `ensureDirReal` (src/main.zig) creates it with mode 0755, subject to umask; `Store.ensureLayout` (src/store.zig) tightens only `data/`, `meta/`, and `pin/` to 0700. The request is read via `O_NOFOLLOW | O_NONBLOCK` and parsed by `decodeReq` (src/handover.zig). A random 16-byte hex token (`randomToken`) lets `cmdReload` match `update.ack` to its request. Unlinking `update.req` upon consumption or timeout removes accidental leftovers, but there is no daemon-side nonce history or authentication of a request planted by a process with the same uid.
 
 **Integrity and confidentiality.** Live daemon knobs and the cluster PSK are serialized into a sealed memfd (`handover.encode`, `sys.memfdSealed`). File descriptor passing keeps the PSK off argv and /proc command lines. The receiving process (`cmdHandover` src/main.zig) verifies the mountpoint matches argv, disables core dumps, scrubs `MODELFS_PSK_VALUE` from the environment, wipes the raw PSK slice in memory with `secureZero` after decode, and closes the state descriptor immediately.
 
@@ -497,6 +587,17 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 **Transport and credential protection.** Network communication uses platform TLS. Bearer tokens travel exclusively to `huggingface.co` and are stripped on cross-host redirects to download CDNs. Core dumps are disabled while tokens reside in memory (`disableCoreDumps` src/main.zig), and token allocations are zeroed with `secureZero` upon deinitialization.
 
 **Staged downloads.** Downloads stream into temporary `.part` files created with `O_NOFOLLOW` and mode 0644, and are atomically renamed into place only after the body lands at exactly the listed size, preventing interrupted downloads from leaving partial models that could be mistaken for valid weights. The rename preserves that mode, so the finished weight is 0644 on the shared origin as well; see [R10](#r10-pulled-origin-artifacts-land-world-readable).
+
+### B7: CLI to GitHub Releases (self-update)
+
+| Threat | State |
+|---|---|
+| **S** spoofing the release publisher | Not mitigated. TLS proves the host, `trustedGithubUrl` confines it to GitHub, and SHA-256 proves the two downloads agree; nothing binds them to the project or to an offline-known digest ([R11](#r11-self-update-trusts-the-publisher-not-just-the-bytes)) |
+| **T** tampering with the installed image | Mitigated against transport and truncation: the digest must match the sidecar line for that exact asset name, a short or oversized body is `BodyTooLarge` rather than a partial install, and the staged file is renamed atomically. Not mitigated against a malicious publisher |
+| **R** repudiation of what was installed | Partial. The command prints `Installed {tag} to {path}` and the handover prints `updated pid {d}`, both on the operator's stdout. Nothing records the installed digest, so there is no way afterwards to prove which bytes a node runs |
+| **I** disclosure of `GITHUB_TOKEN` | Mitigated for transmission: privileged header, stripped on cross-host redirect, and only ever sent to a `trustedGithubUrl` host. Not mitigated for local memory: the buffer is not zeroed and core dumps are not disabled for this command, unlike `cmdMount` and `cmdPull` |
+| **D** denial of service via a hostile release | Bounded: 1 MiB JSON, 64 KiB sidecar, 100 MiB asset, and a pure `decide` that returns before any write. A truncated or lying release yields an error, not a broken install. `decide` returns `.current` on equal versions and nothing is downloaded |
+| **E** elevation through the replacement | Not mitigated beyond the filesystem. The bytes land at mode 0755 over whatever `/proc/self/exe` names, and the same run then drives the B4 handover, so a replaced binary executes inside the live daemon ([R12](#r12-self-update-replaces-the-installed-binary-and-triggers-handover)) |
 
 ---
 
@@ -544,7 +645,7 @@ Controls that exist in code, grouped by what they defend.
 | Disk-cull walk samples cache entries with lstat and skips non-regular files, with a depth cap on nesting; leading-dot `relOk` names are sampled | `walkData` src/store.zig | B1/E: planted symlinks in a writable cache tree steering fallocate punches outside `data/`. B1/D: hidden cache files filling the filesystem past the watermarks after a restart |
 | Cull punch refuses to hole a piece with bytes in flight: the `xfer` counter is held across peer `/data` hydration and send and across FUSE warm cache reads, and entries are punchable only when recency-idle and transfer-free | `punchPiece` / `xfer` src/store.zig (`readCache` holds `xfer` for the warm-read path) | B1/D and the R2/R7 residual: closes the punch-versus-in-flight-read race that would serve hole zeros behind set bits |
 | Cache-identity drop on origin unlink and rename, including FUSE retries that see ENOENT | `Store.unlinkOrigin` / `Store.renameOrigin` src/store.zig | B1/T and the R7 crash window: a lost FUSE reply after origin unlink or rename used to leave `meta/*.pieces` behind, so a same-size recreate served the deleted file's bytes |
-| Handover request opened O_NOFOLLOW \| O_NONBLOCK and written 0600 durable; ack written 0600; unlinked on consumption or timeout | `writeFileOwnerOnlyDurable` / `writeFileOwnerOnly` src/sys.zig, `onUsr2` / `execHandover` src/fuse_fs.zig, `cmdUpdate` / `cmdHandover` src/main.zig | B4/T, B4/E: symlink redirection or tampering of handover control files |
+| Handover request opened O_NOFOLLOW \| O_NONBLOCK and written 0600 durable; ack written 0600; unlinked on consumption or timeout | `writeFileOwnerOnlyDurable` / `writeFileOwnerOnly` src/sys.zig, `onUsr2` / `execHandover` src/fuse_fs.zig, `cmdReload` / `cmdHandover` src/main.zig | B4/T, B4/E: symlink redirection or tampering of handover control files |
 
 ### Piece integrity
 
@@ -645,6 +746,18 @@ rather than ignore.
 |---|---|---|
 | PIE, PIC, stack canaries, stack probes, full RELRO, BIND_NOW, a non-executable stack, and no DT_RPATH/DT_RUNPATH on the shipped image; DWARF stripped from every non-Debug build; build-id frozen at none | `exe.pie`, `exe_mod.pic`, `stack_protector`, `stack_check`, `link_z_relro`, `each_lib_rpath`, `build_id`, `strip`, and `checkHardenedElf` in build.zig | B5: a fixed-address networked daemon, an uninstrumented ReleaseFast stack, lazy binding, an executable stack, a build-host `-L` baked into the spark image, a random build-id, and a `DW_AT_comp_dir` build-path leak in release binaries |
 
+### Release and binary replacement
+
+| Control | Location | Covers |
+|---|---|---|
+| `--repo` held to `owner/name` (no `://`, no second slash, no `.`/`..` side, 100 bytes per side) before the API URL is built | `validRepo` / `repoPartOk` / `releaseApiUrl` src/update.zig | B7: a URL pasted into the flag is refused rather than fetched, and the repo cannot inject path or query syntax into the endpoint |
+| Every remote URL, including both `browser_download_url` values taken from the release JSON and the page URL printed by `--check`, must be `https` with no userinfo or whitespace and a host in `github.com`, `*.github.com`, `*.githubusercontent.com` | `trustedGithubUrl` / `hostTrusted` src/update.zig, applied in `decide` and before each `fetchUrl` in `cmdUpdate` | B7/S: `github.com.evil.com`, `evil@github.com`, `http://api.github.com`, and a release document redirecting assets to an attacker's host are all refused before a byte is fetched |
+| SHA-256 of the asset must equal the sidecar line naming that exact asset, with the `  ` or ` *` separator `sha256sum` writes; a sidecar with no such line is refused | `parseChecksum` / `checksumMatches` / `decide` src/update.zig | B7/T: transport corruption, truncation, and an asset swapped for a different file from the same release. Not publisher identity (R11) |
+| Per-request byte caps with `WriteFailed` past the cap reported as `BodyTooLarge`, and `.current` short-circuits before any download | `max_json_bytes`, `max_sums_bytes`, `max_asset_bytes` in `fetchUrl`; `decide` src/update.zig | B7/D: a hostile or broken release cannot drive unbounded allocation or force a 100 MiB download to compare versions |
+| Staged write beside the destination with `O_NOFOLLOW | O_NONBLOCK` at mode 0755, renamed onto `/proc/self/exe`'s target, staging file unlinked on both failure arms | `replaceVerifiedPath` src/update.zig, `sys.writeFileExec` src/sys.zig | B7/T: a failed write leaves the installed binary intact, and a planted symlink at the staging name fails closed instead of receiving the bytes |
+| `GITHUB_TOKEN` is environment-only, trimmed, refused when empty or holding CR/LF, and sent as a privileged header to trusted hosts only | `githubBearer` src/update.zig, `fetchUrl` `privileged_headers` | B7/I: the token stays off argv and out of a redirected third-party request. Residual: the stack buffer is not zeroed and core dumps stay enabled for this command |
+| The handover gate is unchanged by a self-update: a live daemon still refuses a request it does not own and still requires `SIGUSR2` | `handover.reqOwnerOk` src/handover.zig, `onUsr2` / `execHandover` src/fuse_fs.zig | B4: replacing the on-disk binary does not let a different local uid drive the exec; the run that replaced it is the one that asks |
+
 ### Single points of failure, named honestly
 
 * **The PSK is the only control on B2.** It carries authentication, membership, and, through the
@@ -654,6 +767,10 @@ rather than ignore.
   path (FUSE `resolveRel`, peer `handleConn`, CLI `cmdPin`/`cmdVerify`/`cmdDupes`). Both are
   well tested and centrally defined, which is the right shape, but any new entry point that
   forgets them loses path containment.
+* **The GitHub release publisher is the only control on B7.** Everything `modelfs update` verifies
+  is fetched from the account that published the release, so that account is the whole trust
+  base: the digest, the sidecar, and the asset are one publisher's three statements about itself.
+  Compromise or mistake there is indistinguishable, to this code, from a legitimate release.
 
 ---
 
@@ -798,6 +915,48 @@ The blast radius is the origin tree's own mode discipline, not a traversal: path
 these files. The fix belongs to a sec-review pass, and the choice is the operator's (restrict
 the NFS export, or have pull create 0600).
 
+### R11: self-update trusts the publisher, not just the bytes
+
+**Not mitigated.** `decide` (src/update.zig) compares the asset's SHA-256 against the line
+`parseChecksum` finds in a `SHA256SUMS` the same release document pointed at, fetched from the
+same host moments earlier. That proves the two downloads agree and were not altered in transit.
+It does not prove who published either.
+
+So the trust base for `modelfs update` is one GitHub account and whatever secures it: an
+compromised maintainer account, a leaked upload token, a release edited after the fact, or a
+GitHub-side compromise all produce a self-consistent pair and install. There is no detached
+signature, no pinned digest an operator can compare offline, no transparency log, and no
+confirmation step between "verified" and "installed".
+
+Reach is what makes it worth naming: the installed bytes are the daemon, so a single accepted
+release is code execution on every node an operator updates, and the same run hands the new image
+a live FUSE session, the peer listen sockets, and the cluster PSK (B7, B4).
+
+Countermeasures that exist and are worth saying plainly: TLS with the platform trust store,
+`trustedGithubUrl` on every URL including the ones the release document itself supplies, the
+digest check, and a mode where an operator who does not run `modelfs update` is never exposed to
+this path at all. The gap is the publisher binding, and closing it means a signature or a pinned
+digest, which is a design change for a later pass, not a bug here.
+
+### R12: self-update replaces the installed binary and triggers handover
+
+**No mitigation beyond the filesystem.** `replaceExecutable` (src/update.zig) resolves
+`/proc/self/exe` and renames the verified bytes over it at mode 0755. Write access to that path's
+directory is therefore full control of the next `modelfs` invocation, of the next daemon start on
+a node that runs the mount from a unit or an operator script, and, once a daemon is live, of the
+running mount itself: `cmdUpdate` falls through to `cmdReload` (`liveDaemon` gate on
+`status.json`), and the B4 handover gives the new image the FUSE session, the peer sockets, and
+the PSK.
+
+Two things make this narrower than a remote exploit and worth stating rather than leaving
+implied. The command needs the operator to run it, and a local uid that cannot write the binary's
+directory cannot trigger it. But a directory-writable install (a user-local `~/bin` or a
+world-writable `/usr/local/bin` image) turns any local uid into one, and nothing in the command
+distinguishes "the operator asked for a newer release" from "someone else wrote those bytes
+first": the running binary is never hashed before it is replaced, and the installed digest is
+never recorded afterwards, so post-hoc attribution rests on the operator's terminal scrollback
+and the GitHub release record ([B7/R](#b7-cli-to-github-releases-self-update)).
+
 ### Closed: `status.json` world-readable at the cache root
 
 The file is created 0600 (`writeFileOwnerOnly` src/sys.zig) and leftover 0644 files are tightened
@@ -813,7 +972,9 @@ What a hostile actor can do, with the enabling path named. Cases 1 to 5 need the
 legitimate but curious node, a compromised spark, or anyone who captured it off the wire per R1.
 Case 6 needs write access to the cache directory; Case 7 needs daemon uid access (cache directory
 write plus signal permission); Case 8 needs only a local uid on a node that pulls, or read access
-to the export.
+to the export. Case 9 is the publisher, not a network attacker: the hostile party holds a
+legitimate GitHub account and publishes normally. Case 10 needs write access to the directory
+holding the installed binary.
 
 1. **Bulk weight exfiltration.** Enumerate paths (any `relOk`-clean string; `replyOriginStat`
    src/peer.zig distinguishes 404 absent from 400 over-long from 502 origin-broken), then
@@ -848,8 +1009,8 @@ to the export.
    process running as the daemon's uid (or as root) writes `<cache>/update.req` naming an
    arbitrary executable path; a different local uid is refused by the request-owner check
    (`handover.reqOwnerOk` src/handover.zig), so write access to a group- or world-writable cache
-   root alone is no longer enough. It then
-   then signals `SIGUSR2` (`cmdUpdate` src/main.zig, `onUsr2` src/fuse_fs.zig). The running daemon
+   root alone is no longer enough. It then signals `SIGUSR2` (`cmdReload` src/main.zig, `onUsr2`
+   src/fuse_fs.zig). The running daemon
    encodes its state, unsets `CLOEXEC` on the sealed memfd and descriptors, and executes
    `execve(replacement_bin, ["modelfs", "_handover", "--state-fd", N], environ)` (`execHandover`
    src/fuse_fs.zig). The replacement binary extracts the cluster PSK from the memfd (`readStateFd`
@@ -861,6 +1022,23 @@ to the export.
    with no PSK and no mount access ([R10](#r10-pulled-origin-artifacts-land-world-readable)). Over
    NFS the same files are reachable by every host the export admits, so a pull into a
    broadly-shared export publishes licensed weights to all of its readers.
+9. **Shipping code through a release an operator trusts.** A publisher holding the GitHub account
+   publishes an ordinary release whose asset is built from an attacker-controlled source tree, with
+   a matching `SHA256SUMS` line, because both files come from that same account. `trustedGithubUrl`
+   passes, `decide` returns `.replaced`, and the bytes land over `/proc/self/exe` at 0755
+   (`replaceVerifiedPath` src/update.zig). Every operator who then runs `modelfs update` on a node
+   with a live mount also hands that image the FUSE session, the peer listen sockets, and the
+   cluster PSK, because `cmdUpdate` falls through to the handover. Nothing in the path records the
+   installed digest, so the surviving evidence is the release record and the operator's terminal
+   ([R11](#r11-self-update-trusts-the-publisher-not-just-the-bytes), [R12](#r12-self-update-replaces-the-installed-binary-and-triggers-handover)).
+10. **Owning a directory-writable install.** Where `modelfs` is installed in a directory any local
+    uid can write, that uid can rename its own bytes over the binary and then ask the live daemon
+    to run them: it writes `update.req` naming the path it just installed, and
+    `handover.reqOwnerOk` (src/handover.zig) is satisfied because the request is owned by the
+    uid that wrote it, so the B4 check that stops a *different* local uid does not apply. The
+    replacement image inherits the FUSE session, the peer listen sockets, and the PSK from the
+    sealed memfd, with no ptrace and no `SIGUSR2` from anyone else. On an install that is not
+    directory-writable, the same chain is reachable only through the publisher path (case 9).
 
 **Closed:** reading `status.json` as another uid. The artifact is 0600. Cross-uid theft from the
 per-node cache stays closed by 0600 files and 0700 dirs; leftover 0755 `data/`/`meta/`/`pin/`,
@@ -901,6 +1079,14 @@ intake until a repository admin turns the feature on, and there is no other disc
 [recovery.md](recovery.md), which also documents wiping caches before remounting after a
 rollback. Post-upgrade poison can instead be found per file with `modelfs verify <rel>` once its
 manifest exists.
+
+**A bad self-update is the one incident with no documented path.** `modelfs update` overwrites
+`/proc/self/exe` and, with a live mount, hands the new image the FUSE session and the PSK, but
+nothing in the repository says how to tell which image a node is running, how to put the previous
+one back, or how to decide that a release should not have been installed: the command records the
+tag on the operator's stdout and nothing else. `modelfs version` prints the declared version, not
+a digest. This is a gap in the documents, not a claim a later pass has to reconcile, and it belongs
+with R11 and R12.
 
 This document intentionally does not propose designs for the gaps; sec-review passes aimed by
 the ranking above own those fixes.
