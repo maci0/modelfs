@@ -138,12 +138,6 @@ pub fn trustedGithubUrl(url: []const u8) bool {
     return hostTrusted(host);
 }
 
-/// Stdout of `--check` is this URL, or error when the page is not a trusted GitHub URL.
-pub fn releasePageLine(url: []const u8) error{UntrustedUrl}![]const u8 {
-    if (!trustedGithubUrl(url)) return error.UntrustedUrl;
-    return url;
-}
-
 /// Extracts the 64-character SHA-256 hex checksum for `asset_name` from SHA256SUMS text.
 pub fn parseChecksum(sums_text: []const u8, asset_name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, sums_text, '\n');
@@ -417,20 +411,17 @@ test "decide evaluates release inputs correctly" {
     const data = "abc";
     const sums = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  modelfs-x86_64-linux-musl\n";
 
-    // Same release -> current
     try std.testing.expectEqual(Verdict.current, decide(.{
         .running = "0.18.0",
         .tag = "v0.18.0",
     }));
 
-    // Missing target -> unsupported_target
     try std.testing.expectEqual(Verdict.unsupported_target, decide(.{
         .running = "0.18.0",
         .tag = "v0.19.0",
         .asset_name = null,
     }));
 
-    // Missing asset url -> missing_asset
     try std.testing.expectEqual(Verdict.missing_asset, decide(.{
         .running = "0.18.0",
         .tag = "v0.19.0",
@@ -438,7 +429,6 @@ test "decide evaluates release inputs correctly" {
         .asset_url = null,
     }));
 
-    // Untrusted url -> untrusted_url
     try std.testing.expectEqual(Verdict.untrusted_url, decide(.{
         .running = "0.18.0",
         .tag = "v0.19.0",
@@ -449,7 +439,6 @@ test "decide evaluates release inputs correctly" {
         .sums_bytes = sums,
     }));
 
-    // Checksum mismatch -> checksum_mismatch
     try std.testing.expectEqual(Verdict.checksum_mismatch, decide(.{
         .running = "0.18.0",
         .tag = "v0.19.0",
@@ -460,7 +449,6 @@ test "decide evaluates release inputs correctly" {
         .sums_bytes = sums,
     }));
 
-    // Checksum not found in sums -> checksum_not_found
     try std.testing.expectEqual(Verdict.checksum_not_found, decide(.{
         .running = "0.18.0",
         .tag = "v0.19.0",
@@ -471,7 +459,6 @@ test "decide evaluates release inputs correctly" {
         .sums_bytes = sums,
     }));
 
-    // Valid update -> replaced
     try std.testing.expectEqual(Verdict.replaced, decide(.{
         .running = "0.18.0",
         .tag = "v0.19.0",
@@ -520,14 +507,11 @@ test "replaceVerifiedPath atomically installs binary with 0755 permissions" {
     var pb: [192]u8 = undefined;
     const bin_path = try std.fmt.bufPrintZ(&pb, "{s}/target_bin", .{scratch});
 
-    // Write initial version
     try std.testing.expectEqual(@as(i32, 0), sys.writeFile(bin_path, "old_version"));
 
-    // Replace with verified new version
     const new_bin_data = "#!/bin/sh\necho updated\n";
     try replaceVerifiedPath(bin_path, new_bin_data);
 
-    // Read back and verify content and permissions
     var rbuf: [64]u8 = undefined;
     const read = try sys.readFileBuf(&rbuf, bin_path);
     try std.testing.expectEqualStrings(new_bin_data, read);

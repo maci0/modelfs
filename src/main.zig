@@ -1947,10 +1947,10 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.En
     };
     defer rel.deinit();
 
-    const page = update_mod.releasePageLine(rel.page) catch {
+    if (!update_mod.trustedGithubUrl(rel.page)) {
         printErr("error: refusing to install unverified binary\n", .{});
         return 1;
-    };
+    }
 
     var line_buf: [256]u8 = undefined;
     if (update_mod.sameRelease(build_options.version, rel.tag)) {
@@ -1969,7 +1969,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.En
     printErr("{s}\n", .{line});
 
     if (opts.update_check) {
-        if (!printOut(io, gpa, "{s}\n", .{page})) return 1;
+        if (!printOut(io, gpa, "{s}\n", .{rel.page})) return 1;
         return 0;
     }
 
@@ -2053,9 +2053,8 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.En
     if (!printOut(io, gpa, "{s}\n", .{installed_line})) return 1;
 
     var blob: ?[]u8 = null;
-    if (liveDaemon(io, gpa, opts.cache, &blob)) |pid| {
+    if (liveDaemon(io, gpa, opts.cache, &blob)) |_| {
         defer if (blob) |b| gpa.free(b);
-        _ = pid;
         return cmdReload(io, gpa, opts);
     } else |_| {
         return 0;
