@@ -13,7 +13,7 @@ both at once:
 |---|---|---|
 | Zig | exactly 0.16.0 | `minimum_zig_version` in [build.zig.zon](build.zig.zon) (setup-zig reads it; the build rejects other versions) |
 | Python | 3.12 | [.python-version](.python-version) (setup-uv reads it) |
-| uv | see manifest | `[tool.uv] required-version` in [pyproject.toml](pyproject.toml) |
+| uv | 0.12.13 or newer | `[tool.uv] required-version` in [pyproject.toml](pyproject.toml); CI installs 0.12.13 itself through setup-uv's `version` input |
 | ruff, mypy | exact | [requirements-dev.lock.txt](requirements-dev.lock.txt) |
 | shellcheck | any that defines every `enable=` in [.shellcheckrc](.shellcheckrc) | [.shellcheckrc](.shellcheckrc): `check.sh` compares those names against `shellcheck --list-optional` and fails on one it does not know |
 

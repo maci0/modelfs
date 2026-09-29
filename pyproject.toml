@@ -1,11 +1,15 @@
 # Static analysis configuration for the Python tooling under scripts/.
 
-# Exact pin for the uv that resolves the lock and that CI installs.
-# setup-uv reads this field when its `version` input is empty, so a bump
-# here updates local `uv` and the check job together. Pinned exactly the
-# same way requirements-dev.txt pins ruff/mypy.
+# Floor for the uv a clone may set itself up with: uv refuses every command
+# in a project directory when it does not hold, so an exact pin here made
+# `uv venv .venv` (the first line of the documented setup) fail on any
+# contributor whose uv differed by a patch, and the fix it suggested was a
+# global self-update to a version, not a project-local step. CI keeps the
+# exact version it installs in the `version` input of the setup-uv step in
+# .github/actions/setup-gate-tooling/action.yml, which is where an exact uv
+# actually has to be the same on every run.
 [tool.uv]
-required-version = "==0.12.13"
+required-version = ">=0.12.13"
 
 [tool.ruff]
 line-length = 100
