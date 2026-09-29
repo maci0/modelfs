@@ -59,7 +59,20 @@ dd if=/dev/urandom of="${ORIGIN_DIR}/${TEST_FILE}" bs=1M count="${FILE_SIZE_MB}"
 
 echo "Piece count: ${TOTAL_PIECES} pieces (${PIECE_SIZE_MB}MB per piece)"
 
-BASE_PORT=19080
+BASE_PORT="${MF_CLUSTER_BASE_PORT:-19080}"
+# A run killed before its trap fires leaves the nine daemons holding their
+# ports, and the rerun then fails on bind as a refused connection inside the
+# verifier, long after the real cause. The temp dir is fresh every run, so
+# the ports are the only stale state; check them before the cluster is half
+# up, the way test_hot_reload.sh checks its own.
+for i in $(seq 1 "${NUM_NODES}"); do
+    port=$((BASE_PORT + i))
+    if (exec 9<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+        echo "port ${port} is already in use; a previous run left its nodes up" >&2
+        echo "(set MF_CLUSTER_BASE_PORT to move the range)" >&2
+        exit 1
+    fi
+done
 
 echo "=== Step 2: Spawning ${NUM_NODES} peer nodes ==="
 for i in $(seq 1 "${NUM_NODES}"); do

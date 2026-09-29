@@ -1815,6 +1815,28 @@ fn selfExe(io: std.Io, buf: *[sys.c.PATH_MAX]u8) ![]const u8 {
     return buf[0..n];
 }
 
+/// Publishes the update request into the cache by writing a per-pid staging
+/// file and renaming it onto update.req. Every arm that does not publish
+/// drops the stage: nothing sweeps the cache tree, so an abandoned
+/// update.req.tmp.<pid> would sit there for every later run that lands on
+/// the same pid.
+fn publishReqStaged(cache: []const u8, req: []const u8) !void {
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const req_path = sys.joinZ(&pbuf, cache, handover.req_file) catch return error.StageNameTooLong;
+    var sbuf: [32]u8 = undefined;
+    const ext = std.fmt.bufPrint(&sbuf, ".tmp.{d}", .{sys.pidSelf()}) catch return error.StageNameTooLong;
+    var tbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const staged = sys.appendExt(&tbuf, req_path, ext) catch return error.StageNameTooLong;
+    if (sys.writeFileOwnerOnlyDurable(staged, req) != 0) {
+        _ = sys.unlink(staged);
+        return error.StageWriteFailed;
+    }
+    if (sys.rename(staged, req_path) != 0) {
+        _ = sys.unlink(staged);
+        return error.StageRenameFailed;
+    }
+}
+
 fn cmdReload(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var blob: ?[]u8 = null;
     const pid = liveDaemon(io, gpa, opts.cache, &blob) catch |err| switch (err) {
@@ -1846,22 +1868,14 @@ fn cmdReload(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     // a truncated blob. decodeReq then fails, the session has already been
     // exited, and the mount is gone. A rename publishes the request whole,
     // so the daemon reads either the previous request or this one.
-    var sbuf: [32]u8 = undefined;
-    const ext = std.fmt.bufPrint(&sbuf, ".tmp.{d}", .{sys.pidSelf()}) catch return 1;
-    var tbuf: [sys.c.PATH_MAX]u8 = undefined;
-    const staged = sys.appendExt(&tbuf, req_path, ext) catch {
-        printErr("modelfs: cache path too long to stage {s}/{s}\n", .{ opts.cache, handover.req_file });
+    publishReqStaged(opts.cache, req) catch |err| {
+        switch (err) {
+            error.StageNameTooLong => printErr("modelfs: cache path too long to stage {s}/{s}\n", .{ opts.cache, handover.req_file }),
+            error.StageWriteFailed => printErr("modelfs: cannot write {s}/{s}\n", .{ opts.cache, handover.req_file }),
+            error.StageRenameFailed => printErr("modelfs: cannot publish {s}/{s}\n", .{ opts.cache, handover.req_file }),
+        }
         return 1;
     };
-    if (sys.writeFileOwnerOnlyDurable(staged, req) != 0) {
-        printErr("modelfs: cannot write {s}/{s}\n", .{ opts.cache, handover.req_file });
-        return 1;
-    }
-    if (sys.rename(staged, req_path) != 0) {
-        _ = sys.unlink(staged);
-        printErr("modelfs: cannot publish {s}/{s}\n", .{ opts.cache, handover.req_file });
-        return 1;
-    }
     std.posix.kill(@intCast(pid), .USR2) catch {
         printErr("modelfs: cannot signal pid {d} to replace its image\n", .{pid});
         _ = sys.unlink(req_path);
@@ -3469,6 +3483,40 @@ test "cmdUpdate retires missing stale dead and requests handover for live" {
     defer gpa.free(req_blob);
     try std.testing.expect(std.mem.find(u8, req_blob, "\"bin\"") != null);
     try std.testing.expect(std.mem.find(u8, req_blob, "\"token\"") != null);
+}
+
+test "publishReqStaged leaves no staging file on a failed publish and republishes cleanly" {
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-stage-req");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var reqp: [256]u8 = undefined;
+    const req_path = try std.fmt.bufPrint(&reqp, "{s}/{s}", .{ cache_d, handover.req_file });
+    var req_z: [sys.c.PATH_MAX]u8 = undefined;
+    var sbuf: [32]u8 = undefined;
+    const ext = try std.fmt.bufPrint(&sbuf, ".tmp.{d}", .{sys.pidSelf()});
+    var spp: [300]u8 = undefined;
+    const staged_path = try std.fmt.bufPrint(&spp, "{s}{s}", .{ req_path, ext });
+    var sp_z: [sys.c.PATH_MAX]u8 = undefined;
+    const staged_z = try sys.toZ(&sp_z, staged_path);
+    var stbuf: sys.c.struct_stat = undefined;
+
+    // A directory on the destination name fails the rename after the staging
+    // file is already written. Nothing sweeps the cache tree, so the stage has
+    // to be dropped here or a later `modelfs update` on this pid inherits it.
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(req_path, 0o755));
+    try std.testing.expectError(error.StageRenameFailed, publishReqStaged(cache_d, "first"));
+    try std.testing.expect(sys.statPath(staged_z, &stbuf) != 0);
+
+    // Once the obstruction is gone the same call publishes, and a second one
+    // over the same name converges on the same bytes rather than accumulating.
+    try std.testing.expectEqual(@as(i32, 0), sys.rmdir(try sys.toZ(&req_z, req_path)));
+    try publishReqStaged(cache_d, "first");
+    try publishReqStaged(cache_d, "second");
+    const blob = try sys.readFileAlloc(std.testing.allocator, try sys.toZ(&req_z, req_path), 4096);
+    defer std.testing.allocator.free(blob);
+    try std.testing.expectEqualStrings("second", blob);
+    try std.testing.expect(sys.statPath(staged_z, &stbuf) != 0);
 }
 
 const seed_status_live = fuzzcorpus.entry("{\"id\":\"me\",\"pid\":1,\"uptime_s\":1,\"peers\":0,\"piece\":16,\"inflight\":0,\"now_s\":1710000060,\"mono_s\":100,\"stats\":{}}\n");

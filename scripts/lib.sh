@@ -45,7 +45,8 @@ SCRATCH_DIR="${ROOT_DIR}/.scratch"
 # MF_RESTORE_LOG (dr_pool_restore.sh), MF_POINT_DATASET, MF_POINT_LIVE,
 # MF_POINT_CLONE, MF_POINT_CLONE_MP (dr_point_restore.sh),
 # MF_HOTRELOAD_PORT
-# (test_hot_reload.sh), MF_SYNCOID_SRC, MF_SYNCOID_DEST
+# (test_hot_reload.sh), MF_CLUSTER_BASE_PORT
+# (run_cluster_e2e_9nodes.sh), MF_SYNCOID_SRC, MF_SYNCOID_DEST
 # (nas/syncoid-models.service), MF_DRILL_DATASET (nas/modelfs-drill.service,
 # nas/modelfs-snap-age.service), MF_STUB_CLONE_RACE, MF_STUB_DESTROY_FAIL,
 # MF_STUB_UNMOUNT_FAIL (test_dr_restore_drill.sh's stub zfs). check.sh
