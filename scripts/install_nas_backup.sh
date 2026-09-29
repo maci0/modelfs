@@ -15,9 +15,9 @@ print_usage() {
 Usage: ./scripts/install_nas_backup.sh [--install]
 
 Copy sanoid.conf, OnFailure drop-ins, the replica pull timer, the
-hourly snapshot-age alarm, the restore-drill timers, the pool-loss
-restore wrapper, and the offsite-age alarm from scripts/nas/ into
-MF_NAS_DEST (default /), plus the wrappers, including
+hourly snapshot-age alarm, the restore-drill timers, the pool-loss and
+point-in-time restore wrappers, and the offsite-age alarm from
+scripts/nas/ into MF_NAS_DEST (default /), plus the wrappers, including
 modelfs-backup-config, which prints the drop-in values the installed
 units run with. Without --install, print the plan and exit
 0. An existing sanoid.conf is preserved; edit its dataset and retention
@@ -125,6 +125,7 @@ copy_one "${SCRIPTS_DIR}/dr_restore_drill.sh" "usr/local/sbin/modelfs-restore-dr
 copy_one "${SCRIPTS_DIR}/check_drill_log.sh" "usr/local/sbin/modelfs-check-drill-log"
 copy_one "${SCRIPTS_DIR}/hold_monthlies.sh" "usr/local/sbin/modelfs-hold-monthlies"
 copy_one "${SCRIPTS_DIR}/dr_pool_restore.sh" "usr/local/sbin/modelfs-pool-restore"
+copy_one "${SCRIPTS_DIR}/dr_point_restore.sh" "usr/local/sbin/modelfs-point-restore"
 copy_one "${SCRIPTS_DIR}/check_offsite.sh" "usr/local/sbin/modelfs-check-offsite"
 copy_one "${SCRIPTS_DIR}/backup_config.sh" "usr/local/sbin/modelfs-backup-config"
 copy_one "${ROOT_DIR}/docs/recovery.md" "usr/local/share/doc/modelfs/recovery.md"
@@ -152,4 +153,5 @@ echo "on a rotated disk, when attached: modelfs-check-offsite DATASET"
 echo "capture the drop-in values these units run with (they exist nowhere else):"
 echo "  modelfs-backup-config | tee -a /var/log/modelfs-drill.log"
 echo "pool-loss restore is modelfs-pool-restore (dry-run by default; docs/recovery.md procedure C)"
+echo "point-in-time copy-back is modelfs-point-restore (dry-run by default; docs/recovery.md procedure B)"
 echo "docs/recovery.md section 3 is the runbook; this script does not start units."

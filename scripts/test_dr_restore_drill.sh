@@ -1203,6 +1203,8 @@ elif ! grep -q "modelfs-hold-monthlies" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing hold_monthlies: ${DRY_OUT}"
 elif ! grep -q "modelfs-pool-restore" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing pool-restore: ${DRY_OUT}"
+elif ! grep -q "modelfs-point-restore" <<<"${DRY_OUT}"; then
+    fail "installer dry-run missing point-restore: ${DRY_OUT}"
 elif ! grep -q "modelfs-check-offsite" <<<"${DRY_OUT}"; then
     fail "installer dry-run missing check-offsite: ${DRY_OUT}"
 elif ! grep -q "modelfs-offsite-age.timer" <<<"${DRY_OUT}"; then
@@ -1225,6 +1227,7 @@ cp -R "${SCRIPTS_DIR}/nas" "${INSTALL_SOURCE}/scripts/"
 cp "${INSTALLER}" "${SCRIPTS_DIR}/lib.sh" \
     "${SCRIPTS_DIR}/dr_restore_drill.sh" "${SCRIPTS_DIR}/check_drill_log.sh" \
     "${SCRIPTS_DIR}/hold_monthlies.sh" "${SCRIPTS_DIR}/dr_pool_restore.sh" \
+    "${SCRIPTS_DIR}/dr_point_restore.sh" \
     "${SCRIPTS_DIR}/check_offsite.sh" "${SCRIPTS_DIR}/backup_config.sh" \
     "${INSTALL_SOURCE}/scripts/"
 chmod -R 0777 "${INSTALL_SOURCE}"
@@ -1256,6 +1259,7 @@ else
         usr/local/sbin/modelfs-check-drill-log \
         usr/local/sbin/modelfs-hold-monthlies \
         usr/local/sbin/modelfs-pool-restore \
+        usr/local/sbin/modelfs-point-restore \
         usr/local/sbin/modelfs-check-offsite \
         usr/local/sbin/modelfs-backup-config \
         usr/local/share/doc/modelfs/recovery.md; do
@@ -1362,6 +1366,8 @@ else
         fail "installer --install sanoid.conf lost recursive = yes"
     elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-pool-restore" ]]; then
         fail "installer --install pool-restore wrapper is not executable"
+    elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-point-restore" ]]; then
+        fail "installer --install point-restore wrapper is not executable"
     elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-check-offsite" ]]; then
         fail "installer --install offsite wrapper is not executable"
     elif grep -q "OnFailure" "${INSTALL_DEST}/etc/systemd/system/modelfs-offsite-age.timer"; then
