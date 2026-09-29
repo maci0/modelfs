@@ -130,6 +130,13 @@ pub fn pidSelf() i32 {
     return std.os.linux.getpid();
 }
 
+/// The daemon's own effective uid, the owner a control-plane file it acts on
+/// must have. Same reasoning as `pidSelf`: no Zig abstraction, one call site
+/// in this layer.
+pub fn euidSelf() u32 {
+    return @intCast(std.os.linux.geteuid());
+}
+
 /// True when the process named by pid still exists. kill(pid, 0) signals
 /// nothing; EPERM means the process exists but belongs to another user.
 /// Nonpositive or out-of-range ids name no process.
@@ -797,7 +804,7 @@ pub fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![
 /// `mode_out`, when set, is the fstat mode of the fd that was read, so a
 /// permission check cannot race a path-stat of a different inode.
 pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32, mode_out: ?*c.mode_t) ![]u8 {
-    return readFileAllocFlags(gpa, path, max, 0, open_errno_out, mode_out);
+    return readFileAllocFlags(gpa, path, max, 0, open_errno_out, mode_out, null);
 }
 
 /// readFileAllocOpenErrno for daemon-owned artifacts (cache sidecars,
@@ -806,11 +813,13 @@ pub fn readFileAllocOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: 
 /// sidecar from outside the tree. O_NONBLOCK: a FIFO at the name must not
 /// hang a FUSE worker or the discovery thread (same contract as lease
 /// reads and opendirNoFollow); the flag is ignored on regular files.
-pub fn readFileAllocNoFollowOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32) ![]u8 {
-    return readFileAllocFlags(gpa, path, max, c.O_NOFOLLOW | c.O_NONBLOCK, open_errno_out, null);
+/// `owner_out`, when set, is the fstat uid of the fd that was read, so an
+/// ownership check cannot race a path-stat of a different inode.
+pub fn readFileAllocNoFollowOpenErrno(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, open_errno_out: ?*i32, owner_out: ?*u32) ![]u8 {
+    return readFileAllocFlags(gpa, path, max, c.O_NOFOLLOW | c.O_NONBLOCK, open_errno_out, null, owner_out);
 }
 
-fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, extra_flags: c_int, open_errno_out: ?*i32, mode_out: ?*c.mode_t) ![]u8 {
+fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, extra_flags: c_int, open_errno_out: ?*i32, mode_out: ?*c.mode_t, owner_out: ?*u32) ![]u8 {
     const fd = open(path, c.O_RDONLY | extra_flags, 0);
     if (fd < 0) {
         if (open_errno_out) |out| out.* = errno();
@@ -820,6 +829,7 @@ fn readFileAllocFlags(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize, e
     var st: c.struct_stat = undefined;
     if (fstat(fd, &st) != 0) return error.StatFailed;
     if (mode_out) |out| out.* = st.st_mode;
+    if (owner_out) |out| out.* = @intCast(st.st_uid);
     const n64 = sizeFromStat(st.st_size) orelse return error.StatFailed;
     const size = std.math.cast(usize, n64) orelse return error.FileTooBig;
     if (size > max) return error.FileTooBig;
@@ -1478,7 +1488,7 @@ test "readFile NoFollow refuses a planted symlink that the following form would 
 
     // The artifact form must fail closed: ELOOP, never the target's bytes.
     var open_errno: i32 = 0;
-    try std.testing.expectError(error.OpenFailed, readFileAllocNoFollowOpenErrno(gpa, try toZ(&lz, link), 64, &open_errno));
+    try std.testing.expectError(error.OpenFailed, readFileAllocNoFollowOpenErrno(gpa, try toZ(&lz, link), 64, &open_errno, null));
     try std.testing.expectEqual(@as(i32, c.ELOOP), open_errno);
 
     var rbuf: [16]u8 = undefined;
@@ -1550,6 +1560,25 @@ test "chmod statfs and opendir NoFollow refuse a planted symlink" {
     try std.testing.expectEqual(@as(c.mode_t, 0o644), st.st_mode & 0o777);
     var rbuf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("s3cret", try readFileBuf(&rbuf, target_z));
+}
+
+test "readFileAllocNoFollowOpenErrno reports the owner of the fd it read" {
+    const gpa = std.testing.allocator;
+    var db: [128]u8 = undefined;
+    const scratch = try scratchDir(&db, "modelfs-test-owner");
+    defer deleteTree(std.testing.io, scratch);
+    var pb: [192]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&pb, "{s}/update.req", .{scratch});
+    try std.testing.expectEqual(@as(i32, 0), writeFileOwnerOnly(path, "{}\n"));
+
+    var open_errno: i32 = 0;
+    var owner: u32 = 0;
+    const blob = try readFileAllocNoFollowOpenErrno(gpa, path, 64, &open_errno, &owner);
+    defer gpa.free(blob);
+    // The uid has to come from the fd, or a co-tenant that renames its own
+    // file onto the name between open and check passes as the operator.
+    try std.testing.expectEqual(euidSelf(), owner);
+    try std.testing.expectEqualStrings("{}\n", blob);
 }
 
 test "writeFileExec sets 0755 permissions and selfExe resolves" {

@@ -768,7 +768,11 @@ sides. The writer's binary path is a `PATH_MAX` string before JSON escaping, so 
 replacement image reads under cannot be the one the CLI polls against: a read that stops short
 adopts no token, writes no ack, and turns a swap that already happened into a 30 s timeout
 report. A missing request file is the SIGUSR2 replay case and is quiet; a read or decode that
-fails on a file that is there names the path and the error.
+fails on a file that is there names the path and the error. The daemon also refuses a request
+the cache root's owner is not: the uid comes from the fd it read, and `handover.reqOwnerOk`
+admits the daemon's own uid and root only, so a local uid that can create the name in a
+group- or world-writable cache root cannot make the daemon exec a binary of its choosing with
+the cluster PSK in the handover state blob.
 
 The swap is journaled from both sides, because an exec leaves no other trace: the outgoing
 image logs `handover: execing into <bin> to serve <mount> (listen :<port>)` as its last line

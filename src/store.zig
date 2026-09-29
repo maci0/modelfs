@@ -851,7 +851,7 @@ pub const Store = struct {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = try self.cacheMetaPath(&buf, rel);
         var open_errno: i32 = 0;
-        const blob = sys.readFileAllocNoFollowOpenErrno(self.gpa, p, 8 * 1024 * 1024, &open_errno) catch |err| switch (err) {
+        const blob = sys.readFileAllocNoFollowOpenErrno(self.gpa, p, 8 * 1024 * 1024, &open_errno, null) catch |err| switch (err) {
             // Missing sidecar is every file's first touch: start empty.
             error.OpenFailed => {
                 if (open_errno != c.ENOENT)
@@ -1621,7 +1621,7 @@ pub const Store = struct {
             return;
         };
         var open_errno: i32 = 0;
-        const blob = sys.readFileAllocNoFollowOpenErrno(self.gpa, p, max_manifest_bytes, &open_errno) catch |err| switch (err) {
+        const blob = sys.readFileAllocNoFollowOpenErrno(self.gpa, p, max_manifest_bytes, &open_errno, null) catch |err| switch (err) {
             error.OpenFailed => {
                 // ENOENT is the normal "not yet published" reading and stays
                 // silent; any other open failure is an origin problem this

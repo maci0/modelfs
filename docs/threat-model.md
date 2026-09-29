@@ -248,7 +248,10 @@ replace its process image without unmounting (`cmdUpdate` src/main.zig, src/hand
   against the same cache cannot truncate the request the replacement image is reading.
 * **Daemon verification**: In `onUsr2` (src/fuse_fs.zig), the signal is ignored if no `FUSE_INIT`
   was captured (`st.init_len == 0`) or if `update.req` cannot be opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`.
-  The event loop is awakened via a non-blocking internal pipe (`wakeup_w`).
+  In `execHandover` (src/fuse_fs.zig) the request must additionally be owned by the daemon's uid or
+  by root (`handover.reqOwnerOk` src/handover.zig, uid taken from the fd that was read, not a
+  path-stat), so a co-tenant that can create the name in a group- or world-writable cache root
+  cannot drive the exec. The event loop is awakened via a non-blocking internal pipe (`wakeup_w`).
 * **Authority transition**: In `serve()` and `execHandover` (src/fuse_fs.zig), the daemon verifies
   the replacement path is absolute (`bin[0] == '/'`), encodes live daemon state into a sealed memfd
   (`handover.encode` src/handover.zig), unsets `CLOEXEC` on the memfd, the FUSE session fd, and the
@@ -450,14 +453,14 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 
 | Threat | State |
 |---|---|
-| **S** spoofing an update request | Gated by filesystem write access and signal permission: the CLI writes `<cache>/update.req.tmp.<pid>` mode 0600 and renames it onto `<cache>/update.req` (`writeFileOwnerOnlyDurable` src/sys.zig); the daemon opens it `O_NOFOLLOW \| O_NONBLOCK` but does not validate its owner or mode. The cache root is operator-controlled, not forced to 0700. The kernel enforces `SIGUSR2` delivery permissions. A process running with the daemon's uid or root can plant a request naming an arbitrary binary |
+| **S** spoofing an update request | Gated by filesystem write access, the request's owner, and signal permission: the CLI writes `<cache>/update.req.tmp.<pid>` mode 0600 and renames it onto `<cache>/update.req` (`writeFileOwnerOnlyDurable` src/sys.zig); the daemon opens it `O_NOFOLLOW \| O_NONBLOCK` and refuses a request the daemon's uid or root does not own (`handover.reqOwnerOk`, `execHandover` src/fuse_fs.zig), so a co-tenant that can write a group- or world-writable cache root is refused. The cache root is operator-controlled, not forced to 0700, and a process running with the daemon's uid can still plant a request naming an arbitrary binary |
 | **T** tampering with handover state | Tampering in transit across exec is mitigated: the live state blob is encoded into a sealed memfd (`sys.memfdSealed` src/sys.zig, setting `F_SEAL_SEAL \| F_SEAL_SHRINK \| F_SEAL_GROW \| F_SEAL_WRITE`) before `execve`. JSON parsing validates request structure, not authenticity. The random token correlates the CLI request with its acknowledgement; it does not authenticate a request to the daemon (`decodeReq` / `randomToken` src/handover.zig, `cmdUpdate` src/main.zig) |
 | **R** repudiation of updates | Handover completion logs to stdout (`updated pid {d}`) and daemon logs record handover steps and errors, but no cryptographic audit trail or signing of the replacement binary exists. `update.req` is unlinked after consumption or timeout |
 | **I** disclosure of secrets across handover | Mitigated: the cluster PSK travels exclusively on the sealed memfd descriptor, never on argv or disk (`cmdUpdate` src/main.zig, src/handover.zig). `readStateFd` zeroes the buffer with `secureZero` before free. The state fd is closed immediately (`sys.close` src/main.zig) so it does not sit in `/proc/<pid>/fd`. Core dumps are disabled (`disableCoreDumps`) and environment is scrubbed (`scrubPskEnv`) in `cmdHandover` |
 | **D** denial of service via signal or corrupt state | Unsolicited `SIGUSR2` before `FUSE_INIT` is ignored (`st.init_len == 0` src/fuse_fs.zig). A missing or unopenable `update.req` ignores the signal without leaving the FUSE loop (`onUsr2`). State decode enforces bounds (`max_state_bytes` 1 MiB cap, `init_max` 4096 cap, fuzz-covered `decode` in src/handover.zig) and validates watermark ordering via `cull.ordered` (src/handover.zig) to reject corrupted or disordered eviction thresholds. After the FUSE loop stops, any `execHandover` failure (including malformed request JSON or failed exec) exits the daemon, leaving the mount unserved |
 | **E** elevation of privilege | Handover does not elevate OS privileges (the replacement binary executes with the same UID/GID as the daemon). However, a process with the daemon's UID can plant an arbitrary executable path, taking over the live FUSE mount session fd, peer HTTP listen sockets, and acquiring the cluster PSK from the sealed memfd without ptrace |
 
-**Authentication and gating.** Handover requests require write access to the cache root and the ability to send `SIGUSR2` to the daemon PID. The cache root's permissions are operator-controlled: `ensureDirReal` (src/main.zig) creates it with mode 0755, subject to umask; `Store.ensureLayout` (src/store.zig) tightens only `data/`, `meta/`, and `pin/` to 0700. The request is read via `O_NOFOLLOW | O_NONBLOCK` and parsed by `decodeReq` (src/handover.zig). A random 16-byte hex token (`randomToken`) lets `cmdUpdate` match `update.ack` to its request. Unlinking `update.req` upon consumption or timeout removes accidental leftovers, but there is no daemon-side nonce history or authentication of a request planted by a process with the same uid.
+**Authentication and gating.** Handover requests require write access to the cache root, ownership of the request by the daemon's uid or root, and the ability to send `SIGUSR2` to the daemon PID. The cache root's permissions are operator-controlled: `ensureDirReal` (src/main.zig) creates it with mode 0755, subject to umask; `Store.ensureLayout` (src/store.zig) tightens only `data/`, `meta/`, and `pin/` to 0700. The request is read via `O_NOFOLLOW | O_NONBLOCK` and parsed by `decodeReq` (src/handover.zig). A random 16-byte hex token (`randomToken`) lets `cmdUpdate` match `update.ack` to its request. Unlinking `update.req` upon consumption or timeout removes accidental leftovers, but there is no daemon-side nonce history or authentication of a request planted by a process with the same uid.
 
 **Integrity and confidentiality.** Live daemon knobs and the cluster PSK are serialized into a sealed memfd (`handover.encode`, `sys.memfdSealed`). File descriptor passing keeps the PSK off argv and /proc command lines. The receiving process (`cmdHandover` src/main.zig) verifies the mountpoint matches argv, disables core dumps, scrubs `MODELFS_PSK_VALUE` from the environment, wipes the raw PSK slice in memory with `secureZero` after decode, and closes the state descriptor immediately.
 
@@ -842,8 +845,10 @@ to the export.
    paths uncullable, compounding case 5. The same is true of planting files directly in `pin/`.
    `.cluster` names are refused.
 7. **Local process image replacement and PSK extraction via Handover.** A compromised local
-   process running as the daemon's uid (or with write access to the cache root and signal
-   permission to the daemon PID) writes `<cache>/update.req` naming an arbitrary executable path,
+   process running as the daemon's uid (or as root) writes `<cache>/update.req` naming an
+   arbitrary executable path; a different local uid is refused by the request-owner check
+   (`handover.reqOwnerOk` src/handover.zig), so write access to a group- or world-writable cache
+   root alone is no longer enough. It then
    then signals `SIGUSR2` (`cmdUpdate` src/main.zig, `onUsr2` src/fuse_fs.zig). The running daemon
    encodes its state, unsets `CLOEXEC` on the sealed memfd and descriptors, and executes
    `execve(replacement_bin, ["modelfs", "_handover", "--state-fd", N], environ)` (`execHandover`

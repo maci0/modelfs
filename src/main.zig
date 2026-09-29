@@ -1751,7 +1751,7 @@ fn liveDaemon(io: std.Io, gpa: std.mem.Allocator, cache: []const u8, blob_out: *
     // The writer's derived widest-document bound, not a private guess: a cap
     // below it rejects a healthy daemon's document as unreadable, and `status`
     // would report a running mount as down.
-    const blob = sys.readFileAllocNoFollowOpenErrno(gpa, p, fuse_fs.status_doc_max_bytes, &open_errno) catch |err| {
+    const blob = sys.readFileAllocNoFollowOpenErrno(gpa, p, fuse_fs.status_doc_max_bytes, &open_errno, null) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         // A file past the widest document the daemon can publish is not the
         // daemon's own output; saying "no status.json" sends the operator
@@ -1890,7 +1890,7 @@ fn cmdReload(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var waited: u32 = 0;
     while (waited < update_wait_ms) : (waited += update_poll_ms) {
         var open_errno: i32 = 0;
-        const ack_blob = sys.readFileAllocNoFollowOpenErrno(gpa, ack_path, handover.req_max_bytes, &open_errno) catch {
+        const ack_blob = sys.readFileAllocNoFollowOpenErrno(gpa, ack_path, handover.req_max_bytes, &open_errno, null) catch {
             sys.sleepMs(io, update_poll_ms);
             continue;
         };
@@ -2291,7 +2291,7 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
         var pbuf: [sys.c.PATH_MAX]u8 = undefined;
         if (sys.joinZ(&pbuf, owned.cache, handover.req_file)) |rp| {
             var open_errno: i32 = 0;
-            if (sys.readFileAllocNoFollowOpenErrno(gpa, rp, handover.req_max_bytes, &open_errno)) |req_blob| {
+            if (sys.readFileAllocNoFollowOpenErrno(gpa, rp, handover.req_max_bytes, &open_errno, null)) |req_blob| {
                 defer gpa.free(req_blob);
                 if (handover.decodeReq(gpa, req_blob)) |parsed| {
                     defer parsed.deinit();
@@ -4077,7 +4077,7 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         var fbuf: [sys.c.PATH_MAX]u8 = undefined;
         const fp = sys.joinZ(&fbuf, std.mem.span(dirz), name) catch continue;
         var open_errno: i32 = 0;
-        const blob = sys.readFileAllocNoFollowOpenErrno(gpa, fp, store_mod.Store.max_manifest_bytes, &open_errno) catch |err| switch (err) {
+        const blob = sys.readFileAllocNoFollowOpenErrno(gpa, fp, store_mod.Store.max_manifest_bytes, &open_errno, null) catch |err| switch (err) {
             error.OpenFailed => {
                 if (open_errno != sys.c.ENOENT) {
                     if (!builtin.is_test) std.log.warn("manifest open failed for {s} (errno {d}); skipping", .{ proto.displayName(name), open_errno });
@@ -4186,7 +4186,7 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
             return 1;
         };
         var open_errno: i32 = 0;
-        const blob = sys.readFileAllocNoFollowOpenErrno(gpa, mp, store_mod.Store.max_manifest_bytes, &open_errno) catch |err| switch (err) {
+        const blob = sys.readFileAllocNoFollowOpenErrno(gpa, mp, store_mod.Store.max_manifest_bytes, &open_errno, null) catch |err| switch (err) {
             error.OpenFailed => {
                 if (open_errno == sys.c.ENOENT) {
                     if (!builtin.is_test)

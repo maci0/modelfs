@@ -15,6 +15,18 @@ pub const req_file = "update.req";
 pub const ack_file = "update.ack";
 pub const token_bytes: usize = 16;
 
+/// Whether a request file whose owner is `file_uid` may drive this daemon
+/// (running as `euid`) into replacing its own image. The cache root is
+/// operator-controlled and is not forced to 0700, so on a root that is
+/// group- or world-writable any local uid can create a name there; a request
+/// owned by such a co-tenant names an arbitrary binary, which the daemon
+/// execs with the cluster PSK in the sealed state blob. Root counts as the
+/// operator: `sudo modelfs update` against a daemon started by an init
+/// system is the normal case.
+pub fn reqOwnerOk(file_uid: u32, euid: u32) bool {
+    return file_uid == euid or file_uid == 0;
+}
+
 /// Cap on `update.req` and `update.ack` as either side reads them. One
 /// binary path (PATH_MAX once JSON-escaped) plus the token, with room for
 /// the knobs the request carries. The writer and both readers use this one
@@ -609,6 +621,17 @@ test "parseHandoffArgs takes only the form execArgvZ writes" {
     try std.testing.expectError(error.BadStateFd, parseHandoffArgs(&.{ internal_cmd, state_fd_flag, "nope", "/models" }));
     try std.testing.expectError(error.BadStateFd, parseHandoffArgs(&.{ internal_cmd, state_fd_flag, "11", "" }));
     try std.testing.expectError(error.BadStateFd, parseHandoffArgs(&.{ internal_cmd, "--other", "3", "/models" }));
+}
+
+test "reqOwnerOk admits the operator's own request and root's, not a co-tenant's" {
+    // The cache root's mode is the operator's choice, so a co-tenant that can
+    // write the name must not be able to make the daemon exec a binary of its
+    // choosing with the PSK in the handover blob.
+    try std.testing.expect(reqOwnerOk(1000, 1000));
+    try std.testing.expect(reqOwnerOk(0, 1000));
+    try std.testing.expect(!reqOwnerOk(1001, 1000));
+    try std.testing.expect(!reqOwnerOk(1001, 0));
+    try std.testing.expect(!reqOwnerOk(0, 1001));
 }
 
 test "update req/ack carry a token the client can match" {

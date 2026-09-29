@@ -3199,13 +3199,14 @@ fn execHandover(st: *State) !void {
     const gpa = st.gpa;
     var pbuf: [sys.c.PATH_MAX]u8 = undefined;
     const req_path = try sys.joinZ(&pbuf, st.store.cache, handover.req_file);
+    var req_owner: u32 = 0;
     // The CLI fsyncs then SIGUSR2; still retry ENOENT briefly so a delayed
     // directory update cannot turn a successful update into a dead mount.
     const req_blob = blk: {
         var waited: u32 = 0;
         while (true) {
             var open_errno: i32 = 0;
-            break :blk sys.readFileAllocNoFollowOpenErrno(gpa, req_path, handover.req_max_bytes, &open_errno) catch |err| {
+            break :blk sys.readFileAllocNoFollowOpenErrno(gpa, req_path, handover.req_max_bytes, &open_errno, &req_owner) catch |err| {
                 if (err == error.OpenFailed and open_errno == sys.c.ENOENT and waited < 1000) {
                     sys.sleepMs(st.store.io, 50);
                     waited += 50;
@@ -3216,6 +3217,14 @@ fn execHandover(st: *State) !void {
             };
         }
     };
+    // The name is planted in the cache root, whose mode the operator picks,
+    // so read access is not evidence that the operator asked for this exec.
+    // The uid is the one on the fd just read, not a path-stat: a co-tenant
+    // that swaps the name after the open must not pass as the operator.
+    if (!handover.reqOwnerOk(req_owner, sys.euidSelf())) {
+        std.log.err("handover: {s} is owned by uid {d}, not this daemon (uid {d} or root); refusing to exec", .{ req_path, req_owner, sys.euidSelf() });
+        return error.ForeignRequest;
+    }
     defer gpa.free(req_blob);
     const parsed = handover.decodeReq(gpa, req_blob) catch return error.BadRequest;
     defer parsed.deinit();
