@@ -2384,43 +2384,45 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         gpa: std.mem.Allocator,
         rows: *std.ArrayList(Row),
 
+        // Every arm of the deep copy below unwinds the same partial Row, so
+        // the free list lives in one defer instead of one restatement per
+        // allocation site (four of them, growing by one entry each). `n`
+        // bounds how much of `addrs` is initialized, since a half-filled
+        // slice has no valid tail to free.
         pub fn visit(acc: *@This(), name: []const u8, parsed: std.json.Parsed(proto.Lease)) void {
             const lease = parsed.value;
-            const owned_name = acc.gpa.dupe(u8, name) catch return;
-            const owned_id = acc.gpa.dupe(u8, lease.id) catch {
-                acc.gpa.free(owned_name);
-                return;
-            };
-            const addrs = acc.gpa.alloc(Addr, lease.addrs.len) catch {
-                acc.gpa.free(owned_name);
-                acc.gpa.free(owned_id);
-                return;
-            };
+            var owned_name: ?[]u8 = null;
+            var owned_id: ?[]u8 = null;
+            var addrs: ?[]Addr = null;
             var n: usize = 0;
+            defer {
+                if (addrs) |a| {
+                    for (a[0..n]) |x| acc.gpa.free(x.ip);
+                    acc.gpa.free(a);
+                }
+                if (owned_name) |s| acc.gpa.free(s);
+                if (owned_id) |s| acc.gpa.free(s);
+            }
+            owned_name = acc.gpa.dupe(u8, name) catch return;
+            owned_id = acc.gpa.dupe(u8, lease.id) catch return;
+            addrs = acc.gpa.alloc(Addr, lease.addrs.len) catch return;
             while (n < lease.addrs.len) : (n += 1) {
-                addrs[n] = .{
-                    .ip = acc.gpa.dupe(u8, lease.addrs[n].ip) catch {
-                        for (addrs[0..n]) |a| acc.gpa.free(a.ip);
-                        acc.gpa.free(addrs);
-                        acc.gpa.free(owned_name);
-                        acc.gpa.free(owned_id);
-                        return;
-                    },
+                addrs.?[n] = .{
+                    .ip = acc.gpa.dupe(u8, lease.addrs[n].ip) catch return,
                     .port = lease.addrs[n].port,
                     .mbps = lease.addrs[n].mbps,
                 };
             }
             acc.rows.append(acc.gpa, .{
-                .name = owned_name,
-                .id = owned_id,
+                .name = owned_name.?,
+                .id = owned_id.?,
                 .until = lease.until,
-                .addrs = addrs,
-            }) catch {
-                for (addrs) |a| acc.gpa.free(a.ip);
-                acc.gpa.free(addrs);
-                acc.gpa.free(owned_name);
-                acc.gpa.free(owned_id);
-            };
+                .addrs = addrs.?,
+            }) catch return;
+            // The list owns every block now; the unwind above must not run.
+            owned_name = null;
+            owned_id = null;
+            addrs = null;
         }
     };
 
@@ -4128,7 +4130,12 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             continue;
         };
         total_pieces += m.entries.len;
-        manifests.append(gpa, m) catch return 1;
+        // Same ownership hazard cmdDupes unwinds: until the append lands,
+        // m.entries is reachable from nothing.
+        manifests.append(gpa, m) catch {
+            gpa.free(m.entries);
+            return 1;
+        };
         // Same ownership hazard as cmdDupes: the copy is unreachable from
         // `sorted` until the append lands, and m is already owned by
         // `manifests` either way.

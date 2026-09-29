@@ -418,6 +418,11 @@ fn peerAddrText(peer: c.struct_sockaddr_in, buf: []u8) []const u8 {
 const drain_body_cap_bytes: usize = 64 * 1024;
 const drain_deadline_ms: i64 = 10_000;
 
+/// User-space send chunk for a response body: the /have bitmap and the
+/// /data sendfile fallback both drain a want-sized buffer this far at a
+/// time, so a large range cannot drive a want-sized allocation.
+const send_chunk_bytes: usize = 4 * 1024 * 1024;
+
 fn drainDeclaredBody(io: std.Io, fd: c_int, cl: ?[]const u8, head_len: usize, total_read: usize) void {
     const cl_s = cl orelse return;
     const want = proto.parseU64Fast(cl_s) orelse return;
@@ -725,14 +730,13 @@ fn serveHave(self: *Server, fd: c_int, rel: []const u8) void {
     // socket, and snapshot -- for as long as the trickle continues, and
     // sixteen of those deaden the peer service permanently.
     const deadline_ms = bodyDeadlineFor(self.io, snap.len);
-    const have_chunk: usize = 4 * 1024 * 1024;
     var done: usize = 0;
     while (done < snap.len) {
         if (!armChunkTimeout(self.io, fd, deadline_ms)) {
             std.log.warn("have send budget expired for {s} at {d}/{d} bytes; dropping peer transfer", .{ rel, done, snap.len });
             return;
         }
-        const take = @min(snap.len - done, have_chunk);
+        const take = @min(snap.len - done, send_chunk_bytes);
         const put = sys.writeAll(fd, snap[done..][0..take]);
         if (put < 0) {
             // The 200 header is already on the wire, so the fetching peer
@@ -941,8 +945,7 @@ fn streamRange(self: *Server, fd: c_int, file: *store_mod.Store.Cached, span: pi
         }
     }
 
-    const chunk_cap: usize = 4 * 1024 * 1024;
-    const buf = self.gpa.alloc(u8, @min(want, chunk_cap)) catch {
+    const buf = self.gpa.alloc(u8, @min(want, send_chunk_bytes)) catch {
         // The 206 header is already on the wire, so the peer only sees a
         // truncated body; this line is the sender-side trace of why.
         std.log.warn("range stream buffer alloc failed for {s}; dropping connection", .{file.rel});
