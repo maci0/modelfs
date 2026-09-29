@@ -40,7 +40,10 @@ def main(argv: list[str]) -> int:
         print("✓ rejected invalid PSK with HTTP 401")
         return 0
     except urllib.error.URLError as e:
-        reason = getattr(e, "reason", e)
+        # URLError.reason is typed Any and is absent on some failures, so the
+        # fallback is the error itself; the branch only ever tests it and
+        # prints it, and object is the type both already have.
+        reason: object = getattr(e, "reason", e)
         if isinstance(reason, ConnectionRefusedError) or "refused" in str(reason).lower():
             print(f"SKIP: no modelfs peer listening on {host}:{port}; start a cluster first")
             return 0

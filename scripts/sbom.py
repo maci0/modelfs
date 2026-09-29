@@ -10,6 +10,7 @@ No network. Stdlib only.
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -24,6 +25,20 @@ if TYPE_CHECKING:
 # Sibling module (this directory is sys.path[0] when the script runs): the
 # capitalized-usage parser shared with run_benchmarks_and_plots.py.
 import cli_parser
+
+
+class _Args(argparse.Namespace):
+    """The three mode flags, with the types argparse erases on its own.
+
+    Every attribute of a bare Namespace is Any, so reading one is an
+    unchecked expression; declaring the flags here gives the checks the
+    type store_true already assigns them.
+    """
+
+    write: bool
+    check: bool
+    self_test: bool
+
 
 _PKG = re.compile(r"^([A-Za-z0-9_.-]+)==([^\\\s;]+)(?:\s*;\s*([^\\]+?))?\s*\\?\s*$")
 _SHA1_HEX_LEN = 40
@@ -112,7 +127,11 @@ def project_root() -> Path:
 def zon_string(text: str, field: str) -> str:
     """Quoted string field in build.zig.zon, matched as a whole identifier."""
     for match in _ZON_STRING.finditer(text):
-        if match.group(1) == field:
+        # typeshed types a str pattern's group() as `str | Any`, so comparing
+        # one against a str comes back `bool | Any`. The pattern's groups are
+        # literal strs; name the capture so the comparison is the bool it is.
+        name: str = match.group(1)
+        if name == field:
             return match.group(2)
     sys.exit(f"no .{field} in build.zig.zon")
 
@@ -364,7 +383,11 @@ def github_purl(name: str, digest: str) -> str:
 
 def hashes_cdx(digests: list[str]) -> list[dict[str, str]]:
     # One component, every wheel/sdist digest from the lock: scanners match any.
-    return [{"alg": "SHA-256", "content": digest} for digest in dict.fromkeys(digests)]
+    # dict.fromkeys is typed `dict[str, Any | None]` (the value arm is
+    # `Any | None` because the key may be absent); only the keys are read, so
+    # the value type is declared as the None the function actually inserts.
+    unique: dict[str, None] = dict.fromkeys(digests)
+    return [{"alg": "SHA-256", "content": digest} for digest in unique]
 
 
 def commit_hashes(digest: str) -> list[dict[str, str]]:
@@ -823,7 +846,7 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="run parser tests (lock, bounds, workflow pins, SPDX); no file write",
     )
-    args = parser.parse_args(argv[1:])
+    args = parser.parse_args(argv[1:], namespace=_Args())
     root = project_root()
     if args.self_test:
         self_test(root)

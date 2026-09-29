@@ -6,6 +6,7 @@ figures land in .scratch/benchmarks/ (gitignored); pass --update-docs to
 regenerate the tracked docs/benchmarks.md and docs/figures/.
 """
 
+import argparse
 import os
 import shutil
 import subprocess
@@ -27,6 +28,17 @@ import cli_parser
 import peer_ping
 
 BENCH_PSK = "bench_psk_key_123456789"
+
+
+class _Args(argparse.Namespace):
+    """The one flag, with the type argparse erases on its own.
+
+    Every attribute of a bare Namespace is Any, so reading one is an
+    unchecked expression; declaring the flag here gives the check the
+    type store_true already assigns it.
+    """
+
+    update_docs: bool
 
 
 def bench_headers() -> dict[str, str]:
@@ -1030,7 +1042,7 @@ def main() -> None:
     )
     # Parse before the FUSE preflight so --help and unknown flags never
     # die as "cannot run benchmarks: /dev/fuse is missing".
-    args = parser.parse_args()
+    args = parser.parse_args(namespace=_Args())
     require_fuse()
     out_dir = _ROOT / "docs" if args.update_docs else _SCRATCH / "benchmarks"
     bin_path = build_modelfs()

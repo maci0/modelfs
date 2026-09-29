@@ -110,6 +110,14 @@ disallow_untyped_globals = true
 # A decorator whose signature erases to Any must not silently untype the
 # decorated function; the strict bundle does not cover this.
 disallow_any_decorated = true
+# The other end of the same hole: an expression whose inferred type is Any
+# or contains one, whatever spelled it. disallow_any_explicit above stops
+# `Any` being written in an annotation, disallow_any_unimported stops it
+# arriving from a library with no py.typed, and this stops it arriving from
+# the stdlib and from inference: an argparse Namespace attribute, a
+# re.Match group, a URLError.reason. The findings it raises are the ones
+# the three flags above cannot see, and this tree passes it.
+disallow_any_expr = true
 strict_equality_for_none = true
 # bytes accepts only bytes, not str-like objects: the py314 semantics pulled
 # forward so a bytes/str mixup cannot hide behind implicit coercions.
