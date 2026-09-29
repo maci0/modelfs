@@ -20,8 +20,10 @@
 const std = @import("std");
 
 /// Every daemon module under test, in the order root.zig imports them.
-/// Named rather than globbed: a new src/*.zig that root.zig imports must be
-/// added here, which is the same reminder the aggregator already gives.
+/// Named rather than globbed, because a glob cannot tell the two doors
+/// (sys.zig, c.zig) from a module a caller added; the coverage test below
+/// holds the list to root.zig's import set so the naming is a reminder,
+/// not a chore.
 const modules = [_][]const u8{
     "piece.zig",
     "proto.zig",
@@ -35,6 +37,17 @@ const modules = [_][]const u8{
     "hf.zig",
     "update.zig",
     "main.zig",
+};
+
+/// Modules the scan skips, each for a stated reason. `sys.zig` is the clock
+/// and syscall door itself; `c.zig` re-exports the C bindings; this file
+/// names the syscalls it searches for, in its pattern tables. A fourth
+/// exemption is a hole in the gate, so the list is checked against
+/// root.zig's imports below.
+const exempt = [_][]const u8{
+    "sys.zig",
+    "c.zig",
+    "determinism.zig",
 };
 
 /// Wall-clock and blocking-sleep reads. Each is a value the simulator's
@@ -131,6 +144,101 @@ test "entropy is read through io.randomSecure, never the kernel directly" {
     const ho = try readModule(io, "handover.zig");
     defer std.testing.allocator.free(ho);
     try std.testing.expect(std.mem.indexOf(u8, ho, "io.randomSecure") != null);
+}
+
+// The clock door holds one exemption from the rule above, and the
+// exemption is narrower than the file. Policy instants are the injected
+// `std.Io.Clock.now` and its `std.Io.sleep` wait; the single raw
+// `std.os.linux.clock_gettime` is sys.zig's own `nowSecRaw`, kept for
+// test-scratch directory names, which no simulation replays. A second raw
+// read, or any other clock entry point, lands in the one file the scan
+// never opened, so it is checked here instead.
+test "the clock door itself only samples the injected clock" {
+    const io = std.testing.io;
+    const src = try readModule(io, "sys.zig");
+    defer std.testing.allocator.free(src);
+    var raw_reads: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        if (!codeLine(line)) continue;
+        const p = firstPattern(line, &clock_patterns) orelse continue;
+        if (std.mem.indexOf(u8, line, "std.Io.Clock.now") != null) continue;
+        if (std.mem.indexOf(u8, line, "std.Io.sleep") != null) continue;
+        if (!std.mem.eql(u8, p, "clock_gettime")) {
+            std.debug.print("src/sys.zig: {s}: {s}: the clock door samples the injected clock only\n", .{ line, p });
+            return error.ClockDoorLeak;
+        }
+        raw_reads += 1;
+        if (std.mem.indexOf(u8, line, "std.os.linux.clock_gettime") == null) {
+            std.debug.print("src/sys.zig: {s}: raw clock read outside nowSecRaw\n", .{line});
+            return error.ClockDoorLeak;
+        }
+    }
+    // One, not zero: a helper nobody calls is dead code, and the count is
+    // what anchors this test to the read it permits.
+    try std.testing.expectEqual(@as(usize, 1), raw_reads);
+}
+
+/// The `.zig` module name a source line imports, or null. A module
+/// aggregator writes one import per line; a name that does not end in
+/// `.zig` is a build-options import, which the scan does not cover.
+fn importedModule(line: []const u8) ?[]const u8 {
+    const marker = "@import(\"";
+    const at = std.mem.indexOf(u8, line, marker) orelse return null;
+    const rest = line[at + marker.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    const name = rest[0..end];
+    if (!std.mem.endsWith(u8, name, ".zig")) return null;
+    return name;
+}
+
+fn known(name: []const u8) bool {
+    for (modules) |m| {
+        if (std.mem.eql(u8, m, name)) return true;
+    }
+    for (exempt) |x| {
+        if (std.mem.eql(u8, x, name)) return true;
+    }
+    return false;
+}
+
+// The scan's coverage must be exactly what root.zig imports. A module
+// added to the aggregator and forgotten here ships unscanned: the gate
+// passes a `clock_gettime` in a file it never opens, which is the exact
+// failure these two rules exist to catch. The reverse direction matters
+// too, because a typo in `modules` leaves a real module unwatched while
+// the test still passes.
+test "the scanned module list is exactly what root.zig imports" {
+    const io = std.testing.io;
+    const src = try readModule(io, "root.zig");
+    defer std.testing.allocator.free(src);
+    var seen: usize = 0;
+    var lines = std.mem.splitScalar(u8, src, '\n');
+    while (lines.next()) |line| {
+        const name = importedModule(line) orelse continue;
+        if (std.mem.eql(u8, name, "root.zig")) continue;
+        seen += 1;
+        if (!known(name)) {
+            std.debug.print("src/root.zig imports {s}, which the determinism scan does not cover; add it to modules or exempt it with a reason\n", .{name});
+            return error.UnscannedModule;
+        }
+    }
+    // The parse has to have found the aggregator's imports at all, or the
+    // checks above pass on an empty walk.
+    try std.testing.expect(seen >= modules.len);
+    for (modules) |m| {
+        if (std.mem.indexOf(u8, src, m) == null) {
+            std.debug.print("determinism scan lists {s}, which src/root.zig does not import\n", .{m});
+            return error.StaleModule;
+        }
+    }
+}
+
+test "importedModule reads a module name and skips other imports" {
+    try std.testing.expectEqualStrings("store.zig", importedModule("    _ = @import(\"store.zig\");").?);
+    try std.testing.expect(importedModule("const build_options = @import(\"build_options\");") == null);
+    try std.testing.expect(importedModule("const std = @import(\"std\");") == null);
+    try std.testing.expect(importedModule("test {") == null);
 }
 
 test "codeLine skips prose and keeps code" {
