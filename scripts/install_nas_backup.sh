@@ -17,7 +17,9 @@ Usage: ./scripts/install_nas_backup.sh [--install]
 Copy sanoid.conf, OnFailure drop-ins, the replica pull timer, the
 hourly snapshot-age alarm, the restore-drill timers, the pool-loss
 restore wrapper, and the offsite-age alarm from scripts/nas/ into
-MF_NAS_DEST (default /). Without --install, print the plan and exit
+MF_NAS_DEST (default /), plus the wrappers, including
+modelfs-backup-config, which prints the drop-in values the installed
+units run with. Without --install, print the plan and exit
 0. An existing sanoid.conf is preserved; edit its dataset and retention
 settings on the host. Units and wrappers are refreshed on each install.
 Installed files belong to the installing user (root:root under sudo),
@@ -124,6 +126,7 @@ copy_one "${SCRIPTS_DIR}/check_drill_log.sh" "usr/local/sbin/modelfs-check-drill
 copy_one "${SCRIPTS_DIR}/hold_monthlies.sh" "usr/local/sbin/modelfs-hold-monthlies"
 copy_one "${SCRIPTS_DIR}/dr_pool_restore.sh" "usr/local/sbin/modelfs-pool-restore"
 copy_one "${SCRIPTS_DIR}/check_offsite.sh" "usr/local/sbin/modelfs-check-offsite"
+copy_one "${SCRIPTS_DIR}/backup_config.sh" "usr/local/sbin/modelfs-backup-config"
 copy_one "${ROOT_DIR}/docs/recovery.md" "usr/local/share/doc/modelfs/recovery.md"
 
 echo
@@ -146,5 +149,7 @@ echo "optional, on a hosted always-on offsite box (not a rotated disk):"
 echo "  systemctl edit modelfs-offsite-age.service   # Environment=MF_OFFSITE_DATASET=..."
 echo "  systemctl enable --now modelfs-offsite-age.timer"
 echo "on a rotated disk, when attached: modelfs-check-offsite DATASET"
+echo "capture the drop-in values these units run with (they exist nowhere else):"
+echo "  modelfs-backup-config | tee -a /var/log/modelfs-drill.log"
 echo "pool-loss restore is modelfs-pool-restore (dry-run by default; docs/recovery.md procedure C)"
 echo "docs/recovery.md section 3 is the runbook; this script does not start units."

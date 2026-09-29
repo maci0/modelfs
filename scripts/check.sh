@@ -443,6 +443,7 @@ done
 # is a script that hardcodes a repo-relative path or a scratch location, and
 # naming it is a deliberate act.
 no_lib_sh=(
+    backup_config.sh
     check_drill_log.sh
     check_offsite.sh
     check_release_tag.sh

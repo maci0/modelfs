@@ -1225,7 +1225,8 @@ cp -R "${SCRIPTS_DIR}/nas" "${INSTALL_SOURCE}/scripts/"
 cp "${INSTALLER}" "${SCRIPTS_DIR}/lib.sh" \
     "${SCRIPTS_DIR}/dr_restore_drill.sh" "${SCRIPTS_DIR}/check_drill_log.sh" \
     "${SCRIPTS_DIR}/hold_monthlies.sh" "${SCRIPTS_DIR}/dr_pool_restore.sh" \
-    "${SCRIPTS_DIR}/check_offsite.sh" "${INSTALL_SOURCE}/scripts/"
+    "${SCRIPTS_DIR}/check_offsite.sh" "${SCRIPTS_DIR}/backup_config.sh" \
+    "${INSTALL_SOURCE}/scripts/"
 chmod -R 0777 "${INSTALL_SOURCE}"
 INSTALL_DEST="${TEMP}/nas-root"
 INSTALL_OUT=""
@@ -1256,6 +1257,7 @@ else
         usr/local/sbin/modelfs-hold-monthlies \
         usr/local/sbin/modelfs-pool-restore \
         usr/local/sbin/modelfs-check-offsite \
+        usr/local/sbin/modelfs-backup-config \
         usr/local/share/doc/modelfs/recovery.md; do
         if [[ ! -f "${INSTALL_DEST}/${rel}" ]]; then
             missing="${missing} ${rel}"
@@ -2139,6 +2141,57 @@ elif ! grep -q "zfs send" "${RESTORE_STATE}/commands.log" || ! grep -q "zfs recv
     fail "pool restore --local-from missing send/recv: $(cat "${RESTORE_STATE}/commands.log" 2>/dev/null || true)"
 else
     pass "pool restore --execute --local-from used send/recv, held monthlies, and printed the cache wipe"
+fi
+
+# --- backup_config.sh: the drop-in values a rebuilt host needs
+# The dataset each backup points at lives in a systemd drop-in on the
+# running host and nowhere else, so what is captured is what a replica or
+# offsite host lost with its disk is rebuilt from. A unit that still
+# carries the shipped placeholder must say so: the value parses as a
+# dataset and the pull then names a host nobody chose.
+BACKUP_CONFIG="${SCRIPTS_DIR}/backup_config.sh"
+BC_TREE="${TEMP}/backup-config-root"
+mkdir -p "${BC_TREE}/etc/systemd/system/syncoid-models.service.d" "${BC_TREE}/etc/sanoid"
+cp "${SCRIPTS_DIR}/nas/syncoid-models.service" \
+    "${BC_TREE}/etc/systemd/system/"
+cp "${SCRIPTS_DIR}/nas/sanoid.conf" "${BC_TREE}/etc/sanoid/"
+printf '%s\n' '[Service]' 'Environment=MF_SYNCOID_SRC=replica@nas:tank/models' \
+    >"${BC_TREE}/etc/systemd/system/syncoid-models.service.d/override.conf"
+BC_RC=0
+BC_OUT="$("${BACKUP_CONFIG}" "${BC_TREE}" 2>&1)" || BC_RC=$?
+if [[ "${BC_RC}" -ne 0 ]]; then
+    fail "backup config on a staged tree: rc=${BC_RC}: ${BC_OUT}"
+elif ! grep -q "MF_SYNCOID_SRC=replica@nas:tank/models" <<<"${BC_OUT}"; then
+    fail "backup config did not report the drop-in override: ${BC_OUT}"
+elif grep -q "MF_SYNCOID_SRC=nas:tank/models$" <<<"${BC_OUT}"; then
+    fail "backup config printed the unit-file placeholder over the drop-in: ${BC_OUT}"
+elif grep -q PLACEHOLDER <<<"${BC_OUT}"; then
+    fail "backup config flagged a drop-in value as the placeholder: ${BC_OUT}"
+elif ! grep -q "hourly = 36" <<<"${BC_OUT}"; then
+    fail "backup config did not report the snapshot retention policy: ${BC_OUT}"
+else
+    pass "backup config reports the effective drop-in values and the snapshot policy"
+fi
+
+# Without the drop-in the unit still carries the shipped placeholder, and
+# that is the state a host sits in until an operator picks the SSH target.
+rm "${BC_TREE}/etc/systemd/system/syncoid-models.service.d/override.conf"
+BC_PH_RC=0
+BC_PH_OUT="$("${BACKUP_CONFIG}" "${BC_TREE}" 2>&1)" || BC_PH_RC=$?
+if [[ "${BC_PH_RC}" -ne 0 ]]; then
+    fail "backup config without a drop-in: rc=${BC_PH_RC}: ${BC_PH_OUT}"
+elif ! grep -q "PLACEHOLDER" <<<"${BC_PH_OUT}"; then
+    fail "backup config did not flag the un-overridden syncoid source: ${BC_PH_OUT}"
+else
+    pass "backup config flags a syncoid source still at the shipped placeholder"
+fi
+
+BC_MISSING_RC=0
+BC_MISSING_OUT="$("${BACKUP_CONFIG}" "${TEMP}/no-such-root" 2>&1)" || BC_MISSING_RC=$?
+if [[ "${BC_MISSING_RC}" -eq 0 ]]; then
+    fail "backup config passed a tree with no units: ${BC_MISSING_OUT}"
+else
+    pass "backup config fails on a tree with no backup units"
 fi
 
 if [[ "${FAILS}" -ne 0 ]]; then

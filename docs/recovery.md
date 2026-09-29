@@ -20,6 +20,7 @@ The origin (`tank/models` on the NAS) holds the **only copy** of every weight fi
 | `/var/cache/fscache` (desktop) | FS-Cache pages | derived | no |
 | `/etc/modelfs.psk` (every node) | peer auth secret | regenerable | only with total site loss; regenerate with `openssl rand -hex 32` and redistribute to all nodes |
 | `$HOME` HF token | hub auth | not on the origin | re-login |
+| `/etc/systemd/system/*.d/` drop-ins on the NAS and replica hosts | the dataset each unit runs against (`MF_SYNCOID_SRC`, `MF_DRILL_REPLICA`, `MF_OFFSITE_DATASET`) | **site configuration, not in this repo** | yes (per host). `install_nas_backup.sh --install` never touches a drop-in, so a reinstall keeps it; a rebuilt host comes back with the shipped placeholders. Capture with `modelfs-backup-config` (section 3) |
 
 Verifiably safe to ignore in any backup plan: caches (next read re-hydrates; culling punches holes, and `reapIdle` unlinks empty unpinned artifacts) and leases (swept after 300 s regardless). Everything else in this doc exists to protect row 1.
 
@@ -169,6 +170,27 @@ and monthly clone stay calendar events pinned to UTC (`OnCalendar=daily UTC`,
 
 `notify-admin@.service` logs to syslog under `modelfs-backup`. Replace its `ExecStart` with the
 site mailer or webhook when one exists.
+
+**The drop-ins are the one piece of the backup stack this repo does not
+hold.** Which host the replica pulls from, which dataset it holds, which
+dataset is the offsite copy: each is an `Environment=` in a systemd
+drop-in on the running host, and a host lost with its disk is rebuilt
+from this document and `install_nas_backup.sh`, which restores the
+placeholder rather than the choice. `modelfs-backup-config`
+([`scripts/backup_config.sh`](../scripts/backup_config.sh)) prints the
+`Environment=` lines each installed unit would run with, unit file then
+drop-ins, flags a value still sitting at the shipped placeholder, and
+prints the retention policy the host's snapshots are taken under. It
+reads files only: no pool, no unit, nothing written. Run it after the
+drop-in edits above and keep the output with the drill log, which is
+already checked for staleness.
+
+```bash
+modelfs-backup-config | tee -a /var/log/modelfs-drill.log
+```
+
+It is also how two hosts are compared: a replica whose `MF_SYNCOID_SRC`
+differs from the NAS's record is a host pulling from somewhere else.
 
 These four are alarms, not log noise:
 
@@ -450,3 +472,4 @@ If those keys exist only on the dead NAS, procedure C is blocked. Copy the repli
 * Timed pool-loss RTO (`recv_s` in `/var/log/modelfs-pool-restore.log` after the first `--execute`). `clone_s` in the drill log is not that number.
 * Whether `notify-admin@.service` has been replaced with a mailer, or still only writes syslog.
 * Offsite-copy freshness: `check_offsite.sh` and `modelfs-offsite-age.timer` exist in this repo; whether the weekly timer is enabled on a hosted box, or the script is run by hand when the rotated disk is attached, is site-specific.
+* The drop-in values themselves. `modelfs-backup-config` prints them off a host, but no copy of that output belongs to this repo; until one is filed outside it, a host lost with its disk is rebuilt by re-reading section 3.
