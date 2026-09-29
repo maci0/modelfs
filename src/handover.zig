@@ -631,7 +631,7 @@ test "reqOwnerOk admits the operator's own request and root's, not a co-tenant's
     try std.testing.expect(reqOwnerOk(0, 1000));
     try std.testing.expect(!reqOwnerOk(1001, 1000));
     try std.testing.expect(!reqOwnerOk(1001, 0));
-    try std.testing.expect(!reqOwnerOk(0, 1001));
+    try std.testing.expect(!reqOwnerOk(1000, 1001));
 }
 
 test "update req/ack carry a token the client can match" {
