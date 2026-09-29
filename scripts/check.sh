@@ -29,7 +29,7 @@ answers --help):
   zig build test -Dtest-filter=relOk        tests whose names contain this substring
   zig build test --watch                    rebuild and re-run on change
   zig build check                           this script
-  zig build ci / ./scripts/ci.sh            every CI job (this, aarch64, repro)
+  zig build ci / ./scripts/ci.sh            every CI job (this, aarch64 cross, static, repro)
   ./scripts/cross_aarch64.sh                aarch64 ReleaseFast (extracts vendored libfuse3)
   ./scripts/install_libfuse3_dev.sh         install libfuse3-dev via apt (CI setup; see CONTRIBUTING)
   ./scripts/run_e2e_tests.sh                CLI and peer protocol; no FUSE

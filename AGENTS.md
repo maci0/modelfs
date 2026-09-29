@@ -75,7 +75,7 @@ Suites outside the gate (most need hardware CI lacks):
 |---|---|---|
 | `run_cluster_e2e_9nodes.sh` | `/dev/fuse`, `fusermount3` | 9 mounts exchanging pieces |
 | `test_hot_reload.sh` | same | `modelfs update`: mounts, holds an fd open across two image swaps, then checks the pid, the peer port, the held fd's bytes, and the unmount on exit |
-| `run_vm_cluster_e2e.sh` | libvirt/KVM | the real-NFS cluster, 4 VMs |
+| `run_vm_cluster_e2e.sh` | libvirt/KVM, an x86_64 host | the real-NFS cluster, 4 VMs |
 | `run_e2e_tests.sh` | nothing | CLI and protocol only, no FUSE |
 | `test_fault_tolerance.sh` | a live peer | peer loss and lease expiry; skips loudly without one |
 | `dr_restore_drill.sh` | the NAS | the monthly restore drill. `test_dr_restore_drill.sh` is the CI stand-in against a stub `zfs` |

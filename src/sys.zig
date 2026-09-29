@@ -24,9 +24,9 @@ pub fn errno() i32 {
 }
 
 /// Borrowed name of a readdir entry; valid until the next readdir on its DIR.
-/// Indexes `d_name[0]` so the pointer is the first byte on both glibc
-/// (`char d_name[256]`) and musl (`char d_name[]` flexible array); `&d_name`
-/// on a pointer-typed field would be the address of the pointer instead.
+/// Indexes `d_name[0]` so the pointer is the first byte rather than the
+/// address of the array; on a pointer-typed field it would be the address of
+/// the pointer instead. Both libcs spell the field `char d_name[256]`.
 pub fn dirName(ent: *c.struct_dirent) []const u8 {
     return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.d_name[0])), 0);
 }
@@ -349,11 +349,11 @@ pub fn isListening(fd: c_int) !bool {
 
 const mfd_cloexec: u32 = 1;
 const mfd_allow_sealing: u32 = 2;
-const f_add_seals: i32 = 1033;
-const f_seal_seal: u32 = 0x0001;
-const f_seal_shrink: u32 = 0x0002;
-const f_seal_grow: u32 = 0x0004;
-const f_seal_write: u32 = 0x0008;
+const f_add_seals: i32 = c.F_ADD_SEALS;
+const f_seal_seal: u32 = @intCast(c.F_SEAL_SEAL);
+const f_seal_shrink: u32 = @intCast(c.F_SEAL_SHRINK);
+const f_seal_grow: u32 = @intCast(c.F_SEAL_GROW);
+const f_seal_write: u32 = @intCast(c.F_SEAL_WRITE);
 
 /// memfd holding `blob`, write-sealed so the replacement cannot change the
 /// knobs or PSK after we hand the fd over. Starts CLOEXEC; handover clears

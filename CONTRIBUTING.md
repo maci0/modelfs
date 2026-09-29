@@ -112,8 +112,9 @@ answers `--help` without starting work.
 
 ## Build and release checks
 
-`./scripts/ci.sh` does not run CI's `static-linux` jobs. Reproduce that job's
-test, ELF, and smoke checks on an x86_64 Linux host with:
+`./scripts/ci.sh` runs the `static-linux` job's test, ELF, and smoke checks
+for this host's architecture, and skips it on any other machine. To run that
+job's checks by hand on an x86_64 Linux host:
 
 ```bash
 zig build test -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast -Dfuse-static
