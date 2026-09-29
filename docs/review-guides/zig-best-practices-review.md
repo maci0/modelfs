@@ -57,7 +57,7 @@ Before judging a cast, trace the source type, preceding range checks, and destin
 
 **J. Zero-cost habits.** Prefer slices over pointer arithmetic, `@memcpy` over index loops, and a `switch` over an if-chain on an enum. `inline` belongs on small functions where the call overhead is measurable, not on anything long. None of these is a finding without a named cost on a live path.
 
-Search recipes, each needing the surrounding function read before judging:
+If available, use these search recipes, each needing the surrounding function read before judging:
 
 ```
 rg -n '^const \w+ = @import' src/           # then check direction against the map

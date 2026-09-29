@@ -58,7 +58,7 @@ Report these as missing-abstraction findings, with the duplicate sites named:
 
 ## Search recipes
 
-Each needs the call sites read before judging; a count alone is not proof.
+If available, use these search recipes. Each needs the call sites read before judging; a count alone is not proof.
 
 ```
 rg -n 'pub fn ' src/ | rg -v '_test'        # then count real callers per symbol

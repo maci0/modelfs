@@ -35,7 +35,7 @@ Four tree-specific rules override generic Zig advice. Flagging code for obeying 
 10. **Tests as specification.** Tests live beside the code and drive the real entry point. A test that re-implements the logic it checks, feeds in a finished result and reads it back, or asserts only that a function returned without error is a finding. `std.testing.allocator` is the default so a leak fails the test. A new `src/*.zig` missing from `src/root.zig` is invisible to `zig build test`; that verdict belongs to `zig-src-review.md` item 12, so hand it over.
 11. **Doc comments carry contracts.** `//!` on every module, `///` on anything public, stating what it does, who frees what, and which lock the caller must hold. Comments that narrate control flow, restate the code, or record review history are P3 deletions. Line-number references in comments are a finding: name the function and file.
 
-Search recipes, each needing the surrounding function read before judging (tests match most of these legitimately):
+If available, use these search recipes, each needing the surrounding function read before judging (tests match most of these legitimately):
 
 ```
 rg -n 'catch \{\}|catch unreachable' src/

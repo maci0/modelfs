@@ -24,5 +24,6 @@ applicability gate, a checklist naming real symbols in this tree, and a severity
 | [zig-idiomatic-review.md](review-guides/zig-idiomatic-review.md) | code shape inside a function | allocators, ownership, error sets, comptime, slices |
 | [zig-best-practices-review.md](review-guides/zig-best-practices-review.md) | structure and naming | import direction, concern ownership, `@builtin` choice |
 | [scripts-review.md](review-guides/scripts-review.md) | `scripts/` | harness defects the lint gates cannot see |
+| [build-ci-review.md](review-guides/build-ci-review.md) | `build.zig`, `.github/`, `sbom.cdx.json` | version pins, action pins, gate parity, release publication |
 | [docs-drift-review.md](review-guides/docs-drift-review.md) | these documents | claims that no longer match the code |
 | [agentrules-review.md](review-guides/agentrules-review.md) | `AGENTS.md` | whether the rules work as agent instructions |

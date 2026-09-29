@@ -895,9 +895,7 @@ def main(argv: list[str]) -> int:
     mode.add_argument(
         "--self-test",
         action="store_true",
-        help=(
-            "run parser tests (lock, bounds, workflow pins, SPDX, toolchain pin); no file write"
-        ),
+        help=("run parser tests (lock, bounds, workflow pins, SPDX, toolchain pin); no file write"),
     )
     args = parser.parse_args(argv[1:], namespace=_Args())
     root = project_root()
