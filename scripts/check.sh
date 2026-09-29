@@ -524,6 +524,25 @@ undocumented_mf="$(comm -23 <(printf '%s\n' "${read_mf}") <(printf '%s\n' "${doc
 [[ -z "${undocumented_mf}" ]] \
     || fail "MF_ knobs read under scripts/ but absent from the lib.sh member list:${undocumented_mf}"
 
+# .env.example is the operator's copy of the MODELFS_ namespace, and the
+# daemon refuses any name outside it. A knob added to env_knobs without a
+# line here is documented only in README and the threat model, and a name
+# left in the example after it leaves the table is copied verbatim into a
+# deployment, where the very next modelfs call dies on the typo refusal.
+# Both directions are checked, so the example and the table cannot drift.
+env_example="${ROOT_DIR}/.env.example"
+knob_mf="$(sed -n '/^const env_knobs/,/^};/p' src/main.zig \
+    | grep -oE 'MODELFS_[A-Z0-9_]+' | sort -u)"
+[[ -n "${knob_mf}" ]] \
+    || fail "no MODELFS_ knob read out of the env_knobs table in src/main.zig"
+example_mf="$(grep -oE 'MODELFS_[A-Z0-9_]+' "${env_example}" | sort -u)"
+undocumented_knob="$(comm -23 <(printf '%s\n' "${knob_mf}") <(printf '%s\n' "${example_mf}") | tr '\n' ' ')"
+[[ -z "${undocumented_knob}" ]] \
+    || fail "MODELFS_ knobs in env_knobs but absent from .env.example:${undocumented_knob}"
+stale_knob="$(comm -13 <(printf '%s\n' "${knob_mf}") <(printf '%s\n' "${example_mf}") | tr '\n' ' ')"
+[[ -z "${stale_knob}" ]] \
+    || fail ".env.example documents MODELFS_ names the daemon refuses:${stale_knob}"
+
 # AGENTS.md says every review prompt under docs/review-guides/ names its own
 # applicability gate, so a prompt aimed at another tree skips instead of
 # reporting on code it does not own. A guide without one is a prompt that runs

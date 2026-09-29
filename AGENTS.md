@@ -49,7 +49,9 @@ It runs:
   `SCRIPTS_DIR` sources `lib.sh`, and one that reads none of the three is on
   `check.sh`'s `no_lib_sh` exemption list; a `scripts/nas/*.service` exports
   no `MODELFS_` knob, no secret on `ExecStart`, and no `/tmp` path; and every
-  `MF_` knob read under `scripts/` is listed in `lib.sh`'s member block
+  `MF_` knob read under `scripts/` is listed in `lib.sh`'s member block; and
+  `.env.example` names exactly the `MODELFS_*` knobs in `main.zig`'s
+  `env_knobs` table, in both directions
 - one check per review guide under `docs/review-guides/`: each names its own
   applicability gate, so a prompt for another tree skips instead of reviewing
   code it does not own
