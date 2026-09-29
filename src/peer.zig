@@ -322,7 +322,13 @@ const body_deadline_per_mib_ms: i64 = 1_000;
 /// Deadline instant for the body budget above, stamped at the call so every
 /// chunk check compares against one sample.
 fn bodyDeadlineFor(io: std.Io, want_len: u64) i64 {
-    const mibs: i64 = @intCast(@divFloor(want_len, 1024 * 1024));
+    // saturating, not @intCast: want_len is a peer-declared Content-Length on
+    // the read side and an origin-reported file size on the /data serve side
+    // (serveData's `want` is bounded by the origin stat, which a sparse file
+    // on the origin sets freely), so it is not bounded by any cap this
+    // function can rely on. A file past 8 EiB would overflow the cast, which
+    // panics under the safety build and wraps silently in ReleaseFast.
+    const mibs: i64 = @intCast(@min(@divFloor(want_len, 1024 * 1024), @as(u64, std.math.maxInt(i64))));
     return sys.monoMs(io) +| body_deadline_base_ms +| (mibs *| body_deadline_per_mib_ms);
 }
 
@@ -1827,6 +1833,27 @@ pub fn fillFromPeers(
         waited_ms += poll_ms;
         poll_ms = @min(poll_ms *| 2, probe_wait_poll_max_ms);
     }
+}
+
+test "bodyDeadlineFor survives a want_len past the i64 MiB range" {
+    const io = std.testing.io;
+    // An origin-reported file size reaches here through serveData's `want`,
+    // and a sparse file on the origin sets that size freely. Past 8 EiB the
+    // MiB count stops fitting i64; the deadline must saturate, not overflow
+    // (a panic under the safety build, a silent wrap to a negative budget in
+    // ReleaseFast, which armChunkTimeout would then read as already expired).
+    const huge = std.math.maxInt(u64);
+    const deadline_ms = bodyDeadlineFor(io, huge);
+    try std.testing.expect(deadline_ms > 0);
+
+    // The ordinary path is unchanged: an 8 MiB piece gets the base plus 8s
+    // of budget over the same base the empty case gets. monoMs advances
+    // between the two calls, so the delta is the budget plus that drift.
+    const empty_ms = bodyDeadlineFor(io, 0);
+    const piece_ms = bodyDeadlineFor(io, 8 * 1024 * 1024);
+    const grew_ms = piece_ms - empty_ms;
+    try std.testing.expect(grew_ms >= 8 * body_deadline_per_mib_ms);
+    try std.testing.expect(grew_ms < 8 * body_deadline_per_mib_ms + 1_000);
 }
 
 test "rangeBps" {

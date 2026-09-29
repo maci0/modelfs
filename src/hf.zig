@@ -194,7 +194,11 @@ fn joinRel(buf: []u8, dest: []const u8, path: []const u8) ![]const u8 {
         @memcpy(buf[0..path.len], path);
         return buf[0..path.len];
     }
-    if (dest.len + 1 + path.len > buf.len) return error.NameTooLong;
+    // checked, matching sys.joinZ: dest is operator-supplied and path is
+    // endpoint input, and the two lengths must not be able to wrap past the
+    // bound check below and into the copies.
+    const total = std.math.add(usize, dest.len, path.len) catch return error.NameTooLong;
+    if (total + 1 > buf.len) return error.NameTooLong;
     @memcpy(buf[0..dest.len], dest);
     buf[dest.len] = '/';
     @memcpy(buf[dest.len + 1 ..][0..path.len], path);
