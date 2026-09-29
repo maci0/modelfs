@@ -395,12 +395,14 @@ const KnobSet = packed struct {
 /// The source a resolved knob came from, in the documented precedence order:
 /// the flag first, then the variable, then the default. A flag and its
 /// variable can both be set (the flag wins), and only this order reports
-/// that correctly. `env_name` is empty for the mount-only knobs, which have
-/// no variable: nothing reads from_env for them, so the name would only
-/// advertise a knob that does not exist.
-fn knobSource(from_env: bool, from_flag: bool, env_name: []const u8, flag_name: []const u8) []const u8 {
+/// that correctly. `env_field` is null for the mount-only knobs, which have
+/// no variable: nothing reads from_env for them, so a name would only
+/// advertise a knob that does not exist. The variable's name comes from
+/// env_knobs, the one list the parser applies and the refusal accepts, so
+/// `config` cannot name a variable the daemon does not read.
+fn knobSource(env_field: ?EnvField, from_flag: bool, flag_name: []const u8) []const u8 {
     if (from_flag) return flag_name;
-    if (from_env) return env_name;
+    if (env_field) |f| return envName(f);
     return "default";
 }
 
@@ -2078,30 +2080,32 @@ fn cmdConfig(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     const w = &aw.writer;
 
     if (opts.origin) |v| {
-        try w.print("origin = {s} ({s})\n", .{ v, knobSource(opts.from_env.origin, opts.from_flag.origin, "MODELFS_ORIGIN", "--origin") });
+        try w.print("origin = {s} ({s})\n", .{ v, knobSource(if (opts.from_env.origin) .origin else null, opts.from_flag.origin, "--origin") });
     } else {
         try w.print("origin = (unset: modelfs mount needs --origin or MODELFS_ORIGIN) (default)\n", .{});
     }
-    try w.print("cache = {s} ({s})\n", .{ opts.cache, knobSource(opts.from_env.cache, opts.from_flag.cache, "MODELFS_CACHE", "--cache") });
+    try w.print("cache = {s} ({s})\n", .{ opts.cache, knobSource(if (opts.from_env.cache) .cache else null, opts.from_flag.cache, "--cache") });
     if (opts.id) |v| {
-        try w.print("id = {s} ({s})\n", .{ v, knobSource(opts.from_env.id, opts.from_flag.id, "MODELFS_ID", "--id") });
+        try w.print("id = {s} ({s})\n", .{ v, knobSource(if (opts.from_env.id) .id else null, opts.from_flag.id, "--id") });
     } else {
         try w.print("id = (unset: mount uses the short hostname) (default)\n", .{});
     }
-    try w.print("psk_file = {s} ({s})\n", .{ opts.psk_file, knobSource(opts.from_env.psk_file, opts.from_flag.psk_file, "MODELFS_PSK", "--psk") });
+    try w.print("psk_file = {s} ({s})\n", .{ opts.psk_file, knobSource(if (opts.from_env.psk_file) .psk_file else null, opts.from_flag.psk_file, "--psk") });
     if (opts.psk_value != null) {
         // The secret itself never reaches this line: a config dump lands in
-        // a terminal scrollback, a CI job log, and a paste.
-        try w.print("psk_value = set, value not shown ({s})\n", .{knobSource(opts.from_env.psk_value, false, "MODELFS_PSK_VALUE", "--psk")});
+        // a terminal scrollback, a CI job log, and a paste. MODELFS_PSK_VALUE
+        // is the only source: no flag carries the secret, so the knobSource
+        // precedence does not apply to it.
+        try w.print("psk_value = set, value not shown (MODELFS_PSK_VALUE)\n", .{});
     } else {
         try w.print("psk_value = (unset) (default)\n", .{});
     }
-    try w.print("log = {s} ({s})\n", .{ @tagName(opts.log_level), knobSource(opts.from_env.log, opts.from_flag.log, "MODELFS_LOG", "--log") });
-    try w.print("piece = {d} ({s})\n", .{ opts.piece, knobSource(false, opts.from_flag.piece, "", "--piece") });
-    try w.print("brun = {d} ({s})\n", .{ opts.water.brun, knobSource(false, opts.from_flag.brun, "", "--brun") });
-    try w.print("bcull = {d} ({s})\n", .{ opts.water.bcull, knobSource(false, opts.from_flag.bcull, "", "--bcull") });
-    try w.print("bstop = {d} ({s})\n", .{ opts.water.bstop, knobSource(false, opts.from_flag.bstop, "", "--bstop") });
-    try w.print("listen = {d} ({s})\n", .{ opts.listen_port orelse proto.default_port, knobSource(false, opts.from_flag.listen, "", "--listen") });
+    try w.print("log = {s} ({s})\n", .{ @tagName(opts.log_level), knobSource(if (opts.from_env.log) .log else null, opts.from_flag.log, "--log") });
+    try w.print("piece = {d} ({s})\n", .{ opts.piece, knobSource(null, opts.from_flag.piece, "--piece") });
+    try w.print("brun = {d} ({s})\n", .{ opts.water.brun, knobSource(null, opts.from_flag.brun, "--brun") });
+    try w.print("bcull = {d} ({s})\n", .{ opts.water.bcull, knobSource(null, opts.from_flag.bcull, "--bcull") });
+    try w.print("bstop = {d} ({s})\n", .{ opts.water.bstop, knobSource(null, opts.from_flag.bstop, "--bstop") });
+    try w.print("listen = {d} ({s})\n", .{ opts.listen_port orelse proto.default_port, knobSource(null, opts.from_flag.listen, "--listen") });
     if (opts.advertise.items.len == 0) {
         try w.print("advertise = (auto-detect) (default)\n", .{});
     } else {
@@ -2110,7 +2114,7 @@ fn cmdConfig(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             if (i != 0) try w.writeAll(",");
             try w.print("{s}:{d}", .{ a.ip, a.port orelse (opts.listen_port orelse proto.default_port) });
         }
-        try w.print(" ({s})\n", .{knobSource(false, opts.from_flag.advertise, "", "--advertise")});
+        try w.print(" ({s})\n", .{knobSource(null, opts.from_flag.advertise, "--advertise")});
     }
     if (opts.seed.items.len == 0) {
         try w.print("seed = (none) (default)\n", .{});
@@ -2120,11 +2124,11 @@ fn cmdConfig(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             if (i != 0) try w.writeAll(",");
             try w.print("{s}", .{s});
         }
-        try w.print(" ({s})\n", .{knobSource(false, opts.from_flag.seed, "", "--seed")});
+        try w.print(" ({s})\n", .{knobSource(null, opts.from_flag.seed, "--seed")});
     }
-    try w.print("direct_io = {s} ({s})\n", .{ if (opts.direct_io) "on" else "off", knobSource(false, opts.from_flag.direct_io, "", "--direct-io/--kernel-cache") });
-    try w.print("allow_other = {s} ({s})\n", .{ if (opts.allow_other) "on" else "off", knobSource(false, opts.from_flag.allow_other, "", "--allow-other") });
-    try w.print("detach = {s} ({s})\n", .{ if (opts.detach) "on" else "off", knobSource(false, opts.from_flag.detach, "", "--detach/-f") });
+    try w.print("direct_io = {s} ({s})\n", .{ if (opts.direct_io) "on" else "off", knobSource(null, opts.from_flag.direct_io, "--direct-io/--kernel-cache") });
+    try w.print("allow_other = {s} ({s})\n", .{ if (opts.allow_other) "on" else "off", knobSource(null, opts.from_flag.allow_other, "--allow-other") });
+    try w.print("detach = {s} ({s})\n", .{ if (opts.detach) "on" else "off", knobSource(null, opts.from_flag.detach, "--detach/-f") });
 
     return if (writeOut(io, aw.written())) 0 else 1;
 }

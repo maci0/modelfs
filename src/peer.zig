@@ -1438,7 +1438,7 @@ const ProbeCtx = struct {
     /// Per group: null = no answer, else whether that node has piece idx.
     slots: []?bool,
     cat: *discover.Catalog,
-    stats: ?*store_mod.Stats = null,
+    stats: *store_mod.Stats,
     /// The fill's one edge instant (see probeSlots): fresh answers are put
     /// into the have cache stamped with the same sample the cache-hit
     /// decisions ran on, so every TTL entry this fill writes is a pure
@@ -1479,7 +1479,7 @@ fn probeWorker(ctx: *ProbeCtx) void {
                     ctx.slots[gi] = false;
                     break;
                 }
-                if (ctx.stats) |s| _ = s.probe_err.fetchAdd(1, .monotonic);
+                _ = ctx.stats.probe_err.fetchAdd(1, .monotonic);
                 // Edge-triggered like the origin-outage journal: the first
                 // failure since the peer answered names address and error
                 // class, later ones ride the counter, and a success below
@@ -1492,7 +1492,7 @@ fn probeWorker(ctx: *ProbeCtx) void {
             };
             defer ctx.gpa.free(rep.bits);
             if (rep.piece_size != 0 and rep.piece_size != ctx.local_piece_size) {
-                if (ctx.stats) |s| _ = s.probe_err.fetchAdd(1, .monotonic);
+                _ = ctx.stats.probe_err.fetchAdd(1, .monotonic);
                 if (ctx.cat.noteProbeDown(p.ip, p.port))
                     std.log.warn("peer {s}:{d} /have grid mismatch for {s}: {d}, expected {d}; trying next path", .{ p.ip, p.port, ctx.rel, rep.piece_size, ctx.local_piece_size });
                 continue;
@@ -1522,7 +1522,7 @@ fn probeSlots(
     paths: []const discover.Path,
     groups: []const []const usize,
     slots: []?bool,
-    stats: ?*store_mod.Stats,
+    stats: *store_mod.Stats,
 ) !void {
     var todo: std.ArrayList(usize) = .empty;
     defer todo.deinit(gpa);
@@ -1642,7 +1642,7 @@ fn groupPathsByPeerId(gpa: std.mem.Allocator, paths: []const discover.Path) ![][
 /// node's grid; a peer whose advertised grid differs answers unusable bits,
 /// so its candidates are marked !have rather than routing fills by them.
 /// Caller frees the returned slice with gpa.
-fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32, local_piece_size: u32, stats: ?*store_mod.Stats) ![]discover.PathCand {
+fn probeCandidates(gpa: std.mem.Allocator, psk: []const u8, cat: *discover.Catalog, rel: []const u8, idx: u32, local_piece_size: u32, stats: *store_mod.Stats) ![]discover.PathCand {
     const paths = try cat.snapshot(gpa);
     defer discover.Catalog.freeSnapshot(gpa, paths);
 
@@ -1708,7 +1708,7 @@ fn fetchFromCands(
     piece_size: u32,
     out: []u8,
     cands: []discover.PathCand,
-    stats: ?*store_mod.Stats,
+    stats: *store_mod.Stats,
 ) !void {
     var remaining = cands;
     while (discover.pickBest(remaining)) |bi| {
@@ -1735,7 +1735,7 @@ fn fetchFromCands(
             // a warn per piece.
             if (cat.noteFetchDown(win.ip, win.port))
                 std.log.warn("piece fetch failed on {s}:{d} for {s} piece {d}: {t}", .{ win.ip, win.port, rel, idx, err });
-            if (stats) |s| _ = s.fill_err_peer.fetchAdd(1, .monotonic);
+            _ = stats.fill_err_peer.fetchAdd(1, .monotonic);
             _ = cat.inflight(win.ip, win.port, -1);
             remaining[bi].have = false;
             continue;
@@ -1779,7 +1779,7 @@ pub fn fillFromPeers(
     idx: u32,
     piece_size: u32,
     out: []u8,
-    stats: ?*store_mod.Stats,
+    stats: *store_mod.Stats,
 ) !void {
     // Sequential fills of one file spend the 2s TTL here after the first
     // piece: every live peer already has a cache line (hit or healthy 404),
@@ -1807,7 +1807,7 @@ pub fn fillFromPeers(
                 return fetchFromCands(gpa, psk, cat, rel, idx, piece_size, out, cached, stats);
             }
             const cands = probeCandidates(gpa, psk, cat, rel, idx, piece_size, stats) catch |err| {
-                if (stats) |s| _ = s.fill_err_peer.fetchAdd(1, .monotonic);
+                _ = stats.fill_err_peer.fetchAdd(1, .monotonic);
                 return err;
             };
             defer {
