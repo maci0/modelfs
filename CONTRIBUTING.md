@@ -194,7 +194,11 @@ the CycloneDX record and `python3 scripts/sbom.py --check` holds the tree to it:
   inventory records the digest as a hash and refuses a moving tag.
 * Zig's `minimum_zig_version` and a refresh of the vendored arm64 libfuse3
   `.deb`s (which also regenerates `.deps/fuse3-arm64/SHA256SUMS`) go through
-  the same `--write`.
+  the same `--write`. The version names a download, so
+  `ZIG_TARBALL_SHA256` in `scripts/lib.sh` records the sha256 of the
+  `zig-x86_64-linux` tarball for that version and is the `zig` component's
+  hash; bump it with `minimum_zig_version`. The inventory refuses a
+  constant that is not 64 lowercase hex characters.
 * The vendored static libfuse3 source under `.deps/libfuse3-<version>/` is a
   required component: the release binaries compile it in, so its
   `SHA256SUMS` digests are in the record and a file the sums do not list

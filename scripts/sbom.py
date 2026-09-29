@@ -4,7 +4,8 @@
 Reads requirements-dev.txt, requirements-dev.lock.txt,
 .deps/fuse3-arm64/SHA256SUMS, the vendored libfuse3 static source's
 SHA256SUMS, the SHA-pinned `uses:` in .github/workflows and
-.github/actions, and build.zig.zon.
+.github/actions, the ZIG_TARBALL_SHA256 toolchain pin in scripts/lib.sh,
+and build.zig.zon.
 No network. Stdlib only.
 """
 
@@ -57,6 +58,12 @@ _ACTION = re.compile(
 )
 _LOCK_REL = "requirements-dev.lock.txt"
 _BOUNDS_REL = "requirements-dev.txt"
+_LIB_REL = "scripts/lib.sh"
+# The compiler artifact's digest, defined once beside the scripts that
+# verify the download. Line-anchored and exactly 64 hex chars, so a
+# truncated or reflowed constant fails generation instead of emitting a
+# hash no consumer can match.
+_ZIG_TARBALL = re.compile(r'^ZIG_TARBALL_SHA256="([0-9a-f]{64})"$', re.MULTILINE)
 # The static-build input: libfuse3 source vendored under .deps/, whose
 # SHA256SUMS covers every file (README.md in that directory says so).
 _DEPS_DIR = ".deps"
@@ -134,6 +141,23 @@ def zon_string(text: str, field: str) -> str:
         if name == field:
             return match.group(2)
     sys.exit(f"no .{field} in build.zig.zon")
+
+
+def zig_tarball_sha256(root: Path) -> str:
+    """The digest pinning the Zig tarball the tree builds with.
+
+    minimum_zig_version names a version, not the bytes behind it. This is
+    the recorded digest of the official tarball, so the zig component
+    carries an integrity value like every other one in the inventory.
+    """
+    text = (root / _LIB_REL).read_text(encoding="utf-8")
+    match = _ZIG_TARBALL.search(text)
+    if match is None:
+        sys.exit(f"no ZIG_TARBALL_SHA256 in {_LIB_REL}")
+    # Same shape as zon_string: typeshed types a pattern's group() as
+    # `str | Any`, so the capture is named before it is returned.
+    digest: str = match.group(1)
+    return digest
 
 
 def _pep503(name: str) -> str:
@@ -488,6 +512,7 @@ def build_bom(root: Path) -> dict[str, object]:
             "name": "zig",
             "version": min_zig,
             "purl": f"pkg:github/ziglang/zig@{min_zig}",
+            "hashes": hashes_cdx([zig_tarball_sha256(root)]),
             "licenses": licenses_cdx("zig", required=True),
             "scope": "excluded",
         }
@@ -597,6 +622,28 @@ def _self_test_zon() -> None:
         lambda: zon_string('.{\n    .version = "0.1.0",\n}\n', "minimum_zig_version"),
         "no .minimum_zig_version",
     )
+
+
+def _self_test_zig_tarball(root: Path) -> None:
+    digest = "d" * _SHA256_HEX_LEN
+    scratch = root / ".scratch"
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch) as tmp:
+        scripts_dir = Path(tmp) / "scripts"
+        scripts_dir.mkdir()
+        text = scripts_dir / "lib.sh"
+        text.write_text(f'ZIG_TARBALL_SHA256="{digest}"\n', encoding="utf-8")
+        if zig_tarball_sha256(Path(tmp)) != digest:
+            sys.exit("self-test failed: zig_tarball_sha256")
+        for bad in (
+            f'ZIG_TARBALL_SHA256="{digest[:-1]}"\n',
+            f'ZIG_TARBALL_SHA256="{digest.upper()}"\n',
+            f'  ZIG_TARBALL_SHA256="{digest}"\n',
+            f'ZIG_TARBALL_SHA256 = "{digest}"\n',
+            "# no constant here\n",
+        ):
+            text.write_text(bad, encoding="utf-8")
+            _must_exit(lambda: zig_tarball_sha256(Path(tmp)), "no ZIG_TARBALL_SHA256")
 
 
 def _self_test_sums() -> None:
@@ -775,6 +822,9 @@ def _self_test_bom_pins(root: Path, wanted: set[str]) -> None:
         sys.exit("self-test failed: BOM missing zig from minimum_zig_version")
     if "licenses" not in zig:
         sys.exit("self-test failed: zig component has no licenses")
+    tarball = zig_tarball_sha256(root)
+    if zig.get("hashes") != hashes_cdx([tarball]):
+        sys.exit("self-test failed: zig component does not carry ZIG_TARBALL_SHA256")
     vendored = by_name.get(_VENDORED_NAME)
     versions = {src.version for src in vendored_sources(root)}
     if vendored is None or vendored.get("version") not in versions:
@@ -811,6 +861,7 @@ def self_test(root: Path) -> None:
     _self_test_lock()
     _self_test_bounds()
     _self_test_zon()
+    _self_test_zig_tarball(root)
     _self_test_sums()
     _self_test_vendored(root)
     _self_test_actions()
@@ -838,13 +889,15 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help=(
             "exit 1 if sbom.cdx.json does not match the lock, SHA256SUMS, "
-            "vendored source, and workflows"
+            "vendored source, workflows, and the Zig toolchain pin"
         ),
     )
     mode.add_argument(
         "--self-test",
         action="store_true",
-        help="run parser tests (lock, bounds, workflow pins, SPDX); no file write",
+        help=(
+            "run parser tests (lock, bounds, workflow pins, SPDX, toolchain pin); no file write"
+        ),
     )
     args = parser.parse_args(argv[1:], namespace=_Args())
     root = project_root()
@@ -867,7 +920,10 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"ok: {path} matches lock, SHA256SUMS, vendored source, and workflows")
+    print(
+        f"ok: {path} matches lock, SHA256SUMS, vendored source, workflows, "
+        "and the Zig toolchain pin"
+    )
     return 0
 
 

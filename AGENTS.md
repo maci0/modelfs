@@ -131,5 +131,11 @@ Suites outside the gate (most need hardware CI lacks):
   source of truth including in CI, and `build.zig` rejects a mismatch too.
 - **Docs point at symbols, not line numbers.** Line references rot within a
   commit or two; name the function and the file.
+- **A dependency's artifact is pinned, not just its version.**
+  `ZIG_TARBALL_SHA256` in `scripts/lib.sh` carries the digest of the Zig
+  tarball `minimum_zig_version` names, `scripts/sbom.py` emits it as the
+  `zig` component's hash, and `run_vm_cluster_e2e.sh` verifies its download
+  with it. A version bump without a digest bump fails the inventory, not
+  the suite that happens to notice first.
 - **One rule file.** `CLAUDE.md` stays a symlink pointer to this file rather
   than a copy; edit rules here, never by replacing the pointer.

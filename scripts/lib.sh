@@ -111,6 +111,16 @@ cross_aarch64_flags() {
     )
 }
 
+# sha256 of the official zig-x86_64-linux tarball for the
+# minimum_zig_version in build.zig.zon. A version names a download, not the
+# bytes behind it, so the toolchain artifact is pinned by digest and the pin
+# is bumped together with minimum_zig_version. run_vm_cluster_e2e.sh
+# verifies the tarball it fetches with it; scripts/sbom.py carries it as the
+# zig component's hash, so an inventory consumer sees which compiler bytes
+# this tree builds with.
+# shellcheck disable=SC2034 # read by run_vm_cluster_e2e.sh and scripts/sbom.py
+ZIG_TARBALL_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+
 # Named preflight for scripts that invoke `zig build`: a missing toolchain
 # otherwise dies as bash "command not found" with no pointer at setup.
 require_zig() {

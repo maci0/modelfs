@@ -258,15 +258,14 @@ echo "=== building modelfs inside the NFS VM (matches Ubuntu 24.04 fuse3) ==="
 # zig at minimum_zig_version (sha256-verified), ReleaseFast.
 zig_ver="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
 [[ -n "${zig_ver}" ]] || fail "cannot read minimum_zig_version from build.zig.zon"
-# sha256 of the official x86_64-linux tarball for that version; bump with
-# minimum_zig_version. A version bump that leaves this digest in place
-# fails sha256sum -c instead of running an unverified compiler.
-zig_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+# The tarball digest is ZIG_TARBALL_SHA256 from lib.sh, beside the preflight
+# that pins the version. A version bump that leaves it in place fails
+# sha256sum -c instead of running an unverified compiler.
 (
     cd "${ROOT_DIR}"
     git ls-files -z | tar --null --ignore-failed-read -T - -czf -
 ) | ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "mkdir -p /home/ubuntu/src && tar xzf - -C /home/ubuntu/src"
-zig_cmd="test -x /home/ubuntu/zig/zig || { mkdir -p /home/ubuntu/zig && curl -fSL -o /home/ubuntu/zig/zig.tar.xz https://ziglang.org/download/${zig_ver}/zig-x86_64-linux-${zig_ver}.tar.xz && echo '${zig_sha256}  /home/ubuntu/zig/zig.tar.xz' | sha256sum -c - && tar -xJ --strip-components=1 -f /home/ubuntu/zig/zig.tar.xz -C /home/ubuntu/zig && rm /home/ubuntu/zig/zig.tar.xz; }"
+zig_cmd="test -x /home/ubuntu/zig/zig || { mkdir -p /home/ubuntu/zig && curl -fSL -o /home/ubuntu/zig/zig.tar.xz https://ziglang.org/download/${zig_ver}/zig-x86_64-linux-${zig_ver}.tar.xz && echo '${ZIG_TARBALL_SHA256}  /home/ubuntu/zig/zig.tar.xz' | sha256sum -c - && tar -xJ --strip-components=1 -f /home/ubuntu/zig/zig.tar.xz -C /home/ubuntu/zig && rm /home/ubuntu/zig/zig.tar.xz; }"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${zig_cmd}"; then
     echo "Error: could not fetch zig ${zig_ver} into the NFS VM" >&2
     exit 1
