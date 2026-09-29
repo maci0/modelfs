@@ -121,7 +121,7 @@ so the FUSE connection, the open handles, and the mount knobs (origin, cache, id
 size, water marks, listen port, advertise, seeds, and the PSK) carry over on a sealed
 memfd. Nothing is remounted and no cache is dropped.
 
-Two consequences to plan for before running it on a fleet:
+Three consequences to plan for before running it on a fleet:
 
 * The knobs are validated **after** the exec, not before. An inherited value the new
   binary refuses, a `--piece` that no longer aligns to the cache filesystem's block size
@@ -133,6 +133,13 @@ Two consequences to plan for before running it on a fleet:
   older image into a newer binary is therefore supported in one step; a blob the new
   binary cannot parse, or one naming a different mountpoint, aborts the handover with a
   named line on stderr.
+* `<cache>/update.req` must be owned by the uid that runs the daemon, or by root. The
+  request is what tells the daemon to exec a binary, and it carries the live session,
+  the peer sockets, and the PSK, so any other local uid that can write the cache root
+  is refused. Run `modelfs update` as the daemon's user, or with `sudo` against a
+  root-started daemon, and keep the cache root at `0700`. A refused request writes no
+  ack, so the CLI reports a 30 s timeout and the reason is the one
+  `handover: <cache>/update.req is owned by uid ...` line in the daemon's log.
 
 Per-release breaking changes and the knob each one moved are in
 [CHANGELOG.md](../CHANGELOG.md) under `### Upgrade from <version>`; read those for the

@@ -98,6 +98,26 @@ expect_release_tag "0.19.0-is-not-the-tag" 1
 expect_release_tag "v${zon_pin}-rc1" 1
 expect_release_tag "release-${zon_pin}" 1
 
+# The release's notes are the CHANGELOG.md section the tag named, and the
+# publish step is the only consumer. An extraction that ran past its own
+# section, or matched none, published notes nothing else checked.
+notes_body="$("${SCRIPTS_DIR}/release_notes.sh" "${zon_pin}")"
+[[ "${notes_body}" == *"- "* ]] || fail "release_notes.sh ${zon_pin} printed no entry: ${notes_body}"
+[[ "${notes_body}" != *"## ["* ]] || fail "release_notes.sh ${zon_pin} ran past its own section: ${notes_body}"
+# The next heading down is another version's, and its first entry line must
+# not be in this version's notes.
+next_heading="$(awk -v pin="## [${zon_pin}] - " 'index($0, pin) == 1 { found = 1; next } found && /^## \[/ { print; exit }' CHANGELOG.md)"
+next_ver="${next_heading#\#\# \[}"
+next_ver="${next_ver%%\]*}"
+[[ "${next_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "cannot read the version after ${zon_pin}: ${next_heading}"
+next_entry="$(sed -n "/^## \[${next_ver}\] - /,/^## /p" CHANGELOG.md | grep -m1 '^- ')"
+[[ -n "${next_entry}" ]] || fail "${next_ver} has no entry line to keep out of ${zon_pin}'s notes"
+[[ "${notes_body}" != *"${next_entry}"* ]] || fail "release_notes.sh ${zon_pin} includes ${next_ver}'s entry"
+notes_rc=0
+notes_out="$("${SCRIPTS_DIR}/release_notes.sh" "${zon_pin}-is-not-a-version" 2>&1)" || notes_rc=$?
+[[ "${notes_rc}" -ne 0 ]] || fail "release_notes.sh accepted ${zon_pin}-is-not-a-version"
+[[ "${notes_out}" == *"${zon_pin}-is-not-a-version"* ]] || fail "release_notes.sh omitted the version it could not find: ${notes_out}"
+
 expect_fuse_helper() {
     local helper="$1" output rc=0 bin
     mkdir -p "${SCRATCH_DIR}"
