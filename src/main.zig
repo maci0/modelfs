@@ -1921,6 +1921,22 @@ fn cmdReload(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     return 1;
 }
 
+/// What one failed `update_mod.fetchUrl` call reports. The three answers
+/// an operator can act on are named: a 404 is a repository the API will
+/// not show, a 401 or 403 is a credential it would not take, and a 429 is
+/// the rate limit. Everything else is the reachability failure the message
+/// used to claim for all of them.
+fn updateFetchHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.HttpNotFound => "GitHub has no such repository, or it is private",
+        error.HttpDenied => "GitHub refused the request; check GITHUB_TOKEN",
+        error.HttpRateLimited => "GitHub rate-limited this host; retry later",
+        error.HttpStatus => "the GitHub API answered an error status",
+        error.BodyTooLarge => "the answer was past the read cap",
+        else => "could not reach GitHub",
+    };
+}
+
 fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.Environ.Map, opts: Opts) !u8 {
     if (opts.update_reload or (builtin.is_test and !opts.update_check and opts.update_repo == null)) {
         return cmdReload(io, gpa, opts);
@@ -1934,11 +1950,18 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.En
         return 2;
     };
 
-    var bearer_buf: [4096]u8 = undefined;
-    const bearer = update_mod.githubBearer(&bearer_buf, environ);
+    var bearer_buf: [update_mod.max_token_bytes + "Bearer ".len]u8 = undefined;
+    const bearer = update_mod.githubBearer(&bearer_buf, environ) catch |err| {
+        switch (err) {
+            error.TokenTooLarge => printErr("error: {s} exceeds {d} bytes\n", .{ update_mod.token_env, update_mod.max_token_bytes }),
+            error.TokenNotHeaderSafe => printErr("error: {s} holds a line break\n", .{update_mod.token_env}),
+            error.NameTooLong => printErr("error: {s} does not fit the request head\n", .{update_mod.token_env}),
+        }
+        return 1;
+    };
 
     const rel_json = update_mod.fetchUrl(io, gpa, api, bearer, update_mod.max_json_bytes) catch |err| {
-        printErr("error: could not reach GitHub ({s})\n", .{@errorName(err)});
+        printErr("error: {s} ({s})\n", .{ updateFetchHint(err), repo });
         return 1;
     };
     defer gpa.free(rel_json);
@@ -1996,13 +2019,13 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.En
     }
 
     const sums_bytes = update_mod.fetchUrl(io, gpa, s_url, bearer, update_mod.max_sums_bytes) catch |err| {
-        printErr("error: could not download the checksum sidecar ({s}); the binary was not replaced\n", .{@errorName(err)});
+        printErr("error: could not download the checksum sidecar: {s}; the binary was not replaced\n", .{updateFetchHint(err)});
         return 1;
     };
     defer gpa.free(sums_bytes);
 
     const asset_bytes = update_mod.fetchUrl(io, gpa, a_url, bearer, update_mod.max_asset_bytes) catch |err| {
-        printErr("error: could not download {s} ({s}); the binary was not replaced\n", .{ target_asset, @errorName(err) });
+        printErr("error: could not download {s}: {s}; the binary was not replaced\n", .{ target_asset, updateFetchHint(err) });
         return 1;
     };
     defer gpa.free(asset_bytes);
@@ -5031,6 +5054,19 @@ test "cmdUpdate rejects invalid repo format" {
     });
     try std.testing.expectEqual(@as(u8, 2), code);
     try std.testing.expect(std.mem.find(u8, err.items, "want owner/repo") != null);
+}
+
+test "updateFetchHint tells the actionable refusals apart" {
+    // The point of the split: a report that named every refusal the same
+    // way is a report an operator cannot act on.
+    try std.testing.expect(!std.mem.eql(u8, updateFetchHint(error.HttpNotFound), updateFetchHint(error.HttpDenied)));
+    try std.testing.expect(!std.mem.eql(u8, updateFetchHint(error.HttpDenied), updateFetchHint(error.HttpRateLimited)));
+    try std.testing.expect(!std.mem.eql(u8, updateFetchHint(error.HttpRateLimited), updateFetchHint(error.HttpStatus)));
+    // The unnamed failures keep the reachability wording, and the two that
+    // can be fixed by a token name it.
+    try std.testing.expectEqualStrings("could not reach GitHub", updateFetchHint(error.NetworkError));
+    try std.testing.expect(std.mem.indexOf(u8, updateFetchHint(error.HttpDenied), "GITHUB_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updateFetchHint(error.HttpNotFound), "private") != null);
 }
 
 test "parseArgs scopes the pull flags to pull and defaults the revision" {

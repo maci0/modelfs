@@ -795,6 +795,22 @@ Two things make that possible:
 
 `modelfs update` checks GitHub Releases (`update.default_repo` or `--repo`), verifies the platform asset against `SHA256SUMS`, and atomically replaces `/proc/self/exe`. With `--check`, it reports whether an update is available without installing. With `--reload`, it skips the release check and directly triggers the daemon process-image handover below. When an update replaces the binary on a system running a live mount, it automatically proceeds to the process-image handover so the live daemon adopts the new binary without dropping the mount.
 
+The only credential it takes is `GITHUB_TOKEN`, from the environment and nowhere else: there is
+no token flag and no token file, because argv is world-readable and the value rides the
+request as a privileged header (`githubBearer` src/update.zig). It is trimmed like every
+other secret, an empty one is no token, and a value over 4096 bytes or one holding an interior
+CR or LF is refused with the name and the cap rather than dropped, so an operator who set one
+is never answered as an anonymous caller. Unset, every request is
+anonymous and GitHub's unauthenticated rate limit applies, which is the usual reason a fleet
+of hosts behind one address starts seeing refusals. The release list, the checksum sidecar,
+and the asset are fetched through one request builder, and each answer is classified before it
+reaches the report: a 404 (no such repository, or one the API will not show an anonymous
+caller), a 401 or 403 (a credential the API would not take), and a 429 are named as
+themselves, and only the rest report as an unreachable endpoint (`statusError` src/update.zig,
+`updateFetchHint` src/main.zig). Whatever the token carries is the GitHub account's, and the
+only API it reaches is the release list and the two release assets; `--reload` makes no
+request at all and needs no token.
+
 ```mermaid
 sequenceDiagram
     participant CLI as modelfs update

@@ -249,15 +249,45 @@ pub fn assetUrl(rel: Release, name: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn githubBearer(buf: []u8, environ: ?*const std.process.Environ.Map) ?[]const u8 {
+/// Cap on a `GITHUB_TOKEN`, the same bound `pull` holds a Hugging Face
+/// token to (`hf.max_token_bytes`). The value is one header on one
+/// request, so a longer one is a wrong value to name rather than a
+/// credential to send.
+pub const max_token_bytes: usize = 4096;
+
+/// The `Bearer` header for `GITHUB_TOKEN`, or null when the operator set
+/// none (`pull`'s token loader draws the same line for a missing,
+/// whitespace-only, or empty value). A value the request cannot carry is
+/// an error, not a null: an oversized token silently became no token, and
+/// the operator then read the anonymous rate limit the API answered with
+/// as the endpoint being unreachable. Interior CR or LF would end the
+/// header early, so that is refused rather than trimmed away.
+pub fn githubBearer(buf: []u8, environ: ?*const std.process.Environ.Map) error{ TokenTooLarge, TokenNotHeaderSafe, NameTooLong }!?[]const u8 {
     const map = environ orelse return null;
     const raw = map.get(token_env) orelse return null;
     const tok = std.mem.trim(u8, raw, " \t\r\n");
     if (tok.len == 0) return null;
     for (tok) |ch| {
-        if (ch == '\r' or ch == '\n') return null;
+        if (ch == '\r' or ch == '\n') return error.TokenNotHeaderSafe;
     }
-    return std.fmt.bufPrint(buf, "Bearer {s}", .{tok}) catch null;
+    if (tok.len > max_token_bytes) return error.TokenTooLarge;
+    return std.fmt.bufPrint(buf, "Bearer {s}", .{tok}) catch error.NameTooLong;
+}
+
+/// The failure one non-200 GitHub answer becomes. 401 and 403 are a
+/// credential the API would not take, 404 is a repository it does not
+/// publish (or will not show an anonymous caller), and 429 is the
+/// documented rate-limit answer; the three are what an operator can act
+/// on, so they are named rather than collapsed into one status error the
+/// way every other non-200 would be. Same split `pull` makes of a
+/// Hugging Face listing (src/hf.zig).
+pub fn statusError(status: std.http.Status) error{ HttpDenied, HttpNotFound, HttpRateLimited, HttpStatus } {
+    return switch (status) {
+        .unauthorized, .forbidden => error.HttpDenied,
+        .not_found => error.HttpNotFound,
+        .too_many_requests => error.HttpRateLimited,
+        else => error.HttpStatus,
+    };
 }
 
 pub fn fetchUrl(
@@ -296,7 +326,7 @@ pub fn fetchUrl(
     };
 
     if (res.status != .ok) {
-        return error.HttpStatus;
+        return statusError(res.status);
     }
     const written = writer.end;
     const out = try gpa.alloc(u8, written);
@@ -498,6 +528,44 @@ test "parseRelease extracts metadata and assets from json" {
         assetUrl(rel, "SHA256SUMS").?,
     );
     try std.testing.expect(assetUrl(rel, "missing") == null);
+}
+
+test "githubBearer names a token the request cannot carry" {
+    const gpa = std.testing.allocator;
+    var environ = std.process.Environ.Map.init(gpa);
+    defer environ.deinit();
+    var buf: [max_token_bytes + "Bearer ".len]u8 = undefined;
+
+    try std.testing.expect((try githubBearer(&buf, null)) == null);
+    try std.testing.expect((try githubBearer(&buf, &environ)) == null);
+    try environ.put(token_env, "  \t\r\n");
+    try std.testing.expect((try githubBearer(&buf, &environ)) == null);
+
+    try environ.put(token_env, "  ghp_example  ");
+    try std.testing.expectEqualStrings("Bearer ghp_example", (try githubBearer(&buf, &environ)).?);
+
+    // The two shapes that used to read as no token at all: the operator
+    // set a value and the request could not carry it.
+    try environ.put(token_env, "x" ** (max_token_bytes + 1));
+    try std.testing.expectError(error.TokenTooLarge, githubBearer(&buf, &environ));
+    try environ.put(token_env, "ghp_line\nbreak");
+    try std.testing.expectError(error.TokenNotHeaderSafe, githubBearer(&buf, &environ));
+
+    // The maximum the cap admits still forms its header whole.
+    try environ.put(token_env, "x" ** max_token_bytes);
+    try std.testing.expectEqualStrings("Bearer " ++ "x" ** max_token_bytes, (try githubBearer(&buf, &environ)).?);
+}
+
+test "statusError names the refusals an operator can act on" {
+    try std.testing.expectEqual(error.HttpDenied, statusError(.unauthorized));
+    try std.testing.expectEqual(error.HttpDenied, statusError(.forbidden));
+    try std.testing.expectEqual(error.HttpNotFound, statusError(.not_found));
+    try std.testing.expectEqual(error.HttpRateLimited, statusError(.too_many_requests));
+    // A 200 never reaches the mapping, and every other refusal stays the
+    // one unclassified status rather than borrowing another's name.
+    try std.testing.expectEqual(error.HttpStatus, statusError(.internal_server_error));
+    try std.testing.expectEqual(error.HttpStatus, statusError(.not_implemented));
+    try std.testing.expectEqual(error.HttpStatus, statusError(.bad_gateway));
 }
 
 test "replaceVerifiedPath atomically installs binary with 0755 permissions" {

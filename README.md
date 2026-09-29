@@ -109,6 +109,7 @@ Secrets never take a flag, because argv is world-readable through `/proc`:
 | :--- | :--- |
 | cluster PSK | `--psk FILE` (default `/etc/modelfs.psk`, mode 0600), `MODELFS_PSK`, or `MODELFS_PSK_VALUE` for the inline form |
 | Hugging Face token | `HF_TOKEN`, then `$HF_HOME/token`, then `~/.cache/huggingface/token` |
+| GitHub token | `GITHUB_TOKEN`, for `modelfs update` only; unset means an unauthenticated, rate-limited request |
 
 `MODELFS_ORIGIN`, `MODELFS_CACHE`, `MODELFS_PSK`, `MODELFS_ID`, and `MODELFS_LOG` set the same
 values as their flags; an explicit flag wins, values are whitespace-trimmed, and an empty one
