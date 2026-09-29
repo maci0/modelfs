@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-29
+
 Three of the entries below change what a command does for an existing
 deployment: `modelfs update` refuses a request file the daemon's own uid did not
 write, `pin`/`unpin`/`verify`/`dupes` refuse the bare mountpoint, and
@@ -1419,7 +1421,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/maci0/modelfs/releases/tag/v0.20.0
 [0.19.0]: https://github.com/maci0/modelfs/releases/tag/v0.19.0
 [0.18.0]: https://github.com/maci0/modelfs/releases/tag/v0.18.0
 [0.17.0]: https://github.com/maci0/modelfs/releases/tag/v0.17.0
