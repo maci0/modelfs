@@ -594,7 +594,6 @@ pub const Store = struct {
             // drain wait gave up on. Destroying them would hand those threads
             // freed memory; leaking them is bounded by the stuck-handler cap
             // and strictly safer.
-            // cordis-boundary: stuck handler refs outside restore; compensate by leaking entry until process exit.
             if (f.refs.load(.acquire) != 0) {
                 std.log.warn("store shutdown: {s} still referenced; leaking entry", .{f.rel});
                 continue;

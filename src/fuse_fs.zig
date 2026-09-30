@@ -176,7 +176,6 @@ pub const State = struct {
             // thread freed memory the moment its current syscall unwinds.
             // Leak the whole tree instead, mirroring Store.deinit's
             // stuck-handler policy; process exit reclaims it.
-            // cordis-boundary: stuck peer handler is outside restore; compensate by leaking State until process exit.
             std.log.warn("shutdown: peer handler still inflight after drain; leaking mount state", .{});
             return;
         }
