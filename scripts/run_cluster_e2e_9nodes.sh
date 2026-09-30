@@ -126,7 +126,7 @@ echo "=== Step 5: multi-peer piece exchange ==="
 # and does not fill, so listing leases plus probing empty bitmaps used to
 # count as exchange.
 for i in $(seq 1 "${NUM_NODES}"); do
-    "${MODELFS_BIN}" pin "${TEST_FILE}" --cache "${TEMP_DIR}/node_${i}_cache"
+    "${MODELFS_BIN}" pin "${TEST_FILE}" --origin "${ORIGIN_DIR}" --cache "${TEMP_DIR}/node_${i}_cache"
 done
 # Node 1 fills from origin; node 2 should then take pieces from node 1.
 # Remaining mounts read the same file so every node the verifier asks has

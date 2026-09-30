@@ -48,8 +48,8 @@ const usage =
     \\  modelfs mount <dir> --origin PATH [options]
     \\  modelfs status [--cache PATH]
     \\  modelfs peers --origin PATH
-    \\  modelfs pin <relpath> [--cache PATH]
-    \\  modelfs unpin <relpath> [--cache PATH]
+    \\  modelfs pin <relpath> --origin PATH [--cache PATH]
+    \\  modelfs unpin <relpath> --origin PATH [--cache PATH]
     \\  modelfs verify <relpath> --origin PATH [--cache PATH]
     \\  modelfs dupes <relpath>... --origin PATH
     \\  modelfs dupes --all --origin PATH
@@ -132,7 +132,7 @@ const usage =
     \\Examples:
     \\  modelfs mount /models --origin /net/192.168.0.100/models
     \\  modelfs status | jq -r .id
-    \\  modelfs pin gguf/foo.gguf
+    \\  modelfs pin gguf/foo.gguf --origin /net/192.168.0.100/models
     \\  modelfs verify gguf/foo.gguf --origin /net/192.168.0.100/models
     \\  modelfs dupes gguf/a.gguf gguf/b.gguf --origin /net/192.168.0.100/models
     \\  modelfs dupes --all --origin /net/192.168.0.100/models
@@ -2565,12 +2565,25 @@ fn refuseCliRel(cmd: []const u8, rel: []const u8) bool {
 }
 
 fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: bool) !u8 {
+    // The origin names the mount the relpath is relative to, so a pin
+    // written without one is a pin in no mount: the empty string reached
+    // Store.init below, the pin file landed under the default cache, and
+    // the operator read "pinned" for a file the live mount still culls.
+    // Same named refusal pull/peers/verify/dupes give, and the same
+    // MODELFS_ORIGIN answer, before any cache dir is created.
+    if (opts.origin == null) {
+        // printErr, not std.debug.print: the refusal belongs on stderr, and
+        // under test the captured stderr is where a test reads it. Exit 2,
+        // the usage code, like every other missing-operand refusal.
+        printErr("{s} needs --origin (or MODELFS_ORIGIN)\n", .{if (on) "pin" else "unpin"});
+        return 2;
+    }
     const rel = mountRel(path);
     // Gate before ensureLayout so a refused path cannot create cache dirs.
     if (refuseCliRel(if (on) "pin" else "unpin", rel)) return 1;
     // Same process Io the daemon and cmdDupes use: Store recency and mutex
     // waits stay on the injected clock, not a second Threaded wall clock.
-    var store = store_mod.Store.init(gpa, io, opts.origin orelse "", opts.cache, opts.piece);
+    var store = store_mod.Store.init(gpa, io, opts.origin.?, opts.cache, opts.piece);
     defer store.deinit();
     // Same operator trace as cmdMount's mount-time layout check: the errno
     // distinguishes EACCES from ENOSPC, which the remediation differs for.
@@ -3887,6 +3900,10 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     var cb: [128]u8 = undefined;
     const cache_d = try sys.scratchDir(&cb, "modelfs-pin");
     defer sys.deleteTree(std.testing.io, cache_d);
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-pin-origin");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const opts = Opts{ .origin = origin_d, .cache = cache_d };
 
     var zb: [192]u8 = undefined;
     var pbuf: [192]u8 = undefined;
@@ -3896,28 +3913,28 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
     // artifact lands at cache/pin/<rel>, exactly where punchPiece and
     // reapIdle consult it. This roundtrip is what makes an operator's pin
     // actually protect a file from culling.
-    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "/models/gguf/big.gguf", true));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, opts, "/models/gguf/big.gguf", true));
     var pin_buf: [192]u8 = undefined;
     const pin_fp = try std.fmt.bufPrint(&pin_buf, "{s}/pin/gguf/big.gguf", .{cache_d});
     try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf) == 0);
 
     // A ".." component would write outside cache/pin: refused with exit 1,
     // and nothing may be written for the escaped name.
-    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "../escape.bin", true));
+    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, opts, "../escape.bin", true));
     const escape_fp = try std.fmt.bufPrint(&pbuf, "{s}/pin/escape.bin", .{cache_d});
     try std.testing.expect(sys.statPath(try sys.toZ(&zb, escape_fp), &stbuf) != 0);
 
     // `/models/` is the mount-root prefix strip, not a pinable path: empty
     // after the convenience strip, same exit-1 refusal as an escape.
-    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "/models/", true));
+    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, opts, "/models/", true));
 
     // `.cluster` is the discovery control plane: FUSE and peer HTTP hide it,
     // so pin must not mark those names either. Prefix, not substring.
-    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, ".cluster/spark1.json", true));
-    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "/models/.cluster", true));
+    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, opts, ".cluster/spark1.json", true));
+    try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, opts, "/models/.cluster", true));
     const cluster_pin = try std.fmt.bufPrint(&pbuf, "{s}/pin/.cluster/spark1.json", .{cache_d});
     try std.testing.expect(sys.statPath(try sys.toZ(&zb, cluster_pin), &stbuf) != 0);
-    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, ".clusterfoo", true));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, opts, ".clusterfoo", true));
     const clusterfoo_pin = try std.fmt.bufPrint(&pbuf, "{s}/pin/.clusterfoo", .{cache_d});
     try std.testing.expect(sys.statPath(try sys.toZ(&zb, clusterfoo_pin), &stbuf) == 0);
 
@@ -3926,19 +3943,49 @@ test "cmdPin pins through the /models prefix, refuses escapes, and unpins" {
         var nb: [128]u8 = undefined;
         const cache2 = try sys.scratchDir(&nb, "modelfs-pin-refuse");
         defer sys.deleteTree(std.testing.io, cache2);
-        try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache2 }, "../escape.bin", true));
+        const opts2 = Opts{ .origin = origin_d, .cache = cache2 };
+        try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, opts2, "../escape.bin", true));
         const pin_dir = try std.fmt.bufPrint(&pbuf, "{s}/pin", .{cache2});
         try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_dir), &stbuf) != 0);
-        try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, .{ .cache = cache2 }, ".cluster/spark1.json", true));
+        try std.testing.expectEqual(@as(u8, 1), try cmdPin(std.testing.io, gpa, opts2, ".cluster/spark1.json", true));
         try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_dir), &stbuf) != 0);
     }
 
     // Unpin removes the artifact so the file becomes cullable again.
     try std.testing.expectEqual(@as(i32, 0), sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf));
-    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "gguf/big.gguf", false));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPin(std.testing.io, gpa, opts, "gguf/big.gguf", false));
     try std.testing.expectEqual(@as(i32, -sys.c.ENOENT), sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf));
     const remaining_pin = try std.fmt.bufPrint(&pbuf, "{s}/pin/.clusterfoo", .{cache_d});
     try std.testing.expectEqual(@as(i32, 0), sys.statPath(try sys.toZ(&zb, remaining_pin), &stbuf));
+}
+
+test "cmdPin refuses a missing origin instead of pinning into the default cache" {
+    const gpa = std.testing.allocator;
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-pin-noorigin");
+    defer sys.deleteTree(std.testing.io, cache_d);
+    var zb: [192]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    var stbuf: sys.c.struct_stat = undefined;
+
+    // A relpath is relative to the mount, so without an origin there is no
+    // mount to pin in: the pin file would land under the default cache and
+    // the operator would read "pinned" for a file the live mount still
+    // culls. Exit 2, the usage code, and nothing may be written into the
+    // cache either, the same "a refusal creates no layout" rule the path
+    // gates keep.
+    for ([_]bool{ true, false }) |on| {
+        var err: std.ArrayList(u8) = .empty;
+        defer err.deinit(gpa);
+        captured_stderr = &err;
+        defer captured_stderr = null;
+        try std.testing.expectEqual(@as(u8, 2), try cmdPin(std.testing.io, gpa, .{ .cache = cache_d }, "gguf/big.gguf", on));
+        try std.testing.expect(std.mem.find(u8, err.items, if (on) "pin needs --origin" else "unpin needs --origin") != null);
+    }
+    const pin_fp = try std.fmt.bufPrint(&pbuf, "{s}/pin/gguf/big.gguf", .{cache_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_fp), &stbuf) != 0);
+    const pin_dir = try std.fmt.bufPrint(&pbuf, "{s}/pin", .{cache_d});
+    try std.testing.expect(sys.statPath(try sys.toZ(&zb, pin_dir), &stbuf) != 0);
 }
 
 /// Block size of the filesystem holding a store's cache data directory. It
@@ -5242,6 +5289,11 @@ test "usage lists exclusive dupes forms and interpolates the default port" {
     try std.testing.expect(std.mem.find(u8, text, hf.token_env) != null);
     try std.testing.expect(std.mem.find(u8, text, "modelfs dupes <relpath>... --origin PATH") != null);
     try std.testing.expect(std.mem.find(u8, text, "modelfs dupes --all --origin PATH") != null);
+    // pin/unpin name the mount the relpath is relative to, and the command
+    // refuses without it, so the usage line has to say so: an example that
+    // omits --origin is how the pin-with-no-origin slip got shipped.
+    try std.testing.expect(std.mem.find(u8, text, "modelfs pin <relpath> --origin PATH") != null);
+    try std.testing.expect(std.mem.find(u8, text, "modelfs unpin <relpath> --origin PATH") != null);
     // Combined `[--all]` next to the path list implied `dupes a --all` was
     // legal; that combination is refused (exit 2).
     try std.testing.expect(std.mem.find(u8, text, "[--all]") == null);

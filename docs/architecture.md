@@ -870,6 +870,15 @@ the file form, so an EnvironmentFile newline cannot start a node that then 401s 
 `MODELFS_PSK_VALUE` also cannot be combined with `--psk` or `MODELFS_PSK` on mount, which would
 otherwise silently prefer the inline secret.
 
+### Required values
+
+`mount`, `peers`, `pull`, `verify`, `dupes`, and `pin`/`unpin` each name a mount the path is
+relative to, so each refuses a missing `--origin` with `needs --origin (or MODELFS_ORIGIN)` and
+exits 2 before it touches the origin or the cache. `pin`/`unpin` used to pass the absent origin
+to `Store.init` as `""`, which wrote a pin marker into whichever cache the default named and
+answered `pinned` for a file the live mount still culls: an operator who omitted `--origin` got
+a pin that protected nothing.
+
 Any other `MODELFS_*` name is refused as a typo'd knob on every command. That is why the harness
 and drill scripts keep their knobs outside this namespace (`MF_TEST_*`, `MF_DRILL_*`). The
 namespace is the `env_knobs` table in src/main.zig: `checkKnownEnv` refuses every name outside

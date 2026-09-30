@@ -70,8 +70,8 @@ while `.cluster` has no live lease.
 ```bash
 modelfs status                                    # liveness, peers, origin_down, lifetime counters
 modelfs peers --origin /net/192.168.0.100/models  # cluster leases, each marked live or expired
-modelfs pin gguf/foo.gguf                         # keep a file out of the cull
-modelfs unpin gguf/foo.gguf
+modelfs pin gguf/foo.gguf --origin /net/192.168.0.100/models   # keep a file out of the cull
+modelfs unpin gguf/foo.gguf --origin /net/192.168.0.100/models
 modelfs verify gguf/foo.gguf --origin ...         # rehash cached pieces, clear mismatches
 modelfs dupes gguf/a.gguf gguf/b.gguf --origin .. # how much do two files share?
 modelfs dupes --all --origin ...                  # whole-store duplicate scan
