@@ -57,8 +57,10 @@ sudo ./scripts/install_nas_backup.sh --install
 
 The installer does not start units. Files installed with `sudo` belong to
 `root:root`, not the checkout owner: wrappers use mode `0755`; units, the
-initial snapshot policy, and documentation use `0644`. Unprivileged
-`MF_NAS_DEST` previews belong to the installing user.
+initial snapshot policy, and documentation use `0644`; the directories it
+creates carry `0755` regardless of the invoking shell's umask, which `sudo`
+passes through unchanged. Unprivileged `MF_NAS_DEST` previews belong to the
+installing user.
 
 On the NAS, after `dnf install sanoid`:
 
@@ -137,8 +139,10 @@ until infinity. The ZFS units (`syncoid-models`, drill, snap-age, offsite-age) a
 `Requires=zfs-import.target`, so a failed pool import does not start a oneshot that can only
 fail. `notify-admin@.service` and the read-only age and log alarms are sandboxed
 (`ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`) but keep
-`/dev` visible: `/dev/log` for the notifier, `/dev/zfs` for the age checks. Syncoid does not set
-`ProtectHome=yes`, because its SSH key lives in `/root/.ssh`.
+`/dev` visible: `/dev/log` for the notifier, `/dev/zfs` for the age checks. `syncoid-models.service`
+carries the same set minus `ProtectHome=yes`, because its SSH key lives in `/root/.ssh`; it streams
+through the zfs ioctl and holds snapshots the same way, so it needs no filesystem write access at
+all and `/dev` stays visible only for `/dev/zfs`.
 
 ### Layer 3: offsite (covers site loss)
 

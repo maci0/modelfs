@@ -12,6 +12,12 @@ Type=oneshot
 # fast; the compare is not.
 TimeoutStartSec=infinity
 UMask=0077
+# The rest of the sandbox is deliberately absent on this one unit: zfs
+# clone and zfs destroy need CAP_SYS_ADMIN, so NoNewPrivileges=yes and
+# ProtectSystem= would fail the drill closed rather than sandbox it.
+# PrivateTmp=yes is free of that conflict -- the drill's scratch is
+# MF_DRILL_SCRATCH below, under /var/tmp, which PrivateTmp leaves alone.
+PrivateTmp=yes
 Environment=MF_DRILL_SCRATCH=/var/tmp/modelfs-drill
 Environment=MF_DRILL_LOG=/var/log/modelfs-drill.log
 Environment=MF_DRILL_DATASET=tank/models

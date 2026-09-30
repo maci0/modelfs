@@ -18,7 +18,16 @@ Type=oneshot
 # systemd defaults give Type=oneshot. infinity is explicit so a Rocky
 # host whose DefaultTimeoutStartSec is still 90 s cannot kill the recv.
 TimeoutStartSec=infinity
-# SSH keys live in /root/.ssh; do not set ProtectHome=yes.
+# Sandbox, minus the one knob this unit genuinely needs. ProtectHome=yes
+# is deliberately absent: the SSH key lives in /root/.ssh, and setting it
+# would fail the pull closed. Everything else applies: syncoid streams
+# through the zfs ioctl (no filesystem writes) and hold_monthlies.sh only
+# runs zfs commands, so ProtectSystem=strict costs nothing, PrivateTmp=yes
+# keeps scratch off a shared /tmp, and NoNewPrivileges=yes stops the ssh
+# and zfs helpers from gaining anything. /dev stays visible for /dev/zfs.
+ProtectSystem=strict
+PrivateTmp=yes
+NoNewPrivileges=yes
 Environment=MF_SYNCOID_SRC=nas:tank/models
 Environment=MF_SYNCOID_DEST=tank/models
 # BatchMode: fail the unit on a missing host key or a password prompt

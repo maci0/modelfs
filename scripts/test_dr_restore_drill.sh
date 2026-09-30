@@ -1283,6 +1283,11 @@ else
     done
     if [[ -n "${missing}" ]]; then
         fail "installer --install missing:${missing}"
+    elif [[ -n "$(find "${INSTALL_DEST}" -type d ! -perm 0755 -print -quit || true)" ]]; then
+        # The --install above ran under `umask 0077`, which sudo preserves.
+        # Directories must carry 0755 explicitly rather than inheriting it,
+        # or a restrictive operator umask leaves the unit directories 0700.
+        fail "installer --install created a directory without mode 0755 under umask 0077"
     elif [[ ! -x "${INSTALL_DEST}/usr/local/sbin/modelfs-restore-drill" ]]; then
         fail "installer --install drill wrapper is not executable"
     elif ! grep -q "OnFailure=notify-admin@%n.service" \
@@ -1317,6 +1322,12 @@ else
     elif grep -qE '^ProtectHome=yes' \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit gained ProtectHome=yes (breaks /root/.ssh)"
+    elif ! grep -qE '^ProtectSystem=strict$' \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit is not sandboxed with ProtectSystem=strict"
+    elif ! grep -qE '^NoNewPrivileges=yes$' \
+        "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
+        fail "installer --install syncoid unit is missing NoNewPrivileges=yes"
     elif ! grep -q "Requires=zfs-import.target" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost Requires=zfs-import.target"
@@ -1475,7 +1486,12 @@ if [[ "${INTERRUPTED_RC}" -eq 0 ]]; then
 elif [[ -e "${INTERRUPTED_DEST}/etc/sanoid/sanoid.conf" ]]; then
     fail "installer published an incomplete snapshot policy"
 else
-    INTERRUPTED_LEFTOVERS="$(find "${INTERRUPTED_DEST}/etc/sanoid" -mindepth 1 -print -quit)"
+    # The directory may not exist at all: the fixture stubs `install` out,
+    # and `install -d -m 0755` is the installer's first external call, so
+    # the failure can land before the directory is created. A missing
+    # directory trivially holds no leftover temporary, which is what this
+    # leg asserts; an existing-but-empty one says the same thing.
+    INTERRUPTED_LEFTOVERS="$(find "${INTERRUPTED_DEST}/etc/sanoid" -mindepth 1 -print -quit 2>/dev/null || true)"
     if [[ -n "${INTERRUPTED_LEFTOVERS}" ]]; then
         fail "installer left a temporary policy after copy failure"
     else

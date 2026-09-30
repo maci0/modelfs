@@ -24,8 +24,9 @@ units run with. Without --install, print the plan and exit
 settings on the host. Units and wrappers are refreshed on each install.
 Installed files belong to the installing user (root:root under sudo),
 with mode 0755 for wrappers and 0644 for units, policy, and documentation.
-Does not enable or start any unit; run the printed systemctl lines on
-the NAS and replica host.
+Directories this installer creates carry 0755 under whatever umask the
+invoking shell runs with. Does not enable or start any unit; run the
+printed systemctl lines on the NAS and replica host.
 EOF
 }
 
@@ -67,7 +68,14 @@ copy_one() (
         echo "kept ${dest_path}"
         return 0
     fi
-    mkdir -p "$(dirname "${dest_path}")"
+    # install -d -m, not bare mkdir -p: `sudo` keeps the caller's umask and
+    # mkdir -p -m sets only the final component, so an operator with umask
+    # 0027/0077 would otherwise leave /etc/systemd/system/sanoid.service.d
+    # at 0700, a mode no installed unit directory carries and one that
+    # hides the units from an admin group reading them. install -d applies
+    # the mode to every component it creates. The files themselves already
+    # carry an explicit mode; the directories below them must too.
+    install -d -m 0755 -- "$(dirname "${dest_path}")"
     local temporary
     temporary="$(mktemp "${dest_path}.tmp.XXXXXX")"
     trap 'rm -f -- "${temporary}"' EXIT
