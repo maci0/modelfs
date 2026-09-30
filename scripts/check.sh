@@ -63,11 +63,11 @@ fail() {
 # CI installs the pinned Python tooling into .venv and puts it on PATH
 # before running this script. Refuse to stand in with PATH's ruff/mypy:
 # those versions disagree with the lock and fail either here or only after
-# push. An empty directory (uv venv without the lock install) used to pass
+# push. An empty directory (a bare uv venv without uv sync) used to pass
 # the existence check and then pick up the OS ruff/mypy/python3.
 venv_bin="${ROOT_DIR}/.venv/bin"
 if [[ ! -d "${venv_bin}" ]]; then
-    fail "pinned .venv not found; install it with: uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+    fail "pinned .venv not found; install it with: uv sync --frozen (see CONTRIBUTING.md)"
 fi
 export PATH="${venv_bin}:${PATH}"
 for tool in python3 ruff mypy; do
@@ -75,7 +75,7 @@ for tool in python3 ruff mypy; do
     case "${resolved}" in
         "${venv_bin}"/*) ;;
         *)
-            fail "pinned .venv is missing ${tool}; install it with: uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+            fail "pinned .venv is missing ${tool}; install it with: uv sync --frozen (see CONTRIBUTING.md)"
             ;;
     esac
 done
@@ -90,7 +90,7 @@ py_need="$(awk -v v="${py_want}" 'BEGIN { n = split(v, a, /[^0-9]+/); if (n < 2)
 py_got="$(python3 -c 'import sys; print("%d.%d" % (sys.version_info[0], sys.version_info[1]))')" \
     || fail "venv python3 is not a working interpreter"
 if [[ "${py_got}" != "${py_need}" ]]; then
-    fail "venv python is ${py_got}, want ${py_need} from .python-version; recreate with: uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt (see CONTRIBUTING.md)"
+    fail "venv python is ${py_got}, want ${py_need} from .python-version; recreate with: uv sync --frozen (see CONTRIBUTING.md)"
 fi
 
 # Name every missing tool at once instead of dying mid-gate on a bare
@@ -130,23 +130,28 @@ done <<<"${enabled_optional}"
 # stdlib than CI.
 lock_pin() {
     local name="$1" ver
-    ver="$(sed -n "s/^${name}==\\([^[:space:]\\\\;]*\\).*/\\1/p" "${ROOT_DIR}/requirements-dev.lock.txt")"
+    # uv.lock writes each [[package]] as `name = "..."` directly followed by
+    # `version = "..."`.
+    ver="$(awk -v want="name = \"${name}\"" '
+        found { if (sub(/^version = "/, "") && sub(/"$/, "")) print; found = 0 }
+        $0 == want { found = 1 }
+    ' "${ROOT_DIR}/uv.lock")"
     if [[ -z "${ver}" || "${ver}" == *$'\n'* ]]; then
-        fail "cannot read a single ${name}== pin from requirements-dev.lock.txt"
+        fail "cannot read a single ${name} version from uv.lock"
     fi
     printf '%s' "${ver}"
 }
 ruff_want="$(lock_pin ruff)"
 ruff_have="$(ruff --version)"
 if [[ "${ruff_have}" != "ruff ${ruff_want}" ]]; then
-    fail "ruff is ${ruff_have}, lock pins ${ruff_want}; reinstall .venv from requirements-dev.lock.txt"
+    fail "ruff is ${ruff_have}, lock pins ${ruff_want}; reinstall .venv with: uv sync --frozen"
 fi
 mypy_want="$(lock_pin mypy)"
 mypy_have="$(mypy --version)"
 case "${mypy_have}" in
     "mypy ${mypy_want}" | "mypy ${mypy_want} "*) ;;
     *)
-        fail "mypy is ${mypy_have}, lock pins ${mypy_want}; reinstall .venv from requirements-dev.lock.txt"
+        fail "mypy is ${mypy_have}, lock pins ${mypy_want}; reinstall .venv with: uv sync --frozen"
         ;;
 esac
 

@@ -14,7 +14,7 @@ both at once:
 | Zig | exactly 0.16.0 | `minimum_zig_version` in [build.zig.zon](build.zig.zon) (setup-zig reads it; the build rejects other versions) |
 | Python | 3.12 | [.python-version](.python-version) (setup-uv reads it) |
 | uv | 0.12.13 or newer | `[tool.uv] required-version` in [pyproject.toml](pyproject.toml); CI installs 0.12.13 itself through setup-uv's `version` input |
-| ruff, mypy | exact | [requirements-dev.lock.txt](requirements-dev.lock.txt) |
+| ruff, mypy | exact | `[dependency-groups] dev` in [pyproject.toml](pyproject.toml), hash-locked in [uv.lock](uv.lock) |
 | shellcheck | any that defines every `enable=` in [.shellcheckrc](.shellcheckrc) | [.shellcheckrc](.shellcheckrc): `check.sh` compares those names against `shellcheck --list-optional` and fails on one it does not know |
 
 shellcheck has no version pin because it is a distribution package and CI
@@ -30,16 +30,16 @@ packages on every host: install `dpkg-deb` (the `dpkg` package), or `binutils`
 `zstd` executable. Then:
 
 ```bash
-uv venv .venv && uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt
+uv sync --frozen
 ```
 
-The explicit `--python` keeps the install in this clone even when another
-virtual environment is active.
+`uv sync` installs into this clone's `.venv` even when another virtual
+environment is active: it warns and ignores `VIRTUAL_ENV`.
 
 If uv cannot find an interpreter, run `uv python install 3.12` first.
 `scripts/check.sh` puts `.venv/bin` on PATH itself, so you never activate it,
 but it refuses anything other than that lock's `python3`, `ruff`, and `mypy`:
-an empty `uv venv` or the OS copies disagree with CI and fail either here or
+a bare `uv venv` or the OS copies disagree with CI and fail either here or
 only after push.
 
 If `zig build` stops with "libfuse3 headers not found", install the package it
@@ -185,10 +185,10 @@ reads as a release.
 **Dependency changes carry inventory work.** [sbom.cdx.json](sbom.cdx.json) is
 the CycloneDX record and `python3 scripts/sbom.py --check` holds the tree to it:
 
-* A [requirements-dev.txt](requirements-dev.txt) edit must be reflected in the
-  hash-pinned lock (regeneration command is in the lock's header) and in the
-  SBOM (`python3 scripts/sbom.py --write`). A new package also needs its SPDX
-  id in `_SPDX` in `scripts/sbom.py`, taken from the wheel's
+* A `[dependency-groups] dev` edit in [pyproject.toml](pyproject.toml) must be
+  reflected in [uv.lock](uv.lock) (`uv lock`) and in the SBOM
+  (`python3 scripts/sbom.py --write`). A new package also needs its SPDX id
+  in `_SPDX` in `scripts/sbom.py`, taken from the wheel's
   `License-Expression`.
 * GitHub Actions in `.github/workflows` must be pinned to a 40- or 64-character
   commit SHA and listed in `_SPDX` with the LICENSE at that commit. The

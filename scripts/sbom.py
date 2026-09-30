@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Emit or verify the CycloneDX inventory of declared third-party inputs.
 
-Reads requirements-dev.txt, requirements-dev.lock.txt,
+Reads the dev dependency group in pyproject.toml, uv.lock,
 .deps/fuse3-arm64/SHA256SUMS, the vendored libfuse3 static source's
 SHA256SUMS, the SHA-pinned `uses:` in .github/workflows and
 .github/actions, the ZIG_TARBALL_SHA256 toolchain pin in scripts/lib.sh,
@@ -16,9 +16,10 @@ import json
 import re
 import sys
 import tempfile
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -41,23 +42,21 @@ class _Args(argparse.Namespace):
     self_test: bool
 
 
-_PKG = re.compile(r"^([A-Za-z0-9_.-]+)==([^\\\s;]+)(?:\s*;\s*([^\\]+?))?\s*\\?\s*$")
 _SHA1_HEX_LEN = 40
 _SHA256_HEX_LEN = 64
-_HASH = re.compile(r"^--hash=sha256:([0-9a-f]{64})\s*\\?\s*$")
+_HASH = re.compile(r"sha256:([0-9a-f]{64})")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 # Line-anchored, same as scripts/check.sh. An unanchored `\.version` also
 # matches `.minimum_zig_version` (it ends in `.version`).
 _ZON_STRING = re.compile(r'^\s*\.([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]+)"', re.MULTILINE)
-_BOUND = re.compile(r"^([A-Za-z0-9_.-]+)\s*(?:===|==|!=|<=|>=|~=|<|>)")
 _EXACT = re.compile(r"^([A-Za-z0-9_.-]+)==([^\\\s,;]+)$")
 _PEP503_PUNCT = re.compile(r"[-_.]+")
 _ACTION = re.compile(
     r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)"
     r"@([0-9a-f]{40}|[0-9a-f]{64})$"
 )
-_LOCK_REL = "requirements-dev.lock.txt"
-_BOUNDS_REL = "requirements-dev.txt"
+_LOCK_REL = "uv.lock"
+_BOUNDS_REL = "pyproject.toml"
 _LIB_REL = "scripts/lib.sh"
 # The compiler artifact's digest, defined once beside the scripts that
 # verify the download. Line-anchored and exactly 64 hex chars, so a
@@ -164,74 +163,84 @@ def _pep503(name: str) -> str:
     return _PEP503_PUNCT.sub("-", name).lower()
 
 
+def _toml(text: str, source: str) -> dict[str, object]:
+    try:
+        doc: dict[str, object] = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        sys.exit(f"{source}: {exc}")
+    return doc
+
+
+def _table(value: object, where: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        sys.exit(f"{where} is not a table")
+    return cast("dict[str, object]", value)
+
+
+def _array(value: object, where: str) -> list[object]:
+    if not isinstance(value, list):
+        sys.exit(f"{where} is not an array")
+    return cast("list[object]", value)
+
+
+def _string(value: object, where: str) -> str:
+    if not isinstance(value, str):
+        sys.exit(f"{where} is not a string")
+    return value
+
+
 def parse_lock(text: str) -> list[LockedPackage]:
+    """Every [[package]] in uv.lock with the sha256 of each sdist and wheel."""
+    doc = _toml(text, _LOCK_REL)
     packages: list[LockedPackage] = []
-    current: LockedPackage | None = None
-    for raw in text.removeprefix("\ufeff").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        pkg = _PKG.match(line)
-        if pkg is not None:
-            current = LockedPackage(name=pkg.group(1), version=pkg.group(2))
-            packages.append(current)
-            continue
-        hashed = _HASH.match(line)
-        if hashed is not None:
-            if current is None:
-                sys.exit(f"hash line before any package in {_LOCK_REL}")
-            current.hashes.append(hashed.group(1))
-            continue
-        sys.exit(f"unrecognized lock line: {line}")
+    for entry in _array(doc.get("package", []), f"{_LOCK_REL} package"):
+        pkg = _table(entry, f"{_LOCK_REL} package")
+        name = _string(pkg.get("name"), f"{_LOCK_REL} package name")
+        version = _string(pkg.get("version"), f"{name} version in {_LOCK_REL}")
+        source = _table(pkg.get("source"), f"{name} source in {_LOCK_REL}")
+        if set(source) != {"registry"}:
+            sys.exit(f"{name} in {_LOCK_REL} is not from a package registry")
+        locked = LockedPackage(name=name, version=version)
+        artifacts = _array(pkg.get("wheels", []), f"{name} wheels in {_LOCK_REL}")
+        if "sdist" in pkg:
+            artifacts = [pkg["sdist"], *artifacts]
+        for artifact in artifacts:
+            where = f"{name}=={version} artifact hash in {_LOCK_REL}"
+            digest = _string(_table(artifact, where).get("hash"), where)
+            hashed = _HASH.fullmatch(digest)
+            if hashed is None:
+                sys.exit(f"unrecognized hash for {name}=={version} in {_LOCK_REL}: {digest}")
+            locked.hashes.append(hashed.group(1))
+        packages.append(locked)
     return packages
 
 
 def parse_bounds(text: str) -> list[str]:
-    names: list[str] = []
-    for raw in text.removeprefix("\ufeff").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        bound = _BOUND.match(line)
-        if bound is None:
-            sys.exit(f"unrecognized bounds line: {line}")
-        names.append(bound.group(1))
-    if not names:
-        sys.exit(f"{_BOUNDS_REL} lists no packages")
-    return names
+    """The requirement strings of the dev dependency group in pyproject.toml."""
+    doc = _toml(text, _BOUNDS_REL)
+    groups = _table(doc.get("dependency-groups"), f"{_BOUNDS_REL} [dependency-groups]")
+    where = f"{_BOUNDS_REL} dev group"
+    specs = [_string(spec, where) for spec in _array(groups.get("dev"), where)]
+    if not specs:
+        sys.exit(f"{where} lists no packages")
+    return specs
 
 
-def require_bounds_locked(bounds: list[str], packages: list[LockedPackage]) -> None:
-    if not packages:
-        sys.exit(f"{_LOCK_REL} lists no packages")
-    locked = {_pep503(pkg.name) for pkg in packages}
-    for name in bounds:
-        if _pep503(name) not in locked:
-            sys.exit(f"{name} is in {_BOUNDS_REL} but missing from the lock")
-
-
-def require_exact_pins(text: str, packages: list[LockedPackage]) -> None:
-    """Bounds file must be name==version and match the lock, not a range."""
+def require_exact_pins(specs: list[str], packages: list[LockedPackage]) -> None:
+    """Each dev group entry must be name==version and match the lock, not a range."""
     if not packages:
         sys.exit(f"{_LOCK_REL} lists no packages")
     locked = {_pep503(pkg.name): pkg.version for pkg in packages}
-    saw = False
-    for raw in text.removeprefix("\ufeff").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        saw = True
-        exact = _EXACT.match(line)
+    for spec in specs:
+        exact = _EXACT.match(spec.strip())
         if exact is None:
-            sys.exit(f"{_BOUNDS_REL} must pin exactly (name==version), not {line!r}")
+            sys.exit(f"{_BOUNDS_REL} must pin exactly (name==version), not {spec!r}")
         name, ver = exact.group(1), exact.group(2)
         got = locked.get(_pep503(name))
         if got is None:
             sys.exit(f"{name} is in {_BOUNDS_REL} but missing from the lock")
         if got != ver:
             sys.exit(f"{name}=={ver} in {_BOUNDS_REL} does not match lock {got}")
-    if not saw:
-        sys.exit(f"{_BOUNDS_REL} lists no packages")
 
 
 def parse_sha256sums(text: str) -> list[tuple[str, str]]:
@@ -442,9 +451,7 @@ def build_bom(root: Path) -> dict[str, object]:
     version = zon_string(zon_text, "version")
     min_zig = zon_string(zon_text, "minimum_zig_version")
     packages = parse_lock((root / _LOCK_REL).read_text(encoding="utf-8"))
-    bounds_text = (root / _BOUNDS_REL).read_text(encoding="utf-8")
-    require_bounds_locked(parse_bounds(bounds_text), packages)
-    require_exact_pins(bounds_text, packages)
+    require_exact_pins(parse_bounds((root / _BOUNDS_REL).read_text(encoding="utf-8")), packages)
     deb_dir = root / ".deps" / "fuse3-arm64"
     debs = parse_sha256sums((deb_dir / "SHA256SUMS").read_text(encoding="utf-8"))
     vendored = vendored_sources(root)
@@ -549,63 +556,63 @@ def _must_exit(thunk: Callable[[], object], needle: str) -> None:
     sys.exit(f"self-test failed: {needle!r} did not SystemExit")
 
 
+def _lock_entry(name: str, version: str, artifacts: str) -> str:
+    return (
+        f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
+        f'source = {{ registry = "https://pypi.org/simple" }}\n{artifacts}\n'
+    )
+
+
 def _self_test_lock() -> None:
+    digest = "sha256:" + ("a" * _SHA256_HEX_LEN)
     pkgs = parse_lock(
-        "foo==1.2.3 \\\n    --hash=sha256:" + ("a" * _SHA256_HEX_LEN) + "\n    # via bar\n"
+        _lock_entry(
+            "foo",
+            "1.2.3",
+            f'sdist = {{ url = "u", hash = "{digest}" }}\n'
+            f'wheels = [{{ url = "w", hash = "sha256:{"b" * _SHA256_HEX_LEN}" }}]',
+        )
     )
-    if [p.name for p in pkgs] != ["foo"] or pkgs[0].version != "1.2.3" or len(pkgs[0].hashes) != 1:
-        sys.exit("self-test failed: parse_lock dropped a hashed pin")
-    marked = parse_lock(
-        "librt==0.15.0 ; platform_python_implementation != 'PyPy' \\\n"
-        "    --hash=sha256:" + ("b" * _SHA256_HEX_LEN) + "\n"
-    )
-    if marked[0].name != "librt":
-        sys.exit("self-test failed: parse_lock dropped an environment marker")
+    if (
+        [p.name for p in pkgs] != ["foo"]
+        or pkgs[0].version != "1.2.3"
+        or pkgs[0].hashes != ["a" * _SHA256_HEX_LEN, "b" * _SHA256_HEX_LEN]
+    ):
+        sys.exit("self-test failed: parse_lock dropped a hashed artifact")
     _must_exit(
-        lambda: parse_lock("foo @ https://example.invalid/foo.whl\n"), "unrecognized lock line"
+        lambda: parse_lock(
+            '[[package]]\nname = "foo"\nversion = "1"\nsource = { git = "https://x" }\n'
+        ),
+        "not from a package registry",
     )
     _must_exit(
-        lambda: parse_lock("--hash=sha256:" + ("c" * _SHA256_HEX_LEN) + "\n"), "hash line before"
+        lambda: parse_lock(
+            _lock_entry("foo", "1.0", f'wheels = [{{ url = "w", hash = "sha512:{"d" * 128}" }}]')
+        ),
+        "unrecognized hash",
     )
-    _must_exit(
-        lambda: parse_lock("foo==1.0\n    --hash=sha512:" + ("d" * 128) + "\n"),
-        "unrecognized lock line",
-    )
+    _must_exit(lambda: parse_lock("[[package]\n"), _LOCK_REL)
 
 
 def _self_test_bounds() -> None:
-    names = parse_bounds("# comment\nmypy>=2.1,<3\nruff>=0.16,<0.17\n")
-    if names != ["mypy", "ruff"]:
-        sys.exit(f"self-test failed: parse_bounds got {names}")
-    _must_exit(lambda: parse_bounds("# none\n"), "lists no packages")
-    _must_exit(lambda: parse_bounds("not-a-requirement\n"), "unrecognized bounds line")
-    pkg = LockedPackage(name="mypy", version="2.3.1", hashes=["ab"])
-    _must_exit(lambda: require_bounds_locked(["mypy", "ruff"], [pkg]), "missing from the lock")
-    _must_exit(lambda: require_bounds_locked(["mypy"], []), "lists no packages")
-    require_bounds_locked(["Mypy"], [pkg])
-    require_exact_pins("mypy==2.3.1\n", [pkg])
-    _must_exit(lambda: require_exact_pins("mypy>=2.1,<3\n", [pkg]), "must pin exactly")
-    _must_exit(lambda: require_exact_pins("mypy==2.0.0\n", [pkg]), "does not match lock")
+    pin = LockedPackage(name="mypy", version="2.3.1", hashes=["ab"])
+    specs = parse_bounds('[dependency-groups]\ndev = ["mypy==2.3.1"]\n')
+    if specs != ["mypy==2.3.1"]:
+        sys.exit(f"self-test failed: parse_bounds got {specs}")
+    _must_exit(lambda: parse_bounds("[dependency-groups]\ndev = []\n"), "lists no packages")
+    _must_exit(lambda: parse_bounds("[tool.uv]\n"), "is not a table")
+    _must_exit(lambda: parse_bounds("[dependency-groups]\ndev = [1]\n"), "is not a string")
+    require_exact_pins(["mypy==2.3.1"], [pin])
+    require_exact_pins(["Mypy==2.3.1"], [pin])
+    _must_exit(lambda: require_exact_pins(["mypy>=2.1,<3"], [pin]), "must pin exactly")
+    _must_exit(lambda: require_exact_pins(["mypy==2.0.0"], [pin]), "does not match lock")
     _must_exit(
         lambda: require_exact_pins(
-            "mypy==2.3.1\n",
-            [LockedPackage(name="ruff", version="1", hashes=["a"])],
+            ["mypy==2.3.1"], [LockedPackage(name="ruff", version="1", hashes=["a"])]
         ),
         "missing from the lock",
     )
-    _must_exit(lambda: require_exact_pins("# none\n", [pkg]), "lists no packages")
-    for prefix in ("", "# café\n"):
-        text = "\ufeff" + prefix + "mypy==2.3.1\n"
-        if parse_bounds(text) != ["mypy"]:
-            sys.exit("self-test failed: parse_bounds dropped a BOM-prefixed pin")
-        if parse_lock(text) != [LockedPackage(name="mypy", version="2.3.1")]:
-            sys.exit("self-test failed: parse_lock dropped a BOM-prefixed pin")
-        require_exact_pins(text, [pkg])
-    _must_exit(lambda: parse_bounds("# comment\n\ufeffmypy==2.3.1\n"), "unrecognized bounds line")
-    _must_exit(lambda: parse_lock("# comment\n\ufeffmypy==2.3.1\n"), "unrecognized lock line")
-    _must_exit(
-        lambda: require_exact_pins("# comment\n\ufeffmypy==2.3.1\n", [pkg]), "must pin exactly"
-    )
+    _must_exit(lambda: require_exact_pins(["mypy==2.3.1"], []), "lists no packages")
 
 
 def _self_test_zon() -> None:

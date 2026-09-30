@@ -166,8 +166,8 @@ Setup from a fresh clone, the edit-test loop, the end-to-end suites, and what ea
 script does: [CONTRIBUTING.md](CONTRIBUTING.md). `./scripts/check.sh --help` lists every
 contributor command, and each script answers `--help` itself.
 
-Python tooling is pinned in [requirements-dev.txt](requirements-dev.txt) and installed from
-the hash-verified lock. [sbom.cdx.json](sbom.cdx.json) is the CycloneDX inventory of that
+Python tooling is pinned in [pyproject.toml](pyproject.toml) and installed from the
+hash-verified [uv.lock](uv.lock). [sbom.cdx.json](sbom.cdx.json) is the CycloneDX inventory of that
 lock, the vendored libfuse3 debs, the vendored libfuse3 static source the release binaries
 compile in, the SHA-pinned GitHub Actions, and the pinned Zig toolchain (its
 version and the sha256 of the tarball behind it, `ZIG_TARBALL_SHA256` in

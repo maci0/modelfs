@@ -1,22 +1,31 @@
-# Static analysis configuration for the Python tooling under scripts/.
+# Static analysis configuration and tooling pins for the Python under scripts/.
 
 # Floor for the uv a clone may set itself up with: uv refuses every command
 # in a project directory when it does not hold, so an exact pin here made
-# `uv venv .venv` (the first line of the documented setup) fail on any
-# contributor whose uv differed by a patch, and the fix it suggested was a
-# global self-update to a version, not a project-local step. CI keeps the
-# exact version it installs in the `version` input of the setup-uv step in
+# `uv sync` (the documented setup) fail on any contributor whose uv
+# differed by a patch, and the fix it suggested was a global self-update to
+# a version, not a project-local step. CI keeps the exact version it
+# installs in the `version` input of the setup-uv step in
 # .github/actions/setup-gate-tooling/action.yml, which is where an exact uv
 # actually has to be the same on every run.
 [tool.uv]
 required-version = ">=0.12.13"
+
+# The gate's Python tooling (scripts/check.sh: ruff, mypy). The Zig code has
+# no third-party dependencies; zig (0.16) and shellcheck come from the system
+# and are intentionally not listed. Exact pins: a range would let `uv lock`
+# float a newer ruff/mypy without a diff here. Bump a pin, run `uv lock`,
+# then `python3 scripts/sbom.py --write`. uv.lock carries every artifact's
+# sha256 and `uv sync --frozen` installs exactly that.
+[dependency-groups]
+dev = ["mypy==2.3.1", "ruff==0.16.4"]
 
 [tool.ruff]
 line-length = 100
 # Matches .python-version and the CI interpreter: the only runtimes these
 # scripts are ever installed and run under.
 target-version = "py312"
-# Same pin as requirements-dev.txt / the lock: a bare ruff outside the
+# Same pin as [dependency-groups] and uv.lock: a bare ruff outside the
 # pinned venv with different semantics must refuse to run instead of
 # silently disagreeing with the CI gate.
 required-version = "==0.16.4"

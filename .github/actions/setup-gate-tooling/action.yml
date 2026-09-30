@@ -35,19 +35,18 @@ runs:
         echo "version=${version}" >> "${GITHUB_OUTPUT}"
       shell: bash
 
-    # Python tooling exactly as pinned in requirements-dev.lock.txt
-    # (hash-verified install, per README). activate-environment creates a
+    # Python tooling exactly as pinned in uv.lock (hash-verified install,
+    # per README). activate-environment creates a
     # venv and puts it on PATH. venv-path is explicit: check.sh requires
     # ROOT_DIR/.venv/bin (a setup-uv default change would otherwise pass
     # PATH but fail the existence check). version pins the uv that runs
-    # the install below, so a contributor running the same two commands
-    # with a newer local uv and CI running this one resolve the same
+    # the install below, so a contributor running the same `uv sync
+    # --frozen` with a newer local uv and CI running this one read the same
     # lock. The cache key includes
     # .python-version so a pin bump cannot restore a venv built for the
-    # previous interpreter; requirements*.txt is the lock plus the
-    # un-hashed bounds file (the action's default also lists **/uv.lock,
-    # which this repo does not have, and pyproject.toml, whose tool-config
-    # edits must not bust the package cache).
+    # previous interpreter; pyproject.toml is left out (the action default
+    # lists it) because its tool-config edits must not bust the package cache,
+    # and a dev group pin edit already changes uv.lock.
     - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
       with:
         version: "0.12.13"
@@ -55,10 +54,10 @@ runs:
         venv-path: .venv
         python-version: ${{ steps.py.outputs.version }}
         cache-dependency-glob: |
-          requirements*.txt
+          uv.lock
           .python-version
 
     - name: Install pinned Python tooling
       # check.sh invokes ruff/mypy by name from the activated venv.
-      run: uv pip install --python .venv/bin/python3 --require-hashes -r requirements-dev.lock.txt
+      run: uv sync --frozen
       shell: bash

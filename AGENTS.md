@@ -62,7 +62,7 @@ It runs:
 
 The Python tools must come from `.venv/bin` with an interpreter matching
 `.python-version`, and `ruff` and `mypy` must be the versions
-`requirements-dev.lock.txt` pins; an empty or unpinned venv is not enough.
+`uv.lock` pins (`uv sync --frozen`); an empty or unpinned venv is not enough.
 CI runs that gate plus the aarch64 glibc cross-compile, a native aarch64
 runner running the same gate, the static
 single-file musl smoke build (`scripts/build_static.sh`), and the reproducibility rebuild;
