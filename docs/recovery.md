@@ -20,7 +20,7 @@ The origin (`tank/models` on the NAS) holds the **only copy** of every weight fi
 | `/var/cache/fscache` (desktop) | FS-Cache pages | derived | no |
 | `/etc/modelfs.psk` (every node) | peer auth secret | regenerable | only with total site loss; regenerate with `openssl rand -hex 32` and redistribute to all nodes |
 | `$HOME` HF token | hub auth | not on the origin | re-login |
-| `/etc/systemd/system/*.d/` drop-ins on the NAS and replica hosts | the dataset each unit runs against (`MF_SYNCOID_SRC`, `MF_DRILL_REPLICA`, `MF_OFFSITE_DATASET`) | **site configuration, not in this repo** | yes (per host). `install_nas_backup.sh --install` writes no drop-in for these three units, so a reinstall keeps yours; it does replace the two shipped `sanoid.service.d` drop-ins. A rebuilt host comes back with the shipped placeholders. Capture with `modelfs-backup-config` (section 3) |
+| `/etc/systemd/system/*.d/` drop-ins on the NAS and replica hosts | the dataset each unit runs against (`MF_SYNCOID_SRC`, `MF_DRILL_REPLICA`, `MF_OFFSITE_DATASET`) | **site configuration, not in this repo** | yes (per host). `install_nas_backup.sh --install` writes no drop-in for these three units, so a reinstall keeps yours; it does replace the three shipped `sanoid.service.d` drop-ins (`fail.conf`, `tz.conf`). A rebuilt host comes back with the shipped placeholders. Capture with `modelfs-backup-config` (section 3) |
 
 Verifiably safe to ignore in any backup plan: caches (next read re-hydrates; culling punches holes, and `reapIdle` unlinks empty unpinned artifacts) and leases (swept after 300 s regardless). Everything else in this doc exists to protect row 1.
 
@@ -80,6 +80,16 @@ Recursive is a no-op while `tank/models` has only directories underneath
 snapshotted without rewriting the backup job. The replica pull (`syncoid --recursive`) and
 `hold_monthlies.sh` (which lists with `zfs list -r`) follow the same growth, and the restore drill
 age-checks each child, so a dataset the job never copied cannot look green.
+
+sanoid has no timezone knob: its `hourly`/`daily`/`monthly` names are the **host's** local wall
+clock. On a NAS set to a DST zone, spring-forward deletes one hourly name (02:00 never happens,
+so an RPO hour is lost) and fall-back fires two snapshots under one name (the second replaces
+the first). `scripts/nas/drop-ins/sanoid.service.d/tz.conf` sets `TZ=UTC` for `sanoid.service`,
+so every period boundary is an instant and the 1 h RPO holds for every hour on any host. Remove
+that drop-in only if the site wants local-hour names, and accept the DST hole.
+
+`sanoid-prune.service` only deletes what `sanoid.service` created; it keeps no time of its own
+and needs no `TZ`.
 
 ### Layer 2: the replica (covers pool loss)
 

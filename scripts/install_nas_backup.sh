@@ -110,6 +110,10 @@ fi
 copy_one "${NAS_DIR}/sanoid.conf" "etc/sanoid/sanoid.conf"
 copy_one "${NAS_DIR}/notify-admin@.service" "etc/systemd/system/notify-admin@.service"
 copy_one "${NAS_DIR}/drop-ins/sanoid.service.d/fail.conf" "etc/systemd/system/sanoid.service.d/fail.conf"
+# TZ=UTC: sanoid has no timezone knob, so its hourly/daily/monthly names
+# follow the host TZ and a DST spring-forward deletes an hourly interval
+# from the claimed 1 h RPO. The drop-in pins the unit instead.
+copy_one "${NAS_DIR}/drop-ins/sanoid.service.d/tz.conf" "etc/systemd/system/sanoid.service.d/tz.conf"
 copy_one "${NAS_DIR}/drop-ins/sanoid-prune.service.d/fail.conf" "etc/systemd/system/sanoid-prune.service.d/fail.conf"
 copy_one "${NAS_DIR}/syncoid-models.service" "etc/systemd/system/syncoid-models.service"
 copy_one "${NAS_DIR}/syncoid-models.timer" "etc/systemd/system/syncoid-models.timer"

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **The hourly autosnap cadence no longer follows the NAS host's timezone.** sanoid has no timezone knob, so its `hourly`/`daily`/`monthly` names are the host's local wall clock. On a NAS set to a DST zone that deletes an hour of the claimed 1 h RPO every spring: in `Europe/Berlin`, 2026-03-29 02:00 local never happens, so sanoid takes no `2026-03-29-02:00` snapshot and the 25 h alarm sees a two-hour gap. A fall-back date lands two hourly snapshots under one name and the second replaces the first. `install_nas_backup.sh --install` now also copies `scripts/nas/drop-ins/sanoid.service.d/tz.conf`, which sets `TZ=UTC` for `sanoid.service`: every period boundary is then an instant, and the RPO holds for every hour on any host. `sanoid.conf` said as much in a comment; it could not enforce it, since sanoid reads no TZ from its config. The drill suite asserts the drop-in is installed with mode 0644 and carries `Environment=TZ=UTC`. `sanoid-prune.service` is left alone: it only deletes what `sanoid.service` created and keeps no time of its own.
+
 ## [0.20.0] - 2026-09-29
 
 Three of the entries below change what a command does for an existing

@@ -1244,6 +1244,7 @@ else
         etc/sanoid/sanoid.conf \
         etc/systemd/system/notify-admin@.service \
         etc/systemd/system/sanoid.service.d/fail.conf \
+        etc/systemd/system/sanoid.service.d/tz.conf \
         etc/systemd/system/sanoid-prune.service.d/fail.conf \
         etc/systemd/system/syncoid-models.service \
         etc/systemd/system/syncoid-models.timer \
@@ -1287,6 +1288,13 @@ else
     elif ! grep -q "OnFailure=notify-admin@%n.service" \
         "${INSTALL_DEST}/etc/systemd/system/sanoid.service.d/fail.conf"; then
         fail "installer --install sanoid drop-in lost OnFailure"
+    elif ! grep -q "^Environment=TZ=UTC$" \
+        "${INSTALL_DEST}/etc/systemd/system/sanoid.service.d/tz.conf"; then
+        # sanoid names its hourly/daily/monthly snapshots off the host TZ, so
+        # a DST host loses an hour of the claimed RPO every spring. Without
+        # this drop-in the shipped 1 h RPO holds only when the NAS happens to
+        # run UTC, which sanoid.conf cannot pin on its own.
+        fail "installer --install sanoid tz drop-in lost Environment=TZ=UTC"
     elif grep -q "OnFailure" "${INSTALL_DEST}/etc/systemd/system/modelfs-drill.timer"; then
         fail "installer --install put OnFailure on the drill timer (belongs on the service)"
     elif grep -q "OnFailure" "${INSTALL_DEST}/etc/systemd/system/modelfs-snap-age.timer"; then
