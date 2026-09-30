@@ -38,6 +38,7 @@ answers --help):
   ./scripts/run_vm_cluster_e2e.sh           4 VMs (NFS origin + 3 clients) on libvirt/KVM
   ./scripts/test_fault_tolerance.sh         peer loss and lease expiry
   ./scripts/test_dr_restore_drill.sh        restore drill against stub zfs (also in this script)
+  ./scripts/test_nas_unit_policy.sh         NAS unit policy scan, units and drop-ins (also in this script)
   ./scripts/check_drill_log.sh              alarm if the monthly drill log is stale
   ./scripts/check_offsite.sh                alarm if the site-loss copy is missing or older than 8 days
   ./scripts/dr_pool_restore.sh              pool-loss recv (dry-run; --execute pulls from the replica)
@@ -499,19 +500,37 @@ done
 # a harness that exports one makes every modelfs call in that environment
 # fail before the command runs. Units also keep secrets off ExecStart: argv
 # is world-readable through /proc/<pid>/cmdline.
+#
+# The whole nas/ tree, not just nas/*.service: install_nas_backup.sh ships
+# and installs nas/drop-ins/**/*.conf, and a drop-in is the file an operator
+# edits with `systemctl edit` to override a unit -- so a knob, a secret, or
+# a /tmp payload lands there at least as easily as in the unit itself. The
+# three shipped drop-ins pass (one TZ, two OnFailure), and
+# test_nas_unit_policy.sh runs this block against a drop-in that does not,
+# so the widened glob cannot quietly start skipping the directory.
+#
+# Between these two markers is the scan test_nas_unit_policy.sh extracts and
+# runs verbatim against a scratch copy of nas/. Keep the markers, and keep
+# the block free of anything above ROOT_DIR/SCRIPTS_DIR, so the test can
+# point it at a tree of its own.
+# nas-unit-policy: scan start
+shopt -s nullglob
+nas_unit_files=("${SCRIPTS_DIR}"/nas/*.service "${SCRIPTS_DIR}"/nas/drop-ins/*/*.conf)
+shopt -u nullglob
 nas_unit_violations=""
-for unit in "${SCRIPTS_DIR}"/nas/*.service; do
+for unit in "${nas_unit_files[@]}"; do
     [[ -e "${unit}" ]] || continue
     if grep -qE '^[[:space:]]*Environment=.*MODELFS_' "${unit}"; then
-        nas_unit_violations="${nas_unit_violations} ${unit##*/}:Environment=MODELFS_"
+        nas_unit_violations="${nas_unit_violations} ${unit#*"${SCRIPTS_DIR}"/nas/}:Environment=MODELFS_"
     fi
     if grep -qiE '^[[:space:]]*ExecStart=.*(psk|token|secret)' "${unit}"; then
-        nas_unit_violations="${nas_unit_violations} ${unit##*/}:secret on ExecStart"
+        nas_unit_violations="${nas_unit_violations} ${unit#*"${SCRIPTS_DIR}"/nas/}:secret on ExecStart"
     fi
     if grep -qE '^[[:space:]]*(Environment|ExecStart)=.*[^A-Za-z0-9_]/tmp(/|[^A-Za-z0-9_])' "${unit}"; then
-        nas_unit_violations="${nas_unit_violations} ${unit##*/}:/tmp payload"
+        nas_unit_violations="${nas_unit_violations} ${unit#*"${SCRIPTS_DIR}"/nas/}:/tmp payload"
     fi
 done
+# nas-unit-policy: scan end
 [[ -z "${nas_unit_violations}" ]] \
     || fail "NAS unit policy (harness knobs stay MF_, no secret on ExecStart, no /tmp payload):${nas_unit_violations}"
 
@@ -577,6 +596,11 @@ echo "=== vendored libfuse3 extract ==="
 # The release job is re-runnable, so the packaging step has to be too.
 echo "=== release packaging rerun ==="
 "${SCRIPTS_DIR}/test_package_release.sh" || fail "release packaging rerun tests failed"
+
+# The NAS unit policy above has no linter behind it, so it needs a suite
+# that runs the same scan against a unit and a drop-in that must be flagged.
+echo "=== NAS unit policy ==="
+"${SCRIPTS_DIR}/test_nas_unit_policy.sh" || fail "NAS unit policy tests failed"
 
 echo "=== ruff ==="
 # No path: pyproject.toml is in ruff's default set, and a Python file

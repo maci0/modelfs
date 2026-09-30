@@ -49,7 +49,7 @@ It runs:
   `.scratch/` constraint below; a `scripts/**/*.sh` that reads `ROOT_DIR`,
   `SCRATCH_DIR`, or `SCRIPTS_DIR` sources `lib.sh`, and one that reads none of
   the three is on `check.sh`'s `no_lib_sh` exemption list; a
-  `scripts/nas/*.service` exports
+  `scripts/nas/*.service` or a `scripts/nas/drop-ins/*/*.conf` exports
   no `MODELFS_` knob, no secret on `ExecStart`, and no `/tmp` path; and every
   `MF_` knob read under `scripts/` is listed in `lib.sh`'s member block; and
   `.env.example` names exactly the `MODELFS_*` knobs in `main.zig`'s
