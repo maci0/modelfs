@@ -1937,6 +1937,21 @@ fn updateFetchHint(err: anyerror) []const u8 {
     };
 }
 
+/// What one failed `hf.pull` call reports, on the same terms
+/// `updateFetchHint` uses for the GitHub API: a 404 is a repo the hub will
+/// not show, a 401 or 403 is a credential it would not take, and a 429 is
+/// the rate limit an anonymous fleet behind one address runs into. Null for
+/// every other failure, which the error name already names and the "rerun
+/// to resume" line already covers.
+fn pullFetchHint(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.RepoNotFound => "Hugging Face has no such repository, or it is private",
+        error.ListingDenied, error.DownloadDenied => "Hugging Face refused the request; check HF_TOKEN",
+        error.ListingRateLimited, error.DownloadRateLimited => "Hugging Face rate-limited this host; retry later",
+        else => null,
+    };
+}
+
 fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.Environ.Map, opts: Opts) !u8 {
     if (opts.update_reload or (builtin.is_test and !opts.update_check and opts.update_repo == null)) {
         return cmdReload(io, gpa, opts);
@@ -2241,6 +2256,7 @@ fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Envir
         printErr("modelfs: pull {s}@{s} failed ({t}) after {d} file(s); rerun to resume\n", .{
             proto.displayName(repo), proto.displayName(opts.revision), err, report.pulled,
         });
+        if (pullFetchHint(err)) |hint| printErr("modelfs: {s}\n", .{hint});
         return 1;
     };
     if (!printOut(io, gpa, "pulled {d} file(s), {d} bytes; {d} already present\n", .{
@@ -5089,6 +5105,28 @@ test "updateFetchHint tells the actionable refusals apart" {
     try std.testing.expectEqualStrings("could not reach GitHub", updateFetchHint(error.NetworkError));
     try std.testing.expect(std.mem.indexOf(u8, updateFetchHint(error.HttpDenied), "GITHUB_TOKEN") != null);
     try std.testing.expect(std.mem.indexOf(u8, updateFetchHint(error.HttpNotFound), "private") != null);
+}
+
+test "pullFetchHint names the same actionable refusals updateFetchHint does" {
+    // pull and update are the two CLI network paths; a status one of them
+    // reports by name must be reported by name in the other too, or the
+    // operator learns the rule twice from two different vocabularies.
+    try std.testing.expect(pullFetchHint(error.RepoNotFound) != null);
+    try std.testing.expect(pullFetchHint(error.ListingDenied) != null);
+    try std.testing.expect(pullFetchHint(error.DownloadDenied) != null);
+    try std.testing.expect(pullFetchHint(error.ListingRateLimited) != null);
+    try std.testing.expect(pullFetchHint(error.DownloadRateLimited) != null);
+    // The 401 answers agree across both endpoints of a pull.
+    try std.testing.expectEqualStrings(pullFetchHint(error.ListingDenied).?, pullFetchHint(error.DownloadDenied).?);
+    try std.testing.expectEqualStrings(pullFetchHint(error.ListingRateLimited).?, pullFetchHint(error.DownloadRateLimited).?);
+    // Distinct refusals stay distinct sentences, and each names its fix.
+    try std.testing.expect(!std.mem.eql(u8, pullFetchHint(error.RepoNotFound).?, pullFetchHint(error.ListingDenied).?));
+    try std.testing.expect(!std.mem.eql(u8, pullFetchHint(error.ListingDenied).?, pullFetchHint(error.ListingRateLimited).?));
+    try std.testing.expect(std.mem.indexOf(u8, pullFetchHint(error.ListingDenied).?, "HF_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pullFetchHint(error.RepoNotFound).?, "private") != null);
+    // A failure with nothing actionable to add adds nothing.
+    try std.testing.expect(pullFetchHint(error.DownloadFailed) == null);
+    try std.testing.expect(pullFetchHint(error.ListingFailed) == null);
 }
 
 test "parseArgs scopes the pull flags to pull and defaults the revision" {

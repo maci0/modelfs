@@ -327,8 +327,9 @@ pub fn githubBearer(buf: []u8, environ: ?*const std.process.Environ.Map) error{ 
 /// publish (or will not show an anonymous caller), and 429 is the
 /// documented rate-limit answer; the three are what an operator can act
 /// on, so they are named rather than collapsed into one status error the
-/// way every other non-200 would be. Same split `pull` makes of a
-/// Hugging Face listing (src/hf.zig).
+/// way every other non-200 would be. `hf.listingError` / `hf.downloadError`
+/// (src/hf.zig) make the same split of a Hugging Face answer, so both CLI
+/// network paths classify an HTTP status identically.
 pub fn statusError(status: std.http.Status) error{ HttpDenied, HttpNotFound, HttpRateLimited, HttpStatus } {
     return switch (status) {
         .unauthorized, .forbidden => error.HttpDenied,

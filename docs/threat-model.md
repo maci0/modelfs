@@ -401,6 +401,12 @@ over HTTPS to fetch model file trees and weights into the origin directory (`src
     header and is stripped by `std.http.Client` on cross-host redirects to CDNs. The token is bounded to
     4096 bytes (`max_token_bytes`), core dumps are disabled during execution (`disableCoreDumps` `src/main.zig`),
     and memory is zeroed on exit (`std.crypto.secureZero`).
+  - Answer classification: every non-200 from the tree listing and from each file download is
+    mapped to a named error before it is reported -- 404 to `RepoNotFound`, 401/403 to
+    `ListingDenied`/`DownloadDenied`, 429 to `ListingRateLimited`/`DownloadRateLimited`, and
+    everything else to the one reachability failure (`listingError`/`downloadError`
+    `src/hf.zig`, `pullFetchHint` `src/main.zig`). The split matches `statusError` in B7, so a
+    rate limit a fleet hits is named rather than reported as an unreachable host.
 
 ### B7: CLI to GitHub Releases (self-update)
 

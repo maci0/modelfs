@@ -730,6 +730,16 @@ with no `.`/`..` segments, file names are percent-encoded into the download URL,
 listed path passes `relOk` and `relIsCluster` against the joined destination before it reaches
 the origin (`cmdPull` src/main.zig, src/hf.zig).
 
+Every non-200 answer is classified before it reaches the report, on the same terms `modelfs
+update` classifies a GitHub answer: a 404 is a repository the hub will not show an anonymous
+caller (`RepoNotFound`), a 401 or 403 is a credential it would not take (`ListingDenied`,
+`DownloadDenied`), and a 429 is the rate limit an anonymous fleet behind one address runs into
+(`ListingRateLimited`, `DownloadRateLimited`); everything else reports as one reachability
+failure (`ListingFailed`, `DownloadFailed`). The per-file download takes the same split as the
+listing that preceded it, so a token or a rate limit that changes partway through a run is
+named the same way whichever request hit it (`listingError` / `downloadError` src/hf.zig,
+`pullFetchHint` src/main.zig).
+
 ```mermaid
 flowchart TD
     start["modelfs pull owner/name @revision --dest"] --> token{"HF_TOKEN or the huggingface token file?"}

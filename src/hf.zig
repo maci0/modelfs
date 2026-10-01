@@ -149,6 +149,37 @@ fn fileUrl(gpa: std.mem.Allocator, repo: []const u8, revision: []const u8, path:
 
 pub const Entry = struct { path: []const u8, size: u64 };
 
+/// The failure one non-200 answer from this host becomes. 401 and 403 are a
+/// credential the API would not take, 404 is a repo or file it does not
+/// publish (or will not show an anonymous caller), and 429 is the documented
+/// rate limit; those three are what an operator can act on, so they are
+/// named rather than collapsed into one status error. Same split
+/// `update.statusError` makes of a GitHub answer (src/update.zig), so the
+/// two CLI network paths classify an HTTP status identically.
+fn listingError(status: std.http.Status) error{ ListingDenied, RepoNotFound, ListingRateLimited, ListingFailed } {
+    return switch (status) {
+        .unauthorized, .forbidden => error.ListingDenied,
+        .not_found => error.RepoNotFound,
+        .too_many_requests => error.ListingRateLimited,
+        else => error.ListingFailed,
+    };
+}
+
+/// The same split for a single file download, which is a second request
+/// against the same host with the same credential: a `resolve` that answers
+/// 401 (token rejected mid-run) or 429 (the anonymous limit the listing
+/// already consumed) is not the same operator problem as a truncated
+/// transfer, so it keeps its own name instead of becoming DownloadFailed.
+/// 404 stays DownloadFailed: a file the listing named and the endpoint will
+/// not serve is a pull that cannot be completed, not a mistyped repo.
+fn downloadError(status: std.http.Status) error{ DownloadDenied, DownloadRateLimited, DownloadFailed } {
+    return switch (status) {
+        .unauthorized, .forbidden => error.DownloadDenied,
+        .too_many_requests => error.DownloadRateLimited,
+        else => error.DownloadFailed,
+    };
+}
+
 pub const Listing = struct {
     entries: []Entry,
     arena: std.heap.ArenaAllocator,
@@ -314,11 +345,7 @@ pub fn pull(
     };
     if (listing_res.status != .ok) {
         std.log.err("{s} listing {s}@{s} answered {d}", .{ host, repo, revision, @intFromEnum(listing_res.status) });
-        return switch (listing_res.status) {
-            .unauthorized, .forbidden => error.ListingDenied,
-            .not_found => error.RepoNotFound,
-            else => error.ListingFailed,
-        };
+        return listingError(listing_res.status);
     }
 
     var listing = try parseTree(gpa, listing_writer.buffered(), dest);
@@ -417,7 +444,7 @@ fn fetchOne(
     }) catch return error.DownloadFailed;
     if (res.status != .ok) {
         std.log.err("{s} answered {d} for {s}", .{ host, @intFromEnum(res.status), entry.path });
-        return error.DownloadFailed;
+        return downloadError(res.status);
     }
     file_writer.interface.flush() catch return error.WriteFailed;
     // A 200 whose body stopped short (or ran long) must not take the real
@@ -836,4 +863,33 @@ fn fuzzUrlGenOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
 test "fuzz repo and revision validation gates URL construction" {
     try std.testing.fuzz({}, fuzzUrlGenOne, .{ .corpus = &fuzz_url_corpus });
+}
+
+test "a non-200 answer is classified into the three refusals an operator can act on" {
+    // The listing is the request that decides whether a repo exists and
+    // whether the token was accepted, so its statuses are named rather than
+    // collapsed. 429 is here for the same reason update.statusError names
+    // it: an anonymous pull is exactly the case that runs into the limit.
+    try std.testing.expectEqual(error.ListingDenied, listingError(.unauthorized));
+    try std.testing.expectEqual(error.ListingDenied, listingError(.forbidden));
+    try std.testing.expectEqual(error.RepoNotFound, listingError(.not_found));
+    try std.testing.expectEqual(error.ListingRateLimited, listingError(.too_many_requests));
+    // Everything else is one reachability failure, as before.
+    try std.testing.expectEqual(error.ListingFailed, listingError(.internal_server_error));
+    try std.testing.expectEqual(error.ListingFailed, listingError(.bad_gateway));
+    try std.testing.expectEqual(error.ListingFailed, listingError(.service_unavailable));
+    try std.testing.expectEqual(error.ListingFailed, listingError(.bad_request));
+}
+
+test "a per-file download classifies a status like the listing it followed" {
+    // Two requests, one host, one credential: a 401 or a 429 on the second
+    // is the same operator problem as on the first and keeps the same name.
+    // 404 does not: the listing already named the file, so a missing one is
+    // a pull that cannot complete, not a mistyped repo.
+    try std.testing.expectEqual(error.DownloadDenied, downloadError(.unauthorized));
+    try std.testing.expectEqual(error.DownloadDenied, downloadError(.forbidden));
+    try std.testing.expectEqual(error.DownloadRateLimited, downloadError(.too_many_requests));
+    try std.testing.expectEqual(error.DownloadFailed, downloadError(.not_found));
+    try std.testing.expectEqual(error.DownloadFailed, downloadError(.internal_server_error));
+    try std.testing.expectEqual(error.DownloadFailed, downloadError(.bad_gateway));
 }
