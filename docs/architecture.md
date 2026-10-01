@@ -642,7 +642,12 @@ overlapping range is unmarked so readers refill from the origin.
   (`Cached.xferBusy`): clear the bits of the current buffer rather than `resize` or swap it, since
   both free the allocation the reader is walking. A grow defers the reallocation (appended pieces
   refill); a shrink or rewrite still clears the marks, so nothing past the new end is served. The
-  deferred reallocation lands on the next size or identity change that finds no reader.
+  recorded size follows the origin in both directions regardless: `mf_read` bounds a request by
+  the entry's size, and a warm read reaches the entry through `fileForRead`'s `lookupRef` hit
+  without stat'ing the origin, so a size left at the pre-truncate length would answer EOF for bytes
+  the client had just `ftruncate`d into existence. An undersized bitfield costs a re-hydrate; a
+  short read costs the client the data. The deferred reallocation lands on the next size or
+  identity change that finds no reader.
 
 Further misses on the writing node take the origin (`hydratePiece` in src/fuse_fs.zig). A fill
 discarded by a concurrent write-through retries once from the origin, then fails the read with

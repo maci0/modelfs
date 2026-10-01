@@ -521,6 +521,65 @@ test "truncate invalidates cached bytes even when origin close fails" {
     }
 }
 
+test "truncate to a larger size records the new size while a read holds xfer" {
+    // The truncateWithClose comment above explains why the size must follow
+    // the origin even when the bitfield reallocation is deferred; this pins
+    // it: the grown bytes have to read back at their real offset.
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "truncate-grow-origin");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "truncate-grow-cache");
+    defer sys.deleteTree(std.testing.io, cache_d);
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+    tls_state = &st;
+    defer tls_state = null;
+
+    const rel = "grow.bin";
+    var pbuf: [sys.c.PATH_MAX]u8 = undefined;
+    const origin_z = try st.store.originPath(&pbuf, rel);
+    const ofd = sys.open(origin_z, sys.c.O_WRONLY | sys.c.O_CREAT | sys.c.O_NOFOLLOW, 0o600);
+    defer if (ofd >= 0) sys.close(ofd);
+    try std.testing.expect(ofd >= 0);
+    try std.testing.expectEqual(@as(isize, 16), sys.pwriteAll(ofd, "0123456789abcdef", 0));
+    st.store.cacheFillIdentified(rel, 16, 0, "0123456789abcdef", .{}, 0);
+
+    const file = st.store.lookupRef(rel) orelse return error.TestUnexpectedResult;
+    defer st.store.releaseFile(file);
+
+    // Hold xfer across the truncate, as a concurrent peer /data sendfile or
+    // FUSE read does, so truncateWithClose takes its in-place arm.
+    st.store.beginXfer(file);
+    {
+        // 32 bytes on the piece_size 16 grid is two more pieces.
+        var grown: [32]u8 = undefined;
+        for (&grown, 0..) |*c, i| c.* = @intCast('0' + i % 10);
+        try std.testing.expectEqual(@as(isize, 32), sys.pwriteAll(ofd, &grown, 0));
+    }
+    defer st.store.endXfer(file);
+
+    try std.testing.expectEqual(@as(c_int, 0), truncateWithClose("/grow.bin", 32, null, sys.closeWrite));
+    st.store.lockContentAndState(file);
+    // The recorded size must follow the origin, not stay at the old length.
+    try std.testing.expectEqual(@as(u64, 32), file.size);
+    try std.testing.expectEqual(@as(u32, 0), file.hashes.count());
+    try std.testing.expect(file.bits.nbits == piece.count(32, 16));
+    st.store.unlockContentAndState(file);
+
+    // And the grown bytes must be readable at their real offset, not cut off
+    // at the pre-truncate length.
+    var out: [32]u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, 32), mf_read("/grow.bin", &out, out.len, 0, null));
+    try std.testing.expectEqual(@as(c_int, 16), mf_read("/grow.bin", out[16..].ptr, 16, 16, null));
+    var want: [32]u8 = undefined;
+    for (&want, 0..) |*c, i| c.* = @intCast('0' + i % 10);
+    try std.testing.expectEqualSlices(u8, &want, &out);
+}
+
 test "clientCreateMode strips setuid, setgid, and sticky bits" {
     try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o4755));
     try std.testing.expectEqual(@as(fuse.mode_t, 0o755), clientCreateMode(0o2755));
@@ -1502,7 +1561,20 @@ fn truncateWithClose(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_
         var ob: ?piece.Bitfield = null;
         if (file.xferBusy()) {
             @memset(file.bits.bytes, 0);
-            if (new_size < file.size) file.size = new_size;
+            // Same buffer: a reader is indexing it. Bitfield.resize only
+            // reallocs on a size change, and leaves the field untouched when
+            // the allocation fails, so a resize that cannot happen keeps the
+            // current (safe, just undersized) geometry instead of freeing
+            // bytes under the reader. The size moves either way: leaving a
+            // grown file at the pre-truncate length makes warm reads
+            // (fileForRead's lookupRef hit takes no origin stat) answer EOF
+            // early for bytes the client just ftruncate'd into existence. An
+            // undersized field costs a re-hydrate; a short read costs the
+            // client the data. saveBits below then persists an undersized
+            // sidecar, which Bitfield.decode already treats as empty on the
+            // next open rather than as a valid field.
+            file.bits.resize(st.gpa, piece.count(new_size, st.store.piece_size)) catch {};
+            file.size = new_size;
         } else if (piece.Bitfield.init(st.gpa, piece.count(new_size, st.store.piece_size))) |nb| {
             ob = file.bits;
             file.size = new_size;
@@ -1511,7 +1583,10 @@ fn truncateWithClose(path: [*c]const u8, size: fuse.off_t, fi: ?*fuse.fuse_file_
             @memset(file.bits.bytes, 0);
             file.writes += 1;
             st.store.clearHashes(file);
-            if (new_size < file.size) file.size = new_size;
+            // Same reasoning as the in-place arm above: the recorded size
+            // follows the origin in both directions, so the ENOMEM a caller
+            // sees is a cold cache, never a short read of a file it grew.
+            file.size = new_size;
             _ = st.store.saveBits(file, false);
             store_mod.Store.truncateCacheFd(file, file.size);
             std.log.warn("bitfield alloc failed for {s} after truncate ({t}); cache marks dropped, pieces refill", .{ rel, err });
