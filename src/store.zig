@@ -72,6 +72,20 @@ pub const Stats = struct {
     /// answers "reads got slow".
     read_nanos: std.atomic.Value(u64) = .init(0),
     reads_completed: std.atomic.Value(u64) = .init(0),
+    /// FUSE open failures for service reasons, the open-side twin of
+    /// reads_err: a cache entry the daemon could not build (allocation
+    /// failure) or an origin size it cannot read. Every FUSE read traverses
+    /// an open, so without this counter a mount whose entry allocations
+    /// fail answers ENOMEM to every client while status.json and the tick
+    /// line stay flat -- the identical failure on the read path already
+    /// moves reads_err, this one moved nothing.
+    opens_err: std.atomic.Value(u64) = .init(0),
+    /// Cache-entry warmup failures after a create already landed on the
+    /// origin. The create itself succeeds (mf_create reports the client's
+    /// syscall, not the warmup), so this is counted apart from opens_err:
+    /// an engine looping create/write on a mount that cannot hold entries
+    /// is otherwise visible only as one warning per create.
+    create_warmup_err: std.atomic.Value(u64) = .init(0),
     writes_ok: std.atomic.Value(u64) = .init(0),
     writes_err: std.atomic.Value(u64) = .init(0),
     bytes_written: std.atomic.Value(u64) = .init(0),
@@ -176,6 +190,8 @@ pub const Stats = struct {
         bytes_read: u64 = 0,
         read_nanos: u64 = 0,
         reads_completed: u64 = 0,
+        opens_err: u64 = 0,
+        create_warmup_err: u64 = 0,
         writes_ok: u64 = 0,
         writes_err: u64 = 0,
         bytes_written: u64 = 0,

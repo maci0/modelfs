@@ -694,7 +694,7 @@ keeps the pid check green. Artifacts from builds before `boot_s` age on `mono_s`
 | Topology | `peers`, `piece`, `inflight` (HTTP handlers) |
 | Saturation | `cache_free_pct`, the same sample culling runs on; `-1` when statfs fails, i.e. culling suspended |
 | Origin health | `origin_down`, 1 while an EIO/ESTALE/ETIMEDOUT getattr/open/stat, write, origin pread, lease publish, or `.cluster` walk has not yet recovered |
-| Lifetime counters (`stats`) | reads/writes with errors, warm-cache reads (`reads_warm`), cumulative read/write/peer-HTTP durations in ns (`http_nanos` covers `/have` `/data`, not `/ping`), piece fills by source with byte totals including `bytes_to_peer`, per-tier fill failures (including origin hydrations done to serve a peer), `probe_err`, `lease_err`, `meta_err`, pieces culled, `http_ok`, rejected auths, `http_405`, 5xx replies, malformed request heads, connections dropped at the inflight cap, and `serve_verify_fail` |
+| Lifetime counters (`stats`) | reads/writes with errors, warm-cache reads (`reads_warm`), open failures (`opens_err`) and failed post-create warmups (`create_warmup_err`), cumulative read/write/peer-HTTP durations in ns (`http_nanos` covers `/have` `/data`, not `/ping`), piece fills by source with byte totals including `bytes_to_peer`, per-tier fill failures (including origin hydrations done to serve a peer), `probe_err`, `lease_err`, `meta_err`, pieces culled, `http_ok`, rejected auths, `http_405`, 5xx replies, malformed request heads, connections dropped at the inflight cap, and `serve_verify_fail` |
 
 ### `peers`
 
@@ -953,7 +953,7 @@ The tick line carries the only latency signal there is:
 | `fsync_us` | average origin fsync/fdatasync time for FUSE requests, including failed attempts, over `fsync_completed`. Published cumulatively as `fsync_nanos` and `fsync_completed` in status.json. Path-policy rejections are neither timed nor counted |
 | `http_us` | average `/have`+`/data` handler time, over `http_completed`. Includes misses, invalid ranges, failures, and interrupted sends. `/ping` and requests rejected before entering a handler are neither timed nor counted |
 | `fill_ms peer/nfs` | average per-piece hydration stall by tier. A miss blocks the reader for one whole piece, so this is how "reads got slow" is diagnosed from the journal |
-| `md_us` | interval **total** (these handlers count wall time, not calls) of the getattr/open/statfs latency counters, so a metadata storm is visible in a window where no data read moved. The three publish separately in status.json |
+| `md_us` | interval **total** (these handlers count wall time, not calls) of the getattr/open/statfs latency counters, so a metadata storm is visible in a window where no data read moved. The three publish separately in status.json. The sum is saturating, for the reason `meanPerOp` gives: an interval that hits all three handlers can add past `u64`, which would otherwise take the whole tick line down |
 
 The line also carries the two saturation gauges, which are levels rather than interval deltas
 and are the same readings status.json publishes under the same names: `cache_free_pct` (the
@@ -977,6 +977,8 @@ And the counters worth knowing by name:
 | Counter | What it says |
 |---|---|
 | `reads_warm` | fully cached FUSE reads. Hit rate is `reads_warm / reads_ok` |
+| `opens_err` | FUSE opens that failed for a service reason: a cache entry the daemon could not build (allocation failure, answered to the client as `ENOMEM`) or an origin size it cannot read (`EIO`). Every FUSE read traverses an open, so this is where a mount whose entry allocations fail shows up; the read-side twin of the same failure is `reads_err`, and the two now move together. A failed origin stat is *not* counted here: that is `meta_err`. Published in status.json and on the `tick:` line beside the read counters |
+| `create_warmup_err` | cache-entry warmup failures after a create already landed on the origin. The create syscall succeeds, so this is kept apart from `opens_err`: an engine looping create/write on a mount that cannot hold entries is visible as a rising counter rather than one warning per create |
 | `fsync_ok` / `fsync_err` | successful/failed origin fsync/fdatasync attempts through FUSE, separate from write outcomes. Errors include origin open failures such as ENOENT; infrastructure failures also feed `origin_down` and its path/errno log through `Store.noteOriginIo` in src/store.zig |
 | `probe_err` | `/have` probes that failed for a reason other than a healthy 404: a dead peer, PSK drift, a malformed reply. The signature of a cluster silently degraded to NFS-only |
 | `httpok` / `serve_mib` | accepted `/have` 200 and `/data` 206 headers and their advertised bytes (`Content-Length`), not confirmation of complete body delivery |

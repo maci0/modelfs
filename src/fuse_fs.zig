@@ -972,10 +972,20 @@ fn mf_open(path: [*c]const u8, fi: ?*fuse.fuse_file_info) callconv(.c) c_int {
     if ((ost.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG) {
         if ((fiFlags(fi) & sys.c.O_TRUNC) != 0) return mf_truncate(path, 0, fi);
         const size = sys.sizeFromStat(ost.st_size) orelse {
+            // The read path counts this same unusable origin size as
+            // reads_err; without the count here an origin handing back a
+            // size the daemon cannot read fails every open with EIO and
+            // moves no counter, so the tick line stays silent.
+            _ = st.store.stats.opens_err.fetchAdd(1, .monotonic);
             std.log.warn("origin size unusable for {s}; failing open", .{rel});
             return -sys.c.EIO;
         };
         const file = st.store.getIdentified(rel, size, store_mod.OriginId.fromStat(ost), sys.monoSec(st.io)) catch |err| {
+            // Every read of this file traverses this open, so an entry that
+            // cannot be built is a mount-wide stall the client sees as
+            // ENOMEM on the first open. Counted like fileForRead counts the
+            // identical failure on the read path.
+            _ = st.store.stats.opens_err.fetchAdd(1, .monotonic);
             std.log.warn("cache entry open failed for {s} ({t}); failing open", .{ rel, err });
             return -sys.c.ENOMEM;
         };
@@ -1041,6 +1051,7 @@ fn mf_create(path: [*c]const u8, mode: fuse.mode_t, fi: ?*fuse.fuse_file_info) c
     if (st.store.getIdentified(rel, 0, .{}, sys.monoSec(st.io))) |file| {
         st.store.releaseFile(file);
     } else |err| {
+        _ = st.store.stats.create_warmup_err.fetchAdd(1, .monotonic);
         std.log.warn("cache entry warmup failed for {s} ({t}); rebuilding on next open", .{ rel, err });
     }
     return 0;
@@ -1991,7 +2002,11 @@ fn formatStatsTick(d: store_mod.Stats.Snap, free_pct: i32, inflight: u64, buf: [
     // Total, not a mean: the metadata handlers count wall time but not calls,
     // and a tick fires on any counter moving. Without this field a
     // metadata-only interval logs a line of zeros.
-    const md_us = @divTrunc(d.getattr_nanos + d.open_nanos + d.statfs_nanos, std.time.ns_per_us);
+    // Saturating, for the reason meanPerOp documents: this figure is the sum of
+    // three counters that nothing bounds individually, so a plain `+` panics a
+    // safe build and wraps to a nonsense microsecond count in ReleaseFast,
+    // taking the whole tick line down with it.
+    const md_us = @divTrunc(d.getattr_nanos +| d.open_nanos +| d.statfs_nanos, std.time.ns_per_us);
     // Format into a buffer then log one string: std.log.info is capped at
     // 32 format args, and the tick already named more Snap fields than that.
     var w = std.Io.Writer.fixed(buf);
@@ -2001,7 +2016,8 @@ fn formatStatsTick(d: store_mod.Stats.Snap, free_pct: i32, inflight: u64, buf: [
     // tick readable; no key names two different counters ("err" once named
     // both read and write failures).
     try w.print(
-        "tick: reads_ok={d} reads_err={d} reads_warm={d} read_mib={d} rd_us={d} writes_ok={d} writes_err={d} write_mib={d} wr_us={d}" ++
+        "tick: reads_ok={d} reads_err={d} reads_warm={d} read_mib={d} rd_us={d} opens_err={d} create_warmup_err={d}" ++
+            " writes_ok={d} writes_err={d} write_mib={d} wr_us={d}" ++
             " fills peer={d} nfs={d} fill_ms peer/nfs={d}/{d} fill_err peer/nfs/cache/verify={d}/{d}/{d}/{d}",
         .{
             d.reads_ok,
@@ -2009,6 +2025,8 @@ fn formatStatsTick(d: store_mod.Stats.Snap, free_pct: i32, inflight: u64, buf: [
             d.reads_warm,
             @divTrunc(d.bytes_read, mib),
             rd_us,
+            d.opens_err,
+            d.create_warmup_err,
             d.writes_ok,
             d.writes_err,
             @divTrunc(d.bytes_written, mib),
@@ -4064,9 +4082,75 @@ test "formatStatsTick divides latency by all timed completions" {
     try std.testing.expect(std.mem.find(u8, line, " rd_us=2 ") != null);
     try std.testing.expect(std.mem.find(u8, line, " wr_us=3 ") != null);
     try std.testing.expect(std.mem.find(u8, line, " reads_completed=4 writes_completed=3") != null);
+    // The open-side failure counters ride the line: an open storm whose
+    // cache entries cannot be built used to warn per open and move no
+    // counter, leaving the tick line flat through a mount-wide stall.
+    try std.testing.expect(std.mem.find(u8, line, " opens_err=0 create_warmup_err=0 ") != null);
     // Saturation gauges close the line: the journal reader gets the cache
     // free percentage and the peer listener depth, not just status.json.
     try std.testing.expect(std.mem.endsWith(u8, line, " cache_free_pct=-1 inflight=0"));
+}
+
+test "tick line fits its buffer at every counter's widest value" {
+    // Same contract as `status doc fits its buffer`: an over-wide line makes
+    // formatStatsTick's fixed writer fail, and logStatsTick's `catch return`
+    // then drops the whole heartbeat. A counter added past this bound fails
+    // here instead of silently ending the tick line in production.
+    var stats: store_mod.Stats.Snap = .{};
+    inline for (@typeInfo(store_mod.Stats.Snap).@"struct".fields) |f| {
+        @field(stats, f.name) = std.math.maxInt(f.type);
+    }
+    var buf: [1536]u8 = undefined;
+    const line = try formatStatsTick(stats, std.math.minInt(i32), std.math.maxInt(u64), &buf);
+    try std.testing.expect(std.mem.endsWith(u8, line, " cache_free_pct=-2147483648 inflight=18446744073709551615"));
+}
+
+test "open-side failure counters reach the tick line and stay quiet on success" {
+    const gpa = std.testing.allocator;
+    var ob: [128]u8 = undefined;
+    var cb: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-o-open-errs");
+    defer sys.deleteTree(std.testing.io, origin_d);
+    const cache_d = try sys.scratchDir(&cb, "modelfs-c-open-errs");
+    defer sys.deleteTree(std.testing.io, cache_d);
+
+    var st: State = undefined;
+    st.init(gpa, std.testing.io, origin_d, cache_d, 16, .{}, "me", &.{}, &.{}, &.{}, "", true);
+    defer st.deinit();
+    const previous_state = tls_state;
+    tls_state = &st;
+    defer tls_state = previous_state;
+    const previous_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_level;
+    try std.testing.expectEqual(@as(i32, 0), st.store.ensureLayout());
+
+    var fi_buf: [64]u8 align(8) = @splat(0);
+    const fi: *fuse.fuse_file_info = @ptrCast(&fi_buf);
+
+    // Happy paths must not move either counter: they exist to make a real
+    // open/create failure visible, not to report routine work.
+    try std.testing.expectEqual(@as(c_int, 0), mf_create("m.bin", 0o644, fi));
+    try std.testing.expectEqual(@as(c_int, 0), mf_open("m.bin", fi));
+    var snap = st.store.stats.snap();
+    try std.testing.expectEqual(@as(u64, 0), snap.opens_err);
+    try std.testing.expectEqual(@as(u64, 0), snap.create_warmup_err);
+
+    // A failed open (here: a missing origin file) counts as an origin stat
+    // failure, not an open-side entry failure, so opens_err stays 0 -- the
+    // counter is scoped to the service-side entry failures, matching the
+    // read-side reads_err split.
+    try std.testing.expectEqual(@as(c_int, -sys.c.ENOENT), mf_open("absent.bin", fi));
+    snap = st.store.stats.snap();
+    try std.testing.expectEqual(@as(u64, 0), snap.opens_err);
+
+    // A real open-side failure moves the counter so it publishes.
+    _ = st.store.stats.opens_err.fetchAdd(1, .monotonic);
+    _ = st.store.stats.create_warmup_err.fetchAdd(1, .monotonic);
+    var buf: [1536]u8 = undefined;
+    const line = try formatStatsTick(st.store.stats.snap(), -1, 0, &buf);
+    try std.testing.expect(std.mem.find(u8, line, " opens_err=1 ") != null);
+    try std.testing.expect(std.mem.find(u8, line, " create_warmup_err=1 ") != null);
 }
 
 test "meanPerOp does not overflow the per-op divisor" {
