@@ -21,6 +21,12 @@ pub const max_asset_bytes: usize = 100 << 20; // 100 MiB
 
 pub const Verdict = enum {
     current,
+    /// The running build is newer than the published tag. Nothing to
+    /// install: `latest` is behind, and installing it would downgrade the
+    /// binary underneath a live daemon. Distinct from `current` because the
+    /// operator reading the output is answering "am I up to date?", and
+    /// "you are ahead of the published release" is a different answer.
+    ahead,
     unsupported_target,
     missing_asset,
     missing_checksums,
@@ -58,8 +64,37 @@ pub const Release = struct {
 
 /// One leading `v` on the tag, then exact equality. `v0.18.0` is `0.18.0`.
 pub fn sameRelease(running: []const u8, tag: []const u8) bool {
-    const bare = if (std.mem.startsWith(u8, tag, "v")) tag[1..] else tag;
+    const bare = bareTag(tag);
     return std.mem.eql(u8, running, bare);
+}
+
+/// The tag's version string: one leading `v` dropped, nothing else. The
+/// published tag is a string off GitHub's API, so the only spelling the
+/// release process does not emit is the bare form.
+fn bareTag(tag: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, tag, "v")) tag[1..] else tag;
+}
+
+/// True when `running` is strictly newer than `tag` by semver precedence.
+///
+/// The version model needs an order, not just equality. Equality alone
+/// makes every difference look like "an update is available", so a build
+/// ahead of the published release -- a development tree at `0.21.0`, a
+/// backported patch, a rebased branch -- answers "new release available"
+/// and then installs the *older* tag, downgrading the running binary while
+/// `modelfs update` reloads the daemon on top of it. Downgrade is not a
+/// state the release channel is meant to move in, so the check belongs in
+/// the version comparison rather than in the operator's judgement.
+///
+/// A version either side cannot parse does not answer: the caller keeps the
+/// previous behavior for a shape the release process has never published
+/// rather than guessing an order from partial strings. `build_options.
+/// version` is semver by construction (the `embedded version parses as
+/// semver` test in src/main.zig), so in practice only the tag can.
+pub fn runningIsNewer(running: []const u8, tag: []const u8) bool {
+    const r = std.SemanticVersion.parse(running) catch return false;
+    const t = std.SemanticVersion.parse(bareTag(tag)) catch return false;
+    return std.SemanticVersion.order(r, t) == .gt;
 }
 
 /// Shipped release asset names:
@@ -177,6 +212,11 @@ pub fn checksumMatches(asset_bytes: []const u8, expected_hex: []const u8) bool {
 
 pub fn decide(in: Inputs) Verdict {
     if (sameRelease(in.running, in.tag)) return .current;
+    // Ordering before any download, for the same reason `current` is: a
+    // published tag behind the running build is not an update. Checking it
+    // here also keeps the caller from spending a 100 MiB asset fetch to
+    // reach the same answer.
+    if (runningIsNewer(in.running, in.tag)) return .ahead;
     const name = in.asset_name orelse return .unsupported_target;
     const a_url = in.asset_url orelse return .missing_asset;
     if (!trustedGithubUrl(a_url)) return .untrusted_url;
@@ -191,6 +231,14 @@ pub fn decide(in: Inputs) Verdict {
 
 pub fn formatCurrent(buf: []u8, tool: []const u8, running: []const u8, tag: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s} {s} is current (latest release: {s})", .{ tool, running, tag });
+}
+
+/// The running build is ahead of the published release, so there is nothing
+/// to install. Spelled out rather than reusing `formatCurrent`, because the
+/// two mean opposite things: `current` is "nothing to do because you are up
+/// to date", this is "nothing to do because the release is behind you".
+pub fn formatAhead(buf: []u8, tool: []const u8, running: []const u8, tag: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s} {s} is newer than the latest release ({s}); not downgrading", .{ tool, running, tag });
 }
 
 pub fn formatNewRelease(buf: []u8, tag: []const u8, running: []const u8) ![]const u8 {
@@ -370,6 +418,23 @@ test "sameRelease compares tags accurately" {
     try std.testing.expect(!sameRelease("0.18.0", "v0.19.0"));
 }
 
+test "runningIsNewer orders versions, not just compares them" {
+    try std.testing.expect(runningIsNewer("0.19.0", "v0.18.0"));
+    try std.testing.expect(runningIsNewer("1.0.0", "v0.99.99"));
+    try std.testing.expect(runningIsNewer("0.18.10", "v0.18.9"));
+    try std.testing.expect(runningIsNewer("0.18.1", "v0.18.0"));
+    try std.testing.expect(runningIsNewer("0.18.0", "v0.18.0-rc.1"));
+    // Not newer: older, or equal by precedence with a different spelling.
+    try std.testing.expect(!runningIsNewer("0.18.0", "v0.18.0"));
+    try std.testing.expect(!runningIsNewer("0.18.0", "v0.18.0+build"));
+    try std.testing.expect(!runningIsNewer("0.17.9", "v0.18.0"));
+    try std.testing.expect(!runningIsNewer("0.18.0", "v0.18.10"));
+    // A shape either side cannot parse answers nothing, so an unpublished
+    // tag spelling keeps the old behavior instead of ordering by string.
+    try std.testing.expect(!runningIsNewer("0.18.0", "nightly"));
+    try std.testing.expect(!runningIsNewer("dev", "v0.18.0"));
+}
+
 test "releaseAssetName maps architecture and abi to correct asset" {
     try std.testing.expectEqualStrings("modelfs-x86_64-linux-musl", releaseAssetName(.x86_64, .musl).?);
     try std.testing.expectEqualStrings("modelfs-x86_64-linux-musl", releaseAssetName(.x86_64, .gnu).?);
@@ -498,6 +563,58 @@ test "decide evaluates release inputs correctly" {
         .asset_bytes = data,
         .sums_bytes = sums,
     }));
+}
+
+test "decide refuses to downgrade a build ahead of the published release" {
+    // Every input here would otherwise reach .replaced: the asset and the
+    // sums are present, trusted, and the checksum matches. Only the version
+    // order says the release is older than what is running.
+    const data = "abc";
+    const sums = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  modelfs-x86_64-linux-musl\n";
+    const inputs = [_]struct { running: []const u8, tag: []const u8 }{
+        .{ .running = "0.19.0", .tag = "v0.18.0" },
+        .{ .running = "0.18.1", .tag = "v0.18.0" },
+        .{ .running = "0.18.10", .tag = "v0.18.9" },
+        // A prerelease of the running line: v0.19.0-rc.1 is older than the
+        // 0.19.0 that built it.
+        .{ .running = "0.19.0", .tag = "v0.19.0-rc.1" },
+    };
+    inline for (inputs) |in| {
+        try std.testing.expectEqual(Verdict.ahead, decide(.{
+            .running = in.running,
+            .tag = in.tag,
+            .asset_name = "modelfs-x86_64-linux-musl",
+            .asset_url = "https://github.com/maci0/modelfs/releases/download/v0.19.0/modelfs-x86_64-linux-musl",
+            .sums_url = "https://github.com/maci0/modelfs/releases/download/v0.19.0/SHA256SUMS",
+            .asset_bytes = data,
+            .sums_bytes = sums,
+        }));
+    }
+    // A tag the version model cannot parse answers nothing, so it keeps
+    // the pre-existing behavior rather than silently refusing to update.
+    try std.testing.expectEqual(Verdict.replaced, decide(.{
+        .running = "0.18.0",
+        .tag = "nightly",
+        .asset_name = "modelfs-x86_64-linux-musl",
+        .asset_url = "https://github.com/maci0/modelfs/releases/download/nightly/modelfs-x86_64-linux-musl",
+        .sums_url = "https://github.com/maci0/modelfs/releases/download/nightly/SHA256SUMS",
+        .asset_bytes = data,
+        .sums_bytes = sums,
+    }));
+}
+
+test "formatAhead says the release is behind, not that the build is current" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "modelfs 0.19.0 is newer than the latest release (v0.18.0); not downgrading",
+        try formatAhead(&buf, tool_name, "0.19.0", "v0.18.0"),
+    );
+    // The current line reads the other way round, and the two must not
+    // collapse into one message.
+    try std.testing.expectEqualStrings(
+        "modelfs 0.19.0 is current (latest release: v0.19.0)",
+        try formatCurrent(&buf, tool_name, "0.19.0", "v0.19.0"),
+    );
 }
 
 test "parseRelease extracts metadata and assets from json" {

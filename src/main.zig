@@ -1978,12 +1978,27 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.En
     }
 
     var line_buf: [256]u8 = undefined;
-    if (update_mod.sameRelease(build_options.version, rel.tag)) {
-        const line = update_mod.formatCurrent(&line_buf, update_mod.tool_name, build_options.version, rel.tag) catch {
+    // The version order answers this before anything is downloaded, and
+    // `decide` re-asks it below: an announcement of a release this build is
+    // already past is the same downgrade defect one step earlier. Both sites
+    // read `update_mod.runningIsNewer` so they cannot disagree about what
+    // "newer" means.
+    const is_current = update_mod.sameRelease(build_options.version, rel.tag);
+    if (is_current or update_mod.runningIsNewer(build_options.version, rel.tag)) {
+        const rendered = if (is_current)
+            update_mod.formatCurrent(&line_buf, update_mod.tool_name, build_options.version, rel.tag)
+        else
+            update_mod.formatAhead(&line_buf, update_mod.tool_name, build_options.version, rel.tag);
+        const line = rendered catch {
             printErr("error: could not format the version comparison\n", .{});
             return 1;
         };
         printErr("{s}\n", .{line});
+        // `--check` still names the release page: the operator asked where
+        // the channel is, and that answer does not depend on this build.
+        if (opts.update_check) {
+            if (!printOut(io, gpa, "{s}\n", .{rel.page})) return 1;
+        }
         return 0;
     }
 
@@ -2062,7 +2077,7 @@ fn cmdUpdate(io: std.Io, gpa: std.mem.Allocator, environ: ?*const std.process.En
             printErr("error: unsupported platform for prebuilt releases\n", .{});
             return 1;
         },
-        .current => return 0,
+        .current, .ahead => return 0,
     }
 
     const installed_path = update_mod.replaceExecutable(io, gpa, asset_bytes) catch |err| {
