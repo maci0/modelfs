@@ -1,5 +1,10 @@
 # Security policy
 
+Reports about the recovery plane this repository ships alongside the binary, the systemd units
+under `scripts/nas/` and the restore, drill, and alarm wrappers they install, are in scope for
+this policy as well; the model for that plane is
+[docs/threat-model.md](docs/threat-model.md), boundary B8.
+
 ## Supported versions
 
 `v0.20.0` is the current release: tag `v0.20.0`, matching `.version = "0.20.0"` in

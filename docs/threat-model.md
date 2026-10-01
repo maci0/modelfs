@@ -2,9 +2,9 @@
 
 | Field | Value |
 |---|---|
-| Status | Living document; describes `src/` as of the date below |
-| Last reviewed | 2026-09-29 |
-| Covers | modelfs daemon (`mount`) and CLI as of `v0.20.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull, GitHub release self-update |
+| Status | Living document; describes `src/` and the shipped NAS units and wrappers as of the date below |
+| Last reviewed | 2026-09-30 |
+| Covers | modelfs daemon (`mount`) and CLI as of `v0.20.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull, GitHub release self-update, and the shipped NAS snapshot/replica/drill/offsite plane (`scripts/nas/`, the restore and alarm wrappers) |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
 
@@ -14,7 +14,9 @@ what can be attacked from outside the node, what it costs, and which controls ex
 point at code; fixes belong to sec-review passes, not here.
 
 Every claim below cites a file and symbol. When code moves, re-verify the citation before
-trusting the row.
+trusting the row. Boundaries B1 to B7 are the daemon and CLI; B8 is the shipped recovery plane
+(`scripts/nas/` and the restore and alarm wrappers), which runs on the origin host rather than
+inside the binary.
 
 ---
 
@@ -34,6 +36,8 @@ trusting the row.
 | [R10](#r10-pulled-origin-artifacts-land-world-readable) | `modelfs pull` writes weights 0644 on the shared origin, unlike the 0600 cache | local uid / NFS export reader to origin | **Not prevented** |
 | [R11](#r11-self-update-trusts-the-publisher-not-just-the-bytes) | `modelfs update` checks the digest against a sidecar fetched from the same release, so publisher identity is never established | CLI to GitHub Releases | **Not mitigated**: SHA-256 only, no signature, no pinned digest |
 | [R12](#r12-self-update-replaces-the-installed-binary-and-triggers-handover) | The same command rewrites the on-disk binary and then drives the live daemon's image replacement | CLI to local filesystem / B4 handover | **No mitigation**: write access to the binary's directory is the only gate |
+| [R13](#r13-replica-pull-authenticates-with-one-key-and-verifies-nothing-in-the-stream) | The daily replica pull authenticates with one root SSH key and `zfs send` | replica host to NAS (B8) | Partially mitigated: `BatchMode`, `ConnectTimeout`, unit sandbox, monthlies held |
+| [R14](#r14-recovery-alarms-trust-local-files-nothing-checks) | The drill log and the age alarms are plain local files, so a uid that can write them silences the only evidence the backups work | local uid to NAS alarm plane (B8) | **Not prevented**; root-owned by convention only |
 
 `#` is a stable identifier, not a position: rows are appended as the model grows rather than
 renumbered, so a citation stays valid across passes.
@@ -54,6 +58,7 @@ renumbered, so a citation stays valid across passes.
 | Hugging Face Hub token | `HF_TOKEN`, `$HF_HOME/token`, or `~/.cache/huggingface/token`, CLI memory during `modelfs pull` (src/hf.zig, src/main.zig) | Unauthorized read/write access to user's private models and gated repositories on huggingface.co |
 | The installed binary | `/proc/self/exe`, rewritten in place by `modelfs update` (`update.replaceVerifiedPath` src/update.zig) | Whoever replaces it owns the daemon's next start and, through the handover, the running mount's FUSE session, peer sockets, and PSK (R12) |
 | GitHub API token | `GITHUB_TOKEN`, read into the `Authorization` header by `update.githubBearer` src/update.zig, sent only to hosts passing `trustedGithubUrl` | Whatever read or write access that token carries on `api.github.com`: private repo metadata, release contents, or the ability to publish a release (R11) |
+| The backup chain's credentials and artifacts | The replica host's SSH key under `/root/.ssh` (`scripts/nas/syncoid-models.service`), the `MF_SYNCOID_SRC` / `MF_DRILL_REPLICA` / `MF_OFFSITE_DATASET` drop-in values (`scripts/backup_config.sh`), and the drill and restore logs `/var/log/modelfs-drill.log`, `/var/log/modelfs-pool-restore.log` (`scripts/dr_restore_drill.sh`, `scripts/dr_pool_restore.sh`) | The key that may `zfs send` the whole origin is root-equivalent write on every host that trusts it (R13). The logs are the only record a drill or restore ran, so a stale or forged one is a green alarm (R14) |
 
 The daemon handles no credential but the cluster PSK. Two CLI commands read an outbound token
 from the environment: `modelfs pull` reads the Hugging Face token (environment or token file)
@@ -200,9 +205,41 @@ cryptographically. `modelfs pin`/`unpin` writes `pin/` with no daemon and no PSK
 replacement binary path and a handshake token (0600, O_NOFOLLOW), and anything running as the
 daemon's uid can plant one.
 
+### NAS backup, replica, and restore plane (shipped systemd units and root wrappers)
+
+Not part of the daemon, but shipped by this repository and installed on the host that holds the
+authoritative origin, so it is part of a deployment's attack surface.
+
+* **Scheduled jobs.** Five timers under `scripts/nas/` and the units they drive: the daily
+  replica pull (`syncoid-models.timer` into `syncoid-models.service`), the monthly restore drill
+  (`modelfs-drill.timer`), the hourly snapshot-age alarm (`modelfs-snap-age.timer`), the daily
+  drill-log alarm (`modelfs-drill-log.timer`), and the weekly offsite-age alarm
+  (`modelfs-offsite-age.timer`). Snapshot creation and pruning are sanoid's, configured by the
+  `sanoid.conf` this repository installs; every unit also carries
+  `OnFailure=notify-admin@%n.service`, the `notify-admin@.service` template that records a failure
+  as one `logger` line. None carries `User=`, so each runs as root on the ZFS host.
+  `install_nas_backup.sh` installs them (`copy_one` list in `scripts/install_nas_backup.sh`) at
+  0644, with wrappers at 0755.
+* **Root wrappers taking operator input.** `modelfs-restore-drill` (`scripts/dr_restore_drill.sh`),
+  `modelfs-pool-restore` (`scripts/dr_pool_restore.sh`), `modelfs-point-restore`
+  (`scripts/dr_point_restore.sh`), `modelfs-hold-monthlies` (`scripts/hold_monthlies.sh`),
+  `modelfs-check-drill-log` (`scripts/check_drill_log.sh`), `modelfs-check-offsite`
+  (`scripts/check_offsite.sh`), `modelfs-backup-config` (`scripts/backup_config.sh`). Each takes
+  dataset names, paths, and thresholds from `MF_*` environment variables (the member block in
+  `scripts/lib.sh`), and the two restore scripts take `--execute` to turn a printed plan into a
+  destructive `zfs recv -F`, `zfs destroy`, or `cp -a` against live weights. The `MF_*` values
+  that choose datasets come from `systemctl edit` drop-ins, which `install_nas_backup.sh
+  --install` does not overwrite (it replaces a unit written with `systemctl edit --full`).
+* **The stream itself.** `syncoid` on the replica host opens SSH to the NAS and pipes a `zfs send`
+  stream into `zfs recv` (`ExecStart` in `scripts/nas/syncoid-models.service`), with the dataset
+  names and the SSH source interpolated into that command line.
+* **Alarms read local files.** `check_drill_log.sh` parses the newest line of
+  `/var/log/modelfs-drill.log`; `check_offsite.sh` and `dr_restore_drill.sh --age-only` read
+  `zfs list` output and that log. None checks an owner, a mode, or a signature.
+
 ### Not present
 
-No scheduled jobs, network-based RPC or IPC sockets (Unix domain sockets / named pipes; local
+No network-based RPC or IPC sockets in the binary (Unix domain sockets / named pipes; local
 daemon replacement uses file-and-signal handover via `update.req`/`SIGUSR2` and an inherited
 sealed memfd), message consumers, webhooks, or debug/admin services. The binary links only
 libfuse3, libc, and pthread; `build.zig.zon` declares no dependencies. The static release
@@ -225,6 +262,10 @@ local engines/processes ⇄ [FUSE/kernel] ⇄ modelfs daemon ⇄ [TCP :18080, pl
                        modelfs pull (CLI) ⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄ Hugging Face API & CDNs
                        modelfs update (CLI) ⇄⇄⇄⇄⇄⇄⇄⇄⇄⇄ GitHub release API & assets
                             ⇣ (writes /proc/self/exe, then may drive the handover above)
+
+[origin dataset on the NAS] ⇄ [SSH + zfs send stream] ⇄ replica host (nas/syncoid-models.service)
+          ⇓ snapshot/clone/drill          ⇓ ─────────────────────────────────────────────────
+   /var/log/modelfs-drill.log, age alarms ← any local uid that can write them
 ```
 
 ### B1: local processes to daemon (FUSE)
@@ -392,6 +433,30 @@ B4 path.
   that serves both consistently passes ([R11](#r11-self-update-trusts-the-publisher-not-just-the-bytes)).
   Nor is the running binary checked before it is replaced, so an already-modified `modelfs` is
   silently upgraded over.
+
+### B8: replica host to NAS, and local uid to the NAS alarm plane
+
+The shipped recovery plane: outside the daemon, inside a deployment's blast radius. It carries
+every weight off the origin, and it is the only thing between a site loss and a total loss of the
+data this project exists to serve.
+
+* **Pull.** `syncoid-models.service` on the replica host runs
+  `syncoid --recursive --no-privilege-elevation --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 ${MF_SYNCOID_SRC} ${MF_SYNCOID_DEST}` as root, authenticating to the NAS with an SSH identity under `/root/.ssh`. The pull is `zfs send | zfs recv`: ZFS verifies its own stream framing, and every dataset on the origin lands on the replica with the sender's ownership, so a compromised NAS can plant datasets the replica then holds and can later be asked to restore (R13).
+* **Snapshot policy.** `sanoid.conf` is installed at `/etc/sanoid/sanoid.conf` and edited on the host; the repository ships retention settings, not the site's dataset name. Snapshot creation and pruning are root on the NAS, and the shipped drop-ins under `scripts/nas/drop-ins/` only add `OnFailure=` and `TZ=UTC`.
+* **Drill.** `modelfs-drill.service` clones the newest snapshot `readonly=on`, `sharenfs=off`, `sharesmb=off`, diffs it against the live tree excluding `.cluster` and `.zfs`, hashes one size-stable file in both, appends a UTC line to `/var/log/modelfs-drill.log`, and destroys the clone on exit (`dr_restore_drill.sh`). It runs as root and is deliberately the least sandboxed unit (`UMask=0077`, `PrivateTmp=yes`, no `ProtectSystem` or `NoNewPrivileges`, because `zfs clone` and `zfs destroy` need `CAP_SYS_ADMIN`).
+* **Restore.** `dr_pool_restore.sh --execute` runs `zfs recv -Fs` or a `syncoid --force-delete` pull onto the destination and then sets export properties, with `sharenfs` defaulting to `rw,async,no_root_squash,no_subtree_check`; `dr_point_restore.sh --execute` clones one snapshot and copies the named `--copy` paths back into the live export. Both refuse to write anything without `--execute`, and `dr_pool_restore.sh` refuses an operand beginning with `-` before it reaches `zfs` or syncoid's option parser and a mounted destination without `--force`; `dr_point_restore.sh` requires at least one `--copy`, refuses an absolute or `..`-escaping path, and refuses a clone dataset or mountpoint that already exists.
+* **Alarms.** The three age checks (`check_drill_log.sh`, `check_offsite.sh`, `dr_restore_drill.sh --age-only`) run under `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, and read only a log file, `zfs list` output, and the host clock. `notify-admin@.service` records a failure as one `logger` line.
+
+The `MF_*` knobs that choose the datasets (`MF_SYNCOID_SRC`, `MF_DRILL_REPLICA`,
+`MF_OFFSITE_DATASET`, `MF_DRILL_DATASET`) are set through `systemctl edit` drop-ins. The shipped
+values are placeholders that `backup_config.sh` reports as such, and `check_offsite.sh` refuses to
+run with its dataset unset rather than bless production as the offsite copy.
+
+`syncoid-models.service` is deliberately a pull and not a push, so NAS root cannot destroy the
+pool-loss copy with the credential that can destroy `tank/models`, and the unit tells the
+installer to override `MF_SYNCOID_SRC` with a dedicated replica user's key. The shipped value is
+still the `nas:tank/models` placeholder, so that hardening is a host action this repository asks
+for and cannot enforce, and R13 holds until it is taken.
 
 ### Secrets flow
 
@@ -600,6 +665,18 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 | **D** denial of service via a hostile release | Bounded: 1 MiB JSON, 64 KiB sidecar, 100 MiB asset, and a pure `decide` that returns before any write. A truncated or lying release yields an error, not a broken install. `decide` returns `.current` on equal versions and nothing is downloaded |
 | **E** elevation through the replacement | Not mitigated beyond the filesystem. The bytes land at mode 0755 over whatever `/proc/self/exe` names, and the same run then drives the B4 handover, so a replaced binary executes inside the live daemon ([R12](#r12-self-update-replaces-the-installed-binary-and-triggers-handover)) |
 
+### B8: replica host to NAS, and local uid to the NAS alarm plane
+
+| Threat | State |
+|---|---|
+| **S** spoofing the NAS at the replica | Only SSH's host-key check and the replica's key. Nothing in this repository pins a host key or constrains `MF_SYNCOID_SRC` to a named host: a poisoned `known_hosts`, a rewritten drop-in, or a NAS that is itself compromised produces a stream this plane accepts ([R13](#r13-replica-pull-authenticates-with-one-key-and-verifies-nothing-in-the-stream)) |
+| **T** tampering with what the replica receives | Partly mitigated by ZFS's own stream checksums and `BatchMode=yes` (a missing or changed host key fails rather than hangs). Not mitigated against a malicious sender: a compromised NAS can hand over datasets with any content, and the replica stores them as authoritative |
+| **R** repudiation of a backup or a drill | No record outside the host. The drill appends one line to `/var/log/modelfs-drill.log` and no other artifact; the pull leaves only the receiving pool. A repo outside these hosts cannot show a backup existed ([R14](#r14-recovery-alarms-trust-local-files-nothing-checks)) |
+| **I** disclosure of the whole origin | The pull is an SSH-encrypted stream of the entire dataset, so one key pair copies every weight. Nothing in the plane limits which datasets a destination receives beyond `--recursive`, and `MF_SYNCOID_SRC` is operator-set |
+| **D** denial of read | Bounded for the origin: sanitoids run on the NAS and the pull is `TimeoutStartSec=infinity`, so a failed pull cannot kill the mount. Unbounded for the drill: `modelfs-drill.service` clones and `diff -rq`s the newest snapshot as root on the NAS once a month, and `check_drill_log.sh` fails (so `OnFailure` fires) if the log is more than 35 days stale |
+| **E** elevation via the restore scripts | The `--execute` scripts run as root and destroy live data by design (`zfs recv -F`, `zfs destroy`, `cp -a`). Mitigated against accident: nothing runs without `--execute`, operands beginning with `-` are refused, a mounted destination needs `--force`, and `sharenfs` is an explicit knob. Not mitigated against a caller who already has root, who is the intended caller |
+
+
 ---
 
 ## Mitigations in place
@@ -759,6 +836,20 @@ rather than ignore.
 | `GITHUB_TOKEN` is environment-only, trimmed, refused when empty or holding CR/LF, and sent as a privileged header to trusted hosts only | `githubBearer` src/update.zig, `fetchUrl` `privileged_headers` | B7/I: the token stays off argv and out of a redirected third-party request. Residual: the stack buffer is not zeroed and core dumps stay enabled for this command |
 | The handover gate is unchanged by a self-update: a live daemon still refuses a request it does not own and still requires `SIGUSR2` | `handover.reqOwnerOk` src/handover.zig, `onUsr2` / `execHandover` src/fuse_fs.zig | B4: replacing the on-disk binary does not let a different local uid drive the exec; the run that replaced it is the one that asks |
 
+### Recovery plane (NAS units and root wrappers)
+
+| Control | Location | Covers |
+|---|---|---|
+| Nothing destructive runs without an explicit `--execute`; the default path prints the plan and exits 0 | `dr_pool_restore.sh`, `dr_point_restore.sh` (installed as `modelfs-pool-restore`, `modelfs-point-restore`) | B8/E: an operator reading a recovery step, or a script running one, cannot destroy live data by accident |
+| Dataset operands starting with `-` are refused before reaching `zfs` or syncoid's option parser, and a mounted destination is refused without `--force`; a point restore demands at least one `--copy`, refuses an absolute or `..`-escaping path, and refuses to reuse an existing clone dataset or mountpoint | the dash-leading gate and the `mounted` check in `dr_pool_restore.sh`; the `COPY_PATHS` and clone checks in `dr_point_restore.sh` | B8/E: an `MF_RESTORE_*` value cannot turn into a remote, destructive option, a `zfs recv -F` cannot silently replace a live export, and a leftover clone cannot silently become the restore source |
+| `MF_OFFSITE_DATASET` unset fails closed rather than defaulting, and `backup_config.sh` reports a shipped placeholder as a placeholder | `check_offsite.sh`, `PLACEHOLDERS` in `scripts/backup_config.sh` | B8/R: production snapshots cannot be blessed as the offsite copy by a default |
+| Pull units fail loudly instead of hanging: `BatchMode=yes`, `ConnectTimeout=30`, `TimeoutStartSec=infinity`, `Requires=zfs-import.target`, and `OnFailure=notify-admin@%n.service` on every unit | `scripts/nas/syncoid-models.service`, the five timers, `scripts/nas/notify-admin@.service` | B8/D: a stopped pull or a missing host key raises an alarm rather than sitting silent |
+| The alarm and notifier units are sandboxed (`ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`); `syncoid-models.service` carries the same set minus `ProtectHome=yes`, whose absence the unit explains (the SSH identity lives under `/root/.ssh`); `modelfs-drill.service` carries only `PrivateTmp=yes` and `UMask=0077`, because `zfs clone` and `zfs destroy` need `CAP_SYS_ADMIN` | `scripts/nas/*.service` | B8/E: an alarm or restore wrapper that reads a log cannot write the filesystem or gain privilege. The two exceptions are root with a narrower rationale, not an oversight |
+| Monthlies are `zfs hold` tagged after every pull, so a recursive destroy needs an explicit release; a missing hold fails the unit | `scripts/hold_monthlies.sh`, `ExecStartPost` in `syncoid-models.service` | B8/D: a `destroy -r` on the replica cannot silently take the pool-loss copy with it |
+| Snapshot cadence is pinned to UTC (`TZ=UTC` drop-in, `OnCalendar=... UTC`) rather than host wall clock | `scripts/nas/drop-ins/sanoid.service.d/tz.conf`, the timer `OnCalendar` lines | B8/D: a DST transition cannot skip or double an hourly snapshot and quietly widen the RPO |
+| The gate refuses a shipped unit or drop-in that exports a `MODELFS_` knob, carries a secret on `ExecStart`, or points at a `/tmp` payload | the scan in `scripts/check.sh` between its marker comments, exercised by `scripts/test_nas_unit_policy.sh` | B8/S and B8/I: the units the NAS runs cannot carry the cluster PSK, name a daemon knob the daemon refuses, or leave run artifacts on tmpfs |
+| Installed units are 0644 and the `usr/local/sbin` wrappers 0755, owned by the installing uid; the site's `sanoid.conf` is installed with `mv -nT`, so a later `--install` never overwrites it, and site drop-ins survive | the mode block and the `mv -nT` branch in `copy_one`, `scripts/install_nas_backup.sh` | B8/T: no local uid can change what the timers run, and a re-install cannot silently reset retention or the dataset names an operator edited on the host |
+
 ### Single points of failure, named honestly
 
 * **The PSK is the only control on B2.** It carries authentication, membership, and, through the
@@ -772,6 +863,9 @@ rather than ignore.
   is fetched from the account that published the release, so that account is the whole trust
   base: the digest, the sidecar, and the asset are one publisher's three statements about itself.
   Compromise or mistake there is indistinguishable, to this code, from a legitimate release.
+* **SSH's host-key check is the only control on B8.** One key pair is the only credential that
+  copies the entire origin, and nothing here pins the key, restricts the pull to a subset, or
+  checks what arrived ([R13](#r13-replica-pull-authenticates-with-one-key-and-verifies-nothing-in-the-stream)). The alarm plane is weaker still: a plain log file is the only evidence a drill ran ([R14](#r14-recovery-alarms-trust-local-files-nothing-checks)).
 
 ---
 
@@ -958,6 +1052,34 @@ first": the running binary is never hashed before it is replaced, and the instal
 never recorded afterwards, so post-hoc attribution rests on the operator's terminal scrollback
 and the GitHub release record ([B7/R](#b7-cli-to-github-releases-self-update)).
 
+### R13: replica pull authenticates with one key and verifies nothing in the stream
+
+**Partially mitigated.** `syncoid-models.service` pulls the entire origin to the replica host
+over one SSH session as root, with the identity in `/root/.ssh` and the destination named by
+`MF_SYNCOID_SRC` / `MF_SYNCOID_DEST`. ZFS verifies its own stream framing and `--recursive`
+brings every child dataset, but nothing in this repository pins a host key, restricts the pull to
+a dataset subset, or checks what arrived after the recv. A compromised NAS, a poisoned
+`known_hosts`, or a rewritten drop-in therefore produces a replica holding attacker-chosen
+datasets, and a later `modelfs-pool-restore --execute` from that replica restores them. The
+controls that do exist are named under
+[Recovery plane](#recovery-plane-nas-units-and-root-wrappers): `BatchMode=yes`,
+`ConnectTimeout=30`, the unit sandbox, the pull direction (a push would let NAS root destroy the
+copy with the same credential that destroys `tank/models`), and monthlies held against a
+recursive destroy. The intended fix is named in the unit itself: a dedicated replica user's key,
+overriding the shipped `MF_SYNCOID_SRC` placeholder through a drop-in. It is a host action, so
+until an operator takes it the pull authenticates as whoever root can become on the replica host.
+
+### R14: recovery alarms trust local files nothing checks
+
+**Not prevented.** `check_drill_log.sh` decides whether the monthly restore drill succeeded by
+parsing the newest line of `/var/log/modelfs-drill.log`; `check_offsite.sh` and
+`dr_restore_drill.sh --age-only` decide the same way from `zfs list` output and that log. Neither
+checks the file's owner or mode, and nothing keeps the log off a filesystem any local uid can
+write. A uid that can append to the log silences the only evidence a drill ran; a uid that can
+remove it makes the daily timer fail, which pages rather than hides, so the write is the
+cheaper attack. The same is true of the restore log `dr_pool_restore.sh` appends to: it is the
+only record a pool restore happened, and it lives only on the machine that performed it.
+
 ### Closed: `status.json` world-readable at the cache root
 
 The file is created 0600 (`writeFileOwnerOnly` src/sys.zig) and leftover 0644 files are tightened
@@ -1040,6 +1162,20 @@ holding the installed binary.
     replacement image inherits the FUSE session, the peer listen sockets, and the PSK from the
     sealed memfd, with no ptrace and no `SIGUSR2` from anyone else. On an install that is not
     directory-writable, the same chain is reachable only through the publisher path (case 9).
+11. **Poisoning the replica, then the restore.** An attacker who is the NAS, or who can write the
+    replica host's `/root/.ssh/known_hosts` or the `MF_SYNCOID_SRC` drop-in, feeds the daily
+    `syncoid-models.service` pull a stream that `--recursive` lands whole on the replica. ZFS
+    verifies the stream framing, not the sender, and the replica stores what arrived as
+    authoritative ([R13](#r13-replica-pull-authenticates-with-one-key-and-verifies-nothing-in-the-stream)).
+    The enabling path is the `ExecStart` in `scripts/nas/syncoid-models.service`; the payoff comes
+    later, when an operator runs `modelfs-pool-restore --execute` after a real pool loss and the
+    attacker's datasets become the origin.
+12. **Silencing the only evidence the backups work.** A local uid on the NAS that can append to
+    `/var/log/modelfs-drill.log` writes one well-formed UTC line and keeps `check_drill_log.sh`
+    green for 35 days while no drill, snapshot restore, or offsite check ever runs
+    ([R14](#r14-recovery-alarms-trust-local-files-nothing-checks)). The alarm scripts parse that
+    line and never look at the file's owner; `notify-admin@.service` fires only when the script
+    exits nonzero, and a fresh stamp is what keeps it from doing so.
 
 **Closed:** reading `status.json` as another uid. The artifact is 0600. Cross-uid theft from the
 per-node cache stays closed by 0600 files and 0700 dirs; leftover 0755 `data/`/`meta/`/`pin/`,
@@ -1069,6 +1205,13 @@ saturation (`http_dropped`). status.json exposes lifetime aggregates, `origin_do
 `now_s`, and a same-machine monotonic `mono_s` that the wedge gate prefers (`logStatsTick` and
 the status write, src/fuse_fs.zig). Still missing: a persistent, centralized record, and
 per-client attribution of successful requests.
+
+The recovery plane has the same gap in a smaller form. A successful backup, drill, or restore
+leaves one line in a log on the host that performed it (`/var/log/modelfs-drill.log`,
+`/var/log/modelfs-pool-restore.log`) and nothing else: no remote copy, no per-run identity, and
+nothing that survives the host. A replica that has silently stopped pulling is visible only as
+`syncoid-models.service` failing, which the `OnFailure=` notifier records as one `logger` line on
+the replica itself.
 
 **Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.20.0`
 is current, and fixes land on `main` and ship as the next tag, with no backport line) and the
