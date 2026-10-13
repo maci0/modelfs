@@ -42,7 +42,7 @@ jobs:
         run: zig build test -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast -Dfuse-static
       - name: build static single-file binary
         run: ./scripts/build_static.sh ${{ matrix.target }} --prefix .scratch/release
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rel-${{ matrix.target }}
           path: .scratch/release/modelfs-*
@@ -64,7 +64,7 @@ jobs:
         run: ./scripts/check_release_tag.sh
       - name: cross-compile the spark binary
         run: ./scripts/cross_aarch64.sh --prefix .scratch/release
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rel-sparks
           path: .scratch/release/bin/modelfs
