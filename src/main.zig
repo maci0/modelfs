@@ -1,5 +1,5 @@
 //! CLI entry point: argument parsing, command dispatch (mount/status/peers/
-//! pin/unpin/verify/dupes/config/pull/update, plus help and version), and
+//! pin/unpin/verify/dupes/config/pull/update/schema, plus help and version), and
 //! mount wiring into State.init / fuse_fs.run.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,6 +40,7 @@ const fuzzcorpus = @import("fuzzcorpus.zig");
 const handover = @import("handover.zig");
 const hf = @import("hf.zig");
 const update_mod = @import("update.zig");
+const clispec = @import("clispec.zig");
 
 const usage =
     \\modelfs: POSIX mount for model files. Local NVMe, then peers, then NFS.
@@ -56,6 +57,7 @@ const usage =
     \\  modelfs pull <owner/repo> --origin PATH [--revision REF] [--dest REL]
     \\  modelfs update [--check] [--repo owner/name] [--reload] [--cache PATH]
     \\  modelfs config [mount options]
+    \\  modelfs schema [command]
     \\  modelfs version
     \\  modelfs help
     \\
@@ -103,20 +105,34 @@ const usage =
     \\  --repo OWNER/REPO     GitHub repository to check (default maci0/modelfs)
     \\  --reload              Request live daemon image replacement without checking releases
     \\
-    \\mount/config/status/peers/pin/unpin/verify/dupes/pull/update:
+    \\mount/config/status/peers/pin/unpin/verify/dupes/pull/update/schema:
     \\  --log LEVEL           Journal ceiling: err, warn, info (default), or debug
+    \\  -o, --output FORMAT   auto (default), text, or json. auto is a text
+    \\                        table on a terminal and JSON when stdout is not
+    \\                        a terminal. An explicit value wins, including
+    \\                        -o text on a pipe. Place it before the command
+    \\                        or after it; the last one wins.
     \\
-    \\status/peers/pin/unpin/verify/dupes/pull/update take only the flags shown on
-    \\their Usage line plus the shared --origin/--cache/--psk/--log values;
-    \\config takes the mount options. dupes --all scans every manifest on the
-    \\origin and refuses a path list; mount-only options are refused on the
-    \\rest. Every command also
+    \\status and peers print a table on a terminal and JSON when piped:
+    \\status is one document, peers is one JSON object per lease. -o text
+    \\keeps the table on a pipe. pin, unpin, and pull JSON includes changed
+    \\(false when the requested state was already in place, exit 0).
+    \\dupes --all streams one aggregate JSON object: the scan is not paged,
+    \\because manifests are keyed by digest and cannot be named.
+    \\schema prints the clispec 0.3 document and reads no config or token.
+    \\
+    \\status/peers/pin/unpin/verify/dupes/pull/update/schema take only the flags
+    \\shown on their Usage line plus the shared --origin/--cache/--psk/--log
+    \\and -o/--output values; config takes the mount options. dupes --all scans
+    \\every manifest on the origin and refuses a path list; mount-only options
+    \\are refused on the rest. Every command also
     \\accepts -h/--help and -V/--version. "--" ends flag parsing: later
     \\arguments are taken literally (paths starting with '-'). Long options
     \\accept --name VALUE or --name=VALUE. Usage errors exit 2 with one
     \\named line on stderr; an unknown command names the closest one.
-    \\Other failures exit 1. Help, version, and command results print on
-    \\stdout.
+    \\In JSON mode that line is {{"error":{{"kind","message","hint"}}}} and it
+    \\is the last line on stderr. Other failures exit 1 (kind failed).
+    \\Help, version, and command results print on stdout.
     \\
     \\Env: MODELFS_ORIGIN MODELFS_CACHE MODELFS_PSK MODELFS_PSK_VALUE
     \\MODELFS_ID (mount and config, like --id) MODELFS_LOG set the same values
@@ -151,13 +167,33 @@ pub fn main(init: std.process.Init) !u8 {
     var it = std.process.Args.Iterator.init(init.minimal.args);
     _ = it.next(); // argv0
     while (it.next()) |a| try argv.append(gpa, a);
+    return cli(init.io, gpa, init.environ_map, argv.items, &init);
+}
 
-    if (argv.items.len == 0) {
+/// `init` is null when a test drives the entry point without a process
+/// Init. mount and the internal handover need the real one.
+fn cli(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    args: []const []const u8,
+    init: ?*const std.process.Init,
+) !u8 {
+    clispec.bindIo(io);
+    clispec.errors_as_json = false;
+    defer clispec.errors_as_json = false;
+    if (args.len == 0) {
         // Same one-line usage channel as a missing operand or unknown
         // command: dumping the help blob here made `modelfs` with no args
         // the only usage error that printed the full text instead of
         // naming what was missing.
-        std.debug.print("missing command (want {s})\n", .{commandList()});
+        diagUsage("missing command (want {s})\n", .{commandList()});
+        return 2;
+    }
+    const peeled = peelOutput(args) catch return 2;
+    clispec.setErrorMode(peeled.output);
+    if (peeled.args.len == 0) {
+        diagUsage("missing command (want {s})\n", .{commandList()});
         return 2;
     }
     // Bare global forms live at position 0, where parseArgs sees a command
@@ -165,22 +201,26 @@ pub fn main(init: std.process.Init) !u8 {
     // Extra arguments are refused unless they are themselves those global
     // flags: `modelfs version --help` must match the documented "every
     // command also accepts -h/--help" instead of dying as a positional error.
-    if (std.mem.eql(u8, argv.items[0], handover.internal_cmd)) {
-        return cmdHandover(init, argv.items);
+    if (std.mem.eql(u8, peeled.args[0], handover.internal_cmd)) {
+        const real = init orelse {
+            diagFailed("modelfs: handover is only available from a running process\n", .{});
+            return 1;
+        };
+        return cmdHandover(real.*, peeled.args);
     }
-    switch (classifyMeta(argv.items)) {
+    switch (classifyMeta(peeled.args)) {
         .none => {},
-        .help => return if (printOut(init.io, init.gpa, usage, .{proto.default_port})) 0 else 1,
-        .version => return if (printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
+        .help => return if (printOut(io, gpa, usage, .{proto.default_port})) 0 else 1,
+        .version => return if (printOut(io, gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
         .bad => {
-            const what: []const u8 = if (isHelpTok(argv.items[0])) "help" else "version";
-            std.debug.print("{s} takes no arguments (see 'modelfs help')\n", .{what});
+            const what: []const u8 = if (isHelpTok(peeled.args[0])) "help" else "version";
+            diagUsage("{s} takes no arguments (see 'modelfs help')\n", .{what});
             return 2;
         },
     }
-    const parsed = parseArgs(gpa, init.environ_map, argv.items) catch |err| switch (err) {
-        error.Help => return if (printOut(init.io, init.gpa, usage, .{proto.default_port})) 0 else 1,
-        error.Version => return if (printOut(init.io, init.gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
+    const parsed = parseArgs(gpa, environ, peeled.args) catch |err| switch (err) {
+        error.Help => return if (printOut(io, gpa, usage, .{proto.default_port})) 0 else 1,
+        error.Version => return if (printOut(io, gpa, "modelfs {s}\n", .{build_options.version})) 0 else 1,
         // Usage errors exit 2, like every other bad invocation in this CLI
         // (missing subcommand argument, unknown command). Each one is named
         // at its own flag site inside parseArgs. Allocation failure is not a
@@ -195,83 +235,139 @@ pub fn main(init: std.process.Init) !u8 {
         },
     };
     defer freeParsed(parsed, gpa);
+    var opts = parsed.opts;
+    if (!opts.output_set) opts.output = peeled.output;
+    clispec.setErrorMode(opts.output);
     // Positional shapes follow the Usage lines exactly; extra arguments were
     // silently dropped before, so e.g. `status junk` and `mount a b` both
     // looked like they succeeded with the extras meaning something.
     if (std.mem.eql(u8, parsed.cmd, "mount")) {
         if (parsed.rest.len != 1) {
-            std.debug.print("mount takes exactly one directory argument (see 'modelfs help')\n", .{});
+            diagUsage("mount takes exactly one directory argument (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdMount(init, parsed.opts, parsed.rest[0]);
+        const real = init orelse {
+            diagFailed("modelfs: mount is only available from a running process\n", .{});
+            return 1;
+        };
+        return cmdMount(real.*, opts, parsed.rest[0]);
     }
     if (std.mem.eql(u8, parsed.cmd, "status")) {
         if (parsed.rest.len != 0) {
-            std.debug.print("status takes no arguments (see 'modelfs help')\n", .{});
+            diagUsage("status takes no arguments (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdStatus(init.io, gpa, parsed.opts);
+        return cmdStatus(io, gpa, opts);
     }
     if (std.mem.eql(u8, parsed.cmd, "peers")) {
         if (parsed.rest.len != 0) {
-            std.debug.print("peers takes no arguments (see 'modelfs help')\n", .{});
+            diagUsage("peers takes no arguments (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdPeers(init.io, gpa, parsed.opts);
+        return cmdPeers(io, gpa, opts);
     }
     if (std.mem.eql(u8, parsed.cmd, "pin") or std.mem.eql(u8, parsed.cmd, "unpin")) {
         if (parsed.rest.len != 1) {
-            std.debug.print("{s} takes exactly one path relative to the mount (see 'modelfs help')\n", .{parsed.cmd});
+            diagUsage("{s} takes exactly one path relative to the mount (see 'modelfs help')\n", .{parsed.cmd});
             return 2;
         }
-        return cmdPin(init.io, gpa, parsed.opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
+        return cmdPin(io, gpa, opts, parsed.rest[0], std.mem.eql(u8, parsed.cmd, "pin"));
     }
     if (std.mem.eql(u8, parsed.cmd, "verify")) {
         if (parsed.rest.len != 1) {
-            std.debug.print("verify takes exactly one path relative to the mount (see 'modelfs help')\n", .{});
+            diagUsage("verify takes exactly one path relative to the mount (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdVerify(init.io, gpa, parsed.opts, parsed.rest[0]);
+        return cmdVerify(io, gpa, opts, parsed.rest[0]);
     }
     if (std.mem.eql(u8, parsed.cmd, "dupes")) {
-        if (parsed.opts.all) {
+        if (opts.all) {
             if (parsed.rest.len != 0) {
-                std.debug.print("dupes --all takes no paths (see 'modelfs help')\n", .{});
+                diagUsage("dupes --all takes no paths (see 'modelfs help')\n", .{});
                 return 2;
             }
-            return cmdDupesAll(init.io, gpa, parsed.opts);
+            return cmdDupesAll(io, gpa, opts);
         }
         if (parsed.rest.len == 0) {
-            std.debug.print("dupes takes at least one path relative to the mount (see 'modelfs help')\n", .{});
+            diagUsage("dupes takes at least one path relative to the mount (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdDupes(init.io, gpa, parsed.opts, parsed.rest);
+        return cmdDupes(io, gpa, opts, parsed.rest);
     }
     if (std.mem.eql(u8, parsed.cmd, "pull")) {
         if (parsed.rest.len != 1) {
-            std.debug.print("pull takes exactly one owner/repo (see 'modelfs help')\n", .{});
+            diagUsage("pull takes exactly one owner/repo (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdPull(init.io, gpa, init.environ_map, parsed.opts, parsed.rest[0]);
+        return cmdPull(io, gpa, environ, opts, parsed.rest[0]);
     }
     if (std.mem.eql(u8, parsed.cmd, "update")) {
         if (parsed.rest.len != 0) {
-            std.debug.print("update takes no arguments (see 'modelfs help')\n", .{});
+            diagUsage("update takes no arguments (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdUpdate(init.io, gpa, init.environ_map, parsed.opts);
+        return cmdUpdate(io, gpa, environ, opts);
     }
     if (std.mem.eql(u8, parsed.cmd, "config")) {
         if (parsed.rest.len != 0) {
-            std.debug.print("config takes no arguments (see 'modelfs help')\n", .{});
+            diagUsage("config takes no arguments (see 'modelfs help')\n", .{});
             return 2;
         }
-        return cmdConfig(init.io, gpa, parsed.opts);
+        return cmdConfig(io, gpa, opts);
+    }
+    if (std.mem.eql(u8, parsed.cmd, "schema")) {
+        if (parsed.rest.len > 1) {
+            diagUsage("schema takes at most one command path (see 'modelfs help')\n", .{});
+            return 2;
+        }
+        return cmdSchema(io, gpa, if (parsed.rest.len == 1) parsed.rest[0] else null);
     }
     // parseArgs refuses anything outside the commands dispatched above, so
     // this point is unreachable unless the knownCommand list and this
     // dispatch drift apart; failing loudly here surfaces that immediately.
     unreachable;
+}
+
+/// `-o` / `--output` before the command. Later copies inside parseArgs win.
+fn peelOutput(args: []const []const u8) !struct { output: clispec.Output, args: []const []const u8 } {
+    var output: clispec.Output = .auto;
+    var i: usize = 0;
+    while (i < args.len) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "-o") or std.mem.eql(u8, a, "--output")) {
+            if (i + 1 >= args.len) {
+                diagUsage("{s} needs a value (see 'modelfs help')\n", .{a});
+                return error.MissingValue;
+            }
+            output = clispec.parseOutput(args[i + 1]) orelse {
+                diagUsage("--output must be auto, text, or json (got {s})\n", .{args[i + 1]});
+                return error.BadOutput;
+            };
+            i += 2;
+            continue;
+        }
+        const split = splitFlag(a);
+        if (std.mem.eql(u8, split.name, "--output")) {
+            const raw = split.value orelse "";
+            output = clispec.parseOutput(raw) orelse {
+                diagUsage("--output must be auto, text, or json (got {s})\n", .{raw});
+                return error.BadOutput;
+            };
+            i += 1;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-o=")) {
+            const raw = a["-o=".len..];
+            output = clispec.parseOutput(raw) orelse {
+                diagUsage("--output must be auto, text, or json (got {s})\n", .{raw});
+                return error.BadOutput;
+            };
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    return .{ .output = output, .args = args[i..] };
 }
 
 /// Data output (help text, status JSON, lease listings, pin confirmations)
@@ -305,20 +401,80 @@ var captured_stderr: ?*std.ArrayList(u8) = null;
 /// that buffer belongs to the installing test and the line it drops is a
 /// stderr diagnostic no assertion reads.
 fn printErr(comptime fmt: []const u8, args: anytype) void {
+    diagKind("failed", "", fmt, args);
+}
+
+/// Usage diagnostic. Text mode is the human line. JSON mode (explicit, or
+/// auto when stdout is not a terminal) writes one error object and nothing
+/// else, so that object is the last stderr line. Under test the bytes go to
+/// `captured_stderr` and stay off the runner's log.
+fn diagKind(kind: []const u8, hint: []const u8, comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, fmt, args) catch {
-        if (builtin.is_test) {
+        if (clispec.errors_as_json) {
+            writeErrorJson(kind, "modelfs: error", hint);
+        } else if (builtin.is_test) {
             if (captured_stderr) |b| b.appendSlice(std.testing.allocator, "modelfs: error\n") catch {};
-            return;
+        } else {
+            std.debug.print(fmt, args);
         }
-        std.debug.print(fmt, args);
         return;
     };
+    if (clispec.errors_as_json) {
+        writeErrorJson(kind, std.mem.trimEnd(u8, line, "\n"), hint);
+        return;
+    }
     if (builtin.is_test) {
         if (captured_stderr) |b| b.appendSlice(std.testing.allocator, line) catch {};
         return;
     }
     std.debug.print("{s}", .{line});
+}
+
+fn diagUsage(comptime fmt: []const u8, args: anytype) void {
+    diagKind("usage", "see 'modelfs help'", fmt, args);
+}
+
+fn diagFailed(comptime fmt: []const u8, args: anytype) void {
+    diagKind("failed", "", fmt, args);
+}
+
+fn writeErrorJson(kind: []const u8, message: []const u8, hint: []const u8) void {
+    const Body = struct {
+        kind: []const u8,
+        message: []const u8,
+        hint: ?[]const u8 = null,
+    };
+    const hint_opt: ?[]const u8 = if (hint.len == 0) null else hint;
+    var raw: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&raw);
+    var sty = std.json.Stringify{
+        .writer = &w,
+        .options = .{ .emit_null_optional_fields = false },
+    };
+    sty.write(.{ .@"error" = Body{ .kind = kind, .message = message, .hint = hint_opt } }) catch {
+        const fallback = "{\"error\":{\"kind\":\"failed\",\"message\":\"failed to encode error\"}}\n";
+        if (builtin.is_test) {
+            if (captured_stderr) |b| b.appendSlice(std.testing.allocator, fallback) catch {};
+        } else {
+            std.debug.print("{s}", .{fallback});
+        }
+        return;
+    };
+    w.writeByte('\n') catch {};
+    const bytes = w.buffered();
+    if (builtin.is_test) {
+        if (captured_stderr) |b| b.appendSlice(std.testing.allocator, bytes) catch {};
+        return;
+    }
+    std.debug.print("{s}", .{bytes});
+}
+
+fn writeJson(io: std.Io, gpa: std.mem.Allocator, value: anytype) bool {
+    const bytes = std.json.Stringify.valueAlloc(gpa, value, .{ .emit_null_optional_fields = false }) catch return false;
+    defer gpa.free(bytes);
+    if (!writeOut(io, bytes)) return false;
+    return writeOut(io, "\n");
 }
 
 fn printOut(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) bool {
@@ -338,6 +494,10 @@ fn printOut(io: std.Io, gpa: std.mem.Allocator, comptime fmt: []const u8, args: 
 const Opts = struct {
     origin: ?[]const u8 = null,
     cache: []const u8 = "/var/cache/modelfs",
+    /// Resolved by `-o` / `--output`. auto keeps each command's historical
+    /// bytes under `zig build test` and follows the terminal at runtime.
+    output: clispec.Output = .auto,
+    output_set: bool = false,
     /// dupes-only: scan every manifest under origin/.cluster/manifests
     /// instead of a positional rel list (aggregate duplicate telemetry).
     all: bool = false,
@@ -769,11 +929,12 @@ fn parsePercent(flag: []const u8, raw: []const u8) !u32 {
 /// the dispatched subset, and every "want ..." message renders this list, so
 /// one list keeps the refusal and its help text from drifting.
 const all_commands = [_][]const u8{
-    "mount", "status", "peers",  "pin",    "unpin",   "verify",
-    "dupes", "pull",   "update", "config", "version", "help",
+    "mount", "status", "peers",  "pin",    "unpin",  "verify",
+    "dupes", "pull",   "update", "config", "schema", "version",
+    "help",
 };
 
-const dispatched_commands = all_commands[0..10];
+const dispatched_commands = all_commands[0 .. all_commands.len - 2];
 
 /// The command words main() dispatches on; the bare help/version forms are
 /// answered before parseArgs ever runs. Keeping one list means a newly added
@@ -788,7 +949,7 @@ fn knownCommand(cmd: []const u8) bool {
 
 /// The `want a, b, c ...` tail shared by every missing/unknown-command line.
 fn commandList() []const u8 {
-    return "mount, status, peers, pin, unpin, verify, dupes, pull, update, config, version, help";
+    return "mount, status, peers, pin, unpin, verify, dupes, pull, update, config, schema, version, help";
 }
 
 /// The one command word within a typo of `typed`, or null when nothing is
@@ -845,17 +1006,17 @@ fn editDistance(a: []const u8, b: []const u8) usize {
 /// a bare "--" is the end-of-flags marker with no command behind it.
 fn reportUnknownCommand(cmd: []const u8) void {
     if (std.mem.eql(u8, cmd, "--")) {
-        printErr("missing command (want {s})\n", .{commandList()});
+        diagUsage("missing command (want {s})\n", .{commandList()});
         return;
     }
     if (cmd.len > 1 and cmd[0] == '-') {
-        printErr("unknown flag {s} (see 'modelfs help')\n", .{cmd});
+        diagUsage("unknown flag {s} (see 'modelfs help')\n", .{cmd});
         return;
     }
     if (closestCommand(cmd)) |near| {
-        printErr("unknown command \"{s}\" (did you mean {s}? want {s})\n", .{ cmd, near, commandList() });
+        diagUsage("unknown command \"{s}\" (did you mean {s}? want {s})\n", .{ cmd, near, commandList() });
     } else {
-        printErr("unknown command \"{s}\" (want {s})\n", .{ cmd, commandList() });
+        diagUsage("unknown command \"{s}\" (want {s})\n", .{ cmd, commandList() });
     }
 }
 
@@ -961,6 +1122,16 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             try rest.appendSlice(gpa, args[i + 1 ..]);
             break;
         }
+        if (std.mem.startsWith(u8, a, "-o=")) {
+            const raw = a["-o=".len..];
+            opts.output = clispec.parseOutput(raw) orelse {
+                diagUsage("--output must be auto, text, or json (got {s})\n", .{raw});
+                return error.BadOutput;
+            };
+            opts.output_set = true;
+            clispec.setErrorMode(opts.output);
+            continue;
+        }
         const split = splitFlag(a);
         const flag = split.name;
         const inline_val = split.value;
@@ -977,6 +1148,14 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             opts.log_level = try takeLogLevel(flag, raw);
             opts.from_flag.log = true;
             log_set = true;
+        } else if (std.mem.eql(u8, flag, "-o") or std.mem.eql(u8, flag, "--output")) {
+            const raw = try takeValue(args, flag, &i, inline_val);
+            opts.output = clispec.parseOutput(raw) orelse {
+                diagUsage("--output must be auto, text, or json (got {s})\n", .{raw});
+                return error.BadOutput;
+            };
+            opts.output_set = true;
+            clispec.setErrorMode(opts.output);
         } else if (std.mem.eql(u8, flag, "--origin")) {
             opts.origin = try takeValue(args, flag, &i, inline_val);
             opts.from_flag.origin = true;
@@ -1151,7 +1330,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             // Plain print, like every other usage error in this loop; the
             // logger's level prefix is noise for a one-shot CLI failure.
             // Echo the original token so `--nope=x` still names what was typed.
-            if (!builtin.is_test) std.debug.print("unknown flag {s} (see 'modelfs help')\n", .{a});
+            diagUsage("unknown flag {s} (see 'modelfs help')\n", .{a});
             return error.UnknownFlag;
         } else {
             try rest.append(gpa, a);
@@ -1798,6 +1977,20 @@ fn liveDaemon(io: std.Io, gpa: std.mem.Allocator, cache: []const u8, blob_out: *
     return doc.value.pid;
 }
 
+fn cmdSchema(io: std.Io, gpa: std.mem.Allocator, path: ?[]const u8) !u8 {
+    const bytes = clispec.schemaJson(gpa, build_options.version, path) catch |err| switch (err) {
+        error.UnknownCommand => {
+            diagUsage("schema: unknown command (see 'modelfs schema')\n", .{});
+            return 2;
+        },
+        else => return err,
+    };
+    defer gpa.free(bytes);
+    if (!writeOut(io, bytes)) return 1;
+    if (!writeOut(io, "\n")) return 1;
+    return 0;
+}
+
 fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     var blob: ?[]u8 = null;
     _ = liveDaemon(io, gpa, opts.cache, &blob) catch |err| switch (err) {
@@ -1805,7 +1998,51 @@ fn cmdStatus(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         error.NotLive => return 1,
     };
     defer if (blob) |b| gpa.free(b);
+    if (clispec.asTextTable(opts.output)) return if (writeStatusTable(io, gpa, blob.?)) 0 else 1;
     return if (writeOut(io, blob.?)) 0 else 1;
+}
+
+fn writeStatusTable(io: std.Io, gpa: std.mem.Allocator, blob: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, blob, .{}) catch return false;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return false,
+    };
+    if (!printOut(io, gpa, "{s:<16} {s}\n", .{ "field", "value" })) return false;
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* == .object and std.mem.eql(u8, entry.key_ptr.*, "stats")) {
+            var sit = entry.value_ptr.object.iterator();
+            while (sit.next()) |stat| {
+                var name: [96]u8 = undefined;
+                const label = std.fmt.bufPrint(&name, "stats.{s}", .{stat.key_ptr.*}) catch "stats";
+                if (!printStatusCell(io, gpa, label, stat.value_ptr.*)) return false;
+            }
+            continue;
+        }
+        if (!printStatusCell(io, gpa, entry.key_ptr.*, entry.value_ptr.*)) return false;
+    }
+    return true;
+}
+
+fn printStatusCell(io: std.Io, gpa: std.mem.Allocator, key: []const u8, value: std.json.Value) bool {
+    var buf: [128]u8 = undefined;
+    const shown = switch (value) {
+        .null => "null",
+        .bool => |b| if (b) "true" else "false",
+        .integer => |n| std.fmt.bufPrint(&buf, "{d}", .{n}) catch return false,
+        .float => |n| std.fmt.bufPrint(&buf, "{d}", .{n}) catch return false,
+        .number_string => |s| s,
+        .string => |s| s,
+        .array, .object => std.json.Stringify.valueAlloc(gpa, value, .{}) catch return false,
+    };
+    const owned = switch (value) {
+        .array, .object => true,
+        else => false,
+    };
+    defer if (owned) gpa.free(shown);
+    return printOut(io, gpa, "{s:<16} {s}\n", .{ key, shown });
 }
 
 const update_wait_ms: u32 = 30_000;
@@ -2192,22 +2429,22 @@ fn cmdConfig(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 /// are left alone, so a rerun after a failure finishes the job.
 fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, opts: Opts, repo: []const u8) !u8 {
     const origin_raw = opts.origin orelse {
-        printErr("pull needs --origin (or MODELFS_ORIGIN)\n", .{});
+        diagUsage("pull needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
     if (!hf.repoOk(repo)) {
-        printErr("modelfs: {s} is not a Hugging Face owner/repo id\n", .{proto.displayName(repo)});
+        diagUsage("modelfs: {s} is not a Hugging Face owner/repo id\n", .{proto.displayName(repo)});
         return 2;
     }
     if (!hf.revisionOk(opts.revision)) {
-        printErr("modelfs: --revision {s} is not a branch, tag, or commit\n", .{proto.displayName(opts.revision)});
+        diagUsage("modelfs: --revision {s} is not a branch, tag, or commit\n", .{proto.displayName(opts.revision)});
         return 2;
     }
     // Default destination is the repo id, so two models never collide and
     // the mount path reads like the model card it came from.
     const dest = opts.dest orelse repo;
     if (dest.len != 0 and (!store_mod.relOk(dest) or discover.relIsCluster(dest))) {
-        printErr("modelfs: --dest {s} is not a path under the origin\n", .{proto.displayName(dest)});
+        diagUsage("modelfs: --dest {s} is not a path under the origin\n", .{proto.displayName(dest)});
         return 2;
     }
 
@@ -2259,6 +2496,17 @@ fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Envir
         if (pullFetchHint(err)) |hint| printErr("modelfs: {s}\n", .{hint});
         return 1;
     };
+    if (clispec.asJson(opts.output, false)) {
+        return if (writeJson(io, gpa, .{
+            .repo = repo,
+            .revision = opts.revision,
+            .dest = dest,
+            .pulled = report.pulled,
+            .bytes = report.bytes,
+            .skipped = report.skipped,
+            .changed = report.pulled != 0,
+        })) 0 else 1;
+    }
     if (!printOut(io, gpa, "pulled {d} file(s), {d} bytes; {d} already present\n", .{
         report.pulled, report.bytes, report.skipped,
     })) return 1;
@@ -2385,7 +2633,7 @@ fn cmdHandover(init: std.process.Init, args: []const []const u8) !u8 {
 
 fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     const origin = opts.origin orelse {
-        std.debug.print("peers needs --origin (or MODELFS_ORIGIN)\n", .{});
+        diagUsage("peers needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
     // Same reachability and directory gate mount applies: a typo'd path or
@@ -2476,20 +2724,18 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         },
         .missing_dir => {
             // The origin itself was verified reachable above, so a missing
-            // .cluster dir here is a fresh/empty cluster, not an error: same
-            // exit-0 empty output as below, with the reason on stdout next
-            // to where the listing would have been.
+            // .cluster dir here is a fresh/empty cluster, not an error.
+            // JSON is an empty stream (no record). Text names the directory.
+            if (clispec.asJson(opts.output, false)) return 0;
             return if (printOut(io, gpa, "no cluster leases at {s}/{s}\n", .{ origin, proto.cluster_dir })) 0 else 1;
         },
         .io_err => |e| {
             // EIO/ENOTDIR/EACCES: the origin is there but .cluster cannot
             // be listed. Printing the empty-cluster line would look like a
             // healthy fleet of zero, which is the wrong incident start.
-            // Stdout is the listing a pipe consumes (`modelfs peers | grep
-            // live`); the reason belongs on stderr, like status's "cannot
-            // read" / "not running" lines.
-            if (!builtin.is_test)
-                std.debug.print("cannot read cluster leases at {s}/{s} (errno {d})\n", .{ origin, proto.cluster_dir, e });
+            // The reason belongs on stderr, like status's "cannot read" /
+            // "not running" lines.
+            diagFailed("cannot read cluster leases at {s}/{s} (errno {d})\n", .{ origin, proto.cluster_dir, e });
             return 1;
         },
     }
@@ -2508,6 +2754,18 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     }
 
     const now = sys.nowSec(io);
+    if (clispec.asJson(opts.output, false)) {
+        for (rows.items) |r| {
+            if (!writeJson(io, gpa, .{
+                .id = r.id,
+                .until = r.until,
+                .live = discover.leaseLive(r.until, now),
+                .addrs = r.addrs,
+            })) return 1;
+        }
+        return 0;
+    }
+    if (clispec.asTextTable(opts.output)) return writePeersTable(io, gpa, rows.items, now);
     for (rows.items) |r| {
         const live = discover.leaseLive(r.until, now);
         const status_str = if (live) "live" else "expired";
@@ -2522,6 +2780,23 @@ fn cmdPeers(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
         }
     }
     if (rows.items.len == 0) return if (printOut(io, gpa, "no leases\n", .{})) 0 else 1;
+    return 0;
+}
+
+fn writePeersTable(io: std.Io, gpa: std.mem.Allocator, rows: anytype, now: i64) !u8 {
+    if (rows.len == 0) return if (printOut(io, gpa, "no leases\n", .{})) 0 else 1;
+    if (!printOut(io, gpa, "{s:<24} {s:<12} {s}\n", .{ "id", "until", "state" })) return 1;
+    for (rows) |r| {
+        const id_shown = proto.shownOr(r.id, "<id withheld: control bytes>");
+        var until_buf: [24]u8 = undefined;
+        const until = std.fmt.bufPrint(&until_buf, "{d}", .{r.until}) catch return 1;
+        const state = if (discover.leaseLive(r.until, now)) "live" else "expired";
+        if (!printOut(io, gpa, "{s:<24} {s:<12} {s}\n", .{ id_shown, until, state })) return 1;
+        for (r.addrs) |a| {
+            const ip_shown = proto.shownOr(a.ip, "<ip withheld>");
+            if (!printOut(io, gpa, "  {s}:{d}  {d} mbps\n", .{ ip_shown, a.port, a.mbps })) return 1;
+        }
+    }
     return 0;
 }
 
@@ -2544,21 +2819,17 @@ fn mountRel(path: []const u8) []const u8 {
 /// cache or origin I/O so a refused path cannot create dirs or read.
 fn refuseCliRel(cmd: []const u8, rel: []const u8) bool {
     if (!store_mod.relOk(rel)) {
-        // Suppressed under test like every usage print here, so the refusal
-        // stays assertable without tripping the runner's error-log counter.
         // `/models/` strips to empty (the prefix convenience for the default
         // mountpoint) and `..` would write outside the tree: name which.
-        if (!builtin.is_test) {
-            if (rel.len == 0)
-                std.debug.print("{s}: empty path (need a path relative to the mount, not /models itself)\n", .{cmd})
-            else
-                std.debug.print("{s}: refusing path outside the mount root\n", .{cmd});
-        }
+        if (rel.len == 0)
+            diagFailed("{s}: empty path (need a path relative to the mount, not /models itself)\n", .{cmd})
+        else
+            diagFailed("{s}: refusing path outside the mount root\n", .{cmd});
         return true;
     }
     // Same control-plane hide FUSE and peer HTTP apply.
     if (discover.relIsCluster(rel)) {
-        if (!builtin.is_test) std.debug.print("{s}: refusing cluster control path\n", .{cmd});
+        diagFailed("{s}: refusing cluster control path\n", .{cmd});
         return true;
     }
     return false;
@@ -2572,10 +2843,9 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
     // Same named refusal pull/peers/verify/dupes give, and the same
     // MODELFS_ORIGIN answer, before any cache dir is created.
     if (opts.origin == null) {
-        // printErr, not std.debug.print: the refusal belongs on stderr, and
-        // under test the captured stderr is where a test reads it. Exit 2,
-        // the usage code, like every other missing-operand refusal.
-        printErr("{s} needs --origin (or MODELFS_ORIGIN)\n", .{if (on) "pin" else "unpin"});
+        // Exit 2, the usage code, like every other missing-operand refusal.
+        // The captured stderr is where a test reads the line.
+        diagUsage("{s} needs --origin (or MODELFS_ORIGIN)\n", .{if (on) "pin" else "unpin"});
         return 2;
     }
     const rel = mountRel(path);
@@ -2592,17 +2862,22 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
         std.log.err("cannot create cache dirs under {s} (errno {d})", .{ opts.cache, -layout_rc });
         return 1;
     }
+    const before = store.pinExists(rel);
     const rc = store.setPin(rel, on);
     if (rc != 0) {
         std.log.err("{s} failed errno {d}", .{ if (on) "pin" else "unpin", -rc });
         return 1;
     }
+    const changed = if (on) !before else before;
     // Audit line beside the stdout confirmation: pins are persistent state
     // that shields a file from culling across restarts, so "why is this file
     // never culled" must be answerable from the journal alone, including
     // when stdout went down a pipe. rel passed relOk, so echoing it cannot
     // forge log lines.
     std.log.info("{s} {s}", .{ if (on) "pinned" else "unpinned", rel });
+    if (clispec.asJson(opts.output, false)) {
+        return if (writeJson(io, gpa, .{ .path = rel, .pinned = on, .changed = changed })) 0 else 1;
+    }
     return if (printOut(io, gpa, "{s} {s}\n", .{ if (on) "pinned" else "unpinned", rel })) 0 else 1;
 }
 
@@ -2622,14 +2897,14 @@ fn cmdPin(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8, on: 
 /// against.
 fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !u8 {
     const origin_raw = opts.origin orelse {
-        std.debug.print("verify needs --origin (or MODELFS_ORIGIN)\n", .{});
+        diagUsage("verify needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
     const origin = resolveOriginDir(io, gpa, origin_raw) catch return 1;
     defer gpa.free(origin);
     const cache = opts.cache;
     if (cache.len == 0) {
-        std.debug.print("verify needs --cache (or MODELFS_CACHE)\n", .{});
+        diagUsage("verify needs --cache (or MODELFS_CACHE)\n", .{});
         return 2;
     }
     const rel = mountRel(path);
@@ -4130,7 +4405,7 @@ test "cmdVerify refuses a sidecar grid the cache filesystem cannot back" {
 /// an unreadable `.cluster`.
 fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     const origin_raw = opts.origin orelse {
-        std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
+        diagUsage("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
     const origin = resolveOriginDir(io, gpa, origin_raw) catch return 1;
@@ -4147,18 +4422,20 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     const dir = sys.opendirNoFollow(dirz) orelse {
         const e = sys.errno();
         if (e == sys.c.ENOENT) {
-            // Missing manifests dir is a fresh/empty origin, not an error:
-            // same exit-0 empty report as a dir with no files.
+            // Missing manifests dir is a fresh/empty origin, not an error.
+            // JSON still emits the one aggregate, with every count at zero.
+            if (clispec.asJson(opts.output, false)) {
+                return if (writeDupesAllJson(io, gpa, 0, 0, 0, 0)) 0 else 1;
+            }
             if (!printOut(io, gpa, "no manifests to compare\n", .{})) return 1;
             return 0;
         }
         // EIO/ENOTDIR/EACCES: the origin is there but manifests cannot be
         // listed. Printing the empty-scan line would look like a healthy
         // store of zero, which is the wrong incident start. Same split
-        // walkLeases / cmdPeers apply to origin/.cluster. Stdout is the
-        // report a pipe consumes; the reason belongs on stderr.
-        if (!builtin.is_test)
-            std.debug.print("cannot read manifests at {s}/{s} (errno {d})\n", .{ origin, proto.manifests_dir, e });
+        // walkLeases / cmdPeers apply to origin/.cluster. The reason
+        // belongs on stderr.
+        diagFailed("cannot read manifests at {s}/{s} (errno {d})\n", .{ origin, proto.manifests_dir, e });
         return 1;
     };
     defer sys.closedir(dir);
@@ -4226,6 +4503,9 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 
     if (skipped > 0) return 1;
     if (manifests.items.len == 0) {
+        if (clispec.asJson(opts.output, false)) {
+            return if (writeDupesAllJson(io, gpa, 0, 0, 0, 0)) 0 else 1;
+        }
         if (!printOut(io, gpa, "no manifests to compare\n", .{})) return 1;
         return 0;
     }
@@ -4238,10 +4518,22 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
             if (ov.shared > 0) shared_pairs += 1;
         }
     }
+    if (clispec.asJson(opts.output, false)) {
+        return if (writeDupesAllJson(io, gpa, manifests.items.len, total_pieces, identical_pairs, shared_pairs)) 0 else 1;
+    }
     if (!printOut(io, gpa, "scanned {d} manifest(s), {d} piece(s) total\n", .{ manifests.items.len, total_pieces })) return 1;
     if (!printOut(io, gpa, "byte-identical pairs: {d}\n", .{identical_pairs})) return 1;
     if (!printOut(io, gpa, "pairs sharing any digest: {d}\n", .{shared_pairs})) return 1;
     return 0;
+}
+
+fn writeDupesAllJson(io: std.Io, gpa: std.mem.Allocator, manifests: usize, pieces_n: u64, identical_pairs: u64, shared_pairs: u64) bool {
+    return writeJson(io, gpa, .{
+        .manifests = manifests,
+        .pieces = pieces_n,
+        .identical_pairs = identical_pairs,
+        .shared_pairs = shared_pairs,
+    });
 }
 
 /// The dedup-telemetry command: compares piece-hash manifests across
@@ -4260,7 +4552,7 @@ fn cmdDupesAll(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
 /// measure.
 fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []const u8) !u8 {
     const origin_raw = opts.origin orelse {
-        std.debug.print("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
+        diagUsage("dupes needs --origin (or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
     const origin = resolveOriginDir(io, gpa, origin_raw) catch return 1;
@@ -4343,6 +4635,32 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
     }
 
     if (failed) return 1;
+    if (clispec.asJson(opts.output, false)) {
+        // Zero records when nothing was ingested. Text keeps the sentence.
+        for (files.items) |f| {
+            if (!writeJson(io, gpa, .{
+                .rel = f.rel,
+                .pieces = f.manifest.entries.len,
+                .grid = f.manifest.piece_size,
+                .bytes = f.manifest.file_size,
+            })) return 1;
+        }
+        for (files.items, 0..) |a, ai| {
+            for (files.items[ai + 1 ..]) |b| {
+                const ov = piece.manifestOverlapPrepared(a.manifest, b.manifest, a.by_digest, b.by_digest);
+                if (!writeJson(io, gpa, .{
+                    .left = a.rel,
+                    .right = b.rel,
+                    .aligned = ov.aligned,
+                    .aligned_of = @min(a.manifest.entries.len, b.manifest.entries.len),
+                    .shared = ov.shared,
+                    .shifted = ov.shifted,
+                    .identical = ov.identical,
+                })) return 1;
+            }
+        }
+        return 0;
+    }
     if (files.items.len == 0) {
         // Same empty-report result as cmdDupesAll: the "nothing to compare"
         // line is the report, so it rides stdout where a pipe sees it, not
@@ -5060,9 +5378,9 @@ test "reportUnknownCommand separates a mistyped flag, a bare --, and a word" {
     reportUnknownCommand("frobnicate");
     try std.testing.expectEqualStrings(
         \\unknown flag --hepl (see 'modelfs help')
-        \\missing command (want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, version, help)
-        \\unknown command "verifz" (did you mean verify? want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, version, help)
-        \\unknown command "frobnicate" (want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, version, help)
+        \\missing command (want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, schema, version, help)
+        \\unknown command "verifz" (did you mean verify? want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, schema, version, help)
+        \\unknown command "frobnicate" (want mount, status, peers, pin, unpin, verify, dupes, pull, update, config, schema, version, help)
         \\
     , out.items);
 }
@@ -5832,4 +6150,308 @@ test "leaseAddrs follows --listen and falls back to loopback" {
         try std.testing.expectEqualStrings("127.0.0.1", addrs.items[0].ip);
         try std.testing.expectEqual(@as(u16, 19095), addrs.items[0].port);
     }
+}
+
+fn lastStdErrLine(bytes: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, bytes, "\n");
+    const nl = std.mem.lastIndexOfScalar(u8, trimmed, '\n');
+    return if (nl) |i| trimmed[i + 1 ..] else trimmed;
+}
+
+test "cli schema is the clispec document and ignores the token" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const sentinel = "SENTINEL_HF_9f3c1e";
+    try env.put("HF_TOKEN", sentinel);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var err: std.ArrayList(u8) = .empty;
+    defer err.deinit(gpa);
+    captured_stdout = &out;
+    captured_stderr = &err;
+    defer captured_stdout = null;
+    defer captured_stderr = null;
+    clispec.tty_override = null;
+
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{"schema"}, null));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, sentinel) == null);
+    try std.testing.expect(std.mem.indexOf(u8, err.items, sentinel) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "HF_TOKEN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "--token") == null);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.items, .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqualStrings("0.3", root.get("clispec").?.string);
+        try std.testing.expectEqualStrings("modelfs", root.get("name").?.string);
+        try std.testing.expectEqualStrings(build_options.version, root.get("version").?.string);
+        try std.testing.expectEqualStrings("text", root.get("output").?.object.get("tty").?.string);
+        try std.testing.expectEqualStrings("json", root.get("output").?.object.get("piped").?.string);
+        try std.testing.expect(root.get("commands").?.array.items.len >= 1);
+        try std.testing.expect(root.get("errors").?.array.items.len >= 1);
+        var saw = false;
+        for (root.get("global_args").?.array.items) |arg| {
+            if (!std.mem.eql(u8, arg.object.get("name").?.string, "--output")) continue;
+            saw = true;
+            try std.testing.expectEqualStrings("-o", arg.object.get("short").?.string);
+            try std.testing.expectEqualStrings("auto", arg.object.get("default").?.string);
+        }
+        try std.testing.expect(saw);
+        var saw_usage = false;
+        for (root.get("errors").?.array.items) |e| {
+            if (!std.mem.eql(u8, e.object.get("kind").?.string, "usage")) continue;
+            saw_usage = true;
+            try std.testing.expectEqual(@as(i64, 2), e.object.get("exit_code").?.integer);
+        }
+        try std.testing.expect(saw_usage);
+    }
+    const full = try gpa.dupe(u8, out.items);
+    defer gpa.free(full);
+
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "text", "schema" }, null));
+    try std.testing.expectEqualStrings(full, out.items);
+
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "schema", "status" }, null));
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.items, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("0.3", parsed.value.object.get("clispec").?.string);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("commands").?.array.items.len);
+        try std.testing.expectEqualStrings("status", parsed.value.object.get("commands").?.array.items[0].object.get("name").?.string);
+    }
+
+    out.clearRetainingCapacity();
+    err.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 2), try cli(io, gpa, &env, &.{ "-o", "json", "schema", "nope" }, null));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, lastStdErrLine(err.items), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("usage", parsed.value.object.get("error").?.object.get("kind").?.string);
+    }
+}
+
+test "cli status and peers follow -o and the terminal" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    clispec.tty_override = null;
+    defer clispec.tty_override = null;
+
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-cli-status");
+    defer sys.deleteTree(io, cache_d);
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-cli-peers");
+    defer sys.deleteTree(io, origin_d);
+
+    var zbuf: [256]u8 = undefined;
+    var pbuf: [192]u8 = undefined;
+    const fp = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ cache_d, store_mod.status_file });
+    var live_buf: [160]u8 = undefined;
+    const live_doc = try std.fmt.bufPrint(&live_buf, "{{\"id\":\"me\",\"pid\":{d},\"uptime_s\":1,\"peers\":0,\"stats\":{{}}}}\n", .{sys.pidSelf()});
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, fp), live_doc));
+
+    var cbuf: [160]u8 = undefined;
+    const cluster_d = try std.fmt.bufPrint(&cbuf, "{s}/.cluster", .{origin_d});
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(cluster_d, 0o755));
+    const lease_fp = try std.fmt.bufPrint(&pbuf, "{s}/spark.json", .{cluster_d});
+    const lease = "{\"id\":\"spark\",\"until\":4102444800,\"addrs\":[{\"ip\":\"10.0.0.9\",\"port\":18081,\"mbps\":0},{\"ip\":\"10.0.0.1\",\"port\":18080,\"mbps\":1}]}";
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try sys.toZ(&zbuf, lease_fp), lease));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+
+    const cache_args = [_][]const u8{ "status", "--cache", cache_d };
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "json", "status", "--cache", cache_d }, null));
+    try std.testing.expectEqualStrings(live_doc, out.items);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.items, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("me", parsed.value.object.get("id").?.string);
+        try std.testing.expect(parsed.value.object.get("items") == null);
+    }
+
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "text", "status", "--cache", cache_d }, null));
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "field"));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "me") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"id\"") == null);
+    if (std.json.parseFromSlice(std.json.Value, gpa, out.items, .{})) |parsed| {
+        defer parsed.deinit();
+        return error.TextModeWasJson;
+    } else |_| {}
+
+    out.clearRetainingCapacity();
+    clispec.tty_override = true;
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &cache_args, null));
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "field"));
+    out.clearRetainingCapacity();
+    clispec.tty_override = false;
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &cache_args, null));
+    try std.testing.expectEqualStrings(live_doc, out.items);
+    out.clearRetainingCapacity();
+    clispec.tty_override = true;
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "json", "status", "--cache", cache_d }, null));
+    try std.testing.expectEqualStrings(live_doc, out.items);
+    clispec.tty_override = null;
+
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "json", "peers", "--origin", origin_d }, null));
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out.items, "\n"), '\n');
+    const peer_line = lines.next() orelse return error.MissingPeer;
+    try std.testing.expect(lines.next() == null);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, peer_line, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("spark", parsed.value.object.get("id").?.string);
+        try std.testing.expect(parsed.value.object.get("live").?.bool);
+        const addrs = parsed.value.object.get("addrs").?.array;
+        try std.testing.expectEqual(@as(usize, 2), addrs.items.len);
+        try std.testing.expectEqualStrings("10.0.0.1", addrs.items[0].object.get("ip").?.string);
+    }
+
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "text", "peers", "--origin", origin_d }, null));
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "id"));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "live") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "10.0.0.1:18080") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "{\"id\"") == null);
+
+    var empty_b: [128]u8 = undefined;
+    const empty_origin = try sys.scratchDir(&empty_b, "modelfs-cli-peers-empty");
+    defer sys.deleteTree(io, empty_origin);
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "json", "peers", "--origin", empty_origin }, null));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "cli pin reports changed and dupes --all is one json aggregate" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    clispec.tty_override = null;
+    defer clispec.tty_override = null;
+
+    var ob: [128]u8 = undefined;
+    const origin_d = try sys.scratchDir(&ob, "modelfs-cli-pin");
+    defer sys.deleteTree(io, origin_d);
+    var cb: [128]u8 = undefined;
+    const cache_d = try sys.scratchDir(&cb, "modelfs-cli-pin-cache");
+    defer sys.deleteTree(io, cache_d);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    captured_stdout = &out;
+    defer captured_stdout = null;
+
+    const pin_args = [_][]const u8{ "-o", "json", "pin", "a.bin", "--origin", origin_d, "--cache", cache_d };
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &pin_args, null));
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.items, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("a.bin", parsed.value.object.get("path").?.string);
+        try std.testing.expect(parsed.value.object.get("pinned").?.bool);
+        try std.testing.expect(parsed.value.object.get("changed").?.bool);
+    }
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &pin_args, null));
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.items, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("pinned").?.bool);
+        try std.testing.expect(!parsed.value.object.get("changed").?.bool);
+    }
+    out.clearRetainingCapacity();
+    const unpin_args = [_][]const u8{ "-o", "json", "unpin", "a.bin", "--origin", origin_d, "--cache", cache_d };
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &unpin_args, null));
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.items, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.object.get("pinned").?.bool);
+        try std.testing.expect(parsed.value.object.get("changed").?.bool);
+    }
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &unpin_args, null));
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out.items, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.object.get("changed").?.bool);
+    }
+
+    const h0 = [_]u8{0x11} ** piece.digest_len;
+    const h1 = [_]u8{0x22} ** piece.digest_len;
+    const h2 = [_]u8{0x33} ** piece.digest_len;
+    var a_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h0 },
+        .{ .idx = 1, .hash = h1 },
+    };
+    var c_entries = [_]piece.ManifestEntry{
+        .{ .idx = 0, .hash = h2 },
+        .{ .idx = 1, .hash = h1 },
+    };
+    try writeManifestForTest(gpa, origin_d, "a.bin", 16, 32, &a_entries);
+    try writeManifestForTest(gpa, origin_d, "b.bin", 16, 32, &a_entries);
+    try writeManifestForTest(gpa, origin_d, "c.bin", 16, 32, &c_entries);
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "json", "dupes", "--all", "--origin", origin_d }, null));
+    var agg_lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out.items, "\n"), '\n');
+    const agg = agg_lines.next() orelse return error.MissingAggregate;
+    try std.testing.expect(agg_lines.next() == null);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, agg, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("manifests").?.integer);
+        try std.testing.expectEqual(@as(i64, 6), parsed.value.object.get("pieces").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("identical_pairs").?.integer);
+        try std.testing.expectEqual(@as(i64, 3), parsed.value.object.get("shared_pairs").?.integer);
+    }
+
+    out.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 0), try cli(io, gpa, &env, &.{ "-o", "json", "dupes", "a.bin", "b.bin", "--origin", origin_d }, null));
+    var n_lines: usize = 0;
+    var recs = std.mem.splitScalar(u8, std.mem.trimEnd(u8, out.items, "\n"), '\n');
+    while (recs.next()) |line| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+        defer parsed.deinit();
+        n_lines += 1;
+        if (n_lines == 3) try std.testing.expect(parsed.value.object.get("left") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 3), n_lines);
+}
+
+test "cli json mode reports usage as the last stderr line" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    clispec.tty_override = false;
+    defer clispec.tty_override = null;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var err: std.ArrayList(u8) = .empty;
+    defer err.deinit(gpa);
+    captured_stdout = &out;
+    captured_stderr = &err;
+    defer captured_stdout = null;
+    defer captured_stderr = null;
+
+    try std.testing.expectEqual(@as(u8, 2), try cli(io, gpa, &env, &.{ "-o", "json", "nope" }, null));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, lastStdErrLine(err.items), .{});
+    defer parsed.deinit();
+    const body = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("usage", body.get("kind").?.string);
+    try std.testing.expect(body.get("message").?.string.len > 0);
+    try std.testing.expect(body.get("hint") != null);
 }

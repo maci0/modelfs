@@ -19,7 +19,7 @@ Writes: **origin first → then fill the local cache**.
 A read that misses blocks until that one piece is filled from a single source. If the local cache cannot land the fill (full or broken cache disk), that one read is served from the origin and the piece stays unmarked. There is no background whole-file striping: it OOMed the unified memory on the target hardware.
 
 Status: works on the cluster it was written for (two DGX Spark nodes plus a ZFS/NFS NAS). Linux only.
-Current release `v0.20.0`, which is what a build from this tree prints.
+Current release `v0.21.0`, which is what a build from this tree prints.
 Upgrade notes per release, including the breaking ones, are in [CHANGELOG.md](CHANGELOG.md).
 Security reports: [SECURITY.md](SECURITY.md).
 
@@ -68,15 +68,16 @@ while `.cluster` has no live lease.
 ## Commands
 
 ```bash
-modelfs status                                    # liveness, peers, origin_down, lifetime counters
-modelfs peers --origin /net/192.168.0.100/models  # cluster leases, each marked live or expired
+modelfs status                                    # table on a terminal; the status document when piped
+modelfs peers --origin /net/192.168.0.100/models  # table on a terminal; one JSON object per lease when piped
 modelfs pin gguf/foo.gguf --origin /net/192.168.0.100/models   # keep a file out of the cull
 modelfs unpin gguf/foo.gguf --origin /net/192.168.0.100/models
 modelfs verify gguf/foo.gguf --origin ...         # rehash cached pieces, clear mismatches
 modelfs dupes gguf/a.gguf gguf/b.gguf --origin .. # how much do two files share?
-modelfs dupes --all --origin ...                  # whole-store duplicate scan
+modelfs dupes --all --origin ...                  # whole-store duplicate scan, one aggregate
 modelfs pull unsloth/Qwen3-8B-GGUF --origin ...   # download a Hugging Face revision onto the origin
 modelfs update                                    # swap the running binary without unmounting
+modelfs schema                                    # clispec 0.3 document; reads no config or token
 ```
 
 `modelfs update` replaces a live mount's process image: the kernel connection and the peer
@@ -85,6 +86,9 @@ daemon the same way `status` does, through `--cache`.
 
 `modelfs pull` downloads a Hugging Face revision onto the origin, where every node's mount
 then serves it. Files already there at the listed size are skipped, so a rerun resumes.
+JSON for `pin`, `unpin`, and `pull` includes `changed` (false when the requested state
+was already in place, exit 0). `dupes --all` streams one aggregate object: manifests are
+keyed by digest and the scan is not paged.
 
 `modelfs help` documents every flag. The ones that come up most:
 
@@ -102,6 +106,7 @@ then serves it. Files already there at the listed size are skipped, so a rerun r
 | `--detach` / `-f` | `-f` | background after mount, or stay in the foreground |
 | `--brun` / `--bcull` / `--bstop` | `10` / `7` / `3` | cull watermarks, percent free |
 | `--log LEVEL` | `info` | `err`, `warn`, `info`, `debug` |
+| `-o`, `--output` | `auto` | `text` on a terminal, JSON when stdout is not a terminal. `text` and `json` always win, before or after the command |
 
 Secrets never take a flag, because argv is world-readable through `/proc`:
 

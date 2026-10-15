@@ -36,6 +36,7 @@ const modules = [_][]const u8{
     "handover.zig",
     "hf.zig",
     "update.zig",
+    "clispec.zig",
     "main.zig",
 };
 

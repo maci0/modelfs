@@ -14,5 +14,6 @@ test {
     _ = @import("handover.zig");
     _ = @import("hf.zig");
     _ = @import("update.zig");
+    _ = @import("clispec.zig");
     _ = @import("main.zig");
 }

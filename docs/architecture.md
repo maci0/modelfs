@@ -120,7 +120,11 @@ statfs-to-statvfs copy in `mf_statfs` is the mirror-image case: both libcs spell
 four different types, and the same 8 bytes move either way on LP64.
 
 The commands that skip FUSE (`status`, `peers`, `pin`, `unpin`, `verify`, `dupes`, `pull`,
-`update`) import `store` and `discover` directly. They admit paths through `relOk`/`relIsCluster`
+`update`, `schema`) import `store` and `discover` directly. `schema` is the exception: it
+prints the clispec 0.3 document and reads no store, config, or token. `-o` / `--output`
+selects `auto` (text on a terminal, JSON otherwise), `text`, or `json`, before or after
+the command. `verify`, `config`, `update`, `mount`, `version`, and `schema` keep their
+text (or, for `schema`, the JSON document) whichever way `-o` is set. They admit paths through `relOk`/`relIsCluster`
 and name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`,
 `manifestPath`, `manifestsDirPath`) rather than reconstructing those joins. Status and update
 locate the heartbeat through `Store.cacheStatusPath`, which takes a cache root without
@@ -704,20 +708,27 @@ keeps the pid check green. Artifacts from builds before `boot_s` age on `mono_s`
 | Origin health | `origin_down`, 1 while an EIO/ESTALE/ETIMEDOUT getattr/open/stat, write, origin pread, lease publish, or `.cluster` walk has not yet recovered |
 | Lifetime counters (`stats`) | reads/writes with errors, warm-cache reads (`reads_warm`), open failures (`opens_err`) and failed post-create warmups (`create_warmup_err`), cumulative read/write/peer-HTTP durations in ns (`http_nanos` covers `/have` `/data`, not `/ping`), piece fills by source with byte totals including `bytes_to_peer`, per-tier fill failures (including origin hydrations done to serve a peer), `probe_err`, `lease_err`, `meta_err`, pieces culled, `http_ok`, rejected auths, `http_405`, 5xx replies, malformed request heads, connections dropped at the inflight cap, and `serve_verify_fail` |
 
+On a terminal, or with `-o text`, that document is a `field` / `value` table and `stats` is flattened to `stats.<name>`. A pipe, or `-o json`, prints the file bytes unchanged: one object, not an items envelope.
+
 ### `peers`
 
 Lists every lease in `origin/.cluster` with its addresses and whether it is still live, using
 the same `walkLeases` walk `Catalog.refresh` uses: dot-prefixed names skipped, O_NOFOLLOW,
 corrupt entries skipped. Rows sort by lease file name and each row's addresses by ip then port
 (`addrTieLess`), so NFS readdir and a mixed-fleet document's `getifaddrs` order cannot change
-the listing.
+the listing. A terminal, or `-o text`, prints those rows as a table. A pipe, or `-o json`,
+streams one JSON object per lease (`id`, `until`, `live`, `addrs`) and writes nothing when
+the cluster is empty. There is no page size.
 
 An unreachable `--origin`, or a regular file at `--origin`, exits 1 for mount, peers, verify,
 dupes, and pull (`resolveOriginDir` in src/main.zig; `cmdPull` gates on it before any network
 request). An existing origin with no `.cluster` dir yet lists as empty and exits 0. An
 unreadable `.cluster` (EIO, ENOTDIR, EACCES) exits 1 with the
 reason on stderr (`cmdPeers`), so a pipe cannot read the failure as an empty fleet. `dupes --all`
-applies the same split to `origin/.cluster/manifests` (`cmdDupesAll`).
+applies the same split to `origin/.cluster/manifests` (`cmdDupesAll`). JSON for that scan is
+one object (`manifests`, `pieces`, `identical_pairs`, `shared_pairs`), including zeros when
+the directory is missing: the names are digests, so the result cannot be paged. With paths,
+JSON mode streams one record per file and one per overlap. Text mode keeps the line report.
 
 ### `pull`
 
@@ -731,6 +742,11 @@ origin the files land (default: the repo id). The token comes from `HF_TOKEN`, e
 `$HF_HOME/token`, else `~/.cache/huggingface/token`, and travels as a privileged header so it is
 dropped on the redirect to the signed CDN host. There is no token flag because argv is
 world-readable, and core dumps are disabled for the run when a token is in play.
+JSON output (`-o json`, or a pipe) is one object: `repo`, `revision`, `dest`, `pulled`,
+`bytes`, `skipped`, and `changed`. `changed` is false when this run wrote no file, and the
+command still exits 0. Text output stays the one-line summary. A branch tip can move
+between runs; a commit revision converges to the listed sizes. There is no idempotency key.
+
 `HF_HOME` and `HOME` are trimmed of surrounding spaces, tabs, CR, and LF; an empty
 `HF_HOME` falls back to `HOME`. Tokens are trimmed the same way, but embedded CR or LF
 is refused with exit 1 before downloading (`loadToken` src/hf.zig). A missing or empty token
@@ -885,7 +901,9 @@ relative to, so each refuses a missing `--origin` with `needs --origin (or MODEL
 exits 2 before it touches the origin or the cache. `pin`/`unpin` used to pass the absent origin
 to `Store.init` as `""`, which wrote a pin marker into whichever cache the default named and
 answered `pinned` for a file the live mount still culls: an operator who omitted `--origin` got
-a pin that protected nothing.
+a pin that protected nothing. JSON for `pin` and `unpin` is one object (`path`, `pinned`,
+`changed`). `changed` is false when `pinExists` already matched the request, and the command
+exits 0. `setPin` still rewrites or unlinks the marker.
 
 Any other `MODELFS_*` name is refused as a typo'd knob on every command. That is why the harness
 and drill scripts keep their knobs outside this namespace (`MF_TEST_*`, `MF_DRILL_*`). The

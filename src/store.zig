@@ -713,7 +713,7 @@ pub const Store = struct {
         return rc;
     }
 
-    fn pinExists(self: *const Store, rel: []const u8) bool {
+    pub fn pinExists(self: *const Store, rel: []const u8) bool {
         var buf: [sys.c.PATH_MAX]u8 = undefined;
         const p = self.cachePinPath(&buf, rel) catch return false;
         var st: c.struct_stat = undefined;

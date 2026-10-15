@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-10-15
+
+### Changed - 2026-10-15
+- **Breaking: `modelfs status` on a terminal prints a table.** A pipe, and `-o json`, still print the daemon's `status.json` unchanged, one object. `-o text` keeps the table on a pipe. `modelfs schema` prints the clispec 0.3 document and reads no config, token, or network. `-o` / `--output` (`auto`, `text`, `json`) is accepted before or after the command. `auto` is the table on a terminal and JSON otherwise.
+- **Breaking: `modelfs peers` on a pipe streams one JSON object per lease.** A terminal, and `-o text`, print a table. An empty cluster writes no JSON record and exits 0. The walk is not paged.
+- **`pin`, `unpin`, and `pull` include `changed` in JSON.** A repeat that finds the requested state already in place exits 0 with `changed` false. `pull` still skips files already present at the listed size. The Hugging Face token stays in `HF_TOKEN` or the token file. There is no token flag.
+- **`dupes --all` streams one aggregate JSON object.** Manifests are keyed by digest, so the scan cannot name files and is not paged. With paths, JSON mode streams one record per file and one per pair. Text mode keeps the existing lines.
+
 ### Changed - 2026-10-15
 - The cluster's single AI origin is now `tank/ai` at `/export/ai`, retaining ModelFS metadata, files, and snapshot history. Sparks keep their existing client paths; the desktop mounts at `/ai`, with matching cache and Strata configuration. NAS backup, restore, and replica defaults and their regression fixtures follow the dataset rename. Export policy lives only in ZFS `sharenfs`: the desktop and two Sparks retain user writes with `sync,root_squash`; documented client mounts use `hard` retries.
 
@@ -1452,7 +1460,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/maci0/modelfs/releases/tag/v0.21.0
 [0.20.0]: https://github.com/maci0/modelfs/releases/tag/v0.20.0
 [0.19.0]: https://github.com/maci0/modelfs/releases/tag/v0.19.0
 [0.18.0]: https://github.com/maci0/modelfs/releases/tag/v0.18.0

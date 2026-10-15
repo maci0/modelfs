@@ -4,7 +4,7 @@
 |---|---|
 | Status | Living document; describes `src/` and the shipped NAS units and wrappers as of the date below |
 | Last reviewed | 2026-09-30 |
-| Covers | modelfs daemon (`mount`) and CLI as of `v0.20.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull, GitHub release self-update, and the shipped NAS snapshot/replica/drill/offsite plane (`scripts/nas/`, the restore and alarm wrappers) |
+| Covers | modelfs daemon (`mount`) and CLI as of `v0.21.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull, GitHub release self-update, and the shipped NAS snapshot/replica/drill/offsite plane (`scripts/nas/`, the restore and alarm wrappers) |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
 
@@ -1219,7 +1219,7 @@ nothing that survives the host. A replica that has silently stopped pulling is v
 `syncoid-models.service` failing, which the `OnFailure=` notifier records as one `logger` line on
 the replica itself.
 
-**Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.20.0`
+**Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.21.0`
 is current, and fixes land on `main` and ship as the next tag, with no backport line) and the
 route from report to shipped fix.
 GitHub private vulnerability reporting is not enabled on the repository, so that route has no
