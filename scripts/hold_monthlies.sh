@@ -20,7 +20,7 @@ print_usage() {
 Usage: ./scripts/hold_monthlies.sh [DATASET]
 
 Hold every *_monthly snapshot of DATASET and its descendants
-(default tank/models) with tag modelfs-dr. Already-held is success.
+(default tank/ai) with tag modelfs-dr. Already-held is success.
 Any other hold failure exits 1.
 EOF
 }
@@ -35,14 +35,14 @@ if [[ $# -gt 1 || ( $# -eq 1 && "$1" == -* ) ]]; then
 fi
 
 TAG="modelfs-dr"
-DATASET="${1:-tank/models}"
+DATASET="${1:-tank/ai}"
 command -v zfs >/dev/null 2>&1 || die "zfs not found; this runs on the replica host"
 
 zfs list -H -o name "${DATASET}" >/dev/null 2>&1 \
     || die "dataset ${DATASET} does not exist on this host"
 
 # -r: sanoid recursive and syncoid --recursive cover child datasets
-# (a later zfs create tank/models/gguf). Holds on the parent alone
+# (a later zfs create tank/ai/gguf). Holds on the parent alone
 # would leave those monthlies destroyable without zfs release.
 LIST="$(zfs list -H -t snapshot -r -o name "${DATASET}")" || die "cannot list snapshots of ${DATASET}"
 HELD=0

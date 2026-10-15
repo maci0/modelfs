@@ -8,7 +8,7 @@
 # log line that proves the drill ran.
 #
 # Runs on the NAS (Rocky/RHEL, GNU coreutils), not on sparks or the desktop:
-#   ./scripts/dr_restore_drill.sh [DATASET]             # default: tank/models
+#   ./scripts/dr_restore_drill.sh [DATASET]             # default: tank/ai
 #   ./scripts/dr_restore_drill.sh --age-only [DATASET]  # snapshot/replica
 #                                                       # freshness only
 #
@@ -54,7 +54,7 @@ print_usage() {
 Usage: ./scripts/dr_restore_drill.sh [--age-only] [DATASET]
 
 Monthly restore drill (docs/recovery.md section 6). Default DATASET is
-tank/models. Exit 0 means the newest snapshot restored, mounted off the
+tank/ai. Exit 0 means the newest snapshot restored, mounted off the
 live tree, and read back verified. --age-only checks snapshot, child
 dataset, and optional replica age only: no clone, no drill log. That
 is the hourly sanoid.timer-down alarm (modelfs-snap-age.timer).
@@ -99,7 +99,7 @@ if [[ $# -gt 0 ]]; then
     print_usage >&2
     exit 2
 fi
-DATASET="${DATASET:-tank/models}"
+DATASET="${DATASET:-tank/ai}"
 
 # Repo runs keep using .scratch via lib.sh. A copy at /usr/local/sbin
 # (scripts/install_nas_backup.sh) has no build.zig.zon above it, so
@@ -270,7 +270,7 @@ if [[ -n "${MF_DRILL_REPLICA:-}" ]]; then
     echo "drill: replica ${MF_DRILL_REPLICA} newest ${REPLICA_SNAP} (age ${REPLICA_AGE}s)"
 fi
 
-# Child datasets (a later `zfs create tank/models/gguf`) have their own
+# Child datasets (a later `zfs create tank/ai/gguf`) have their own
 # snapshots under sanoid recursive=. The parent clone does not include
 # them, but a child with no snapshot, or one older than the RPO, means
 # backup scope shrank when the layout grew. Age-check every descendant
@@ -347,7 +347,7 @@ case "${LIVE}" in
 esac
 [[ -d "${LIVE}" ]] || die "live tree ${LIVE} is not a directory"
 
-# A clone inherits the origin's mountpoint. tank/models is /export/models, so
+# A clone inherits the origin's mountpoint. tank/ai is /export/ai, so
 # `zfs clone SNAP tank/drill` would report that same path, and every diff and
 # checksum below would run against the live export: a green drill that never
 # restored anything. Force a distinct mountpoint (sibling modelfs-drill, or

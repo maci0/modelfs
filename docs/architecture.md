@@ -26,14 +26,22 @@ daemon does once it is running.
 
 | Path | What |
 |---|---|
-| `192.168.0.100:/export/models` | ZFS NFS export; `.cluster/` holds leases (`<id>.json`) and piece-hash manifests (`manifests/<hex>`, see [Piece integrity](#piece-integrity-blake3-level-1)) |
+| `192.168.0.100:/export/ai` | ZFS NFS export; `.cluster/` holds leases (`<id>.json`) and piece-hash manifests (`manifests/<hex>`, see [Piece integrity](#piece-integrity-blake3-level-1)) |
 | `/net/192.168.0.100/models` | NFS origin on sparks, **no `fsc`** |
 | `/models` | FUSE (sparks). Empty local dir, uid 1000 |
 | `/var/cache/modelfs` | pieces (`data/` 0600 files under 0700 dirs, leftover 0755 dirs tightened at layout; `meta/*.pieces` and `pin/` 0600; `status.json` 0600) |
 | `:18080` | peer HTTP, bound on all interfaces; non-loopback IPv4 advertised in the lease (127.0.0.1 if none) |
 
-Desktop: mount NFS at `/models` with `fsc` as in [operations.md](operations.md). Do not run
+Desktop: mount NFS at `/ai` with `fsc` as in [operations.md](operations.md). Do not run
 `modelfs` there.
+
+The origin is the single `tank/ai` dataset, renamed from `tank/models` without
+moving files or discarding snapshots. Its NFS export is controlled only by
+ZFS `sharenfs`, allowing uid/gid 1000 writes from the desktop and two Sparks
+with `sync,root_squash`. Sparks retain their local paths; the desktop uses
+`/ai` and its cache environment and Strata settings follow that path. All
+clients use `hard` mounts. HF caches and model files are directories within
+this same export.
 
 ### What the origin must be
 

@@ -59,7 +59,7 @@ SANOID_CONF="${ROOT}/etc/sanoid/sanoid.conf"
 # The placeholder syncoid-models.service ships. A pull still carrying it
 # names no host: the unit would resolve "nas" from the replica's own ssh
 # config, or fail, either way without recording which machine was chosen.
-PLACEHOLDERS="nas:tank/models"
+PLACEHOLDERS="nas:tank/ai"
 
 UNITS=(
     sanoid.service

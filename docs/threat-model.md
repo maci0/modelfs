@@ -450,7 +450,7 @@ data this project exists to serve.
   `syncoid --recursive --no-privilege-elevation --sshoption=BatchMode=yes --sshoption=ConnectTimeout=30 ${MF_SYNCOID_SRC} ${MF_SYNCOID_DEST}` as root, authenticating to the NAS with an SSH identity under `/root/.ssh`. The pull is `zfs send | zfs recv`: ZFS verifies its own stream framing, and every dataset on the origin lands on the replica with the sender's ownership, so a compromised NAS can plant datasets the replica then holds and can later be asked to restore (R13).
 * **Snapshot policy.** `sanoid.conf` is installed at `/etc/sanoid/sanoid.conf` and edited on the host; the repository ships retention settings, not the site's dataset name. Snapshot creation and pruning are root on the NAS, and the shipped drop-ins under `scripts/nas/drop-ins/` only add `OnFailure=` and `TZ=UTC`.
 * **Drill.** `modelfs-drill.service` clones the newest snapshot `readonly=on`, `sharenfs=off`, `sharesmb=off`, diffs it against the live tree excluding `.cluster` and `.zfs`, hashes one size-stable file in both, appends a UTC line to `/var/log/modelfs-drill.log`, and destroys the clone on exit (`dr_restore_drill.sh`). It runs as root and is deliberately the least sandboxed unit (`UMask=0077`, `PrivateTmp=yes`, no `ProtectSystem` or `NoNewPrivileges`, because `zfs clone` and `zfs destroy` need `CAP_SYS_ADMIN`).
-* **Restore.** `dr_pool_restore.sh --execute` runs `zfs recv -Fs` or a `syncoid --force-delete` pull onto the destination and then sets export properties, with `sharenfs` defaulting to `rw,async,no_root_squash,no_subtree_check`; `dr_point_restore.sh --execute` clones one snapshot and copies the named `--copy` paths back into the live export. Both refuse to write anything without `--execute`, and `dr_pool_restore.sh` refuses an operand beginning with `-` before it reaches `zfs` or syncoid's option parser and a mounted destination without `--force`; `dr_point_restore.sh` requires at least one `--copy`, refuses an absolute or `..`-escaping path, and refuses a clone dataset or mountpoint that already exists.
+* **Restore.** `dr_pool_restore.sh --execute` runs `zfs recv -Fs` or a `syncoid --force-delete` pull onto the destination and then sets export properties, with `sharenfs` defaulting to `rw=192.168.0.77:192.168.0.211:192.168.0.212,sync,root_squash,no_subtree_check`; `dr_point_restore.sh --execute` clones one snapshot and copies the named `--copy` paths back into the live export. Both refuse to write anything without `--execute`, and `dr_pool_restore.sh` refuses an operand beginning with `-` before it reaches `zfs` or syncoid's option parser and a mounted destination without `--force`; `dr_point_restore.sh` requires at least one `--copy`, refuses an absolute or `..`-escaping path, and refuses a clone dataset or mountpoint that already exists.
 * **Alarms.** The three age checks (`check_drill_log.sh`, `check_offsite.sh`, `dr_restore_drill.sh --age-only`) run under `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `NoNewPrivileges=yes`, and read only a log file, `zfs list` output, and the host clock. `notify-admin@.service` records a failure as one `logger` line.
 
 The `MF_*` knobs that choose the datasets (`MF_SYNCOID_SRC`, `MF_DRILL_REPLICA`,
@@ -459,9 +459,9 @@ values are placeholders that `backup_config.sh` reports as such, and `check_offs
 run with its dataset unset rather than bless production as the offsite copy.
 
 `syncoid-models.service` is deliberately a pull and not a push, so NAS root cannot destroy the
-pool-loss copy with the credential that can destroy `tank/models`, and the unit tells the
+pool-loss copy with the credential that can destroy `tank/ai`, and the unit tells the
 installer to override `MF_SYNCOID_SRC` with a dedicated replica user's key. The shipped value is
-still the `nas:tank/models` placeholder, so that hardening is a host action this repository asks
+still the `nas:tank/ai` placeholder, so that hardening is a host action this repository asks
 for and cannot enforce, and R13 holds until it is taken.
 
 ### Secrets flow
@@ -1070,7 +1070,7 @@ datasets, and a later `modelfs-pool-restore --execute` from that replica restore
 controls that do exist are named under
 [Recovery plane](#recovery-plane-nas-units-and-root-wrappers): `BatchMode=yes`,
 `ConnectTimeout=30`, the unit sandbox, the pull direction (a push would let NAS root destroy the
-copy with the same credential that destroys `tank/models`), and monthlies held against a
+copy with the same credential that destroys `tank/ai`), and monthlies held against a
 recursive destroy. The intended fix is named in the unit itself: a dedicated replica user's key,
 overriding the shipped `MF_SYNCOID_SRC` placeholder through a drop-in. It is a host action, so
 until an operator takes it the pull authenticates as whoever root can become on the replica host.

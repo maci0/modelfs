@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily pull of tank/models onto this replica host
+Description=Daily pull of tank/ai onto this replica host
 Documentation=file:///usr/local/share/doc/modelfs/recovery.md
 
 [Timer]

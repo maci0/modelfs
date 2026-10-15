@@ -2,7 +2,7 @@
 # Regression tests for scripts/dr_restore_drill.sh, hold_monthlies.sh,
 # check_drill_log.sh, check_offsite.sh, dr_pool_restore.sh,
 # dr_point_restore.sh, and install_nas_backup.sh. The real drill runs on
-# the NAS against tank/models; this drives it through a stub zfs(8) that
+# the NAS against tank/ai; this drives it through a stub zfs(8) that
 # copies fixture trees in place of clone, so CI can fail a drill that
 # would hash the live export against itself, bless an empty or lease-only
 # snapshot, ignore a dead autosnap schedule, hold a replica with no
@@ -363,7 +363,7 @@ expect_ok() {
     out="$(env "MF_DRILL_LIVE=${live}" "MF_DRILL_LOG=${log}" \
         "${DRILL_DEFAULTS[@]}" \
         "$@" \
-        "${DRILL}" tank/models 2>&1)" || rc=$?
+        "${DRILL}" tank/ai 2>&1)" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
         fail "${name}: expected success, rc=${rc}: ${out}"
         return 0
@@ -386,7 +386,7 @@ expect_fail() {
     out="$(env "MF_DRILL_LIVE=${live}" "MF_DRILL_LOG=${log}" \
         "${DRILL_DEFAULTS[@]}" \
         "$@" \
-        "${DRILL}" tank/models 2>&1)" || rc=$?
+        "${DRILL}" tank/ai 2>&1)" || rc=$?
     if [[ "${rc}" -eq 0 ]]; then
         fail "${name}: expected failure, got success: ${out}"
         return 0
@@ -416,7 +416,7 @@ echo lease-old >"${SNAP1}/.cluster/spark1.json"
 echo lease-new >"${LIVE1}/.cluster/spark1.json"
 echo 'only on live' >"${LIVE1}/gguf/new-after-snap.gguf"
 LOG1="${TEMP}/drill1.log"
-write_env tank/models "${LIVE1}" tank/models@autosnap_test "${FRESH}" "${SNAP1}"
+write_env tank/ai "${LIVE1}" tank/ai@autosnap_test "${FRESH}" "${SNAP1}"
 expect_ok "happy path restores off the live tree" "${LIVE1}" "${LOG1}"
 INHERITED_MP="${TEMP}/inherited-clone"
 mkdir -p "${INHERITED_MP}"
@@ -499,14 +499,14 @@ zfs destroy tank/drill
 # --- 2. no snapshots
 LIVE2="${TEMP}/live2"
 mkdir -p "${LIVE2}"
-write_env tank/models "${LIVE2}" "" "${FRESH}" "${TEMP}/empty-snap"
+write_env tank/ai "${LIVE2}" "" "${FRESH}" "${TEMP}/empty-snap"
 # Override SNAP_NAME empty via env file: list -t snapshot prints a tab-only line
 # if SNAP_NAME is empty. Force the stub to print nothing by using a snap name
 # of empty string: printf '%s\t%s\n' "" epoch still prints a tab. Use a
 # dedicated snaps-empty mode: SNAP_NAME empty and snap_creation 0, and tweak
 # the stub to print nothing when SNAP_NAME is empty.
 LOG2="${TEMP}/drill2.log"
-write_env tank/models "${LIVE2}" "" "${FRESH}" "${TEMP}/nosnap"
+write_env tank/ai "${LIVE2}" "" "${FRESH}" "${TEMP}/nosnap"
 expect_fail "no snapshots is an alarm" "no snapshots" "${LIVE2}" "${LOG2}"
 
 # --- 3. stale snapshot
@@ -516,17 +516,17 @@ mkdir -p "${LIVE3}/gguf" "${SNAP3}/gguf"
 echo weight >"${SNAP3}/gguf/m.gguf"
 cp -a "${SNAP3}/gguf/m.gguf" "${LIVE3}/gguf/m.gguf"
 LOG3="${TEMP}/drill3.log"
-write_env tank/models "${LIVE3}" tank/models@old "${STALE}" "${SNAP3}"
+write_env tank/ai "${LIVE3}" tank/ai@old "${STALE}" "${SNAP3}"
 expect_fail "stale snapshot is an alarm" "past the" "${LIVE3}" "${LOG3}"
 
 # 200000s-old snap: octal 0300000 is 98304 (would still fail); decimal
 # 300000 is above the age, so a leading zero must not keep the alarm.
 LOG3A="${TEMP}/drill3a.log"
-write_env tank/models "${LIVE3}" tank/models@old "${STALE}" "${SNAP3}"
+write_env tank/ai "${LIVE3}" tank/ai@old "${STALE}" "${SNAP3}"
 expect_ok "padded MF_DRILL_MAX_SNAP_AGE=0300000 is decimal" "${LIVE3}" "${LOG3A}" \
     MF_DRILL_MAX_SNAP_AGE=0300000
 LOG3A2="${TEMP}/drill3a2.log"
-write_env tank/models "${LIVE1}" tank/models@autosnap_test "${FRESH}" "${SNAP1}"
+write_env tank/ai "${LIVE1}" tank/ai@autosnap_test "${FRESH}" "${SNAP1}"
 expect_fail "padded MF_DRILL_MAX_SNAP_AGE=08 is decimal not an octal abort" "past the" "${LIVE1}" "${LOG3A2}" \
     MF_DRILL_MAX_SNAP_AGE=08
 
@@ -538,7 +538,7 @@ echo weight >"${SNAP3B}/gguf/m.gguf"
 cp -a "${SNAP3B}/gguf/m.gguf" "${LIVE3B}/gguf/m.gguf"
 LOG3B="${TEMP}/drill3b.log"
 FUTURE=$((NOW + 3600))
-write_env tank/models "${LIVE3B}" tank/models@future "${FUTURE}" "${SNAP3B}"
+write_env tank/ai "${LIVE3B}" tank/ai@future "${FUTURE}" "${SNAP3B}"
 expect_fail "future snapshot creation is an alarm" "in the future" "${LIVE3B}" "${LOG3B}"
 
 # --- 4. empty snapshot (no files at all)
@@ -547,7 +547,7 @@ SNAP4="${TEMP}/snap4"
 mkdir -p "${LIVE4}/gguf" "${SNAP4}"
 echo weight >"${LIVE4}/gguf/m.gguf"
 LOG4="${TEMP}/drill4.log"
-write_env tank/models "${LIVE4}" tank/models@empty "${FRESH}" "${SNAP4}"
+write_env tank/ai "${LIVE4}" tank/ai@empty "${FRESH}" "${SNAP4}"
 expect_fail "empty snapshot is an alarm" "zero files" "${LIVE4}" "${LOG4}"
 
 # --- 5. lease-only snapshot (the previous FILE_COUNT hole)
@@ -557,7 +557,7 @@ mkdir -p "${LIVE5}/.cluster" "${SNAP5}/.cluster"
 echo lease >"${SNAP5}/.cluster/spark1.json"
 echo lease >"${LIVE5}/.cluster/spark1.json"
 LOG5="${TEMP}/drill5.log"
-write_env tank/models "${LIVE5}" tank/models@leases "${FRESH}" "${SNAP5}"
+write_env tank/ai "${LIVE5}" tank/ai@leases "${FRESH}" "${SNAP5}"
 expect_fail "lease-only snapshot is an alarm" "zero files" "${LIVE5}" "${LOG5}"
 
 # --- 6. hash mismatch at the same size
@@ -567,7 +567,7 @@ mkdir -p "${LIVE6}/gguf" "${SNAP6}/gguf"
 printf 'AAAA' >"${SNAP6}/gguf/m.gguf"
 printf 'BBBB' >"${LIVE6}/gguf/m.gguf"
 LOG6="${TEMP}/drill6.log"
-write_env tank/models "${LIVE6}" tank/models@bad "${FRESH}" "${SNAP6}"
+write_env tank/ai "${LIVE6}" tank/ai@bad "${FRESH}" "${SNAP6}"
 expect_fail "content mismatch is an alarm" "hashes" "${LIVE6}" "${LOG6}"
 
 # --- 7. size-changed file skipped; smaller stable file hashed
@@ -579,7 +579,7 @@ printf 'old-weight-xxxxx-AND-MORE' >"${LIVE7}/gguf/growing.gguf"
 printf 'stable-bytes' >"${SNAP7}/gguf/small.bin"
 printf 'stable-bytes' >"${LIVE7}/gguf/small.bin"
 LOG7="${TEMP}/drill7.log"
-write_env tank/models "${LIVE7}" tank/models@grow "${FRESH}" "${SNAP7}"
+write_env tank/ai "${LIVE7}" tank/ai@grow "${FRESH}" "${SNAP7}"
 expect_ok "size-changed file is skipped" "${LIVE7}" "${LOG7}"
 if [[ -f "${LOG7}" ]] && grep -q "sample=/gguf/small.bin" "${LOG7}"; then
     pass "sampler hashed the size-stable file"
@@ -593,7 +593,7 @@ mkdir -p "${LIVE_NAMES}/gguf" "${SNAP_NAMES}/gguf"
 SAMPLE_NAME=$'model.gguf\t'
 printf 'stable-bytes' >"${SNAP_NAMES}/gguf/${SAMPLE_NAME}"
 cp -a "${SNAP_NAMES}/gguf/${SAMPLE_NAME}" "${LIVE_NAMES}/gguf/${SAMPLE_NAME}"
-write_env tank/models "${LIVE_NAMES}" tank/models@names "${FRESH}" "${SNAP_NAMES}"
+write_env tank/ai "${LIVE_NAMES}" tank/ai@names "${FRESH}" "${SNAP_NAMES}"
 expect_ok "sampler preserves a trailing tab in a filename" "${LIVE_NAMES}" "${TEMP}/names.log"
 
 # An origin filename carrying a newline cannot be written to the one-line
@@ -608,7 +608,7 @@ printf 'stable-bytes' >"${LIVE_NL}/gguf/${NL_NAME}"
 # A second, ordinary file so the drill still has a sampleable candidate.
 printf 'stable-bytes' >"${SNAP_NL}/gguf/ordinary.gguf"
 printf 'stable-bytes' >"${LIVE_NL}/gguf/ordinary.gguf"
-write_env tank/models "${LIVE_NL}" tank/models@newline "${FRESH}" "${SNAP_NL}"
+write_env tank/ai "${LIVE_NL}" tank/ai@newline "${FRESH}" "${SNAP_NL}"
 expect_ok "drill succeeds with a newline in an origin filename" "${LIVE_NL}" "${TEMP}/newline.log"
 if grep -q "$(printf '2026-01-01T00:00:00Z ok forged')" "${TEMP}/newline.log" 2>/dev/null; then
     fail "a newline in the sampled name split the drill log record: $(cat "${TEMP}/newline.log" 2>/dev/null || true)"
@@ -623,7 +623,7 @@ mkdir -p "${LIVE8}/gguf" "${SNAP8}/gguf"
 echo weight >"${SNAP8}/gguf/m.gguf"
 cp -a "${SNAP8}/gguf/m.gguf" "${LIVE8}/gguf/m.gguf"
 LOG8="${TEMP}/drill8.log"
-write_env tank/models "${LIVE8}" tank/models@ok "${FRESH}" "${SNAP8}"
+write_env tank/ai "${LIVE8}" tank/ai@ok "${FRESH}" "${SNAP8}"
 expect_fail "clone mp colliding with live is refused" "collides with the live tree" \
     "${LIVE8}" "${LOG8}" MF_DRILL_CLONE_MP="${LIVE8}"
 
@@ -634,9 +634,9 @@ mkdir -p "${LIVE9}/gguf" "${SNAP9}/gguf"
 echo weight >"${SNAP9}/gguf/m.gguf"
 cp -a "${SNAP9}/gguf/m.gguf" "${LIVE9}/gguf/m.gguf"
 LOG9="${TEMP}/drill9.log"
-write_env tank/models "${LIVE9}" tank/models@ok "${FRESH}" "${SNAP9}"
+write_env tank/ai "${LIVE9}" tank/ai@ok "${FRESH}" "${SNAP9}"
 expect_fail "missing replica dataset is an alarm" "replica dataset" \
-    "${LIVE9}" "${LOG9}" MF_DRILL_REPLICA="tank/models-backup"
+    "${LIVE9}" "${LOG9}" MF_DRILL_REPLICA="tank/ai-backup"
 
 # --- 10. replica present and fresh
 LIVE10="${TEMP}/live10"
@@ -645,9 +645,9 @@ mkdir -p "${LIVE10}/gguf" "${SNAP10}/gguf"
 echo weight >"${SNAP10}/gguf/m.gguf"
 cp -a "${SNAP10}/gguf/m.gguf" "${LIVE10}/gguf/m.gguf"
 LOG10="${TEMP}/drill10.log"
-write_env tank/models "${LIVE10}" tank/models@ok "${FRESH}" "${SNAP10}" \
-    tank/models-backup tank/models-backup@ok "${FRESH}"
-expect_ok "fresh replica is recorded" "${LIVE10}" "${LOG10}" MF_DRILL_REPLICA="tank/models-backup"
+write_env tank/ai "${LIVE10}" tank/ai@ok "${FRESH}" "${SNAP10}" \
+    tank/ai-backup tank/ai-backup@ok "${FRESH}"
+expect_ok "fresh replica is recorded" "${LIVE10}" "${LOG10}" MF_DRILL_REPLICA="tank/ai-backup"
 if [[ -f "${LOG10}" ]] && grep -q "replica=ok" "${LOG10}"; then
     pass "log records replica=ok"
 else
@@ -661,10 +661,10 @@ mkdir -p "${LIVE11}/gguf" "${SNAP11}/gguf"
 echo weight >"${SNAP11}/gguf/m.gguf"
 cp -a "${SNAP11}/gguf/m.gguf" "${LIVE11}/gguf/m.gguf"
 LOG11="${TEMP}/drill11.log"
-write_env tank/models "${LIVE11}" tank/models@ok "${FRESH}" "${SNAP11}" \
-    tank/models-backup tank/models-backup@old "${STALE}"
+write_env tank/ai "${LIVE11}" tank/ai@ok "${FRESH}" "${SNAP11}" \
+    tank/ai-backup tank/ai-backup@old "${STALE}"
 expect_fail "stale replica is an alarm" "replica newest snapshot" \
-    "${LIVE11}" "${LOG11}" MF_DRILL_REPLICA="tank/models-backup"
+    "${LIVE11}" "${LOG11}" MF_DRILL_REPLICA="tank/ai-backup"
 
 # --- 12. already-mounted leftover clone is refused
 LIVE12="${TEMP}/live12"
@@ -673,7 +673,7 @@ mkdir -p "${LIVE12}/gguf" "${SNAP12}/gguf"
 echo weight >"${SNAP12}/gguf/m.gguf"
 cp -a "${SNAP12}/gguf/m.gguf" "${LIVE12}/gguf/m.gguf"
 LOG12="${TEMP}/drill12.log"
-write_env tank/models "${LIVE12}" tank/models@ok "${FRESH}" "${SNAP12}"
+write_env tank/ai "${LIVE12}" tank/ai@ok "${FRESH}" "${SNAP12}"
 printf 'CLONE_NAME=%q\nCLONE_MP=%q\nCLONE_MOUNTED=%q\n' tank/drill "${TEMP}/leftover" yes >"${STUB_STATE}/clone"
 expect_fail "mounted leftover clone is refused" "already exists" \
     "${LIVE12}" "${LOG12}"
@@ -713,7 +713,7 @@ cp -a "${SNAP13}/gguf/m.gguf" "${LIVE13}/gguf/m.gguf"
 LOG13="${TEMP}/readonly.log"
 touch "${LOG13}"
 chmod a-w "${LOG13}"
-write_env tank/models "${LIVE13}" tank/models@ok "${FRESH}" "${SNAP13}"
+write_env tank/ai "${LIVE13}" tank/ai@ok "${FRESH}" "${SNAP13}"
 expect_fail "unwritable log is an alarm" "cannot write the drill log" \
     "${LIVE13}" "${LOG13}"
 chmod u+w "${LOG13}"
@@ -726,10 +726,10 @@ echo weight >"${SNAP14}/gguf/m.gguf"
 cp -a "${SNAP14}/gguf/m.gguf" "${LIVE14}/gguf/m.gguf"
 LOG14="${TEMP}/drill14.log"
 REPLICA_26H=$((NOW - 93600))
-write_env tank/models "${LIVE14}" tank/models@ok "${FRESH}" "${SNAP14}" \
-    tank/models-backup tank/models-backup@ok "${REPLICA_26H}"
+write_env tank/ai "${LIVE14}" tank/ai@ok "${FRESH}" "${SNAP14}" \
+    tank/ai-backup tank/ai-backup@ok "${REPLICA_26H}"
 expect_ok "replica 26h old is inside the daily slack" "${LIVE14}" "${LOG14}" \
-    MF_DRILL_REPLICA="tank/models-backup"
+    MF_DRILL_REPLICA="tank/ai-backup"
 
 # --- child datasets: sanoid recursive must still cover them
 LIVE14C="${TEMP}/live14c"
@@ -738,21 +738,21 @@ mkdir -p "${LIVE14C}/gguf" "${SNAP14C}/gguf"
 echo weight >"${SNAP14C}/gguf/m.gguf"
 cp -a "${SNAP14C}/gguf/m.gguf" "${LIVE14C}/gguf/m.gguf"
 LOG14C="${TEMP}/drill14c.log"
-CHILD_DS="tank/models/gguf" CHILD_SNAP="tank/models/gguf@autosnap_ok" CHILD_CREATION="${FRESH}" \
-    write_env tank/models "${LIVE14C}" tank/models@ok "${FRESH}" "${SNAP14C}"
+CHILD_DS="tank/ai/gguf" CHILD_SNAP="tank/ai/gguf@autosnap_ok" CHILD_CREATION="${FRESH}" \
+    write_env tank/ai "${LIVE14C}" tank/ai@ok "${FRESH}" "${SNAP14C}"
 expect_ok "fresh child dataset snapshot is recorded" "${LIVE14C}" "${LOG14C}"
 unset CHILD_DS CHILD_SNAP CHILD_CREATION
 
 LOG14D="${TEMP}/drill14d.log"
-CHILD_DS="tank/models/gguf" CHILD_SNAP="" CHILD_CREATION="${FRESH}" \
-    write_env tank/models "${LIVE14C}" tank/models@ok "${FRESH}" "${SNAP14C}"
+CHILD_DS="tank/ai/gguf" CHILD_SNAP="" CHILD_CREATION="${FRESH}" \
+    write_env tank/ai "${LIVE14C}" tank/ai@ok "${FRESH}" "${SNAP14C}"
 expect_fail "child dataset with no snapshots is an alarm" "child dataset" \
     "${LIVE14C}" "${LOG14D}"
 unset CHILD_DS CHILD_SNAP CHILD_CREATION
 
 LOG14E="${TEMP}/drill14e.log"
-CHILD_DS="tank/models/gguf" CHILD_SNAP="tank/models/gguf@old" CHILD_CREATION="${STALE}" \
-    write_env tank/models "${LIVE14C}" tank/models@ok "${FRESH}" "${SNAP14C}"
+CHILD_DS="tank/ai/gguf" CHILD_SNAP="tank/ai/gguf@old" CHILD_CREATION="${STALE}" \
+    write_env tank/ai "${LIVE14C}" tank/ai@ok "${FRESH}" "${SNAP14C}"
 expect_fail "stale child dataset snapshot is an alarm" "stopped covering" \
     "${LIVE14C}" "${LOG14E}"
 unset CHILD_DS CHILD_SNAP CHILD_CREATION
@@ -768,7 +768,7 @@ expect_age_ok() {
     out="$(env "MF_DRILL_LIVE=${live}" "MF_DRILL_LOG=${log}" \
         "${DRILL_DEFAULTS[@]}" \
         "$@" \
-        "${DRILL}" --age-only tank/models 2>&1)" || rc=$?
+        "${DRILL}" --age-only tank/ai 2>&1)" || rc=$?
     if [[ "${rc}" -ne 0 ]]; then
         fail "${name}: expected success, rc=${rc}: ${out}"
         return 0
@@ -795,7 +795,7 @@ expect_age_fail() {
     out="$(env "MF_DRILL_LIVE=${live}" "MF_DRILL_LOG=${log}" \
         "${DRILL_DEFAULTS[@]}" \
         "$@" \
-        "${DRILL}" --age-only tank/models 2>&1)" || rc=$?
+        "${DRILL}" --age-only tank/ai 2>&1)" || rc=$?
     if [[ "${rc}" -eq 0 ]]; then
         fail "${name}: expected failure, got success: ${out}"
         return 0
@@ -817,7 +817,7 @@ mkdir -p "${LIVE15}/gguf" "${SNAP15}/gguf"
 echo weight >"${SNAP15}/gguf/m.gguf"
 cp -a "${SNAP15}/gguf/m.gguf" "${LIVE15}/gguf/m.gguf"
 LOG15="${TEMP}/drill15.log"
-write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
+write_env tank/ai "${LIVE15}" tank/ai@ok "${FRESH}" "${SNAP15}"
 expect_age_ok "age-only succeeds on a fresh snapshot" "${LIVE15}" "${LOG15}"
 AGE_SCRATCH="${TEMP}/age-only-unused"
 expect_age_ok "age-only does not create scratch" "${LIVE15}" "${LOG15}" \
@@ -840,34 +840,34 @@ else
 fi
 
 LOG15A="${TEMP}/drill15a.log"
-write_env tank/models "${LIVE15}" tank/models@old "${STALE}" "${SNAP15}"
+write_env tank/ai "${LIVE15}" tank/ai@old "${STALE}" "${SNAP15}"
 expect_age_fail "age-only stale snapshot is an alarm" "past the" "${LIVE15}" "${LOG15A}"
 
 LOG15B="${TEMP}/drill15b.log"
-write_env tank/models "${LIVE15}" "" "${FRESH}" "${TEMP}/nosnap-age"
+write_env tank/ai "${LIVE15}" "" "${FRESH}" "${TEMP}/nosnap-age"
 expect_age_fail "age-only no snapshots is an alarm" "no snapshots" "${LIVE15}" "${LOG15B}"
 
 LOG15C="${TEMP}/drill15c.log"
-write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
+write_env tank/ai "${LIVE15}" tank/ai@ok "${FRESH}" "${SNAP15}"
 expect_age_fail "age-only missing replica is an alarm" "replica dataset" \
-    "${LIVE15}" "${LOG15C}" MF_DRILL_REPLICA="tank/models-backup"
+    "${LIVE15}" "${LOG15C}" MF_DRILL_REPLICA="tank/ai-backup"
 
 LOG15D="${TEMP}/readonly-age.log"
 touch "${LOG15D}"
 chmod a-w "${LOG15D}"
-write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
+write_env tank/ai "${LIVE15}" tank/ai@ok "${FRESH}" "${SNAP15}"
 expect_age_ok "age-only does not need a writable drill log" "${LIVE15}" "${LOG15D}"
 chmod u+w "${LOG15D}"
 
 LOG15E="${TEMP}/drill15e.log"
-CHILD_DS="tank/models/gguf" CHILD_SNAP="" CHILD_CREATION="${FRESH}" \
-    write_env tank/models "${LIVE15}" tank/models@ok "${FRESH}" "${SNAP15}"
+CHILD_DS="tank/ai/gguf" CHILD_SNAP="" CHILD_CREATION="${FRESH}" \
+    write_env tank/ai "${LIVE15}" tank/ai@ok "${FRESH}" "${SNAP15}"
 expect_age_fail "age-only child with no snapshots is an alarm" "child dataset" \
     "${LIVE15}" "${LOG15E}"
 unset CHILD_DS CHILD_SNAP CHILD_CREATION
 
 AGE_USAGE_RC=0
-AGE_USAGE_OUT="$("${DRILL}" --age-only tank/models extra 2>&1)" || AGE_USAGE_RC=$?
+AGE_USAGE_OUT="$("${DRILL}" --age-only tank/ai extra 2>&1)" || AGE_USAGE_RC=$?
 if [[ "${AGE_USAGE_RC}" -ne 2 ]]; then
     fail "age-only extra operand: expected rc=2, got ${AGE_USAGE_RC}: ${AGE_USAGE_OUT}"
 elif ! grep -q "Usage:" <<<"${AGE_USAGE_OUT}"; then
@@ -1005,18 +1005,18 @@ write_hold_env() {
 }
 
 rm -rf "${HOLD_STATE}/holds"
-write_hold_env tank/models "" \
-    tank/models@autosnap_h_hourly tank/models@autosnap_m_monthly
+write_hold_env tank/ai "" \
+    tank/ai@autosnap_h_hourly tank/ai@autosnap_m_monthly
 HOLD_OUT=""
 HOLD_RC=0
-HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/ai 2>&1)" || HOLD_RC=$?
 if [[ "${HOLD_RC}" -ne 0 ]]; then
     fail "hold monthlies: expected success, rc=${HOLD_RC}: ${HOLD_OUT}"
 elif ! grep -q "hold OK: 1 monthly" <<<"${HOLD_OUT}"; then
     fail "hold monthlies missing one-monthly OK: ${HOLD_OUT}"
-elif [[ ! -f "${HOLD_STATE}/holds/tank_models@autosnap_m_monthly" ]]; then
+elif [[ ! -f "${HOLD_STATE}/holds/tank_ai@autosnap_m_monthly" ]]; then
     fail "hold monthlies did not tag the monthly"
-elif [[ -f "${HOLD_STATE}/holds/tank_models@autosnap_h_hourly" ]]; then
+elif [[ -f "${HOLD_STATE}/holds/tank_ai@autosnap_h_hourly" ]]; then
     fail "hold monthlies tagged an hourly snapshot"
 else
     pass "hold monthlies tags only *_monthly"
@@ -1024,7 +1024,7 @@ fi
 
 HOLD_OUT=""
 HOLD_RC=0
-HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/ai 2>&1)" || HOLD_RC=$?
 if [[ "${HOLD_RC}" -ne 0 ]]; then
     fail "hold already-held: expected success, rc=${HOLD_RC}: ${HOLD_OUT}"
 elif ! grep -q "already modelfs-dr" <<<"${HOLD_OUT}"; then
@@ -1034,10 +1034,10 @@ else
 fi
 
 rm -rf "${HOLD_STATE}/holds"
-write_hold_env tank/models "" tank/models@autosnap_h_hourly
+write_hold_env tank/ai "" tank/ai@autosnap_h_hourly
 HOLD_OUT=""
 HOLD_RC=0
-HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/ai 2>&1)" || HOLD_RC=$?
 if [[ "${HOLD_RC}" -ne 0 ]]; then
     fail "hold no-monthlies: expected success, rc=${HOLD_RC}: ${HOLD_OUT}"
 elif ! grep -q "hold OK: 0 monthly" <<<"${HOLD_OUT}"; then
@@ -1047,10 +1047,10 @@ else
 fi
 
 rm -rf "${HOLD_STATE}/holds"
-write_hold_env tank/models ""
+write_hold_env tank/ai ""
 HOLD_OUT=""
 HOLD_RC=0
-HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/ai 2>&1)" || HOLD_RC=$?
 if [[ "${HOLD_RC}" -eq 0 ]]; then
     fail "hold no-snapshots: expected failure: ${HOLD_OUT}"
 elif ! grep -q "no snapshots" <<<"${HOLD_OUT}"; then
@@ -1060,11 +1060,11 @@ else
 fi
 
 rm -rf "${HOLD_STATE}/holds"
-write_hold_env tank/models tank/models@autosnap_m_monthly \
-    tank/models@autosnap_m_monthly
+write_hold_env tank/ai tank/ai@autosnap_m_monthly \
+    tank/ai@autosnap_m_monthly
 HOLD_OUT=""
 HOLD_RC=0
-HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/ai 2>&1)" || HOLD_RC=$?
 if [[ "${HOLD_RC}" -eq 0 ]]; then
     fail "hold denied: expected failure: ${HOLD_OUT}"
 elif ! grep -q "cannot hold" <<<"${HOLD_OUT}"; then
@@ -1074,18 +1074,18 @@ else
 fi
 
 rm -rf "${HOLD_STATE}/holds"
-write_hold_env tank/models "" \
-    tank/models@autosnap_m_monthly tank/models/gguf@autosnap_m_monthly
+write_hold_env tank/ai "" \
+    tank/ai@autosnap_m_monthly tank/ai/gguf@autosnap_m_monthly
 HOLD_OUT=""
 HOLD_RC=0
-HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/models 2>&1)" || HOLD_RC=$?
+HOLD_OUT="$(env HOLD_STATE="${HOLD_STATE}" PATH="${HOLD_BIN}:${PATH}" "${HOLD}" tank/ai 2>&1)" || HOLD_RC=$?
 if [[ "${HOLD_RC}" -ne 0 ]]; then
     fail "hold child monthlies: expected success, rc=${HOLD_RC}: ${HOLD_OUT}"
 elif ! grep -q "hold OK: 2 monthly" <<<"${HOLD_OUT}"; then
     fail "hold child monthlies missing two-monthly OK: ${HOLD_OUT}"
-elif [[ ! -f "${HOLD_STATE}/holds/tank_models@autosnap_m_monthly" ]]; then
+elif [[ ! -f "${HOLD_STATE}/holds/tank_ai@autosnap_m_monthly" ]]; then
     fail "hold child monthlies did not tag the parent monthly"
-elif [[ ! -f "${HOLD_STATE}/holds/tank_models_gguf@autosnap_m_monthly" ]]; then
+elif [[ ! -f "${HOLD_STATE}/holds/tank_ai_gguf@autosnap_m_monthly" ]]; then
     fail "hold child monthlies did not tag the child monthly"
 else
     pass "hold monthlies tags child dataset monthlies"
@@ -1130,24 +1130,24 @@ expect_check "missing drill log is an alarm" 1 "is missing" \
 expect_check "empty drill log is an alarm" 1 "is empty" \
     MF_DRILL_LOG="${TEMP}/empty-drill.log"
 
-echo "not-a-stamp tank/models@x ok" >"${TEMP}/bad-stamp.log"
+echo "not-a-stamp tank/ai@x ok" >"${TEMP}/bad-stamp.log"
 expect_check "non-UTC stamp is an alarm" 1 "not a UTC stamp" \
     MF_DRILL_LOG="${TEMP}/bad-stamp.log"
 
 FUTURE_STAMP="$(date -u -d "+2 hours" +%Y-%m-%dT%H:%M:%SZ)"
-echo "${FUTURE_STAMP} tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+echo "${FUTURE_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/future-drill.log"
 expect_check "future drill log stamp is an alarm" 1 "in the future" \
     MF_DRILL_LOG="${TEMP}/future-drill.log"
 
 STALE_STAMP="$(date -u -d "-40 days" +%Y-%m-%dT%H:%M:%SZ)"
-echo "${STALE_STAMP} tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+echo "${STALE_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/stale-drill.log"
 expect_check "stale drill log is an alarm" 1 "has not succeeded recently" \
     MF_DRILL_LOG="${TEMP}/stale-drill.log"
 
 FRESH_STAMP="$(date -u -d "-1 hour" +%Y-%m-%dT%H:%M:%SZ)"
-echo "${FRESH_STAMP} tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+echo "${FRESH_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/fresh-drill.log"
 expect_check "fresh drill log is ok" 0 "drill-log OK" \
     MF_DRILL_LOG="${TEMP}/fresh-drill.log"
@@ -1159,7 +1159,7 @@ expect_check "bad MF_DRILL_LOG_MAX_AGE is an alarm" 1 "whole number of seconds" 
 # [[ -gt ]] ("value too great for base"). 0120 octal is 80, so a 90s-old
 # log would fail that limit; decimal 120 keeps it fresh.
 NINETY_STAMP="$(date -u -d "-90 seconds" +%Y-%m-%dT%H:%M:%SZ)"
-echo "${NINETY_STAMP} tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+echo "${NINETY_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/ninety-drill.log"
 expect_check "padded MF_DRILL_LOG_MAX_AGE=08 is decimal not an octal abort" 1 "has not succeeded recently" \
     MF_DRILL_LOG="${TEMP}/ninety-drill.log" MF_DRILL_LOG_MAX_AGE="08"
@@ -1172,7 +1172,7 @@ expect_check "overlong MF_DRILL_LOG_MAX_AGE is an alarm" 1 "whole number of seco
 # GNU date without a Z suffix rejects that wall time under that TZ. A UTC
 # stamp with Z must still parse. Max age is ~31 y so the fixture cannot
 # go stale.
-echo "2026-03-08T02:30:00Z tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+echo "2026-03-08T02:30:00Z tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/dst-gap-drill.log"
 expect_check "spring-forward UTC stamp ages under America/Los_Angeles" 0 "drill-log OK" \
     TZ=America/Los_Angeles MF_DRILL_LOG="${TEMP}/dst-gap-drill.log" MF_DRILL_LOG_MAX_AGE="999999999"
@@ -1181,7 +1181,7 @@ expect_check "spring-forward UTC stamp ages under America/Los_Angeles" 0 "drill-
 # stamp is one instant; GNU date under that TZ must not pick the other
 # 01:30 and disagree with UTC age. 2025-11-02T09:30:00Z is the second
 # 01:30 (PST).
-echo "2025-11-02T09:30:00Z tank/models@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
+echo "2025-11-02T09:30:00Z tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/dst-fold-drill.log"
 expect_check "fall-back UTC stamp ages under America/Los_Angeles" 0 "drill-log OK" \
     TZ=America/Los_Angeles MF_DRILL_LOG="${TEMP}/dst-fold-drill.log" MF_DRILL_LOG_MAX_AGE="999999999"
@@ -1310,15 +1310,15 @@ else
     elif ! grep -q "BatchMode=yes" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost SSH BatchMode"
-    elif ! grep -q "^Environment=MF_SYNCOID_SRC=nas:tank/models$" \
+    elif ! grep -q "^Environment=MF_SYNCOID_SRC=nas:tank/ai$" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit lost MF_SYNCOID_SRC default"
     elif ! grep -Fq "\${MF_SYNCOID_SRC}" \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid ExecStart lost \${MF_SYNCOID_SRC}"
-    elif grep -qE '^ExecStart=.*nas:tank/models' \
+    elif grep -qE '^ExecStart=.*nas:tank/ai' \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
-        fail "installer --install syncoid ExecStart still hardcodes nas:tank/models"
+        fail "installer --install syncoid ExecStart still hardcodes nas:tank/ai"
     elif grep -qE '^ProtectHome=yes' \
         "${INSTALL_DEST}/etc/systemd/system/syncoid-models.service"; then
         fail "installer --install syncoid unit gained ProtectHome=yes (breaks /root/.ssh)"
@@ -1437,7 +1437,7 @@ fi
 # not --full). The unit file is refreshed; override.conf is not.
 OVERRIDE_DIR="${INSTALL_DEST}/etc/systemd/system/syncoid-models.service.d"
 mkdir -p "${OVERRIDE_DIR}"
-printf '%s\n' '[Service]' 'Environment=MF_SYNCOID_SRC=replica@nas:tank/models' \
+printf '%s\n' '[Service]' 'Environment=MF_SYNCOID_SRC=replica@nas:tank/ai' \
     >"${OVERRIDE_DIR}/override.conf"
 SANOID_EXPECTED="${TEMP}/sanoid.expected"
 printf '%s\n' '[tank/site-models]' 'recursive = yes' 'daily = 90' \
@@ -1451,7 +1451,7 @@ if [[ "${REINSTALL_RC}" -ne 0 ]]; then
     fail "installer second --install: expected success, rc=${REINSTALL_RC}: ${REINSTALL_OUT}"
 elif [[ ! -f "${OVERRIDE_DIR}/override.conf" ]]; then
     fail "installer --install removed syncoid drop-in override.conf"
-elif ! grep -q "Environment=MF_SYNCOID_SRC=replica@nas:tank/models" \
+elif ! grep -q "Environment=MF_SYNCOID_SRC=replica@nas:tank/ai" \
     "${OVERRIDE_DIR}/override.conf"; then
     fail "installer --install clobbered syncoid drop-in override.conf"
 elif ! grep -q "BatchMode=yes" \
@@ -1474,7 +1474,7 @@ mkdir -p "${COPY_FAIL_BIN}"
 cat >"${COPY_FAIL_BIN}/install" <<'COPYFAIL'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' '[tank/models]' >"${@: -1}"
+printf '%s\n' '[tank/ai]' >"${@: -1}"
 exit 1
 COPYFAIL
 chmod +x "${COPY_FAIL_BIN}/install"
@@ -1647,70 +1647,70 @@ expect_offsite "offsite with no dataset is an alarm" 1 "dataset required" \
     "${OFFSITE}"
 
 OFFSITE_FRESH=$((OFFSITE_NOW - 60))
-write_offsite_env tank/models-offsite tank/models-offsite@autosnap_ok "${OFFSITE_FRESH}"
+write_offsite_env tank/ai-offsite tank/ai-offsite@autosnap_ok "${OFFSITE_FRESH}"
 expect_offsite "missing offsite dataset is an alarm" 1 "does not exist" \
-    "${OFFSITE}" tank/models
+    "${OFFSITE}" tank/ai
 
-write_offsite_env tank/models-offsite "" "${OFFSITE_FRESH}"
+write_offsite_env tank/ai-offsite "" "${OFFSITE_FRESH}"
 expect_offsite "offsite with no snapshots is an alarm" 1 "has no snapshots" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
 OFFSITE_STALE=$((OFFSITE_NOW - 800000))
-write_offsite_env tank/models-offsite tank/models-offsite@old "${OFFSITE_STALE}"
+write_offsite_env tank/ai-offsite tank/ai-offsite@old "${OFFSITE_STALE}"
 expect_offsite "stale offsite snapshot is an alarm" 1 "past the" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
-write_offsite_env tank/models-offsite tank/models-offsite@future "$((OFFSITE_NOW + 3600))"
+write_offsite_env tank/ai-offsite tank/ai-offsite@future "$((OFFSITE_NOW + 3600))"
 expect_offsite "future offsite snapshot is an alarm" 1 "in the future" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
-write_offsite_env tank/models-offsite tank/models-offsite@ok "${OFFSITE_FRESH}"
+write_offsite_env tank/ai-offsite tank/ai-offsite@ok "${OFFSITE_FRESH}"
 expect_offsite "fresh offsite snapshot is ok" 0 "offsite OK" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
 expect_offsite "padded MF_OFFSITE_MAX_AGE=08 is decimal not an octal abort" 1 "past the" \
-    MF_OFFSITE_MAX_AGE=08 "${OFFSITE}" tank/models-offsite
+    MF_OFFSITE_MAX_AGE=08 "${OFFSITE}" tank/ai-offsite
 expect_offsite "MF_OFFSITE_DATASET names the copy when no operand" 0 "offsite OK" \
-    MF_OFFSITE_DATASET=tank/models-offsite "${OFFSITE}"
+    MF_OFFSITE_DATASET=tank/ai-offsite "${OFFSITE}"
 expect_offsite "bad MF_OFFSITE_MAX_AGE is an alarm" 1 "whole number of seconds" \
-    MF_OFFSITE_MAX_AGE="8d" "${OFFSITE}" tank/models-offsite
+    MF_OFFSITE_MAX_AGE="8d" "${OFFSITE}" tank/ai-offsite
 expect_offsite "overlong MF_OFFSITE_MAX_AGE is an alarm" 1 "whole number of seconds" \
-    MF_OFFSITE_MAX_AGE="12345678901" "${OFFSITE}" tank/models-offsite
+    MF_OFFSITE_MAX_AGE="12345678901" "${OFFSITE}" tank/ai-offsite
 
 # A 90s-old snap is stale under decimal 08 and fresh under decimal 0120
 # (octal 0120 is 80, which would fail). Off OFFSITE_NOW, so the 30 s of slack
 # between this stamp and the 120 s limit is real slack and not suite runtime.
 NINETY_CTIME=$((OFFSITE_NOW - 90))
-write_offsite_env tank/models-offsite tank/models-offsite@ok "${NINETY_CTIME}"
+write_offsite_env tank/ai-offsite tank/ai-offsite@ok "${NINETY_CTIME}"
 expect_offsite "padded MF_OFFSITE_MAX_AGE=0120 is 120 seconds, not octal 80" 0 "offsite OK" \
-    MF_OFFSITE_MAX_AGE=0120 "${OFFSITE}" tank/models-offsite
+    MF_OFFSITE_MAX_AGE=0120 "${OFFSITE}" tank/ai-offsite
 
 # Freshness is not a restore point: a rotation that lands a snapshot of an
 # empty or unimported copy is as fresh as a good one.
-write_offsite_env tank/models-offsite tank/models-offsite@empty "${OFFSITE_FRESH}" "${OFFSITE_LEASES_ONLY}"
+write_offsite_env tank/ai-offsite tank/ai-offsite@empty "${OFFSITE_FRESH}" "${OFFSITE_LEASES_ONLY}"
 expect_offsite "fresh but empty offsite copy is an alarm" 1 "holds no files" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
-write_offsite_env tank/models-offsite tank/models-offsite@unmounted "${OFFSITE_FRESH}" "-"
+write_offsite_env tank/ai-offsite tank/ai-offsite@unmounted "${OFFSITE_FRESH}" "-"
 expect_offsite "unmounted offsite copy is an alarm" 1 "is not mounted" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
 # Mountpoint property set but the filesystem never mounted: the pool was
 # imported and nothing mounted it, so the path holds host content, not the
 # copy. Reading the mountpoint property alone called this offsite OK.
-write_offsite_env tank/models-offsite tank/models-offsite@notmounted "${OFFSITE_FRESH}" \
+write_offsite_env tank/ai-offsite tank/ai-offsite@notmounted "${OFFSITE_FRESH}" \
     "${OFFSITE_PAYLOAD}" "no"
 expect_offsite "imported but not mounted offsite copy is an alarm" 1 "is not mounted" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
-write_offsite_env tank/models-offsite tank/models-offsite@gone "${OFFSITE_FRESH}" \
+write_offsite_env tank/ai-offsite tank/ai-offsite@gone "${OFFSITE_FRESH}" \
     "${OFFSITE_STATE}/not-imported"
 expect_offsite "offsite mountpoint missing from disk is an alarm" 1 "not a directory" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
-write_offsite_env tank/models-offsite tank/models-offsite@ok "${OFFSITE_FRESH}" "${OFFSITE_PAYLOAD}"
+write_offsite_env tank/ai-offsite tank/ai-offsite@ok "${OFFSITE_FRESH}" "${OFFSITE_PAYLOAD}"
 expect_offsite "fresh offsite copy holding files is ok" 0 "offsite OK" \
-    "${OFFSITE}" tank/models-offsite
+    "${OFFSITE}" tank/ai-offsite
 
 # --- dr_point_restore.sh: procedure B copy-back
 # A stub zfs that records every call. Clone copies the fixture snapshot
@@ -1791,7 +1791,7 @@ esac
 POINTSTUB
 chmod +x "${POINT_BIN}/zfs"
 
-POINT_SNAP="tank/models@known-good"
+POINT_SNAP="tank/ai@known-good"
 printf 'SNAPSHOT_NAME=%q\nSNAPSHOT_TREE=%q\n' "${POINT_SNAP}" "${POINT_SNAP_TREE}" >"${POINT_STATE}/env"
 
 expect_point() {
@@ -1980,7 +1980,7 @@ case "${sub}" in
                 ;;
             mountpoint)
                 if [[ "${dataset}" == "${DEST:-}" ]]; then
-                    printf '%s\n' "${DEST_MP:-/export/models}"
+                    printf '%s\n' "${DEST_MP:-/export/ai}"
                     exit 0
                 fi
                 exit 1
@@ -1997,16 +1997,20 @@ case "${sub}" in
         ;;
     recv)
         cat >/dev/null
-        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=/export/models\n' >"${STATE}/runtime"
+        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=/export/ai\n' >"${STATE}/runtime"
         exit 0
         ;;
     set)
         mp=""
+        nfs=""
         dest=""
         for arg in "$@"; do
             case "${arg}" in
                 mountpoint=*)
                     mp="${arg#mountpoint=}"
+                    ;;
+                sharenfs=*)
+                    nfs="${arg#sharenfs=}"
                     ;;
                 *=*)
                     ;;
@@ -2015,8 +2019,8 @@ case "${sub}" in
                     ;;
             esac
         done
-        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=%q\n' "${mp:-/export/models}" >"${STATE}/runtime"
-        printf 'zfs set dest=%s mp=%s\n' "${dest}" "${mp}" >>"${STATE}/set.log"
+        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=%q\n' "${mp:-/export/ai}" >"${STATE}/runtime"
+        printf 'zfs set dest=%s mp=%s nfs=%s\n' "${dest}" "${mp}" "${nfs}" >>"${STATE}/set.log"
         exit 0
         ;;
     hold)
@@ -2038,7 +2042,7 @@ cat >"${RESTORE_BIN}/syncoid" <<'SYNSTUB'
 set -euo pipefail
 STATE="${RESTORE_STATE:?}"
 printf '%s\n' "$*" >"${STATE}/syncoid.args"
-printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=/export/models\n' >"${STATE}/runtime"
+printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=/export/ai\n' >"${STATE}/runtime"
 exit 0
 SYNSTUB
 chmod +x "${RESTORE_BIN}/syncoid"
@@ -2077,11 +2081,11 @@ expect_restore() {
     pass "${name}"
 }
 
-write_restore_env tank/models 0 no /export/models
+write_restore_env tank/ai 0 no /export/ai
 expect_restore "pool restore dry-run --from prints the plan" 0 "without --execute" \
-    "${RESTORE}" --from replica-host:tank/models
+    "${RESTORE}" --from replica-host:tank/ai
 expect_restore "pool restore dry-run --from names recursive syncoid" 0 "syncoid --recursive" \
-    "${RESTORE}" --from replica-host:tank/models
+    "${RESTORE}" --from replica-host:tank/ai
 if [[ -f "${RESTORE_STATE}/syncoid.args" ]]; then
     fail "pool restore dry-run invoked syncoid"
 else
@@ -2089,36 +2093,36 @@ else
 fi
 
 expect_restore "pool restore with no source is an alarm" 1 "replica source required" \
-    "${RESTORE}" tank/models
+    "${RESTORE}" tank/ai
 
 expect_restore "pool restore with both sources is an alarm" 1 "only one of" \
-    "${RESTORE}" --from replica-host:tank/models --local-from tank/models-backup
+    "${RESTORE}" --from replica-host:tank/ai --local-from tank/ai-backup
 
 expect_restore "pool restore dest must be nested" 1 "must be nested" \
-    "${RESTORE}" --from replica-host:tank/models models
+    "${RESTORE}" --from replica-host:tank/ai models
 
-write_restore_env tank/models 1 yes /export/models
+write_restore_env tank/ai 1 yes /export/ai
 expect_restore "pool restore refuses a mounted dest" 1 "is mounted" \
-    "${RESTORE}" --from replica-host:tank/models
+    "${RESTORE}" --from replica-host:tank/ai
 
 expect_restore "pool restore dry-run --force on mounted dest prints the plan" 0 "without --execute" \
-    "${RESTORE}" --force --from replica-host:tank/models
+    "${RESTORE}" --force --from replica-host:tank/ai
 
-write_restore_env tank/models 0 no /export/models \
-    tank/models-backup tank/models-backup@autosnap_ok "${FRESH}"
-expect_restore "pool restore dry-run --local-from names the newest snap" 0 "zfs send -R tank/models-backup@autosnap_ok" \
-    "${RESTORE}" --local-from tank/models-backup
+write_restore_env tank/ai 0 no /export/ai \
+    tank/ai-backup tank/ai-backup@autosnap_ok "${FRESH}"
+expect_restore "pool restore dry-run --local-from names the newest snap" 0 "zfs send -R tank/ai-backup@autosnap_ok" \
+    "${RESTORE}" --local-from tank/ai-backup
 
-write_restore_env tank/models 0 no /export/models tank/models-backup "" "${FRESH}"
+write_restore_env tank/ai 0 no /export/ai tank/ai-backup "" "${FRESH}"
 expect_restore "pool restore --local-from with no snapshots is an alarm" 1 "has no snapshots" \
-    "${RESTORE}" --local-from tank/models-backup
+    "${RESTORE}" --local-from tank/ai-backup
 
-write_restore_env tank/models 0 no /export/models tank/models tank/models@snap "${FRESH}"
+write_restore_env tank/ai 0 no /export/ai tank/ai tank/ai@snap "${FRESH}"
 expect_restore "pool restore --local-from DEST is an alarm" 1 "is DEST" \
-    "${RESTORE}" --local-from tank/models
+    "${RESTORE}" --local-from tank/ai
 
-for RESTORE_SOURCE in tank/models/backup tank; do
-    write_restore_env tank/models 0 no /export/models \
+for RESTORE_SOURCE in tank/ai/backup tank; do
+    write_restore_env tank/ai 0 no /export/ai \
         "${RESTORE_SOURCE}" "${RESTORE_SOURCE}@autosnap_ok" "${FRESH}"
     OVERLAP_LOG="${TEMP}/overlap-restore.log"
     expect_restore "pool restore refuses overlapping source ${RESTORE_SOURCE} even with --force" 1 "overlaps destination" \
@@ -2131,14 +2135,14 @@ for RESTORE_SOURCE in tank/models/backup tank; do
 done
 
 RLOG="${TEMP}/pool-restore.log"
-write_restore_env tank/models 0 no /export/models
+write_restore_env tank/ai 0 no /export/ai
 expect_restore "pool restore --execute --from pulls and sets properties" 0 "pool-restore OK" \
-    MF_RESTORE_LOG="${RLOG}" "${RESTORE}" --execute --from replica-host:tank/models
+    MF_RESTORE_LOG="${RLOG}" "${RESTORE}" --execute --from replica-host:tank/ai
 if [[ ! -f "${RESTORE_STATE}/syncoid.args" ]]; then
     fail "pool restore --execute --from did not invoke syncoid"
 elif ! grep -q -- "--force-delete" "${RESTORE_STATE}/syncoid.args"; then
     fail "pool restore syncoid args: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
-elif ! grep -q -- "replica-host:tank/models tank/models" "${RESTORE_STATE}/syncoid.args"; then
+elif ! grep -q -- "replica-host:tank/ai tank/ai" "${RESTORE_STATE}/syncoid.args"; then
     fail "pool restore syncoid lost source/dest: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
 elif ! grep -q -- "--recursive" "${RESTORE_STATE}/syncoid.args"; then
     fail "pool restore syncoid lost --recursive: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
@@ -2146,8 +2150,10 @@ elif ! grep -q -- "BatchMode=yes" "${RESTORE_STATE}/syncoid.args"; then
     fail "pool restore syncoid lost SSH BatchMode: $(cat "${RESTORE_STATE}/syncoid.args" 2>/dev/null || true)"
 elif [[ ! -f "${RESTORE_STATE}/set.log" ]]; then
     fail "pool restore --execute --from did not zfs set"
-elif ! grep -q "mp=/export/models" "${RESTORE_STATE}/set.log"; then
+elif ! grep -q "mp=/export/ai" "${RESTORE_STATE}/set.log"; then
     fail "pool restore zfs set lost mountpoint: $(cat "${RESTORE_STATE}/set.log" 2>/dev/null || true)"
+elif ! grep -qF "nfs=rw=192.168.0.77:192.168.0.211:192.168.0.212,sync,root_squash,no_subtree_check" "${RESTORE_STATE}/set.log"; then
+    fail "pool restore lost the ZFS-controlled, restricted synchronous NFS policy"
 elif [[ ! -f "${RESTORE_STATE}/hold.log" ]]; then
     fail "pool restore --execute --from did not hold monthlies"
 elif [[ ! -f "${RLOG}" ]] || ! grep -q "recv_s=" "${RLOG}"; then
@@ -2159,10 +2165,10 @@ else
 fi
 
 RLOG2="${TEMP}/pool-restore-local.log"
-write_restore_env tank/models 0 no /export/models \
-    tank/models-backup tank/models-backup@autosnap_ok "${FRESH}"
+write_restore_env tank/ai 0 no /export/ai \
+    tank/ai-backup tank/ai-backup@autosnap_ok "${FRESH}"
 expect_restore "pool restore --execute --local-from send/recv" 0 "cache/modelfs" \
-    MF_RESTORE_LOG="${RLOG2}" "${RESTORE}" --execute --local-from tank/models-backup
+    MF_RESTORE_LOG="${RLOG2}" "${RESTORE}" --execute --local-from tank/ai-backup
 if [[ -f "${RESTORE_STATE}/syncoid.args" ]]; then
     fail "pool restore --local-from invoked syncoid"
 elif [[ ! -f "${RESTORE_STATE}/set.log" ]]; then
@@ -2187,15 +2193,15 @@ mkdir -p "${BC_TREE}/etc/systemd/system/syncoid-models.service.d" "${BC_TREE}/et
 cp "${SCRIPTS_DIR}/nas/syncoid-models.service" \
     "${BC_TREE}/etc/systemd/system/"
 cp "${SCRIPTS_DIR}/nas/sanoid.conf" "${BC_TREE}/etc/sanoid/"
-printf '%s\n' '[Service]' 'Environment=MF_SYNCOID_SRC=replica@nas:tank/models' \
+printf '%s\n' '[Service]' 'Environment=MF_SYNCOID_SRC=replica@nas:tank/ai' \
     >"${BC_TREE}/etc/systemd/system/syncoid-models.service.d/override.conf"
 BC_RC=0
 BC_OUT="$("${BACKUP_CONFIG}" "${BC_TREE}" 2>&1)" || BC_RC=$?
 if [[ "${BC_RC}" -ne 0 ]]; then
     fail "backup config on a staged tree: rc=${BC_RC}: ${BC_OUT}"
-elif ! grep -q "MF_SYNCOID_SRC=replica@nas:tank/models" <<<"${BC_OUT}"; then
+elif ! grep -q "MF_SYNCOID_SRC=replica@nas:tank/ai" <<<"${BC_OUT}"; then
     fail "backup config did not report the drop-in override: ${BC_OUT}"
-elif grep -q "MF_SYNCOID_SRC=nas:tank/models$" <<<"${BC_OUT}"; then
+elif grep -q "MF_SYNCOID_SRC=nas:tank/ai$" <<<"${BC_OUT}"; then
     fail "backup config printed the unit-file placeholder over the drop-in: ${BC_OUT}"
 elif grep -q PLACEHOLDER <<<"${BC_OUT}"; then
     fail "backup config flagged a drop-in value as the placeholder: ${BC_OUT}"

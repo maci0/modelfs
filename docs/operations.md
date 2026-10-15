@@ -5,11 +5,15 @@
 | Status | Ops runbook for this cluster; pairs with [architecture.md](architecture.md) |
 | Date | 2026-08-27 |
 
-The NAS (Rocky/RHEL) exports `tank/models`. Everything is uid **1000**, mode **755**.
+The NAS (Rocky/RHEL) exports the single `tank/ai` dataset at `/export/ai`.
+`hf/`, `gguf/`, `lora/`, and `.cluster/` remain ordinary directories in that
+share. Sparks retain their paths; the desktop now mounts at `/ai`. Share ownership is uid/gid
+**1000**; ModelFS nodes need writes for leases and manifests even when they
+only read model weights.
 
 | Host | Mounts the export at | With |
 |---|---|---|
-| Desktop (Arch/Cachy) | `/models` | `cachefilesd`, `fsc` on |
+| Desktop (Arch/Cachy) | `/ai` | `cachefilesd`, `fsc` on |
 | Sparks (Ubuntu/DGX) | `/net/192.168.0.100/models` | **no** `fsc`; `modelfs` FUSE owns `/models` instead |
 
 ```mermaid
@@ -26,11 +30,11 @@ flowchart LR
 dnf install -y nfs-utils
 systemctl enable --now nfs-server rpcbind
 
-zfs create -o mountpoint=/export/models -o compression=lz4 \
-  -o recordsize=1M -o atime=off -o xattr=sa -o relatime=off tank/models
+zfs create -o mountpoint=/export/ai -o compression=lz4 \
+  -o recordsize=1M -o atime=off -o xattr=sa -o relatime=off tank/ai
 
-# Linux sharenfs = exports(5) flags, not Solaris rw=host
-zfs set sharenfs="rw,async,no_root_squash,no_subtree_check" tank/models
+# Colon-separated sharenfs hosts are supported by OpenZFS on Linux.
+zfs set sharenfs="rw=192.168.0.77:192.168.0.211:192.168.0.212,sync,root_squash,no_subtree_check" tank/ai
 exportfs -v
 showmount -e localhost
 
@@ -58,15 +62,12 @@ section 3, installed from `scripts/nas/` via `scripts/install_nas_backup.sh`.
 Until those timers are enabled, a deleted or overwritten weight is gone.
 Scrub and smartd do not replace them.
 
-A `*` in the `showmount -e` output means the export accepts every source, and with
-`no_root_squash` that is root-writable from anywhere. The firewall rich rules above are what
-actually limits NFS to `192.168.0.0/24`: `--add-service=nfs` would open the default zone
-globally and make a later source filter a no-op. The alternative is `sharenfs=off` plus
-`/etc/exports`:
-
-```
-/export/models  192.168.0.0/24(rw,async,no_root_squash,no_subtree_check)
-```
+The `sharenfs` host list limits this share to the desktop and two Sparks.
+Do not add entries to `/etc/exports` or another `.exports` file. OpenZFS
+generates `/etc/exports.d/zfs.exports`; inspect it, but never edit it.
+`sync` preserves acknowledged writes across a crash, and `root_squash`
+keeps client root from acting as server root. Match uid/gid 1000 on clients
+and run ModelFS as that user. Keep firewall restrictions as a second layer.
 
 Odds and ends: confirm the listener with `ss -lntp | grep 2049` on the client-facing NIC; an
 SELinux `EACCES` wants `setsebool -P nfs_export_all_rw 1`; keep `dedup=off`; and since LoRAs
@@ -76,7 +77,7 @@ share one base, copy with `cp --reflink=auto`.
 
 ## 2. Clients
 
-### Desktop (Arch/Cachy): NFS at `/models` + cachefilesd
+### Desktop (Arch/Cachy): NFS at `/ai` + cachefilesd
 
 ```bash
 pacman -S nfs-utils
@@ -87,7 +88,7 @@ systemctl enable --now nfs-client.target cachefilesd
 
 ```
 # /etc/fstab
-192.168.0.100:/export/models  /models  nfs  vers=4.2,nconnect=8,rsize=1048576,wsize=1048576,soft,timeo=30,retrans=2,noatime,nosharecache,fsc,_netdev,nofail,x-systemd.automount,x-systemd.mount-timeout=15  0  0
+192.168.0.100:/export/ai  /ai  nfs  vers=4.2,nconnect=8,rsize=1048576,wsize=1048576,hard,noatime,nosharecache,fsc,_netdev,nofail,x-systemd.automount,x-systemd.mount-timeout=15  0  0
 ```
 
 ### Sparks (Ubuntu/DGX): NFS origin, no fsc
@@ -100,7 +101,7 @@ apt-get install -y nfs-common fuse3
 
 ```
 # /etc/fstab
-192.168.0.100:/export/models  /net/192.168.0.100/models  nfs4  vers=4.2,nconnect=8,rsize=1048576,wsize=1048576,soft,timeo=30,retrans=2,noatime,nosharecache,_netdev,nofail,x-systemd.automount,x-systemd.mount-timeout=15  0  0
+192.168.0.100:/export/ai  /net/192.168.0.100/models  nfs4  vers=4.2,nconnect=8,rsize=1048576,wsize=1048576,hard,noatime,nosharecache,_netdev,nofail,x-systemd.automount,x-systemd.mount-timeout=15  0  0
 ```
 
 ```bash
@@ -111,8 +112,9 @@ sudo chown 1000:1000 /net/192.168.0.100/models /models /var/cache/modelfs
 Then start the daemon per the [README](../README.md) quickstart. There is no autofs package
 involved: `/net/...` is just a directory name.
 
-The mount options are chosen so boot cannot hang: `soft` plus `nofail` plus automount. `hard`
-would wait forever, and `timeo` is in tenths of a second.
+`nofail` and automount keep the share out of the boot-critical path. Once
+mounted, `hard` retries interrupted I/O instead of returning a partial
+operation to ModelFS; applications can wait while the NAS is unavailable.
 
 ### Hot update
 
@@ -148,10 +150,10 @@ version you are leaving before you update a node.
 
 ### Origin directory layout
 
-On the **origin** (desktop `/models`, spark `/net/.../models`), after it is mounted:
+On the **origin** (desktop `/ai`, spark `/net/.../models`), after it is mounted:
 
 ```bash
-chown 1000:1000 /net/192.168.0.100/models   # or /models on desktop
+chown 1000:1000 /net/192.168.0.100/models   # or /ai on desktop
 chmod 755 /net/192.168.0.100/models
 mkdir -p /net/192.168.0.100/models/hf/{hub,datasets,xet} \
          /net/192.168.0.100/models/gguf /net/192.168.0.100/models/lora
@@ -170,7 +172,7 @@ parameter, not a sysctl, so persist it with `options nfs nfs4_disable_idmapping=
 | Question | Command |
 |---|---|
 | Is cachefilesd running (desktop)? | `pgrep -a cachefilesd` must show a process |
-| Is FS-Cache actually attached (desktop)? | `findmnt /models \| grep fsc` |
+| Is FS-Cache actually attached (desktop)? | `findmnt /ai \| grep fsc` |
 | Is the NFS port reachable, or is it the firewall? | `timeout 5 bash -c "echo >/dev/tcp/192.168.0.100/2049"`, then `timeout 10 showmount -e 192.168.0.100` |
 | What configuration would a mount use here, and from where? | `modelfs config`; the inline PSK is reported as set, never printed |
 | Do two nodes agree? | `diff <(ssh spark-a modelfs config) <(ssh spark-b modelfs config)` |
@@ -195,8 +197,10 @@ The desktop FS-Cache defaults to `dir /var/cache/fscache` and culls LRU at about
 /models/lora/          adapters
 ```
 
-On sparks those paths are the FUSE `/models`, with bytes from NVMe, peers, or NFS. On the
-desktop they are the NFS mount.
+On Sparks those paths are the FUSE `/models`, with bytes from NVMe, peers,
+or NFS. On the desktop substitute `/ai` for `/models`: its direct NFS
+mount contains the same directories. Strata's desktop data directory is
+`/ai/strata`.
 
 **Weights on a spark must be regular files.** Hub cache snapshot trees are symlink farms into
 `blobs/`, and the mount does not follow a symlink at a model path (`O_NOFOLLOW` on
@@ -207,7 +211,12 @@ desktop they are the NFS mount.
 The Hugging Face token stays in `$HOME`, and Triton, inductor, CUDA, and vLLM compile caches
 stay local.
 
-`/etc/profile.d/models-hf.sh` (systemd needs the same `Environment=`):
+The following environment block is for Sparks. On the desktop, Ansible's
+`desktop-storage.yaml` sets the equivalent `/ai` paths in
+`~/.config/environment.d/60-ai-storage.conf` and loads that same file from
+login shells; `HF_HOME` and token paths remain local.
+
+`/etc/profile.d/models-hf.sh` on Sparks (systemd needs the same `Environment=`):
 
 ```bash
 export HF_HUB_CACHE=/models/hf/hub
@@ -308,11 +317,10 @@ separately from distinct shared digests. Shifted counts shared digests with
 no same-index match on the same piece grid; repeated aligned pieces do not
 reduce that count.
 
-### Durability caveat, kept as-is on purpose
+### Durability
 
-`sharenfs="rw,async"` lets the NAS acknowledge writes before they reach stable storage, bounded
-by the txg interval, so a crash can lose writes clients already saw succeed. The `soft` client
-mounts turn NAS trouble into `EIO` after 2 retrans rather than hanging.
-
-Synced exports would close that window at the cost of ingest throughput. That trade is not made
-here. [recovery.md](recovery.md) section 2 records it as the one gap no snapshot RPO covers.
+The share uses `sync` and ZFS retains `sync=standard`; acknowledged NFS
+writes reach stable storage. Clients use `hard` mounts, so I/O waits while
+the NAS is unavailable instead of failing after a short retransmit window.
+Snapshots and independent backups still protect against deletion and pool
+loss; see [recovery.md](recovery.md) section 2.

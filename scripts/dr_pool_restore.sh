@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pool-loss restore from docs/recovery.md procedure C, as one runnable
-# artifact instead of a paste-from-docs procedure. Pulls tank/models onto
+# artifact instead of a paste-from-docs procedure. Pulls tank/ai onto
 # DEST from the replica (syncoid, or zfs send | recv of a locally imported
 # copy), sets the export properties from operations.md, and appends the
 # timed log line that is the pool-loss RTO. Does not create the pool
@@ -22,7 +22,7 @@ print_usage() {
 Usage: ./scripts/dr_pool_restore.sh [--execute] [--force] --from HOST:DATASET [DEST]
        ./scripts/dr_pool_restore.sh [--execute] [--force] --local-from DATASET [DEST]
 
-Replay the pool-loss copy onto DEST (default tank/models). This is
+Replay the pool-loss copy onto DEST (default tank/ai). This is
 docs/recovery.md procedure C. Without --execute, print the plan and
 write nothing.
 
@@ -35,7 +35,7 @@ Does not create the pool. Does not wipe node caches: after a successful
 recv, hold monthlies on DEST (holds do not travel with zfs send) and
 print the cache-wipe commands that must run before any client remounts.
 Environment: MF_RESTORE_FROM, MF_RESTORE_LOCAL_FROM,
-MF_RESTORE_MOUNTPOINT (default /export/models), MF_RESTORE_SHARENFS
+MF_RESTORE_MOUNTPOINT (default /export/ai), MF_RESTORE_SHARENFS
 (default operations.md flags), MF_RESTORE_LOG (default
 /var/log/modelfs-pool-restore.log).
 EOF
@@ -101,9 +101,9 @@ fi
 
 FROM="${FROM:-${MF_RESTORE_FROM:-}}"
 LOCAL_FROM="${LOCAL_FROM:-${MF_RESTORE_LOCAL_FROM:-}}"
-DEST="${DEST:-tank/models}"
-MOUNTPOINT="${MF_RESTORE_MOUNTPOINT:-/export/models}"
-SHARENFS="${MF_RESTORE_SHARENFS:-rw,async,no_root_squash,no_subtree_check}"
+DEST="${DEST:-tank/ai}"
+MOUNTPOINT="${MF_RESTORE_MOUNTPOINT:-/export/ai}"
+SHARENFS="${MF_RESTORE_SHARENFS:-rw=192.168.0.77:192.168.0.211:192.168.0.212,sync,root_squash,no_subtree_check}"
 LOG_FILE="${MF_RESTORE_LOG:-/var/log/modelfs-pool-restore.log}"
 
 if [[ -n "${FROM}" && -n "${LOCAL_FROM}" ]]; then

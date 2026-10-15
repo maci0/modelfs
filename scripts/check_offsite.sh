@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Freshness check for the site-loss copy of tank/models. Local snapshots
+# Freshness check for the site-loss copy of tank/ai. Local snapshots
 # and the replica already alarm on staleness (modelfs-snap-age.timer,
 # MF_DRILL_REPLICA). A weekly disk rotation or hosted offsite box does
 # not, so a stopped rotation is otherwise silent until the next
@@ -21,7 +21,7 @@ has no snapshots, is older than MF_OFFSITE_MAX_AGE seconds (default
 691200 = 8 days, weekly rotation plus slack), is not mounted, or holds
 no files outside the .cluster lease dir and the .zfs snapdir. DATASET
 comes from the operand or MF_OFFSITE_DATASET; there is no live-NAS
-default, because checking tank/models on the NAS would bless production
+default, because checking tank/ai on the NAS would bless production
 snapshots as the offsite copy. Exit 0 means the copy is a usable
 site-loss restore point.
 EOF
@@ -38,7 +38,7 @@ fi
 
 DATASET="${1:-${MF_OFFSITE_DATASET:-}}"
 if [[ -z "${DATASET}" ]]; then
-    die "dataset required: pass DATASET or set MF_OFFSITE_DATASET (the offsite copy, not the live tank/models on the NAS)"
+    die "dataset required: pass DATASET or set MF_OFFSITE_DATASET (the offsite copy, not the live tank/ai on the NAS)"
 fi
 
 command -v zfs >/dev/null 2>&1 || die "zfs not found; this runs against an imported offsite copy"
@@ -85,7 +85,7 @@ if [[ "${SNAP_AGE}" -gt "${MAX_AGE}" ]]; then
     die "offsite newest snapshot ${SNAP} is ${SNAP_AGE}s old, past the ${MAX_AGE}s limit: the site-loss copy stopped keeping restore points inside the claimed RPO (docs/recovery.md sections 3 and 5)"
 fi
 
-# Child datasets (a later `zfs create tank/models/gguf` or recursive syncoid)
+# Child datasets (a later `zfs create tank/ai/gguf` or recursive syncoid)
 # have their own snapshots. An offsite child with no snapshot, or one older
 # than MAX_AGE, means the site-loss copy stopped covering it.
 CHILD_LIST="$(zfs list -H -o name -r -t filesystem "${DATASET}")" \

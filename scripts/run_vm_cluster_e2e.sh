@@ -150,7 +150,7 @@ fi
 
 # --- one disk + cloud-init seed per VM ---------------------------------
 # user-data: default cloud user, our key, the VM's packages; the NFS VM
-# additionally exports /export/models to the 192.168.122.0/24 fabric.
+# additionally exports /export/ai to the 192.168.122.0/24 fabric.
 # network-config: static fabric address so the script knows every IP, with
 # the NAT gateway as default route (in-VM apt works, and all VMs see each
 # other -- one NIC is both the cluster fabric and the internet path).
@@ -174,9 +174,9 @@ make_vm() {
         if [[ "${name}" == "${NFS_VM}" ]]; then
             cat <<'RUNC'
 runcmd:
-  - mkdir -p /export/models
-  - chown ubuntu:ubuntu /export/models
-  - printf '/export/models 192.168.122.0/24(rw,sync,no_subtree_check,no_root_squash)\n' > /etc/exports
+  - mkdir -p /export/ai
+  - chown ubuntu:ubuntu /export/ai
+  - printf '/export/ai 192.168.122.0/24(rw,sync,no_subtree_check,no_root_squash)\n' > /etc/exports
   - exportfs -a
   - systemctl enable --now nfs-server
 RUNC
@@ -276,7 +276,7 @@ if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/
     exit 1
 fi
 # Share the binary over the origin mount so every client picks it up.
-publish_cmd="mkdir -p /export/models/.build && cp /home/ubuntu/src/zig-out/bin/modelfs /export/models/.build/modelfs && chmod 755 /export/models/.build/modelfs"
+publish_cmd="mkdir -p /export/ai/.build && cp /home/ubuntu/src/zig-out/bin/modelfs /export/ai/.build/modelfs && chmod 755 /export/ai/.build/modelfs"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${publish_cmd}"; then
     echo "Error: could not place the built binary on the origin" >&2
     exit 1
@@ -296,7 +296,7 @@ for vm in "${C1_VM}" "${C2_VM}" "${C3_VM}"; do
     fi
     # The origin is real NFS from the separate NFS VM: mount it, then prove
     # the mount is NFS before any daemon starts.
-    mount_cmd="sudo mkdir -p /net/origin /models && sudo chown ubuntu:ubuntu /models && sudo mount -t nfs ${NFS_IP}:/export/models /net/origin"
+    mount_cmd="sudo mkdir -p /net/origin /models && sudo chown ubuntu:ubuntu /models && sudo mount -t nfs ${NFS_IP}:/export/ai /net/origin"
     if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${ip}" "${mount_cmd}"; then
         echo "Error: ${vm} could not mount the NFS origin" >&2
         exit 1
@@ -330,7 +330,7 @@ done
 echo "=== waiting for 3 cluster leases on the NFS origin ==="
 LEASE_DEADLINE=$((SECONDS + 45))
 while :; do
-    leases="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "ls /export/models/.cluster/*.json 2>/dev/null | wc -l")"
+    leases="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "ls /export/ai/.cluster/*.json 2>/dev/null | wc -l")"
     if [[ "${leases}" -ge 3 ]]; then
         break
     fi
@@ -359,7 +359,7 @@ fi
 echo "✓ peers listing shows ${PEER_ROWS} nodes"
 
 echo "=== generating ${FILE_SIZE_MB} MB model on the NFS origin ==="
-dd_cmd="dd if=/dev/urandom of=/export/models/big.gguf bs=1M count=${FILE_SIZE_MB} status=none"
+dd_cmd="dd if=/dev/urandom of=/export/ai/big.gguf bs=1M count=${FILE_SIZE_MB} status=none"
 ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${dd_cmd}"
 
 echo "=== client 1 reads the model (fills from NFS origin) ==="
@@ -372,7 +372,7 @@ echo "✓ client 1 served big.gguf matching origin"
 echo "=== waiting for the piece-hash manifest on the origin ==="
 MANIFEST_DEADLINE=$((SECONDS + 30))
 while :; do
-    manifests="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "ls /export/models/.cluster/manifests/ 2>/dev/null | wc -l")"
+    manifests="$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "ls /export/ai/.cluster/manifests/ 2>/dev/null | wc -l")"
     if [[ "${manifests}" -ge 1 ]]; then
         break
     fi

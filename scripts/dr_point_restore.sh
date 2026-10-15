@@ -28,22 +28,22 @@ the plan and write nothing.
 
 SNAPSHOT              full snapshot name, DATASET@snap (no newest-pick)
 --copy RELPATH        path under the dataset root to restore; repeatable
---dataset DATASET     dataset holding SNAPSHOT (default tank/models)
---live PATH           live export mountpoint (default /export/models)
+--dataset DATASET     dataset holding SNAPSHOT (default tank/ai)
+--live PATH           live export mountpoint (default /export/ai)
 --clone DATASET       throwaway clone dataset (default tank/recover)
 --clone-mp PATH       clone mountpoint (default /export/modelfs-recover)
 --execute             run the copy-back
 
 Fence the clients first: the script stops no daemon, unmounts nothing,
-and cannot tell whether a reader is still attached to /export/models.
+and cannot tell whether a reader is still attached to /export/ai.
 The clone is left mounted on success; destroy it by hand, and run
 procedure C step 3 (node cache wipe) before reopening clients.
 EOF
 }
 
 EXECUTE=0
-DATASET="${MF_POINT_DATASET:-tank/models}"
-LIVE="${MF_POINT_LIVE:-/export/models}"
+DATASET="${MF_POINT_DATASET:-tank/ai}"
+LIVE="${MF_POINT_LIVE:-/export/ai}"
 CLONE="${MF_POINT_CLONE:-tank/recover}"
 CLONE_MP="${MF_POINT_CLONE_MP:-/export/modelfs-recover}"
 SNAPSHOT=""
