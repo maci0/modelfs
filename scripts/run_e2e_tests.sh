@@ -13,6 +13,7 @@ EOF
 echo "=== Building modelfs binary ==="
 cd "${ROOT_DIR}"
 require_zig
+require_python
 zig build
 
 MODELFS_BIN="${ROOT_DIR}/zig-out/bin/modelfs"
@@ -144,9 +145,18 @@ echo "=== Test Case 3: Peer Discovery Listing ==="
 mkdir -p "${ORIGIN_DIR}/.cluster"
 printf '%s\n' '{"id":"spark9","until":4102444800,"addrs":[]}' > "${ORIGIN_DIR}/.cluster/spark9.json"
 printf '%s\n' '{"id":"old","until":1,"addrs":[]}' > "${ORIGIN_DIR}/.cluster/old.json"
-PEERS_OUT="$("${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}")"
-if grep -q 'spark9 (until=4102444800, live)' <<< "${PEERS_OUT}" \
-    && grep -q 'old (until=1, expired)' <<< "${PEERS_OUT}"; then
+PEERS_OUT="$("${MODELFS_BIN}" peers --origin "${ORIGIN_DIR}" -o json)"
+if python3 -c '
+import json
+import sys
+
+rows = [json.loads(line) for line in sys.stdin if line.strip()]
+assert len(rows) == 2, rows
+assert {row["id"]: (row["until"], row["live"]) for row in rows} == {
+    "spark9": (4102444800, True),
+    "old": (1, False),
+}, rows
+' <<< "${PEERS_OUT}"; then
     echo "✓ Peer listing shows live and expired leases"
 else
     echo "Error: unexpected peers output: ${PEERS_OUT}" >&2
