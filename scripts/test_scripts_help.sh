@@ -110,7 +110,8 @@ next_heading="$(awk -v pin="## [${zon_pin}] - " 'index($0, pin) == 1 { found = 1
 next_ver="${next_heading#\#\# \[}"
 next_ver="${next_ver%%\]*}"
 [[ "${next_ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "cannot read the version after ${zon_pin}: ${next_heading}"
-next_entry="$(sed -n "/^## \[${next_ver}\] - /,/^## /p" CHANGELOG.md | grep -m1 '^- ')"
+# One reader avoids SIGPIPE when grep exits before sed finishes under pipefail.
+next_entry="$(awk -v heading="## [${next_ver}] - " 'index($0, heading) == 1 { found = 1; next } found && /^## / { exit } found && /^- / { print; exit }' CHANGELOG.md)"
 [[ -n "${next_entry}" ]] || fail "${next_ver} has no entry line to keep out of ${zon_pin}'s notes"
 [[ "${notes_body}" != *"${next_entry}"* ]] || fail "release_notes.sh ${zon_pin} includes ${next_ver}'s entry"
 notes_rc=0

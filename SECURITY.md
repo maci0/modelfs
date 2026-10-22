@@ -27,11 +27,9 @@ revision.
 
 Do not open a public issue for anything you suspect is exploitable.
 
-The intended intake is GitHub private vulnerability reporting (Security tab,
-"Report a vulnerability"), which feeds the advisory-thread path under
-"What happens next". That feature is not enabled on this repository, so
-there is no private inbox until a repository admin turns it on. There is
-no other disclosed contact.
+Email the maintainer at `maci.stgn@gmail.com` for private vulnerability reports.
+Do not include exploit details or credentials in a public issue. GitHub private
+vulnerability reporting is not currently enabled on this repository.
 
 Please include what you can of:
 
@@ -45,7 +43,7 @@ Please include what you can of:
 
 ## What happens next
 
-Maintainers triage in the advisory thread, land the fix on `main`, and note it
+Maintainers triage privately, land the fix on `main`, and note it
 in [CHANGELOG.md](CHANGELOG.md) under `[Unreleased]` with credit to the
 reporter unless asked not to. When a released line is affected, the entry
 names the affected and fixed versions so users can tell whether they must
