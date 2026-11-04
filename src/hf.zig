@@ -355,7 +355,7 @@ pub fn pull(
         // lstat sees it and the fetch below replaces it.
         if (sys.lstatPath(path, &st) == 0) {
             const regular = (st.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG;
-            const have = sys.sizeFromStat(st.st_size) orelse 0;
+            const have = sys.sizeFromStatSaturating(st.st_size);
             if (regular and have == entry.size) {
                 report.skipped += 1;
                 continue;

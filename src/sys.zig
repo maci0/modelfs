@@ -417,10 +417,23 @@ pub fn closeWrite(fd: c_int) i32 {
 
 /// `stat.st_size` is signed off_t. NFS fattr is u64, so a size of 2^63 or
 /// more shows up negative here; `@intCast` into piece/cache math panics in
-/// safe builds and wraps to a multi-exabyte length in ReleaseFast.
+/// safe builds and wraps to a multi-exabyte length in ReleaseFast. A size
+/// that large cannot be addressable by any caller in this tree, so the
+/// saturating form is the default: callers that probe before deciding
+/// (hf.zig's skip check) read a truncated-at-zero file as absent instead of
+/// an unusable size, while `sizeFromStat` stays strict for callers that
+/// must fail loudly on an absurd origin size.
 pub fn sizeFromStat(st_size: c.off_t) ?u64 {
     if (st_size < 0) return null;
     return @intCast(st_size);
+}
+
+/// Saturating name for the probe callers: a negative st_size is a file
+/// this daemon cannot address, so it reads as size 0 (absent) rather than
+/// an error. Every other caller keeps the strict form so an absurd origin
+/// size fails instead of silently serving nothing.
+pub fn sizeFromStatSaturating(st_size: c.off_t) u64 {
+    return sizeFromStat(st_size) orelse 0;
 }
 
 /// Kernel file offsets are signed. A u64 that does not fit must not become
@@ -1147,6 +1160,8 @@ test "sizeFromStat rejects a signed overflow" {
     // so piece.count would clamp to a 512 MiB bitfield for one file.
     try std.testing.expect(sizeFromStat(-1) == null);
     try std.testing.expect(sizeFromStat(std.math.minInt(c.off_t)) == null);
+    try std.testing.expectEqual(@as(u64, 0), sizeFromStatSaturating(-1));
+    try std.testing.expectEqual(@as(u64, 7), sizeFromStatSaturating(7));
 }
 
 test "I/O wrappers refuse offsets that do not fit off_t" {
