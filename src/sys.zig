@@ -1011,12 +1011,17 @@ pub fn deleteTree(io: std.Io, path: []const u8) void {
 }
 
 /// Creates a unique throwaway directory for test fixtures:
-/// ".zig-cache/tmp/<name>-<unix sec>-<pid>". The pid suffix keeps two test
-/// processes starting in the same second from sharing a tree (second-
-/// resolution stamps collide otherwise). Returns the path in buf; remove it
-/// with deleteTree.
+/// ".zig-cache/tmp/<name>-<unix sec>-<pid>-<counter>". The pid suffix keeps
+/// two test processes starting in the same second from sharing a tree
+/// (second-resolution stamps collide otherwise); the per-process counter
+/// keeps two calls with the same name in the same second of one process
+/// from colliding — the old sec+pid name returned the same path twice
+/// within one run, so a second fixture silently reused the first's tree.
+/// Returns the path in buf; remove it with deleteTree.
+var scratch_seq: std.atomic.Value(u64) = .init(0);
 pub fn scratchDir(buf: []u8, name: []const u8) ![]const u8 {
-    const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}", .{ name, nowSecRaw(), pidSelf() });
+    const seq = scratch_seq.fetchAdd(1, .monotonic);
+    const p = try std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}-{d}-{d}-{d}", .{ name, nowSecRaw(), pidSelf(), seq });
     if (mkdirAll(p, 0o755) != 0) return error.MkdirFailed;
     return p;
 }

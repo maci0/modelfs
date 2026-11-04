@@ -955,7 +955,12 @@ test "headerGet3 matches three headerGet calls in one pass" {
 test "headerGet3 retires fewer instructions than headerGet2 plus headerGet" {
     // Work counter, not wall clock: one pass must beat two walks on the
     // handleConn Authorization+Range then Content-Length shape. Skips when
-    // perf_event_open is unavailable (paranoid, missing PMU).
+    // perf_event_open is unavailable (paranoid, missing PMU) or the counter
+    // reads zero (virtualized PMU). The previous shape asserted one < two
+    // on a single noisy sample: perf includes interrupts, migrations, and
+    // warmup, so a real regression could pass and a good build could flake.
+    // Assert on the minimum of repeated interleaved samples instead, which
+    // tracks the best-case instruction count for each shape.
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const linux = std.os.linux;
     var attr = linux.perf_event_attr{
@@ -992,34 +997,43 @@ test "headerGet3 retires fewer instructions than headerGet2 plus headerGet" {
         }
     }.go;
 
-    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.RESET, 0);
-    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.ENABLE, 0);
-    var i: usize = 0;
-    while (i < inner) : (i += 1) {
-        const a, const b = headerGet2(head, "Authorization", "Range");
-        const c = headerGet(head, "Content-Length");
-        std.mem.doNotOptimizeAway(a);
-        std.mem.doNotOptimizeAway(b);
-        std.mem.doNotOptimizeAway(c);
+    var min_two: u64 = std.math.maxInt(u64);
+    var min_one: u64 = std.math.maxInt(u64);
+    const rounds: usize = 7;
+    var r: usize = 0;
+    while (r < rounds) : (r += 1) {
+        // Alternate order each round so warmup favors neither shape.
+        const two_first = (r % 2) == 0;
+        for ([_]bool{ two_first, !two_first }) |is_two| {
+            _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.RESET, 0);
+            _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.ENABLE, 0);
+            var i: usize = 0;
+            while (i < inner) : (i += 1) {
+                if (is_two) {
+                    const a, const b = headerGet2(head, "Authorization", "Range");
+                    const c = headerGet(head, "Content-Length");
+                    std.mem.doNotOptimizeAway(a);
+                    std.mem.doNotOptimizeAway(b);
+                    std.mem.doNotOptimizeAway(c);
+                } else {
+                    const a, const b, const c = headerGet3(head, "Authorization", "Range", "Content-Length");
+                    std.mem.doNotOptimizeAway(a);
+                    std.mem.doNotOptimizeAway(b);
+                    std.mem.doNotOptimizeAway(c);
+                }
+            }
+            _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.DISABLE, 0);
+            const got = read_count(fd);
+            if (is_two) {
+                min_two = @min(min_two, got);
+            } else {
+                min_one = @min(min_one, got);
+            }
+        }
     }
-    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.DISABLE, 0);
-    const two = read_count(fd);
 
-    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.RESET, 0);
-    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.ENABLE, 0);
-    i = 0;
-    while (i < inner) : (i += 1) {
-        const a, const b, const c = headerGet3(head, "Authorization", "Range", "Content-Length");
-        std.mem.doNotOptimizeAway(a);
-        std.mem.doNotOptimizeAway(b);
-        std.mem.doNotOptimizeAway(c);
-    }
-    _ = linux.ioctl(fd, linux.PERF.EVENT_IOC.DISABLE, 0);
-    const one = read_count(fd);
-
-    try std.testing.expect(two > 0);
-    try std.testing.expect(one > 0);
-    try std.testing.expect(one < two);
+    if (min_one == 0 or min_two == 0 or min_one == std.math.maxInt(u64) or min_two == std.math.maxInt(u64)) return error.SkipZigTest;
+    try std.testing.expect(min_one < min_two);
 }
 
 test "HaveBits.hasPiece respects advertised grid" {
