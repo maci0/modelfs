@@ -446,7 +446,7 @@ fn commandNamed(parsed: std.json.Value, name: []const u8) ?std.json.ObjectMap {
 
 test "schema document is clispec 0.3 and names output, errors, and effects" {
     const gpa = std.testing.allocator;
-    const bytes = try schemaJson(gpa, "0.21.0", null);
+    const bytes = try schemaJson(gpa, "0.22.0", null);
     defer gpa.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "HF_TOKEN") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "--token") == null);
@@ -455,7 +455,7 @@ test "schema document is clispec 0.3 and names output, errors, and effects" {
     const root = parsed.value.object;
     try std.testing.expectEqualStrings("0.3", root.get("clispec").?.string);
     try std.testing.expectEqualStrings("modelfs", root.get("name").?.string);
-    try std.testing.expectEqualStrings("0.21.0", root.get("version").?.string);
+    try std.testing.expectEqualStrings("0.22.0", root.get("version").?.string);
     try std.testing.expectEqualStrings("text", root.get("output").?.object.get("tty").?.string);
     try std.testing.expectEqualStrings("json", root.get("output").?.object.get("piped").?.string);
     try std.testing.expect(root.get("outcomes") == null);
@@ -520,12 +520,12 @@ test "schema document is clispec 0.3 and names output, errors, and effects" {
 
 test "schema path filter keeps the top-level document" {
     const gpa = std.testing.allocator;
-    const bytes = try schemaJson(gpa, "0.21.0", "status");
+    const bytes = try schemaJson(gpa, "0.22.0", "status");
     defer gpa.free(bytes);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("0.3", parsed.value.object.get("clispec").?.string);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("commands").?.array.items.len);
     try std.testing.expectEqualStrings("status", commandNamed(parsed.value, "status").?.get("name").?.string);
-    try std.testing.expectError(error.UnknownCommand, schemaJson(gpa, "0.21.0", "nope"));
+    try std.testing.expectError(error.UnknownCommand, schemaJson(gpa, "0.22.0", "nope"));
 }
