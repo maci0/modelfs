@@ -585,7 +585,7 @@ fn handleConn(self: *Server, fd: c_int, peer: c.struct_sockaddr_in) void {
     // (ENOENT lookup) and a GET here would hydrate lease JSON into the piece
     // cache and advertise it via `/have`. Same 404 as an unknown route so
     // the data plane does not confirm the control dir's existence.
-    if (discover.relIsCluster(rel)) {
+    if (proto.relIsCluster(rel)) {
         replyStatus(self, fd, "404 Not Found");
         return;
     }
@@ -4738,7 +4738,7 @@ fn classifyServedHead(head: []const u8) ServeClass {
     const q = proto.queryGet(target, "path") orelse return .bad_path;
     const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
     if (!store_mod.relOk(rel)) return .bad_path;
-    if (discover.relIsCluster(rel)) return .miss;
+    if (proto.relIsCluster(rel)) return .miss;
     if (is_data) {
         const rh = range_h orelse return .bad_range;
         _ = proto.parseRange(rh) orelse return .bad_range;
@@ -4959,7 +4959,7 @@ fn classifyDataHead(head: []const u8) DataClass {
     const q = proto.queryGet(target, "path") orelse return .bad_path;
     const rel = proto.urlDecode(&rel_buf, q) catch return .bad_path;
     if (!store_mod.relOk(rel)) return .bad_path;
-    if (discover.relIsCluster(rel)) return .not_found;
+    if (proto.relIsCluster(rel)) return .not_found;
     if (is_data) {
         const rh = range_h orelse return .bad_range;
         const rg = proto.parseRange(rh) orelse return .bad_range;

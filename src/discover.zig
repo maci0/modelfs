@@ -139,17 +139,6 @@ pub fn pickBest(cands: []const PathCand) ?usize {
 /// spelling.
 const cluster_dir = proto.cluster_dir;
 
-/// True when an origin-relative path names the lease directory or a file
-/// under it. Prefix, not substring: a model named `.clusterfoo` is not the
-/// control plane. Applied at every external path boundary after `relOk`
-/// (FUSE `resolveRel`, peer `handleConn`, CLI `cmdPin`) so a PSK holder
-/// cannot hydrate lease JSON as a piece and a local pin cannot mark the
-/// control dir uncullable.
-pub fn relIsCluster(rel: []const u8) bool {
-    return std.mem.eql(u8, rel, cluster_dir) or
-        std.mem.startsWith(u8, rel, cluster_dir ++ "/");
-}
-
 pub const max_id_bytes: usize = c.NAME_MAX - ".json.tmp".len;
 
 /// True when s is safe to publish as this node's cluster id. The id names
@@ -1619,17 +1608,6 @@ test "proto.containsControl gates lease names and ids for log echo" {
     try std.testing.expect(!proto.containsControl("a\u{ac}"));
     try std.testing.expect(!proto.containsControl("a\u{1810}"));
     try std.testing.expect(!proto.containsControl("a\u{1bc9f}"));
-}
-
-test "relIsCluster matches the lease dir by prefix, not substring" {
-    try std.testing.expect(relIsCluster(cluster_dir));
-    try std.testing.expect(relIsCluster(cluster_dir ++ "/spark1.json"));
-    try std.testing.expect(relIsCluster(cluster_dir ++ "/a/b.json"));
-    // Prefix, not substring: a model named .clusterfoo is not the lease dir.
-    try std.testing.expect(!relIsCluster(cluster_dir ++ "foo"));
-    try std.testing.expect(!relIsCluster("foo/" ++ cluster_dir));
-    try std.testing.expect(!relIsCluster("gguf/a.gguf"));
-    try std.testing.expect(!relIsCluster(""));
 }
 
 test "validId gates the lease file name and JSON document" {

@@ -251,3 +251,16 @@ test "codeLine skips prose and keeps code" {
     try std.testing.expect(!codeLine(""));
     try std.testing.expect(!codeLine("   "));
 }
+
+test "cluster-namespace predicate lives in proto, not discover" {
+    // relIsCluster guards the .cluster namespace proto already spells once
+    // (cluster_dir/manifests_dir). Discover owns the lease walk; every
+    // caller (store, peer, fuse_fs, hf, main) asks a path question, so the
+    // predicate in discover forced a dependency on the lease module to
+    // gate a path. A second home for it would drift from cluster_dir.
+    const discover_src = @embedFile("discover.zig");
+    const proto_src = @embedFile("proto.zig");
+    try std.testing.expect(std.mem.indexOf(u8, proto_src, "pub fn relIsCluster(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, discover_src, "pub fn relIsCluster(") == null);
+    try std.testing.expect(std.mem.indexOf(u8, discover_src, "proto.zig") != null);
+}

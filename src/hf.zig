@@ -3,7 +3,7 @@
 //! files on the NFS origin. CLI-only, over HTTPS with the platform trust
 //! store; the daemon itself never speaks to anything but its peers.
 const std = @import("std");
-const discover = @import("discover.zig");
+const proto = @import("proto.zig");
 const store_mod = @import("store.zig");
 const sys = @import("sys.zig");
 const fuzzcorpus = @import("fuzzcorpus.zig");
@@ -212,7 +212,7 @@ fn parseTree(gpa: std.mem.Allocator, json: []const u8, dest: []const u8) !Listin
         if (!store_mod.relOk(item.path)) return error.BadEntryPath;
         var rel_buf: [sys.c.PATH_MAX]u8 = undefined;
         const rel = joinRel(&rel_buf, dest, item.path) catch return error.BadEntryPath;
-        if (!store_mod.relOk(rel) or discover.relIsCluster(rel)) return error.BadEntryPath;
+        if (!store_mod.relOk(rel) or proto.relIsCluster(rel)) return error.BadEntryPath;
         try list.append(a, .{ .path = try a.dupe(u8, item.path), .size = item.size });
     }
     return .{ .entries = try list.toOwnedSlice(a), .arena = arena };
@@ -722,7 +722,7 @@ fn fuzzTreeParseOne(_: void, smith: *std.testing.Smith) anyerror!void {
 
         for (mut_root.entries) |item| {
             try std.testing.expect(store_mod.relOk(item.path));
-            try std.testing.expect(!discover.relIsCluster(item.path));
+            try std.testing.expect(!proto.relIsCluster(item.path));
         }
 
         // Determinism: parsing again produces identical entries
@@ -745,7 +745,7 @@ fn fuzzTreeParseOne(_: void, smith: *std.testing.Smith) anyerror!void {
             var rel_buf: [sys.c.PATH_MAX]u8 = undefined;
             const rel = try joinRel(&rel_buf, "models/dest", item.path);
             try std.testing.expect(store_mod.relOk(rel));
-            try std.testing.expect(!discover.relIsCluster(rel));
+            try std.testing.expect(!proto.relIsCluster(rel));
         }
 
         var again_dest = try parseTree(gpa, json, "models/dest");

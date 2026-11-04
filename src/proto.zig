@@ -448,6 +448,21 @@ pub const manifests_dir_leaf: []const u8 = "manifests";
 /// `manifests_dir_leaf` to the `.cluster` path it already holds.
 pub const manifests_dir: []const u8 = cluster_dir ++ "/" ++ manifests_dir_leaf;
 
+/// True when an origin-relative path names the lease directory or a file
+/// under it. Prefix, not substring: a model named `.clusterfoo` is not the
+/// control plane. Applied at every external path boundary after `relOk`
+/// (FUSE `resolveRel`, peer `handleConn`, CLI `cmdPin`) so a PSK holder
+/// cannot hydrate lease JSON as a piece and a local pin cannot mark the
+/// control dir uncullable. It lives in proto, next to `cluster_dir` and
+/// the lease document that lives in it, because store, discover, peer,
+/// fuse_fs and the CLI all name that namespace: putting the predicate in
+/// discover made every one of them depend on the lease-walk module to ask
+/// a path question.
+pub fn relIsCluster(rel: []const u8) bool {
+    return std.mem.eql(u8, rel, cluster_dir) or
+        std.mem.startsWith(u8, rel, cluster_dir ++ "/");
+}
+
 test "the cluster path namespace is spelled once and nests" {
     // store, discover, peer, fuse_fs and the CLI all name these three. The
     // manifests dir is the cluster dir plus its leaf by construction, so a
@@ -459,6 +474,17 @@ test "the cluster path namespace is spelled once and nests" {
     // must be the last segment of the joined path and nothing else.
     try std.testing.expect(std.mem.endsWith(u8, manifests_dir, "/" ++ manifests_dir_leaf));
     try std.testing.expect(std.mem.startsWith(u8, manifests_dir, cluster_dir ++ "/"));
+}
+
+test "relIsCluster matches the lease dir by prefix, not substring" {
+    try std.testing.expect(relIsCluster(cluster_dir));
+    try std.testing.expect(relIsCluster(cluster_dir ++ "/spark1.json"));
+    try std.testing.expect(relIsCluster(cluster_dir ++ "/a/b.json"));
+    // Prefix, not substring: a model named .clusterfoo is not the lease dir.
+    try std.testing.expect(!relIsCluster(cluster_dir ++ "foo"));
+    try std.testing.expect(!relIsCluster("foo/" ++ cluster_dir));
+    try std.testing.expect(!relIsCluster("gguf/a.gguf"));
+    try std.testing.expect(!relIsCluster(""));
 }
 
 pub const LeaseAddr = struct {

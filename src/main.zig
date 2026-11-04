@@ -2443,7 +2443,7 @@ fn cmdPull(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Envir
     // Default destination is the repo id, so two models never collide and
     // the mount path reads like the model card it came from.
     const dest = opts.dest orelse repo;
-    if (dest.len != 0 and (!store_mod.relOk(dest) or discover.relIsCluster(dest))) {
+    if (dest.len != 0 and (!store_mod.relOk(dest) or proto.relIsCluster(dest))) {
         diagUsage("modelfs: --dest {s} is not a path under the origin\n", .{proto.displayName(dest)});
         return 2;
     }
@@ -2828,7 +2828,7 @@ fn refuseCliRel(cmd: []const u8, rel: []const u8) bool {
         return true;
     }
     // Same control-plane hide FUSE and peer HTTP apply.
-    if (discover.relIsCluster(rel)) {
+    if (proto.relIsCluster(rel)) {
         diagFailed("{s}: refusing cluster control path\n", .{cmd});
         return true;
     }

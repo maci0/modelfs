@@ -2,10 +2,10 @@
 //! write-through cache fill, daemon `State` lifecycle, and the background
 //! discovery/cull loops.
 const std = @import("std");
+const sys = @import("sys.zig");
 const fuse = sys.c;
 const piece = @import("piece.zig");
 const proto = @import("proto.zig");
-const sys = @import("sys.zig");
 const store_mod = @import("store.zig");
 const discover = @import("discover.zig");
 const peer = @import("peer.zig");
@@ -224,7 +224,7 @@ fn relFromFuse(path: []const u8) ?[]const u8 {
 
 fn isCluster(path: []const u8) bool {
     const rel = if (path.len > 0 and path[0] == '/') path[1..] else path;
-    return discover.relIsCluster(rel);
+    return proto.relIsCluster(rel);
 }
 
 /// One path policy for every handler: cluster control files are invisible

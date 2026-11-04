@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **`relIsCluster` moves from `src/discover.zig` to `src/proto.zig`.** The cluster-namespace predicate (`cluster_dir`, `manifests_dir`, `relIsCluster`) lived in the lease-walk module, so `store`, `peer`, `fuse_fs`, `hf`, and `main` all depended on `discover` to ask a path question about a namespace `proto` already spelled once. The predicate now sits next to the constants and lease document it guards; every caller imports `proto` instead, `hf` no longer imports `discover` at all, and the module table in `docs/architecture.md` gains the missing `clispec.zig` row while correcting the `relIsCluster` location it named. No behavior change.
+
 ## [0.21.0] - 2026-10-15
 
 ### Changed - 2026-10-15

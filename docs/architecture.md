@@ -83,6 +83,7 @@ New code goes in the module that already owns that concern.
 | `fuse_fs.zig` | FUSE handlers, daemon `State` (`init`/`spawnWorkers`/`deinit`/`run`/`attach`), discovery/cull loops, process-image handover |
 | `handover.zig` | Sealed-memfd knobs+PSK codec and `update` request/ack for `modelfs update` |
 | `hf.zig` | Hugging Face pulls: id and ref validation, listing/download endpoints, and the download loop for `modelfs pull` |
+| `clispec.zig` | CLI output-mode and `modelfs schema` clispec 0.3 document (no config, token, or network) |
 | `update.zig` | Self-update from GitHub Releases: release check, asset selection, SHA256SUMS verification, and binary replacement |
 | `main.zig` | CLI and mount wiring into `State.init` / `State.deinit`; mount-time `disableCoreDumps` / `scrubPskEnv` |
 | `determinism.zig` | Test-only source guards: the wall clock and sleep are read only through `sys.zig`, and entropy only through `io.randomSecure` |
@@ -192,7 +193,7 @@ past the last slot falls back to the allocator rather than blocking a reader.
 `.cluster` is the cluster control plane and is not part of the filesystem the mount presents.
 It is hidden from FUSE `readdir`, answers `ENOENT` on lookup and `EPERM` on mutation, answers
 404 on peer `/have`/`/data`, and is refused by `modelfs pin`/`unpin`/`verify`/`dupes`
-(`relIsCluster` in src/discover.zig).
+(`relIsCluster` in src/proto.zig).
 
 Names that fail `relOk` (C0/DEL, UTF-8 C1, Default_Ignorable) are omitted from FUSE `readdir`
 the same way open and getattr refuse them. NFC/NFD spellings and non-UTF-8 names still list:
