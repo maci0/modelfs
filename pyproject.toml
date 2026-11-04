@@ -18,7 +18,7 @@ required-version = ">=0.12.13"
 # then `python3 scripts/sbom.py --write`. uv.lock carries every artifact's
 # sha256 and `uv sync --frozen` installs exactly that.
 [dependency-groups]
-dev = ["mypy==2.3.1", "ruff==0.16.4"]
+dev = ["mypy==2.4.1", "ruff==0.16.4"]
 
 [tool.ruff]
 line-length = 100
