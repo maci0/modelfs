@@ -17,7 +17,7 @@ edit to `docs/architecture.md` when shipped behavior moves.
 | `src/c.h`, `src/c.zig` | Sole C-header door (libfuse3 + libc types). `build.zig` translates `c.h` once (through `src/c_musl.h` for musl). Change the maintained headers or `build.zig`, never the generated bindings; `src/c.zig` is a maintained re-export. Import via `c.zig` / `sys.zig`, never `@cImport` |
 | `scripts/` | Gates and harnesses. `lib.sh` defines `ROOT_DIR`/`SCRATCH_DIR`/`SCRIPTS_DIR`; shell scripts source it before using those variables; a script reading none of the three is exempt only when `check.sh` names it in `no_lib_sh`. `SCRIPTS_DIR` is the on-disk name; leave the spelling alone: every suite that sources `lib.sh` reads it |
 | `docs/` | `README.md` indexes them. `architecture.md` is shipped behavior. `review-guides/` holds the per-subject review prompts, each with its own applicability gate |
-| `.github/` | Workflows plus the composite action in `.github/actions/` (the gate toolchain both check jobs share) and `dependabot.yml`, which proposes the action-pin bumps in PRs. `scripts/sbom.py` reads the SHA pins out of both directories: an unpinned `uses:` fails generation, a bumped pin fails `--check` until `sbom.cdx.json` is regenerated |
+| `.github/` | Workflows plus the composite action in `.github/actions/` (the gate toolchain both check jobs share) and `dependabot.yml`, which proposes the action-pin bumps in PRs. `scripts/sbom.py` reads the SHA pins out of both directories: an unpinned `uses:` fails generation, a bumped pin fails `--check` until the generated `sbom.cdx.json` (repo root) is regenerated with `scripts/sbom.py --write`; never hand-edit `sbom.cdx.json` |
 | `.deps/fuse3-arm64/` | Vendored arm64 libfuse3 `.deb` files, `SHA256SUMS`, NOTICE, and copyright. `build.zig` and `scripts/extract_fuse3_arm64.sh` verify the digests; extract writes under `.scratch/fuse3-arm64/`; `check.sh` checks them too. Pinned input, not a place to patch: a fix goes in `build.zig`, `src/c.h`, or a version bump, and an edit here fails the digest checks |
 | `.deps/libfuse3-3.16.2/` | Vendored libfuse3 3.16.2 source for the static single-file release builds (`-Dfuse-static` compiles it in; `scripts/build_static.sh` drives it, `.github/workflows/release.yml` publishes the artifacts). `build.zig` and `check.sh` verify its `SHA256SUMS` too, including that the sums list every file present. Pinned input, not a place to patch: same rule as `.deps/fuse3-arm64/` |
 
@@ -86,14 +86,18 @@ Suites outside the gate (most need hardware CI lacks):
 
 ## Constraints
 
-- **No secret reaches argv.** The PSK comes from `--psk FILE`, from the file
-  path in `MODELFS_PSK`, or from the secret in `MODELFS_PSK_VALUE`, which the
-  mount refuses to combine with either of the first two; the Hugging Face
-  token from `HF_TOKEN`, else `$HF_HOME/token`, else
-  `~/.cache/huggingface/token`. argv is world-readable through
-  `/proc/<pid>/cmdline`. A handover passes both knobs and PSK on a sealed
-  memfd for the same reason.
-- **Only `src/hf.zig` and `src/update.zig` may contact hosts outside the cluster.** The daemon
+- **No secret reaches argv.** The PSK comes from `--psk FILE` (default
+  `/etc/modelfs.psk`), from the file path in `MODELFS_PSK`, or from the
+  secret in `MODELFS_PSK_VALUE`, which the mount refuses to combine with
+  either of the first two; the Hugging Face token from `HF_TOKEN`, else
+  `$HF_HOME/token`, else `~/.cache/huggingface/token`; the GitHub token
+  from `GITHUB_TOKEN` (`token_env` in `src/update.zig`), environment only,
+  never a flag. argv is world-readable through `/proc/<pid>/cmdline`.
+  A handover passes both knobs and PSK on a sealed memfd for the same
+  reason.
+- **Only `src/hf.zig` and `src/update.zig` (via `cmdPull`/`cmdUpdate` in
+  `src/main.zig`, which construct the `std.http.Client` they hand to those
+  modules) may contact hosts outside the cluster.** The daemon
   talks to peers and the origin; `modelfs pull` and `modelfs update` are the two paths that contact
   a host outside the cluster, from the CLI, never from the mount.
 - **Run artifacts go to the repo's `.scratch/`**, never `/tmp`: it is tmpfs here,
