@@ -1763,6 +1763,30 @@ case "${sub}" in
         printf '%s\n' "${SNAPSHOT_NAME}"
         ;;
     snapshot)
+        # Simulate a snapshot already taken in the same wall-clock second:
+        # zfs refuses a duplicate snapshot name, which is how a rerun of
+        # dr_point_restore.sh inside one second used to fail hard at the
+        # preserve step.
+        dest=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -r | -p | -H | -s)
+                    shift
+                    ;;
+                -*)
+                    shift
+                    ;;
+                *)
+                    dest="$1"
+                    shift
+                    ;;
+            esac
+        done
+        if [[ -f "${STATE}/existing-snaps" ]] && grep -Fxq "${dest}" "${STATE}/existing-snaps"; then
+            echo "cannot create snapshot ${dest} (already exists)" >&2
+            exit 1
+        fi
+        printf '%s\n' "${dest}" >>"${STATE}/existing-snaps"
         exit 0
         ;;
     clone)
@@ -1874,6 +1898,38 @@ elif ! grep -q 'zfs clone -o mountpoint=' <<<"${POINT_LOG}" || ! grep -q 'readon
     fail "point restore clone is not an explicit readonly, unshared clone: ${POINT_LOG}"
 else
     pass "point restore preserved the pre-restore state before cloning, readonly"
+fi
+
+# Rerun within the same wall-clock second must not collide on the
+# pre-restore snapshot name: the stub records every snapshot taken, so
+# a second --execute in the same second fails unless the name carries
+# a per-run disambiguator.
+POINT_SEED_TS="$(date -u +%s)"
+POINT_DATE_BIN="${TEMP}/pointdatebin"
+mkdir -p "${POINT_DATE_BIN}"
+cat >"${POINT_DATE_BIN}/date" <<'DATESTUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "${POINT_SEED_TS:?}"
+DATESTUB
+chmod +x "${POINT_DATE_BIN}/date"
+: >"${POINT_STATE}/existing-snaps"
+POINT_CLONE_MP="${TEMP}/recover"
+POINT_LIVE="${POINT_LIVE_TREE}"
+rm -rf "${POINT_CLONE_MP}"
+env PATH="${POINT_DATE_BIN}:${POINT_BIN}:${PATH}" POINT_STATE="${POINT_STATE}" POINT_SEED_TS="${POINT_SEED_TS}" \
+    "${POINT}" --live "${POINT_LIVE}" --clone-mp "${POINT_CLONE_MP}" \
+    "${POINT_SNAP}" --copy gguf/model.gguf --execute >/dev/null 2>&1
+POINT_FIRST_RC=$?
+rm -rf "${POINT_CLONE_MP}"
+env PATH="${POINT_DATE_BIN}:${POINT_BIN}:${PATH}" POINT_STATE="${POINT_STATE}" POINT_SEED_TS="${POINT_SEED_TS}" \
+    "${POINT}" --live "${POINT_LIVE}" --clone-mp "${POINT_CLONE_MP}" \
+    "${POINT_SNAP}" --copy gguf/model.gguf --execute >/dev/null 2>&1
+POINT_SECOND_RC=$?
+if [[ "${POINT_FIRST_RC}" -eq 0 && "${POINT_SECOND_RC}" -eq 0 ]]; then
+    pass "point restore rerun within the same second does not collide on its preserve snapshot"
+else
+    fail "point restore rerun within the same second collided on its preserve snapshot (first=${POINT_FIRST_RC} second=${POINT_SECOND_RC})"
 fi
 
 # An existing clone dataset or mountpoint is someone else's restore
