@@ -141,7 +141,7 @@ case "${LIVE}" in
         ;;
 esac
 
-PRESERVE="${DATASET}@pre-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+PRESERVE="${DATASET}@pre-restore-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
 echo "point-restore plan (docs/recovery.md procedure B)"
 echo "  restore from : ${SNAPSHOT}"
