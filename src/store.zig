@@ -2133,6 +2133,17 @@ pub const Store = struct {
         if (!std.mem.eql(u8, orel, nrel)) {
             if (orel.len != 0) self.forget(orel);
             if (nrel.len != 0) self.forget(nrel);
+            // FUSE retry after a lost reply: the rename already landed, so
+            // the retry sees ENOENT at the old name with the new name in
+            // place. A first-call ENOENT (old name never existed) has no
+            // new name either. Only the first proves the destination now
+            // holds the moved file, so only it converges to success;
+            // returning ENOENT here makes the retry report failure and
+            // risks a client re-creating the old name over a moved file.
+            if (e == -c.ENOENT) {
+                var lst: c.struct_stat = undefined;
+                if (sys.lstatPath(ob, &lst) == 0 and (lst.st_mode & c.S_IFMT) != c.S_IFDIR) return 0;
+            }
         }
         return e;
     }
@@ -5634,7 +5645,9 @@ test "renameOrigin on a retry after origin-only rename still drops cache" {
     var stbuf: c.struct_stat = undefined;
     try std.testing.expect(sys.statPath(try st.cacheMetaPath(&ma, "a.bin"), &stbuf) == 0);
 
-    try std.testing.expectEqual(@as(i32, -c.ENOENT), st.renameOrigin("a.bin", "b.bin", 0));
+    // Retry after a completed origin rename converges to success, and
+    // still drops both sidecars (forget runs on every errno).
+    try std.testing.expectEqual(@as(i32, 0), st.renameOrigin("a.bin", "b.bin", 0));
     try std.testing.expect(sys.statPath(try st.cacheMetaPath(&ma, "a.bin"), &stbuf) != 0);
     var mb: [sys.c.PATH_MAX]u8 = undefined;
     try std.testing.expect(sys.statPath(try st.cacheMetaPath(&mb, "b.bin"), &stbuf) != 0);
@@ -5653,7 +5666,10 @@ test "renameOrigin on a retry after origin-only rename still drops cache" {
     try std.testing.expect((try st.beginFill(f3, 0, now)) == .len);
     try std.testing.expectEqual(@as(i32, 0), st.completeFill(f3, 0, content, null, now));
     try std.testing.expectEqual(@as(i32, 0), st.renameOrigin("c.bin", "d.bin", 0));
-    try std.testing.expectEqual(@as(i32, -c.ENOENT), st.renameOrigin("c.bin", "d.bin", 0));
+    // A retry of the same rename matches one run: success, not ENOENT.
+    try std.testing.expectEqual(@as(i32, 0), st.renameOrigin("c.bin", "d.bin", 0));
+    // A genuinely missing source with no destination stays ENOENT.
+    try std.testing.expectEqual(@as(i32, -c.ENOENT), st.renameOrigin("missing.bin", "also-missing.bin", 0));
     try std.testing.expect(sys.statPath(try st.originPath(&oa, "c.bin"), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try st.originPath(&obuf, "d.bin"), &stbuf) == 0);
     try std.testing.expect(sys.statPath(try st.cacheMetaPath(&ma, "c.bin"), &stbuf) != 0);

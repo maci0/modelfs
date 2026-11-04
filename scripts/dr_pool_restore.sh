@@ -248,6 +248,15 @@ fi
     || die "recv succeeded but holding monthlies on ${DEST} failed (docs/recovery.md section 3)"
 
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "${STAMP} ${DEST} ok recv_s=${ELAPSED} source=${SOURCE_LABEL}" >>"${LOG_FILE}"
-echo "pool-restore OK: ${DEST} from ${SOURCE_LABEL} in ${ELAPSED}s (recorded in ${LOG_FILE})"
+LOG_LINE="${STAMP} ${DEST} ok recv_s=${ELAPSED} source=${SOURCE_LABEL}"
+# A rerun must not append a second line: the syncoid/zfs recv and zfs set
+# above converge, so treat the log the same. Match "ok" for this
+# dest+source; a new snapshot source is a new restore, not a reopen.
+if grep -qF -- "${DEST} ok" "${LOG_FILE}" 2>/dev/null \
+    && grep -qF -- "source=${SOURCE_LABEL}" "${LOG_FILE}" 2>/dev/null; then
+    echo "pool-restore OK: ${DEST} from ${SOURCE_LABEL} in ${ELAPSED}s (already recorded in ${LOG_FILE})"
+else
+    echo "${LOG_LINE}" >>"${LOG_FILE}"
+    echo "pool-restore OK: ${DEST} from ${SOURCE_LABEL} in ${ELAPSED}s (recorded in ${LOG_FILE})"
+fi
 print_cache_wipe
