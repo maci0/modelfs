@@ -2108,9 +2108,15 @@ const StatusFields = struct {
 };
 
 // Widest decimal rendering of an integer of type `T`, sign included.
+// The shift below materializes 2^bits in a u128, so a 128-bit type has no
+// room for the sentinel: refuse it at compile time rather than wrap in
+// ReleaseFast or panic in safe builds when a new counter widens past 64 bits.
 fn widestDigits(comptime T: type) usize {
     @setEvalBranchQuota(4000);
     const info = @typeInfo(T).int;
+    if (info.bits >= 128) {
+        @compileError("widestDigits cannot size a 128-bit integer in a u128; derive the digit count before adding one");
+    }
     const sign: u7 = switch (info.signedness) {
         .signed => 1,
         .unsigned => 0,
