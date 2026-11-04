@@ -10,6 +10,8 @@
 # the claim stays enforced for exactly the three artifacts releases attach
 # rather than merely documented. CI runs this as its own job.
 set -euo pipefail
+export LC_ALL=C
+export TZ=UTC
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

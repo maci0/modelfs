@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Build - 2026-11-04
+- **Vendored libfuse3 now builds with `_FORTIFY_SOURCE=2`.** The static single-file release binaries previously compiled the vendored C at the optimizer's default with no fortify wrappers, so a buffer overflow in libfuse3 would not abort at the call site. `fuse_static_cflags` in `build.zig` now passes `-D_FORTIFY_SOURCE=2`, which Zig's `-O<optimize>` already enables in ReleaseFast and leaves as a no-op in Debug. No source changed.
+
 ## [0.21.0] - 2026-10-15
 
 ### Changed - 2026-10-15
