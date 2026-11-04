@@ -1110,6 +1110,18 @@ test "lease json roundtrip" {
     const need = full.len;
     try std.testing.expectEqualStrings(full, try formatLease(tight[0..need], "spark1", 1710000060, &single));
     try std.testing.expectError(error.WriteFailed, formatLease(tight[0 .. need - 1], "spark1", 1710000060, &single));
+
+    // Invalid UTF-8, DEL, and truncated UTF-8 are refused whole too: the
+    // verbatim embedding would otherwise publish bytes every peer's
+    // parser rejects (SyntaxError), dropping the node from the cluster.
+    try std.testing.expectError(error.LeaseStringUnclean, formatLease(&tight, "\xff", 1710000060, &single));
+    try std.testing.expectError(error.LeaseStringUnclean, formatLease(&tight, "a\xc3", 1710000060, &single));
+    try std.testing.expectError(error.LeaseStringUnclean, formatLease(&tight, "a\x7fb", 1710000060, &single));
+    try std.testing.expectError(error.LeaseStringUnclean, formatLease(&tight, "spark1", 1710000060, &[_]LeaseAddr{.{ .ip = "\xff", .port = default_port }}));
+    // A valid non-ASCII UTF-8 id (e.g. "caf\xc3\xa9") is still clean here:
+    // validId at the publish site is the ASCII gate, formatLease's job is
+    // only to never publish unreadable JSON.
+    try std.testing.expect((try formatLease(&tight, "caf\xc3\xa9", 1710000060, &single)).len > 0);
 }
 
 const seed_lease_ok = fuzzcorpus.entry("{\"id\":\"spark1\",\"until\":1710000060,\"addrs\":[{\"ip\":\"192.168.100.1\",\"port\":18080,\"mbps\":200000},{\"ip\":\"192.168.0.11\",\"port\":18080,\"mbps\":10000}]}");
@@ -1138,11 +1150,20 @@ const fuzz_lease_corpus = [_][]const u8{
 
 /// True when s survives formatLease's verbatim embedding: the writer does
 /// no JSON escaping, so a quote, backslash, or C0 byte would publish a
-/// document every peer's parser refuses. Producers gate ids through
-/// discover.validId; this mirrors just the JSON-hostile part of that gate.
+/// document every peer's parser refuses, and invalid UTF-8 would publish
+/// bytes std.json refuses on read (SyntaxError). Producers gate ids
+/// through discover.validId (printable ASCII); this mirrors just the
+/// JSON-hostile part of that gate, plus UTF-8 validity, so a caller that
+/// bypasses validId (a future non-ASCII id) cannot publish a lease whose
+/// own peers reject as corrupt and silently drop the node from the
+/// cluster. DEL (0x7f) is also rejected: it is not valid in a JSON string
+/// per RFC 8259's unescaped range and validId already excludes it.
+/// Note: a lone-surrogate escape (`\uD800`) is rejected by the parser
+/// itself (SyntaxError), so no parsed lease ever carries one here.
 fn leaseJsonClean(s: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(s)) return false;
     for (s) |ch| {
-        if (ch < 0x20 or ch == '"' or ch == '\\') return false;
+        if (ch < 0x20 or ch == 0x7f or ch == '"' or ch == '\\') return false;
     }
     return true;
 }
