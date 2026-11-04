@@ -5,6 +5,9 @@
 ### Fixed - 2026-11-04
 - **`require_zig` names the version a missing toolchain needs.** A fresh clone whose `PATH` had no `zig` died with "zig not found -- see CONTRIBUTING.md" without the pinned version the error was about, and a wrong-version toolchain's diagnostic gained no install pointer. `require_zig` in `scripts/lib.sh` now reads `minimum_zig_version` first and names it (and the CONTRIBUTING setup section) in both failures, and CONTRIBUTING's setup gains the one line the contributor actually needs: Zig is installed from ziglang.org at exactly that version, not from a package manager. No version or gate behavior changes.
 
+### Documentation - 2026-11-04
+- **`docs/threat-model.md` catches up with the 0.21.0/0.22.0 surface.** Corrections recorded when code moved: the `relIsCluster` citation moves from `src/discover.zig` to `src/proto.zig` (moved in 0.22.0, and `docs/architecture.md` already named the new home); the missing `modelfs schema` subcommand and the global `-o`/`--output` flag are now named as entry points (they read no config or token and change rendering only); boundary B5 now records `_FORTIFY_SOURCE=2` on the vendored libfuse3 build and the `sbom.cdx.json` that releases ship and cover with `SHA256SUMS`. Last-reviewed date moves to 2026-11-04. No code changed.
+
 ## [0.22.0] - 2026-11-04
 
 ### Build - 2026-11-04

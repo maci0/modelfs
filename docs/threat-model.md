@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Living document; describes `src/` and the shipped NAS units and wrappers as of the date below |
-| Last reviewed | 2026-09-30 |
+| Last reviewed | 2026-11-04 |
 | Covers | modelfs daemon (`mount`) and CLI as of `v0.22.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull, GitHub release self-update, and the shipped NAS snapshot/replica/drill/offsite plane (`scripts/nas/`, the restore and alarm wrappers) |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
@@ -105,6 +105,13 @@ the NFS export.
 
 Dispatch and `parseArgs`, src/main.zig. Accepts paths, addresses, sizes, watermarks, id, the log
 ceiling (`--log`), and the PSK **file path**, never the secret: `--psk-value` is gone.
+
+`modelfs schema` (src/clispec.zig, `cmdSchema` src/main.zig) prints the static clispec 0.3
+document and reads no config, token, or network; its optional command-path argument is matched
+against the command table and refused (`UnknownCommand`) when unknown. The global `-o` /
+`--output` flag (`peelOutput` src/main.zig) is accepted before or after the command and takes
+only `auto`, `text`, or `json`; it changes rendering, not authority, and every output mode
+still passes the same `relOk`/`relIsCluster` gates on paths it prints.
 
 `--seed HOST[:PORT]` hostnames are DNS-resolved once at mount (`buildSeeds` src/main.zig).
 `modelfs update --reload` (and the automatic handover after a self-update) locates the daemon via
@@ -361,8 +368,17 @@ cross-aarch64 build vendors two libfuse3 `.deb`s in `.deps/fuse3-arm64/`. Both d
 `SHA256SUMS` digests are verified by `build.zig` before compiling (and verified by
 `scripts/extract_fuse3_arm64.sh` before unpack for arm64). Static release binaries compile the
 vendored libfuse3 directly (`-Dfuse-static`), producing a fully static binary with no external
-dynamic dependencies. The host build links whatever libfuse3 dev package is installed system-wide,
+dynamic dependencies. The vendored C is compiled with `_FORTIFY_SOURCE=2`
+(`fuse_static_cflags` in build.zig), so a buffer overflow in libfuse3 aborts at the call site
+rather than corrupting silently. The host build links whatever libfuse3 dev package is installed system-wide,
 so host provenance is an operator concern.
+
+Releases ship `sbom.cdx.json` (the CycloneDX inventory of every pinned input: uv.lock
+artifacts, vendored libfuse3, SHA-pinned actions, the Zig tarball digest) alongside the
+binaries, covered by the release `SHA256SUMS` (`scripts/package_release.sh`,
+`.github/workflows/release.yml`). It is inventory, not a signature: it records what a build
+was made against and establishes nothing about who published the release (R11). `scripts/sbom.py
+--check` fails the gate when a pin moves without regenerating it.
 
 The long-lived networked image is hardened at build time: a PIE (`exe.pie`) compiled PIC
 (`exe_mod.pic`) with stack canaries and stack probes in every optimize mode (`stack_protector`,
@@ -715,7 +731,7 @@ Controls that exist in code, grouped by what they defend.
 | Control | Location | Covers |
 |---|---|---|
 | `relOk` applied at every external path boundary: FUSE handlers and readdir components, peer HTTP, and CLI pin/unpin/verify/dupes | src/store.zig; call sites in src/peer.zig, src/fuse_fs.zig, src/main.zig | B1/B2/E traversal out of the origin and cache roots, plus log and terminal injection and display-identity spoofing via control bytes (C0, DEL, UTF-8 C1, Default_Ignorable including U+2028/U+2029, bidi and zero-width format controls, variation selectors, BOM, soft hyphen, Mongolian FVS4, shorthand format controls, tags, VS17-256, via `containsControl` src/proto.zig). FUSE `readdir` omits the same names so a planted `a\nERROR.bin` cannot split `ls` |
-| Centralized `.cluster` hide on FUSE, peer HTTP, and CLI pin/unpin/verify/dupes | `relIsCluster` src/discover.zig; `resolveRel` src/fuse_fs.zig; `handleConn` src/peer.zig; `cmdPin`/`cmdVerify`/`cmdDupes` src/main.zig | Lease-file exposure and mutation through the mount, piece-protocol hydration of lease JSON, and pin/verify/dupes of control-plane names |
+| Centralized `.cluster` hide on FUSE, peer HTTP, and CLI pin/unpin/verify/dupes | `relIsCluster` src/proto.zig; `resolveRel` src/fuse_fs.zig; `handleConn` src/peer.zig; `cmdPin`/`cmdVerify`/`cmdDupes` src/main.zig | Lease-file exposure and mutation through the mount, piece-protocol hydration of lease JSON, and pin/verify/dupes of control-plane names |
 | Untrusted-name hygiene: printable gates before echoing lease names and ids to logs or terminal output | src/discover.zig, src/main.zig | Log forgery and terminal escape injection from crafted lease names |
 
 ### Local filesystem hardening
