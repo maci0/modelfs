@@ -10,15 +10,18 @@
 # The Python gate tooling (ruff, mypy) is pinned exactly in pyproject.toml
 # and locked with sha256 hashes in uv.lock; a stale or vulnerable pin ages
 # the same way a workflow pin does. Dependabot proposes the bump as a
-# reviewable PR; merging it still needs `uv lock` and a regenerated
-# sbom.cdx.json, the same recorded-change rule as an action bump.
+# reviewable PR; the `uv` ecosystem updates pyproject.toml and uv.lock
+# together, so merging still needs only a regenerated sbom.cdx.json, the
+# same recorded-change rule as an action bump. The `pip` ecosystem would
+# edit a requirements file in isolation and leave uv.lock stale, which
+# `uv sync --frozen` in check.sh then rejects.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: weekly
-  - package-ecosystem: "pip"
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: weekly

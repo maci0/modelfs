@@ -8,6 +8,9 @@
 ### Documentation - 2026-11-04
 - **`docs/threat-model.md` catches up with the 0.21.0/0.22.0 surface.** Corrections recorded when code moved: the `relIsCluster` citation moves from `src/discover.zig` to `src/proto.zig` (moved in 0.22.0, and `docs/architecture.md` already named the new home); the missing `modelfs schema` subcommand and the global `-o`/`--output` flag are now named as entry points (they read no config or token and change rendering only); boundary B5 now records `_FORTIFY_SOURCE=2` on the vendored libfuse3 build and the `sbom.cdx.json` that releases ship and cover with `SHA256SUMS`. Last-reviewed date moves to 2026-11-04. No code changed.
 
+### CI
+- **Dependabot now uses the `uv` ecosystem for the Python pins.** The `pip` entry edited its own requirements view and left `uv.lock` stale, so every proposed bump failed `uv sync --frozen` until a maintainer ran `uv lock` by hand. The `uv` entry updates `pyproject.toml` and `uv.lock` together; only the regenerated `sbom.cdx.json` remains a manual step.
+
 ## [0.22.0] - 2026-11-04
 
 ### Build - 2026-11-04
