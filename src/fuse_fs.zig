@@ -1324,6 +1324,9 @@ fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*
     const st = statePtr();
     // Latency covers the whole handler: warm reads too, so the tick line's
     // average tracks real reader-perceived latency, not just miss stalls.
+    // monoNs is one clock_gettime per FUSE read; the recency stamp below
+    // reuses this sample's seconds instead of paying a second syscall per
+    // read on the warm path.
     const rd_t0 = sys.monoNs(st.io);
     defer {
         _ = st.store.stats.read_nanos.fetchAdd(@intCast(@max(sys.monoNs(st.io) - rd_t0, 0)), .monotonic);
@@ -1355,8 +1358,10 @@ fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*
     const fsize = file.size;
     // Checking the covered bits in this same window lets a fully-cached
     // range skip ensureRange's per-piece lock (hasPiece stamps and
-    // re-checks what we already know). last_access still feeds LRU.
-    file.last_access.store(sys.monoSec(st.io), .monotonic);
+    // re-checks what we already know). last_access still feeds LRU; the
+    // seconds come from rd_t0's sample (truncated, as monoSec does), not
+    // a second clock read per FUSE read.
+    file.last_access.store(@intCast(@divTrunc(rd_t0, std.time.ns_per_s)), .monotonic);
     if (uoff >= fsize) {
         file.mu.unlock(st.io);
         _ = st.store.stats.reads_ok.fetchAdd(1, .monotonic);
