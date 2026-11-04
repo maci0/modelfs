@@ -2,7 +2,7 @@
 //! bitfields with persisted sidecars, hydration claims, pinning, hole-punch
 //! culling (in-memory and disk-only victims), and the cache/origin artifact
 //! path helpers CLI verify/dupes use (`cacheMetaPath`, `sidecarPieceSize`,
-//! `manifestPath`).
+//! `manifestPath`, `manifestsDirPath`).
 const std = @import("std");
 const piece = @import("piece.zig");
 const proto = @import("proto.zig");
