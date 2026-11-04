@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-05
+
 ### Fixed - 2026-11-04
 - **`require_zig` names the version a missing toolchain needs.** A fresh clone whose `PATH` had no `zig` died with "zig not found -- see CONTRIBUTING.md" without the pinned version the error was about, and a wrong-version toolchain's diagnostic gained no install pointer. `require_zig` in `scripts/lib.sh` now reads `minimum_zig_version` first and names it (and the CONTRIBUTING setup section) in both failures, and CONTRIBUTING's setup gains the one line the contributor actually needs: Zig is installed from ziglang.org at exactly that version, not from a package manager. No version or gate behavior changes.
 - **`widestDigits` in `src/fuse_fs.zig` now refuses 128-bit integers at compile time.** The helper materializes `2^bits` in a `u128`, so a `u128`/`i128` counter would wrap the shift in ReleaseFast and panic in safe builds; the existing `i64`/`u64`/`i32`/`u32` fields are unaffected.
@@ -1486,7 +1488,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/maci0/modelfs/releases/tag/v0.23.0
 [0.22.0]: https://github.com/maci0/modelfs/releases/tag/v0.22.0
 [0.21.0]: https://github.com/maci0/modelfs/releases/tag/v0.21.0
 [0.20.0]: https://github.com/maci0/modelfs/releases/tag/v0.20.0
