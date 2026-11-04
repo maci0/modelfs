@@ -148,6 +148,11 @@ const fuse_static_cflags = [_][]const u8{
     "-D_GNU_SOURCE",
     "-D_REENTRANT",
     "-D_FILE_OFFSET_BITS=64",
+    // _FORTIFY_SOURCE=2: buffer-overflow checks on the vendored C. Zig already
+    // passes -O<optimize>, so the flag is active in ReleaseFast and a no-op
+    // warning-free in Debug (-O0). musl and glibc both provide __chk since
+    // the flag is a no-op where unsupported, never a link error.
+    "-D_FORTIFY_SOURCE=2",
 };
 
 fn addVendoredFuse(m: *std.Build.Module) void {

@@ -6,6 +6,8 @@
 # replaced. The static job's other leg is CI's other architecture, so a host
 # runs the leg it can execute.
 set -euo pipefail
+export LC_ALL=C
+export TZ=UTC
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"

@@ -2,11 +2,14 @@
 
 ## [Unreleased]
 
-### Fixed
-- **`relIsCluster` moves from `src/discover.zig` to `src/proto.zig`.** The cluster-namespace predicate (`cluster_dir`, `manifests_dir`, `relIsCluster`) lived in the lease-walk module, so `store`, `peer`, `fuse_fs`, `hf`, and `main` all depended on `discover` to ask a path question about a namespace `proto` already spelled once. The predicate now sits next to the constants and lease document it guards; every caller imports `proto` instead, `hf` no longer imports `discover` at all, and the module table in `docs/architecture.md` gains the missing `clispec.zig` row while correcting the `relIsCluster` location it named. No behavior change.
+### Build - 2026-11-04
+- **Vendored libfuse3 now builds with `_FORTIFY_SOURCE=2`.** The static single-file release binaries previously compiled the vendored C at the optimizer's default with no fortify wrappers, so a buffer overflow in libfuse3 would not abort at the call site. `fuse_static_cflags` in `build.zig` now passes `-D_FORTIFY_SOURCE=2`, which Zig's `-O<optimize>` already enables in ReleaseFast and leaves as a no-op in Debug. No source changed.
 
 ### CI - 2026-11-04
 - **GitHub releases now ship the SBOM, and Dependabot watches the Python pins.** `scripts/package_release.sh` copies `sbom.cdx.json` into the release dist and covers it in `SHA256SUMS`, and `.github/workflows/release.yml` attaches it alongside the binaries, so a downstream consumer gets the CycloneDX inventory of every pinned input (uv.lock, vendored libfuse3, SHA-pinned actions, Zig tarball) the release was built against, not just the repo's main-branch copy at some earlier tag. `scripts/test_package_release.sh` pins that the shipped file is byte-identical to the tracked one and covered by the digest list. `.github/dependabot.yml` gains a `pip` ecosystem entry for the exact-pinned ruff/mypy dev group: previously only `github-actions` bumps were proposed, so a stale or vulnerable Python pin aged with no reviewable PR, the same failure the action-pin entry was built to close.
+
+### Fixed
+- **`relIsCluster` moves from `src/discover.zig` to `src/proto.zig`.** The cluster-namespace predicate (`cluster_dir`, `manifests_dir`, `relIsCluster`) lived in the lease-walk module, so `store`, `peer`, `fuse_fs`, `hf`, and `main` all depended on `discover` to ask a path question about a namespace `proto` already spelled once. The predicate now sits next to the constants and lease document it guards; every caller imports `proto` instead, `hf` no longer imports `discover` at all, and the module table in `docs/architecture.md` gains the missing `clispec.zig` row while correcting the `relIsCluster` location it named. No behavior change.
 
 ## [0.21.0] - 2026-10-15
 

@@ -29,6 +29,13 @@ command -v sudo >/dev/null 2>&1 || {
     exit 1
 }
 
+# Version of the system libfuse3-dev the host build compiles against. On
+# ubuntu-24.04 (the CI runner) this is the noble archive's 3.14.0-5build1 --
+# the same build the vendored arm64 .debs carry. It is the only system
+# dependency that floats with the distro, so the pin lives here, not in a
+# workflow, and the install below refuses to proceed against any other.
+FUSE_DEV_VERSION="3.14.0-5build1"
+
 # Put DEBIAN_FRONTEND on the sudo command line: sudo resets the environment
 # by default, so a step-level export never reaches apt and a tzdata/needrestart
 # prompt would hang the job until timeout.
@@ -36,7 +43,7 @@ apt_cmd=(sudo -n env DEBIAN_FRONTEND=noninteractive apt-get)
 
 ok=0
 for attempt in 1 2 3; do
-    if "${apt_cmd[@]}" update && "${apt_cmd[@]}" install -y --no-install-recommends libfuse3-dev; then
+    if "${apt_cmd[@]}" update && "${apt_cmd[@]}" install -y --no-install-recommends "libfuse3-dev=${FUSE_DEV_VERSION}"; then
         ok=1
         break
     fi
@@ -44,6 +51,15 @@ for attempt in 1 2 3; do
     sleep $((attempt * 5))
 done
 if [[ "${ok}" -ne 1 ]]; then
-    echo "FAIL: could not install libfuse3-dev after 3 attempts" >&2
+    echo "FAIL: could not install libfuse3-dev=${FUSE_DEV_VERSION} after 3 attempts" >&2
+    exit 1
+fi
+
+# A pinned install can still resolve to a different build if the archive's
+# version string moves; verify what landed, so a drifted mirror surfaces
+# here instead of as a binary built against headers nobody reviewed.
+installed="$(dpkg-query -W -f='${Version}' libfuse3-dev 2>/dev/null || true)"
+if [[ "${installed}" != "${FUSE_DEV_VERSION}" ]]; then
+    echo "FAIL: libfuse3-dev ${installed:-missing} does not match pinned ${FUSE_DEV_VERSION}" >&2
     exit 1
 fi

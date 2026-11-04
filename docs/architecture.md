@@ -110,7 +110,9 @@ gains a second, uninjected entrance.
 `@cImport` is deprecated in Zig 0.16, so C declarations are translated once from `src/c.h` by
 `build.zig` (musl targets translate `src/c_musl.h`, which includes `c.h` after working around
 translate-c's musl timespec demotion, with `src/c-musl-shim/` first on the include path);
-`c.zig` re-exports that module and every other module goes through it.
+`c.zig` re-exports that module and every other module goes through it. The vendored libfuse3
+for `-Dfuse-static` builds carries `-D_FORTIFY_SOURCE=2` in `fuse_static_cflags`, so the
+static single-file binaries get fortify buffer-overflow checks in ReleaseFast.
 
 One libfuse struct is still reached by hand: `fuse_file_info` carries bitfields, so
 translate-c renders it opaque and `fuse_fs.zig` reads its head by offset (`flags` at 0, the
