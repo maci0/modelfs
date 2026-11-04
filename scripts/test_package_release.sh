@@ -38,12 +38,19 @@ cp "${DIST}/SHA256SUMS" "${SCRATCH_DIR}/package-release-test/sums1"
 cmp -s "${SCRATCH_DIR}/package-release-test/sums1" "${DIST}/SHA256SUMS" \
     || fail "a rerun produced different digests than the first run"
 
-for asset in modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl modelfs-aarch64-linux-gnu modelfs-licenses.tar.gz; do
+for asset in modelfs-x86_64-linux-musl modelfs-aarch64-linux-musl modelfs-aarch64-linux-gnu modelfs-licenses.tar.gz sbom.cdx.json; do
     [[ -f "${DIST}/${asset}" ]] || fail "rerun left ${asset} missing"
-    [[ -x "${DIST}/${asset}" ]] || [[ "${asset}" == "modelfs-licenses.tar.gz" ]] \
+    [[ -x "${DIST}/${asset}" ]] || [[ "${asset}" == "modelfs-licenses.tar.gz" || "${asset}" == "sbom.cdx.json" ]] \
         || fail "rerun left ${asset} without the executable bit"
 done
 [[ ! -d "${DIST}/rel-sparks" ]] || fail "rerun left the emptied rel-sparks directory"
+
+# The shipped inventory is the tracked one, byte for byte: a copy that drifted
+# from sbom.cdx.json would ship dependencies the gate never verified.
+cmp -s "${ROOT_DIR}/sbom.cdx.json" "${DIST}/sbom.cdx.json" \
+    || fail "shipped sbom.cdx.json differs from the tracked inventory"
+grep -q '^.*  sbom\.cdx\.json$' "${DIST}/SHA256SUMS" \
+    || fail "SHA256SUMS does not cover sbom.cdx.json"
 
 # The archive's metadata is the whole reason the tarball can be
 # deterministic, and the two runs above share an environment: they would

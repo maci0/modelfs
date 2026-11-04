@@ -8,7 +8,8 @@
 #      steps produce into one directory, giving each binary its release name
 #   2. build modelfs-licenses.tar.gz from the tracked license and NOTICE
 #      files, with normalized archive metadata
-#   3. write SHA256SUMS over every asset, in a fixed order
+#   3. copy sbom.cdx.json into the dist and write SHA256SUMS over every asset,
+#      in a fixed order
 #
 # The tarball is deterministic: entries in the fixed order of the licenses
 # list below, mtime pinned, uid/gid 0, mode 0644, and a gzip stream
@@ -30,8 +31,9 @@ usage() {
 Usage: ./scripts/package_release.sh --dist DIR
 
 Flatten the rel-<target>/ artifact directories into DIR under their release
-names, write DIR/modelfs-licenses.tar.gz with normalized metadata, and
-write DIR/SHA256SUMS over every asset in a fixed order. Deterministic: two
+names, write DIR/modelfs-licenses.tar.gz with normalized metadata, copy
+sbom.cdx.json into DIR, and write DIR/SHA256SUMS over every asset in a fixed
+order. Deterministic: two
 runs over the same inputs produce byte-identical outputs, and a rerun over
 a dist an earlier pass already flattened converges on the same digests
 instead of failing on the moved artifacts.
@@ -112,6 +114,17 @@ tar --format=gnu --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --grou
     --numeric-owner --mode=0644 -cf - "${licenses[@]}" \
     | gzip -n >"${DIST}/modelfs-licenses.tar.gz"
 
+# The CycloneDX inventory of every pinned input the binaries were built
+# against (scripts/sbom.py). Shipping it with the release is what lets a
+# downstream consumer run a vuln scanner over what actually shipped, not
+# just what the repo's main branch carried at some earlier tag.
+[[ -f sbom.cdx.json ]] || fail "sbom.cdx.json is missing; it cannot be shipped with the release"
+if [[ -f "${DIST}/sbom.cdx.json" ]]; then
+    cmp -s sbom.cdx.json "${DIST}/sbom.cdx.json" || fail "dist sbom.cdx.json differs from the tracked inventory"
+else
+    cp sbom.cdx.json "${DIST}/sbom.cdx.json"
+fi
+
 # Written fresh so a leftover file from an earlier layout cannot leave a
 # stale digest line in the published list. LC_ALL=C is exported above: the
 # glob expands in collation order, and a locale-dependent order would make
@@ -119,9 +132,9 @@ tar --format=gnu --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --grou
 rm -f "${DIST}/SHA256SUMS"
 (
     cd "${DIST}"
-    # Includes modelfs-licenses.tar.gz, so the lines name exactly the
-    # assets a downloader sees.
-    sha256sum modelfs-*
+    # Includes modelfs-licenses.tar.gz and sbom.cdx.json, so the lines name
+    # exactly the assets a downloader sees.
+    sha256sum modelfs-* sbom.cdx.json
 ) >"${DIST}/SHA256SUMS"
 cat "${DIST}/SHA256SUMS"
 # upload-artifact does not promise to preserve the executable bit, so set it

@@ -6,9 +6,19 @@
 # .github/workflows and .github/actions, so a merged bump fails
 # `sbom.py --check` until sbom.cdx.json is regenerated: a rotated action pin
 # is a recorded change, not a silent one.
+#
+# The Python gate tooling (ruff, mypy) is pinned exactly in pyproject.toml
+# and locked with sha256 hashes in uv.lock; a stale or vulnerable pin ages
+# the same way a workflow pin does. Dependabot proposes the bump as a
+# reviewable PR; merging it still needs `uv lock` and a regenerated
+# sbom.cdx.json, the same recorded-change rule as an action bump.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: weekly
