@@ -28,7 +28,7 @@ target-version = "py312"
 # Same pin as [dependency-groups] and uv.lock: a bare ruff outside the
 # pinned venv with different semantics must refuse to run instead of
 # silently disagreeing with the CI gate.
-required-version = "==0.16.4"
+required-version = "==0.17.3"
 
 [tool.ruff.lint]
 # Every group, including preview: a new prefix that lands in the pinned
