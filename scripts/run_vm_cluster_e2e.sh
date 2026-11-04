@@ -270,7 +270,7 @@ if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/
     echo "Error: could not fetch zig ${zig_ver} into the NFS VM" >&2
     exit 1
 fi
-build_cmd="cd /home/ubuntu/src && PATH=/home/ubuntu/zig:\$PATH zig build -Doptimize=ReleaseFast"
+build_cmd="cd /home/ubuntu/src && LC_ALL=C TZ=UTC PATH=/home/ubuntu/zig:\$PATH zig build -Doptimize=ReleaseFast"
 if ! ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes "ubuntu@${NFS_IP}" "${build_cmd}"; then
     echo "Error: modelfs build failed inside the NFS VM" >&2
     exit 1

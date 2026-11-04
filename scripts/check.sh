@@ -93,6 +93,27 @@ if [[ "${py_got}" != "${py_need}" ]]; then
     fail "venv python is ${py_got}, want ${py_need} from .python-version; recreate with: uv sync --frozen (see CONTRIBUTING.md)"
 fi
 
+# pyproject.toml duplicates the Python version twice more: mypy's
+# python_version and ruff's target-version. Neither is read from
+# .python-version, so bumping .python-version alone leaves mypy checking
+# the old stdlib and ruff linting for the old grammar while the venv runs
+# the new interpreter. Fail the gate on drift instead of letting the two
+# pins silently disagree.
+mypy_py="$(sed -n 's/^[[:space:]]*python_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${ROOT_DIR}/pyproject.toml")"
+[[ -n "${mypy_py}" && "${mypy_py}" != *$'\n'* ]] \
+    || fail "cannot read mypy python_version from pyproject.toml"
+if [[ "${mypy_py}" != "${py_need}" ]]; then
+    fail "pyproject.toml mypy python_version is ${mypy_py}, want ${py_need} from .python-version"
+fi
+ruff_target="$(sed -n 's/^[[:space:]]*target-version[[:space:]]*=[[:space:]]*"py\([^"]*\)".*/\1/p' "${ROOT_DIR}/pyproject.toml")"
+[[ -n "${ruff_target}" && "${ruff_target}" != *$'\n'* ]] \
+    || fail "cannot read ruff target-version from pyproject.toml"
+# ruff spells the series without the dot (py312 for 3.12).
+ruff_need="${py_need//./}"
+if [[ "${ruff_target}" != "${ruff_need}" ]]; then
+    fail "pyproject.toml ruff target-version is py${ruff_target}, want py${ruff_need} from .python-version"
+fi
+
 # Name every missing tool at once instead of dying mid-gate on a bare
 # "command not found"; CONTRIBUTING.md documents where each comes from.
 missing=""

@@ -3,6 +3,8 @@
 # match SHA256SUMS, a previous extract's leftover files must not survive,
 # and the header/library layout scripts/cross_aarch64.sh consumes must exist.
 set -euo pipefail
+export LC_ALL=C
+export TZ=UTC
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
