@@ -3,7 +3,8 @@
 # which is how a step could be added to one job's gate and not the other.
 #
 # The checkout and the Zig toolchain come from the steps the
-# job runs first. Run steps need an explicit `shell`: a composite action has
+# job runs first (actions/checkout + mlugg/setup-zig, pinned in the workflow).
+# Run steps need an explicit `shell`: a composite action has
 # no workflow-level default.
 name: setup-gate-tooling
 description: Install the libfuse3 headers and the hash-pinned .venv that scripts/check.sh refuses to run without.

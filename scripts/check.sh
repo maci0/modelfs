@@ -27,7 +27,7 @@ answers --help):
   .venv/bin/ruff format                     apply pinned ruff format
   zig build test                            unit tests
   zig build test -Dtest-filter=relOk        tests whose names contain this substring
-  zig build test --watch                    rebuild and re-run on change
+  zig build test --watch                    rebuild and re-run on change (exits non-zero on first failure)
   zig build check                           this script
   zig build ci / ./scripts/ci.sh            every CI job (this, aarch64 cross, static, repro)
   ./scripts/cross_aarch64.sh                aarch64 ReleaseFast (extracts vendored libfuse3)

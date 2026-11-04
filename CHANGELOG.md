@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed - 2026-11-04
+- **`require_zig` names the version a missing toolchain needs.** A fresh clone whose `PATH` had no `zig` died with "zig not found -- see CONTRIBUTING.md" without the pinned version the error was about, and a wrong-version toolchain's diagnostic gained no install pointer. `require_zig` in `scripts/lib.sh` now reads `minimum_zig_version` first and names it (and the CONTRIBUTING setup section) in both failures, and CONTRIBUTING's setup gains the one line the contributor actually needs: Zig is installed from ziglang.org at exactly that version, not from a package manager. No version or gate behavior changes.
+
 ## [0.22.0] - 2026-11-04
 
 ### Build - 2026-11-04

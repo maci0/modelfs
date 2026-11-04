@@ -27,7 +27,12 @@ Also needed from the package manager: libfuse3 headers (`libfuse3-dev` /
 `fuse3-devel`). The gate also extracts the vendored arm64
 packages on every host: install `dpkg-deb` (the `dpkg` package), or `binutils`
 (for `ar`), `tar`, and `zstd`. GNU tar's `--zstd` flag still requires the
-`zstd` executable. Then:
+`zstd` executable.
+
+Zig itself is not packaged here: install exactly `minimum_zig_version` from
+[build.zig.zon](build.zig.zon) (0.16.0) from https://ziglang.org/download/ and
+put it on `PATH`; `require_zig` in [scripts/lib.sh](scripts/lib.sh) rejects any
+other version by name. Then:
 
 ```bash
 uv sync --frozen
@@ -91,10 +96,12 @@ zig build fmt                          # apply zig fmt (check.sh only --checks)
 Unit tests live next to the code they cover in `src/*.zig`. A new module's
 tests only run once that file is imported from [src/root.zig](src/root.zig).
 The filter matches test *names*, not file names: Zig collects tests from the
-whole import graph, so `-Dtest-filter=store` would miss most of `store.zig`.
-`zig build test` also links the shipped `modelfs` ELF and fails unless it is
+whole import graph, so a filter only catches tests whose names contain it
+(`-Dtest-filter=relOk` catches the `relOk` tests; a module name alone would
+miss most of that module's tests). `zig build test` also links the shipped
+`modelfs` ELF and fails unless it is
 a PIE with full RELRO, BIND_NOW, a non-executable stack, and no
-DT_RPATH/DT_RUNPATH.
+DT_RPATH/DT_RUNPATH. `--watch` exits non-zero on the first failure.
 
 ## End-to-end suites
 

@@ -124,19 +124,19 @@ ZIG_TARBALL_SHA256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba
 # Named preflight for scripts that invoke `zig build`: a missing toolchain
 # otherwise dies as bash "command not found" with no pointer at setup.
 require_zig() {
-    if ! command -v zig >/dev/null 2>&1; then
-        echo "cannot run: zig not found on PATH -- see CONTRIBUTING.md (setup section)" >&2
-        exit 1
-    fi
     local min_zig zig_ver
     min_zig="$(sed -n 's/^[[:space:]]*\.minimum_zig_version *= *"\([^"]*\)".*/\1/p' "${ROOT_DIR}/build.zig.zon")"
     if [[ -z "${min_zig}" ]]; then
-        echo "cannot read minimum_zig_version from build.zig.zon" >&2
+        echo "cannot run: cannot read minimum_zig_version from build.zig.zon" >&2
+        exit 1
+    fi
+    if ! command -v zig >/dev/null 2>&1; then
+        echo "cannot run: zig not found on PATH (need ${min_zig} from build.zig.zon; see CONTRIBUTING.md setup for install)" >&2
         exit 1
     fi
     zig_ver="$(zig version)"
     if [[ "${zig_ver}" != "${min_zig}" ]]; then
-        echo "cannot run: zig ${zig_ver} does not match minimum_zig_version ${min_zig} in build.zig.zon" >&2
+        echo "cannot run: zig ${zig_ver} does not match minimum_zig_version ${min_zig} in build.zig.zon (install ${min_zig}; see CONTRIBUTING.md setup)" >&2
         exit 1
     fi
 }
