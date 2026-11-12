@@ -1263,12 +1263,22 @@ fn serveHydrated(
     span: piece.Span,
     file_size: u64,
     ready: bool,
+    now_sec: i64,
 ) isize {
     std.debug.assert(span.len == buf.len);
     const rc = if (ready) 0 else ensureRange(st, file, span, file_size);
     if (rc == 0) {
         var cache_hit = false;
-        const got = st.store.readServed(file, buf, span.off, sys.monoSec(st.io), &cache_hit);
+        // mf_read leaves file.mu held only on the warm path, where the size
+        // sample and the bit check already ran under it. The miss path
+        // unlocked before ensureRange, so it takes the lock here.
+        // Warm path already holds xfer (mf_read's beginXfer) and file.mu, so
+        // it uses the claimed-free pread. The miss path arrives unlocked and
+        // unclaimed; readServed takes both.
+        const got = if (ready)
+            st.store.readServedHeld(file, buf, span.off, now_sec, &cache_hit)
+        else
+            st.store.readServed(file, buf, span.off, now_sec, &cache_hit);
         if (ready and cache_hit) _ = st.store.stats.reads_warm.fetchAdd(1, .monotonic);
         return got;
     }
@@ -1369,8 +1379,15 @@ fn mf_read(path: [*c]const u8, buf: [*c]u8, size: usize, off: fuse.off_t, fi: ?*
     }
     const n = @min(want, @as(usize, @intCast(fsize - uoff)));
     const ready = store_mod.Store.rangeFilled(file, .{ .off = uoff, .len = @as(u64, n) }, fsize, st.store.piece_size);
-    file.mu.unlock(st.io);
-    const got = serveHydrated(st, file, rel, buf[0..n], .{ .off = uoff, .len = n }, fsize, ready);
+    // ready keeps the held lock: serveHydrated's cache pread reuses it
+    // (readServedHeld). A miss drops it before ensureRange, which takes
+    // the lock itself per fill.
+    if (!ready) file.mu.unlock(st.io);
+    // Warm path reuses rd_t0's seconds (already written to last_access above).
+    // A miss that hydrated for seconds must not stamp that stale instant: the
+    // piece just filled would look idle and a cull could hole it.
+    const served_sec: i64 = if (ready) @intCast(@divTrunc(rd_t0, std.time.ns_per_s)) else sys.monoSec(st.io);
+    const got = serveHydrated(st, file, rel, buf[0..n], .{ .off = uoff, .len = n }, fsize, ready, served_sec);
     if (got < 0) {
         // The failing tier kept its own fill_err_* count; the op-level
         // counter must still see the read fail, or error-rate alerts keying
@@ -4489,7 +4506,7 @@ test "serveHydrated falls back to origin when the cache cannot land a fill" {
     defer std.testing.log_level = prev_log_level;
 
     var rb: [16]u8 = undefined;
-    const n = serveHydrated(&st, file, "fb.bin", &rb, .{ .off = 0, .len = rb.len }, pattern.len, false);
+    const n = serveHydrated(&st, file, "fb.bin", &rb, .{ .off = 0, .len = rb.len }, pattern.len, false, sys.monoSec(st.io));
     try std.testing.expectEqual(@as(isize, @intCast(pattern.len)), n);
     try std.testing.expectEqualStrings(pattern, rb[0..pattern.len]);
     try std.testing.expect(!st.store.hasPiece(file, 0, sys.monoSec(st.io)));

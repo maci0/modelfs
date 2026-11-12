@@ -666,7 +666,10 @@ overlapping range is unmarked so readers refill from the origin.
   mark a torn piece filled.
 * `mf_read` holds `xfer` from the size sample through the cache pread, so a cull cannot hole a
   piece between the bit check and the pread, including while a straddling read hydrates the next
-  piece past the 10 s recency window.
+  piece past the 10 s recency window. On a warm hit that same `file.mu` window resolves the cache
+  fd (`Store.readServedHeld`); the lock is dropped before the pread, and the pread does not take
+  a second `xfer` claim or a second `file.mu` trip. A miss unlocks before `ensureRange`, which
+  takes the lock itself per fill.
 * `Store.punchPiece` takes the same content lock as the copy, so a cull cannot hole a piece
   between the write-through pwrite and its mark.
 * `Store.truncateCacheFd` refuses to cut a live cache descriptor while a peer `/data` send

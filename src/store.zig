@@ -1963,9 +1963,30 @@ pub const Store = struct {
         _ = file.xfer.fetchAdd(1, .monotonic);
         defer _ = file.xfer.fetchSub(1, .monotonic);
         const fd = self.openCache(file);
+        return preadCacheFd(file, fd, buf, off, now_sec);
+    }
+
+    /// pread of a cache fd the caller already resolved. Caller holds `xfer`
+    /// (mf_read's beginXfer, or readCache's own claim) and does NOT hold
+    /// file.mu: the open and the recency stamp happened under that lock, and
+    /// this runs after it was released so the pread never pins the entry
+    /// lock across NVMe latency. A negative fd is returned unchanged.
+    fn preadCacheFd(file: *Cached, fd: i32, buf: []u8, off: u64, now_sec: i64) isize {
         if (fd < 0) return fd;
         file.last_access.store(now_sec, .monotonic);
         return sys.preadAll(fd, buf, off);
+    }
+
+    /// preadCacheFd plus the xfer claim for callers that arrive without one
+    /// (readServed's bare callers: the store tests, streamRange's fallback).
+    /// mf_read's warm path calls preadCacheFd directly: it already holds the
+    /// claim from beginXfer, and a second fetchAdd/fetchSub per warm read is
+    /// the cost this split removes.
+    fn preadClaimed(self: *Store, file: *Cached, fd: i32, buf: []u8, off: u64, now_sec: i64) isize {
+        _ = self;
+        _ = file.xfer.fetchAdd(1, .monotonic);
+        defer _ = file.xfer.fetchSub(1, .monotonic);
+        return preadCacheFd(file, fd, buf, off, now_sec);
     }
 
     /// Serves one read range from the cache copy, falling back to the
@@ -1980,10 +2001,29 @@ pub const Store = struct {
     /// returns hole zeros as a successful read, so those ranges go to origin
     /// without touching the cache fd.
     pub fn readServed(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64, cache_hit: ?*bool) isize {
-        if (cache_hit) |hit| hit.* = false;
         file.mu.lockUncancelable(self.io);
+        return self.readServedLocked(file, buf, off, now_sec, cache_hit, true);
+    }
+
+    /// Like readServed, but the caller already holds file.mu (mf_read sampled
+    /// size and bits under it) and `xfer` (mf_read's beginXfer). Releases the
+    /// lock before any pread or origin open. The pread takes no second xfer
+    /// claim: the caller's covers the hole-under-pread window.
+    pub fn readServedHeld(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64, cache_hit: ?*bool) isize {
+        return self.readServedLocked(file, buf, off, now_sec, cache_hit, false);
+    }
+
+    /// `claim` adds readServed's own xfer bump. False only for readServedHeld,
+    /// whose caller already holds one.
+    fn readServedLocked(self: *Store, file: *Cached, buf: []u8, off: u64, now_sec: i64, cache_hit: ?*bool, claim: bool) isize {
+        if (cache_hit) |hit| hit.* = false;
         const fsize = file.size;
         const dead = file.dead.load(.acquire);
+        // Resolve the fd in the same window as the size sample: the warm
+        // path (mf_read) already holds this lock, so a cached file with an
+        // open fd pays no second lock trip. Released before the pread so the
+        // entry lock is never held across NVMe latency.
+        const fd: i32 = if (dead) -1 else self.openCacheUnlocked(file);
         file.mu.unlock(self.io);
         // A forget (unlink, rename-over) that raced the hydration left the
         // entry dead: pieces this span was supposed to hydrate are sparse
@@ -1993,7 +2033,10 @@ pub const Store = struct {
         if (dead) return self.originPread(file.rel, buf, off);
         if (!piece.rangeTracked(.{ .off = off, .len = buf.len }, fsize, self.piece_size))
             return self.originPread(file.rel, buf, off);
-        const n = self.readCache(file, buf, off, now_sec);
+        const n = if (claim)
+            self.preadClaimed(file, fd, buf, off, now_sec)
+        else
+            preadCacheFd(file, fd, buf, off, now_sec);
         if (n >= 0) {
             if (cache_hit) |hit| hit.* = true;
             return n;
