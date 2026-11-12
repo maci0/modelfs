@@ -1959,12 +1959,15 @@ fn discLoop(st: *State) void {
     }
 }
 
-/// Mean of `total` time in `unit` ticks per op. Divides by the unit first so
-/// `count * unit` cannot overflow u64 (debug panic / wrapped average).
+/// Mean of `total` time in `unit` ticks per op. Widens before dividing so
+/// `count * unit` cannot overflow u64 (debug panic / wrapped average) and so
+/// the quotient is the true integer mean: dividing by `unit` first truncates
+/// every average below one displayed unit to 0, so a read averaging 1500 ns
+/// published `rd_us=0` while status.json's raw counter showed the latency.
 /// Equivalent to `total / (count * unit)` for positive integers.
 fn meanPerOp(total: u64, count: u64, unit: u64) u64 {
     if (count == 0 or unit == 0) return 0;
-    return @divTrunc(@divTrunc(total, unit), count);
+    return @intCast(@divTrunc(@as(u128, total), @as(u128, count) * @as(u128, unit)));
 }
 
 /// One summary line per discovery tick, and only when some counter moved:
@@ -4173,6 +4176,11 @@ test "meanPerOp does not overflow the per-op divisor" {
     try std.testing.expectEqual(@as(u64, 1), meanPerOp(2500, 2, 1000));
     try std.testing.expectEqual(@as(u64, 0), meanPerOp(100, 0, 1000));
     try std.testing.expectEqual(@as(u64, 0), meanPerOp(100, 1, 0));
+    // 1500 ns per op is 0 us when the unit divides first (1500/1000 = 1,
+    // then 1/4 = 0) and 1 us as one division. The tick's rd_us must not
+    // read as idle while reads are taking microseconds.
+    try std.testing.expectEqual(@as(u64, 1), meanPerOp(1500 * 4, 4, std.time.ns_per_us));
+    try std.testing.expectEqual(@as(u64, 0), meanPerOp(499, 1, std.time.ns_per_us));
 }
 
 test "logStatsTick summarizes deltas and stays silent when idle" {

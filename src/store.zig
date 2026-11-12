@@ -2484,7 +2484,7 @@ pub const Store = struct {
         var z: [sys.c.PATH_MAX]u8 = undefined;
         const p = sys.toZ(&z, self.cache) catch return null;
         if (sys.statfsPath(p, &vs) != 0) return null;
-        return cull.freePercent(@as(u64, vs.f_bavail), @as(u64, vs.f_blocks));
+        return cull.freePercent(sys.fsCount(vs.f_bavail), sys.fsCount(vs.f_blocks));
     }
 
     /// Punches piece idx when it may be culled at instant `now_sec`. The

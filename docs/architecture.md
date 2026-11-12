@@ -435,7 +435,10 @@ of a conversation parse only the status line.
 
 Like cachefilesd, on **percent free** of the filesystem that holds `/var/cache/modelfs` (here
 the 3.6T root): unprivileged available blocks (`statfs.f_bavail` via `cull.freePercent`), not
-root-reserved `f_bfree`.
+root-reserved `f_bfree`. `freePercentChecked` reads both counters through `sys.fsCount`:
+glibc types them as signed `__fsword_t`, and a direct unsigned cast would read a count
+past 2^63 as a huge value, so one free block on a filesystem larger than 8 EiB would
+report about 100% free and culling would never start.
 
 | flag | default | meaning |
 |---|---|---|
@@ -991,7 +994,7 @@ The tick line carries the only latency signal there is:
 
 | Field | Meaning |
 |---|---|
-| `rd_us` / `wr_us` | average wall time of a FUSE read/write over the interval, using `reads_completed` / `writes_completed`. These count every timed handler, including caller errors excluded from the service-health outcome counters. Null-buffer requests are neither timed nor counted |
+| `rd_us` / `wr_us` | average wall time of a FUSE read/write over the interval, using `reads_completed` / `writes_completed`, computed by `meanPerOp` as one widened division (`total / (count * unit)`). Dividing by the unit first would publish 0 for any average below one displayed unit. These count every timed handler, including caller errors excluded from the service-health outcome counters. Null-buffer requests are neither timed nor counted |
 | `fsync_us` | average origin fsync/fdatasync time for FUSE requests, including failed attempts, over `fsync_completed`. Published cumulatively as `fsync_nanos` and `fsync_completed` in status.json. Path-policy rejections are neither timed nor counted |
 | `http_us` | average `/have`+`/data` handler time, over `http_completed`. Includes misses, invalid ranges, failures, and interrupted sends. `/ping` and requests rejected before entering a handler are neither timed nor counted |
 | `fill_ms peer/nfs` | average per-piece hydration stall by tier. A miss blocks the reader for one whole piece, so this is how "reads got slow" is diagnosed from the journal |

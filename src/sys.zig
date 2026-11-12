@@ -436,6 +436,33 @@ pub fn sizeFromStatSaturating(st_size: c.off_t) u64 {
     return sizeFromStat(st_size) orelse 0;
 }
 
+/// One `statfs` block or inode counter as an unsigned count. glibc types
+/// `f_blocks`/`f_bavail`/`f_files` as signed `__fsword_t` (`__FSWORD_T_TYPE`
+/// is `__SWORD_TYPE` on x86_64), so `@as(u64, vs.f_bavail)` reinterprets a
+/// count past 2^63 as a huge unsigned value. A 9 EiB filesystem with one
+/// free block then reads as ~100% free and culling never starts. The bits
+/// are reinterpreted, not clamped: i64 -1 is a full u64, which freePercent
+/// already clamps to 100. musl types the same fields unsigned, where the
+/// conversion is a no-op.
+pub fn fsCount(v: anytype) u64 {
+    const T = @TypeOf(v);
+    const info = switch (@typeInfo(T)) {
+        .int => |i| i,
+        else => @compileError("fsCount expects an integer statfs counter"),
+    };
+    // 64 bits is the width glibc's __fsword_t and musl's unsigned counters
+    // both have under _FILE_OFFSET_BITS=64 on LP64. A narrower signed type
+    // would need its own bit width here: widening it first sign-extends.
+    if (info.bits != 64) @compileError("fsCount expects a 64-bit statfs counter");
+    return switch (info.signedness) {
+        .unsigned => v,
+        // A negative value is the two's-complement reading of a counter past
+        // 2^63, not a count below zero. @as(u64, v) sign-extends that into a
+        // near-full u64; the bits are the count.
+        .signed => @as(u64, @bitCast(v)),
+    };
+}
+
 /// Kernel file offsets are signed. A u64 that does not fit must not become
 /// a truncated (often negative) off_t: that would pread/pwrite/ftruncate
 /// at the wrong address instead of failing the op.
@@ -1517,6 +1544,22 @@ test "readFile NoFollow refuses a planted symlink that the following form would 
     try std.testing.expectEqual(@as(i32, c.ELOOP), buf_errno);
     // The planted target keeps its bytes.
     try std.testing.expectEqualStrings("s3cret", try readFileBuf(&rbuf, target_z));
+}
+
+test "fsCount reads a signed statfs counter past 2^63 as unsigned" {
+    // glibc's __fsword_t is signed: a block count of 2^63 + 1 arrives
+    // negative, and @as(u64, v) would publish 2^64 - (2^63 - 1). One free
+    // block on that filesystem must stay 1, not a near-full u64.
+    const signed: i64 = -9223372036854775807;
+    try std.testing.expectEqual(@as(u64, 9223372036854775809), fsCount(signed));
+    try std.testing.expectEqual(@as(u64, 7), fsCount(@as(i64, 7)));
+    try std.testing.expectEqual(@as(u64, 0), fsCount(@as(i64, 0)));
+    // musl types the same fields unsigned; the cast must not change them.
+    try std.testing.expectEqual(@as(u64, 9223372036854775809), fsCount(@as(u64, 9223372036854775809)));
+    // i64 -1 is the bit pattern of u64 max: a counter of every block
+    // available, which freePercent clamps to 100. Zeroing it would report
+    // a full filesystem as empty and cull it.
+    try std.testing.expectEqual(std.math.maxInt(u64), fsCount(@as(i64, -1)));
 }
 
 test "chmod statfs and opendir NoFollow refuse a planted symlink" {
