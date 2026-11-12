@@ -1134,19 +1134,26 @@ echo "not-a-stamp tank/ai@x ok" >"${TEMP}/bad-stamp.log"
 expect_check "non-UTC stamp is an alarm" 1 "no drill record" \
     MF_DRILL_LOG="${TEMP}/bad-stamp.log"
 
-FUTURE_STAMP="$(date -u -d "+2 hours" +%Y-%m-%dT%H:%M:%SZ)"
+# Epoch seconds, not `date -d '+2 hours'`. A leading sign is a zone offset
+# (`+2` is UTC+02), so under a non-UTC TZ the "future" stamp lands in the
+# past and the alarm never fires. A relative item (`now - 40 days`) is
+# calendar arithmetic in the host zone and `date` rejects it outright when
+# the result falls in a spring-forward gap (America/New_York 2026-03-08
+# 02:00-03:00 never exists). @epoch is one UTC instant in every zone.
+NOW_EPOCH="$(date -u +%s)"
+FUTURE_STAMP="$(date -u -d "@$((NOW_EPOCH + 2 * 3600))" +%Y-%m-%dT%H:%M:%SZ)"
 echo "${FUTURE_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/future-drill.log"
 expect_check "future drill log stamp is an alarm" 1 "in the future" \
     MF_DRILL_LOG="${TEMP}/future-drill.log"
 
-STALE_STAMP="$(date -u -d "-40 days" +%Y-%m-%dT%H:%M:%SZ)"
+STALE_STAMP="$(date -u -d "@$((NOW_EPOCH - 40 * 86400))" +%Y-%m-%dT%H:%M:%SZ)"
 echo "${STALE_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/stale-drill.log"
 expect_check "stale drill log is an alarm" 1 "has not succeeded recently" \
     MF_DRILL_LOG="${TEMP}/stale-drill.log"
 
-FRESH_STAMP="$(date -u -d "-1 hour" +%Y-%m-%dT%H:%M:%SZ)"
+FRESH_STAMP="$(date -u -d "@$((NOW_EPOCH - 3600))" +%Y-%m-%dT%H:%M:%SZ)"
 echo "${FRESH_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/fresh-drill.log"
 expect_check "fresh drill log is ok" 0 "drill-log OK" \
@@ -1181,7 +1188,7 @@ expect_check "bad MF_DRILL_LOG_MAX_AGE is an alarm" 1 "whole number of seconds" 
 # Leading zeros are decimal seconds, not octal. 08 used to abort inside
 # [[ -gt ]] ("value too great for base"). 0120 octal is 80, so a 90s-old
 # log would fail that limit; decimal 120 keeps it fresh.
-NINETY_STAMP="$(date -u -d "-90 seconds" +%Y-%m-%dT%H:%M:%SZ)"
+NINETY_STAMP="$(date -u -d "@$((NOW_EPOCH - 90))" +%Y-%m-%dT%H:%M:%SZ)"
 echo "${NINETY_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked" \
     >"${TEMP}/ninety-drill.log"
 expect_check "padded MF_DRILL_LOG_MAX_AGE=08 is decimal not an octal abort" 1 "has not succeeded recently" \
