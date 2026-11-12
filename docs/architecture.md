@@ -165,7 +165,10 @@ FUSE can replay an operation whose reply was lost, so the destructive ones are i
 
 `unlink` and `rename` (`Store.renameOrigin`) also drop cache identity through `Store.forget`,
 including when the origin name is already gone, so a replayed request cannot leave a sidecar
-that a same-size recreate would then serve as the new file. Unlinking a file another process
+that a same-size recreate would then serve as the new file. A replayed rename whose source is
+gone converges to success only when the destination exists and the call did not ask
+`RENAME_NOREPLACE`: with that flag a destination that exists is the collision being refused, and
+reporting success would claim a move that never happened. Unlinking a file another process
 still has open removes it: there is no `.fuse_hiddenNNNN` rename, which on a shared origin
 would be visible to every other node and orphaned if this one died.
 

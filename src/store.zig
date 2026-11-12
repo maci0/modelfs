@@ -2140,7 +2140,14 @@ pub const Store = struct {
             // holds the moved file, so only it converges to success;
             // returning ENOENT here makes the retry report failure and
             // risks a client re-creating the old name over a moved file.
-            if (e == -c.ENOENT) {
+            // RENAME_NOREPLACE is the exception: a destination that exists
+            // is exactly the collision the flag refuses, and treating it
+            // as proof the earlier call landed would report success for a
+            // rename that never moved anything (a replay of a refused
+            // NOREPLACE, or a plain ENOENT racing a file created at the
+            // destination). The kernel replays the same flags, so the
+            // first call's EEXIST already answered that case.
+            if (e == -c.ENOENT and (flags & c.RENAME_NOREPLACE) == 0) {
                 var lst: c.struct_stat = undefined;
                 if (sys.lstatPath(ob, &lst) == 0 and (lst.st_mode & c.S_IFMT) != c.S_IFDIR) return 0;
             }
@@ -5670,6 +5677,14 @@ test "renameOrigin on a retry after origin-only rename still drops cache" {
     try std.testing.expectEqual(@as(i32, 0), st.renameOrigin("c.bin", "d.bin", 0));
     // A genuinely missing source with no destination stays ENOENT.
     try std.testing.expectEqual(@as(i32, -c.ENOENT), st.renameOrigin("missing.bin", "also-missing.bin", 0));
+    // RENAME_NOREPLACE stays a refusal when the source is gone and an
+    // unrelated file already occupies the destination: that file's
+    // existence is the collision, not proof an earlier rename landed.
+    // Reporting success here would tell the caller the move happened
+    // while both names keep what they had.
+    try std.testing.expectEqual(@as(i32, 0), sys.writeFile(try st.originPath(&oa, "kept.bin"), "KEEP"));
+    try std.testing.expectEqual(@as(i32, -c.ENOENT), st.renameOrigin("missing.bin", "kept.bin", c.RENAME_NOREPLACE));
+    try std.testing.expectEqual(@as(i32, 0), sys.lstatPath(try st.originPath(&oa, "kept.bin"), &stbuf));
     try std.testing.expect(sys.statPath(try st.originPath(&oa, "c.bin"), &stbuf) != 0);
     try std.testing.expect(sys.statPath(try st.originPath(&obuf, "d.bin"), &stbuf) == 0);
     try std.testing.expect(sys.statPath(try st.cacheMetaPath(&ma, "c.bin"), &stbuf) != 0);
