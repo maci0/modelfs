@@ -401,7 +401,10 @@ The long-lived networked image is hardened at build time: a PIE (`exe.pie`) comp
 (`exe_mod.pic`) with stack canaries and stack probes in every optimize mode (`stack_protector`,
 `stack_check`, on both the executable and test modules). RELRO, BIND_NOW, a non-executable
 stack, and the absence of DT_RPATH/DT_RUNPATH are pinned and checked on the linked ELF
-(`checkHardenedElf` in build.zig, run from `zig build` and `zig build test`). `each_lib_rpath`
+(`checkHardenedElf` in build.zig, run from `zig build` and `zig build test`). The static
+release binaries are checked by `assert_static_elf` (`scripts/lib.sh`, called from
+`scripts/build_static.sh`), which reads the same PT_GNU_STACK and refuses one whose flags
+carry PF_X or one that is missing. `each_lib_rpath`
 is off so `-Dfuse-lib` cannot become a runtime search path, build-ids stay `none` so a uuid
 stamp cannot make two builds disagree, and non-Debug builds strip DWARF so `DW_AT_comp_dir`
 cannot leak the build path into a shipped binary.
@@ -666,7 +669,7 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 | Threat | State |
 |---|---|
 | **S** spoofing dependencies | Mitigated: `build.zig.zon` declares zero external package dependencies (`dependencies = .{}`). The only compiled-in external C library is libfuse3. Static release builds vendor static libfuse3 source in `.deps/libfuse3-3.16.2/` and arm64 packages in `.deps/fuse3-arm64/`, both verified against hardcoded `SHA256SUMS` at build time. Host dynamic builds link system libfuse3 (operator provenance concern) |
-| **T** tampering with compiler output | Mitigated by build hardening: PIE (`exe.pie`), PIC (`exe_mod.pic`), stack canaries (`stack_protector`), stack probes on x86/x86_64 (`stack_check`), full RELRO (`link_z_relro`), BIND_NOW, a non-executable stack (`GNU_STACK RW`), and the absence of DT_RPATH/DT_RUNPATH are pinned and checked on the linked ELF (`checkHardenedElf` in build.zig) |
+| **T** tampering with compiler output | Mitigated by build hardening: PIE (`exe.pie`), PIC (`exe_mod.pic`), stack canaries (`stack_protector`), stack probes on x86/x86_64 (`stack_check`), full RELRO (`link_z_relro`), BIND_NOW, a non-executable stack (`GNU_STACK RW`), and the absence of DT_RPATH/DT_RUNPATH are pinned and checked on the linked ELF (`checkHardenedElf` in build.zig). The static release binaries get the same stack check from `assert_static_elf` (`scripts/lib.sh`) |
 | **R** repudiation of build artifacts | Proven reproducible: `scripts/repro_check.sh` proves every shipped recipe (host glibc, both musl static targets, the `aarch64-linux-gnu` spark binary) byte-identical across differently named trees, taking the spark flags from the same `cross_aarch64_flags` helper `scripts/cross_aarch64.sh` builds with. `scripts/package_release.sh` normalizes the license archive's entry order, mtimes, and ownership, and writes the digest list in a fixed order. Build-id is frozen at `none` to prevent UUID divergence |
 | **I** disclosure of build host paths | Mitigated: non-Debug builds strip DWARF (`strip = true`), suppressing host build paths (`DW_AT_comp_dir`). `each_lib_rpath = false` prevents host search paths from leaking into DT_RPATH |
 | **D** build-time resource exhaustion | Bounded: minimal build graph and zero remote dependencies |
@@ -674,7 +677,7 @@ loops, and authenticated requests force per-piece origin reads plus NVMe writes
 
 **Provenance and dependency isolation.** Shipped binaries eliminate supply chain risk by declaring no external Zig package dependencies in `build.zig.zon`. The single required C dependency (libfuse3) is vendored and cryptographically verified against pinned SHA-256 sums prior to compilation (`build.zig`, `scripts/extract_fuse3_arm64.sh`).
 
-**Binary hardening and runtime exploit mitigations.** The executable is compiled with position-independent execution (`pie`), stack protector canaries, and stack probing (on supported x86/x86_64 architectures). The linker enforces full RELRO, immediate binding (`BIND_NOW`), non-executable stack permissions, and strips search paths (RPATH/RUNPATH). All properties are asserted post-link by `checkHardenedElf`.
+**Binary hardening and runtime exploit mitigations.** The executable is compiled with position-independent execution (`pie`), stack protector canaries, and stack probing (on supported x86/x86_64 architectures). The linker enforces full RELRO, immediate binding (`BIND_NOW`), non-executable stack permissions, and strips search paths (RPATH/RUNPATH). `checkHardenedElf` asserts those properties post-link, and `assert_static_elf` asserts the non-executable stack on the static release binaries, which that step never links.
 
 ### B6: CLI to external model hub (Hugging Face API & CDN)
 
@@ -867,7 +870,7 @@ rather than ignore.
 
 | Control | Location | Covers |
 |---|---|---|
-| PIE, PIC, stack canaries, stack probes, full RELRO, BIND_NOW, a non-executable stack, and no DT_RPATH/DT_RUNPATH on the shipped image; DWARF stripped from every non-Debug build; build-id frozen at none | `exe.pie`, `exe_mod.pic`, `stack_protector`, `stack_check`, `link_z_relro`, `each_lib_rpath`, `build_id`, `strip`, and `checkHardenedElf` in build.zig | B5: a fixed-address networked daemon, an uninstrumented ReleaseFast stack, lazy binding, an executable stack, a build-host `-L` baked into the spark image, a random build-id, and a `DW_AT_comp_dir` build-path leak in release binaries |
+| PIE, PIC, stack canaries, stack probes, full RELRO, BIND_NOW, a non-executable stack, and no DT_RPATH/DT_RUNPATH on the shipped image; DWARF stripped from every non-Debug build; build-id frozen at none | `exe.pie`, `exe_mod.pic`, `stack_protector`, `stack_check`, `link_z_relro`, `each_lib_rpath`, `build_id`, `strip`, and `checkHardenedElf` in build.zig; `assert_static_elf` in scripts/lib.sh for the static release binaries | B5: a fixed-address networked daemon, an uninstrumented ReleaseFast stack, lazy binding, an executable stack, a build-host `-L` baked into the spark image, a random build-id, and a `DW_AT_comp_dir` build-path leak in release binaries |
 
 ### Release and binary replacement
 

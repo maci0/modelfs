@@ -20,8 +20,8 @@ Usage: ./scripts/build_static.sh <x86_64-linux-musl|aarch64-linux-musl> [--prefi
 Build a ReleaseFast single-file static binary for one musl target
 (-Dfuse-static compiles the vendored libfuse3 in; see
 .deps/libfuse3-3.16.2/README.md). The ELF is then asserted static
-(no PT_INTERP, no DT_NEEDED), static-PIE, RELRO-protected, and of the
-requested machine. Without --prefix the binary lands at zig-out/bin/modelfs
+(no PT_INTERP, no DT_NEEDED), static-PIE, RELRO-protected, with a
+non-executable PT_GNU_STACK, and of the requested machine. Without --prefix the binary lands at zig-out/bin/modelfs
 (replacing whatever target was built last); --prefix DIR installs to
 DIR/bin/modelfs -- the release workflow always passes it so the two matrix
 legs cannot clobber each other, and a native zig-out/ build survives.

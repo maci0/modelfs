@@ -231,12 +231,13 @@ assert_aarch64_elf() {
 # True when path is a fully static 64-bit little-endian ELF of the given
 # machine ("3e00" = x86-64, "b700" = aarch64): ET_DYN (static-PIE, the
 # release binaries keep ASLR), a program header table with no PT_INTERP, a
-# dynamic table with no DT_NEEDED, and a PT_GNU_RELRO entry. Reads raw
-# header bytes (POSIX od) like assert_aarch64_elf, not file(1) text. Does
-# not rely on set -e (callers use the status in &&/||).
+# dynamic table with no DT_NEEDED, a PT_GNU_RELRO entry, and a PT_GNU_STACK
+# whose flags are RW (non-executable). Reads raw header bytes (POSIX od)
+# like assert_aarch64_elf, not file(1) text. Does not rely on set -e
+# (callers use the status in &&/||).
 assert_static_elf() {
     local bin="$1" machine_want="$2"
-    local ident etype machine phoff phentsize phnum i off ptype saw_relro=0 saw_interp=0 saw_dyn=0 dyn_off dtag
+    local ident etype machine phoff phentsize phnum i off ptype pflags saw_relro=0 saw_interp=0 saw_dyn=0 saw_stack=0 dyn_off dtag
     ident="$(od -An -t x1 -N 6 "${bin}")" || return 1
     ident="$(printf '%s' "${ident}" | tr -d '[:space:]')"
     if [[ "${ident}" != "7f454c460201" ]]; then
@@ -268,16 +269,29 @@ assert_static_elf() {
         case "${ptype}" in
             03000000) saw_interp=1 ;;
             52e57464) saw_relro=1 ;;
+            51e57464)
+                # PT_GNU_STACK. p_flags is the little-endian u32 at +4, so
+                # its low byte, which holds PF_X in bit 0, is the first
+                # byte od prints. An executable stack starts with an odd
+                # nibble; matching the last byte would read the high byte,
+                # which is zero for every real flag combination.
+                saw_stack=1
+                pflags="$(od -An -t x1 -j $(( off + 4 )) -N 1 "${bin}")" || return 1
+                pflags="$(printf '%s' "${pflags}" | tr -d '[:space:]')"
+                case "${pflags}" in
+                    00|02|04|06|08|0a|0c|0e) ;;
+                    *)
+                        echo "executable stack: PT_GNU_STACK flags ${pflags} (want RW, no PF_X): ${bin}" >&2
+                        return 1
+                        ;;
+                esac
+                ;;
             02000000)
                 saw_dyn=1
                 dyn_off="$(od -An -t u8 -j $(( off + 8 )) -N 8 "${bin}")" || return 1
                 dyn_off="${dyn_off//[[:space:]]/}"
                 ;;
-            *)
-                # PT_NULL / PT_LOAD / PT_GNU_STACK / the rest: nothing to
-                # assert on here, the RELRO and INTERP cases above are the
-                # whole check.
-                ;;
+            *) ;;
         esac
     done
     if [[ ${saw_interp} -ne 0 ]]; then
@@ -290,6 +304,10 @@ assert_static_elf() {
     fi
     if [[ ${saw_relro} -eq 0 ]]; then
         echo "static ELF without PT_GNU_RELRO: ${bin}" >&2
+        return 1
+    fi
+    if [[ ${saw_stack} -eq 0 ]]; then
+        echo "static ELF without PT_GNU_STACK: ${bin}" >&2
         return 1
     fi
     # The dynamic table holds 16-byte entries (d_tag, d_val) and ends at

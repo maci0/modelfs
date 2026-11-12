@@ -395,7 +395,11 @@ pub fn build(b: *std.Build) void {
     // interpreter and relocate themselves at entry.
     exe.pie = true;
     // Zig already defaults these on; pin them so a default flip cannot ship
-    // a lazy-binding or partial-RELRO networked image.
+    // a lazy-binding or partial-RELRO networked image. This Zig has no
+    // link_z_noexecstack field, so the non-executable stack is pinned by
+    // the check instead: checkHardenedElf refuses a GNU_STACK that is not
+    // RW, and assert_static_elf (scripts/lib.sh) does the same for the
+    // static release binaries, which this step never sees.
     exe.link_z_relro = true;
     exe.link_z_lazy = false;
     // -Dfuse-lib is a link-time -L search path. Embedding it as DT_RPATH

@@ -114,8 +114,10 @@ gains a second, uninjected entrance.
 `build.zig` (musl targets translate `src/c_musl.h`, which includes `c.h` after working around
 translate-c's musl timespec demotion, with `src/c-musl-shim/` first on the include path);
 `c.zig` re-exports that module and every other module goes through it. The vendored libfuse3
-for `-Dfuse-static` builds carries `-D_FORTIFY_SOURCE=2` in `fuse_static_cflags`, so the
-static single-file binaries get fortify buffer-overflow checks in ReleaseFast.
+for `-Dfuse-static` builds carries `-D_FORTIFY_SOURCE=2` in `fuse_static_cflags`, giving the
+static single-file binaries fortify buffer-overflow checks in ReleaseFast. `assert_static_elf`
+(`scripts/lib.sh`) refuses one whose `PT_GNU_STACK` is missing or executable, the same
+non-executable-stack check `checkHardenedElf` runs on the install step.
 
 One libfuse struct is still reached by hand: `fuse_file_info` carries bitfields, so
 translate-c renders it opaque and `fuse_fs.zig` reads its head by offset (`flags` at 0, the
