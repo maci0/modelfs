@@ -110,8 +110,20 @@ ceiling (`--log`), and the PSK **file path**, never the secret: `--psk-value` is
 document and reads no config, token, or network; its optional command-path argument is matched
 against the command table and refused (`UnknownCommand`) when unknown. The global `-o` /
 `--output` flag (`peelOutput` src/main.zig) is accepted before or after the command and takes
-only `auto`, `text`, or `json`; it changes rendering, not authority, and every output mode
-still passes the same `relOk`/`relIsCluster` gates on paths it prints.
+only `auto`, `text`, or `json`. It changes rendering, not authority: every output mode still
+passes the same `relOk`/`relIsCluster` gates on paths it prints.
+
+JSON mode is also an output channel of its own. When `clispec.errors_as_json` is set (explicit
+`-o json`, or `auto` with stdout off a terminal), `diagKind` (src/main.zig) writes one
+`{"error":{"kind","message","hint"}}` object through `writeErrorJson`, and that object is the
+last line on stderr. `diagUsage` sets `kind` `usage` and exit 2; a non-regular `verify` target
+and a missing `dupes` manifest go through `diagFailed` (`kind` `failed`, exit 1). `verify`,
+`config`, `update`, `mount`, `version`, and `schema` keep their own text (the JSON document, for
+`schema`) whichever way `-o` is set, so a consumer that branches on the error object must not
+expect one from those commands. The message is the human line, cut to the 512-byte stack buffer
+`diagKind` formats into; a line that does not fit becomes the fixed `modelfs: error`, and a
+stringify failure becomes the fixed `failed to encode error` object. The object carries no path,
+no token, and no PSK: the refusal lands before the command body runs.
 
 `--seed HOST[:PORT]` hostnames are DNS-resolved once at mount (`buildSeeds` src/main.zig).
 `modelfs update --reload` (and the automatic handover after a self-update) locates the daemon via
@@ -207,8 +219,11 @@ the store walk and load paths (src/store.zig), the status read (src/main.zig), a
 request (src/handover.zig).
 
 This is on-disk state written by this same process, trusted structurally but not
-cryptographically. `modelfs pin`/`unpin` writes `pin/` with no daemon and no PSK check
-(`cmdPin`); `modelfs verify` rehashes cache bytes against the origin manifest (`cmdVerify`);
+cryptographically. `modelfs pin`/`unpin` writes `pin/` with no daemon and no PSK check, but
+refuses before creating any cache directory when `--origin` and `MODELFS_ORIGIN` are both absent
+(`cmdPin`, exit 2): the relpath is relative to a mount, and a pin with no origin used to land
+under the default cache while the live mount kept culling the file. `modelfs verify` rehashes
+cache bytes against the origin manifest (`cmdVerify`);
 `.cluster` names are refused on pin, verify, and dupes (`relIsCluster`). `update.req` names the
 replacement binary path and a handshake token (0600, O_NOFOLLOW), and anything running as the
 daemon's uid can plant one.
@@ -824,6 +839,12 @@ rather than ignore.
   and `--revision`/`--dest` outside pull (`rejectOutsideCommand`).
 * **Shape.** Positional arity is enforced at parse (exit 2), percentages clamp to 0..100
   (`parsePercent`), and watermark ordering is validated cross-field (`cull.ordered`).
+* **Error channel.** JSON mode makes the refusal the contract rather than a side channel:
+  `diagKind` (src/main.zig) emits exactly one `{"error":...}` object as the last stderr line
+  (`kind` `usage` at exit 2, `kind` `failed` at exit 1), so a parser reading that line gets the
+  refusal instead of human prose. Text mode is unchanged. The object is bounded to a 512-byte
+  message plus two fixed fallback strings, and it holds no secret; the CLI entry point above
+  names which commands emit it.
 * **Paths.** `--origin` must be an existing directory for mount, peers, verify, dupes, and
   pull (`resolveOriginDir`): a regular file realpaths fine but can never hold leases or serve
   joined reads, and `dupes --all` would otherwise exit 0 as an empty scan. Cache and mountpoint
@@ -1146,11 +1167,13 @@ holding the installed binary.
    src/fuse_fs.zig) fights back, but pinned files and active transfers are exempt (`cullOne`
    skip conditions and `punchPiece`'s xfer guard, src/store.zig), so steady pressure raises IO
    load and evicts useful pieces.
-6. **Pin junk against cull, locally.** `modelfs pin <rel>` writes a marker under `cache/pin/`
-   with a `relOk` plus `relIsCluster` check, no PSK and no running daemon (`cmdPin`
-   src/main.zig). Any local uid that can write the cache dir can make attacker-chosen model
-   paths uncullable, compounding case 5. The same is true of planting files directly in `pin/`.
-   `.cluster` names are refused.
+6. **Pin junk against cull, locally.** `modelfs pin <rel> --origin <dir>` writes a marker under
+   `cache/pin/` with a `relOk` plus `relIsCluster` check, no PSK and no running daemon (`cmdPin`
+   src/main.zig). It refuses, exit 2, before any cache directory is created when neither
+   `--origin` nor `MODELFS_ORIGIN` is set, so a pin can no longer land under the default cache
+   for a file the live mount still culls. Any local uid that can write the cache dir and name an
+   origin can still make attacker-chosen model paths uncullable, compounding case 5, and planting
+   files directly in `pin/` needs no origin at all. `.cluster` names are refused.
 7. **Local process image replacement and PSK extraction via Handover.** A compromised local
    process running as the daemon's uid (or as root) writes `<cache>/update.req` naming an
    arbitrary executable path; a different local uid is refused by the request-owner check
