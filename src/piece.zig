@@ -311,10 +311,18 @@ pub const Bitfield = struct {
             // stale sidecar: empty field, caller will refill
             return bf;
         }
-        const want = bytesLen(n);
+        // body_len above is the blob's own geometry. The caller's geometry
+        // can be smaller, and the length check still passes, so the bytes
+        // past this field are not a complete identity trailer. Refuse that
+        // shape: a caller that reads the trailer at 16 + bf.bytes.len (the
+        // sidecar loader) would otherwise decode bit bytes as an identity
+        // and keep the field.
+        if (blob.len != 16 + bf.bytes.len and blob.len != 16 + bf.bytes.len + manifest_identity_len) {
+            bf.deinit(gpa);
+            return error.BadBitfield;
+        }
         const src = blob[16..];
-        const copy = @min(want, src.len);
-        @memcpy(bf.bytes[0..copy], src[0..copy]);
+        @memcpy(bf.bytes, src[0..bf.bytes.len]);
         clearPadBits(bf.bytes, n);
         return bf;
     }
@@ -1005,6 +1013,19 @@ test "bitfield decode rejects truncated bodies and incomplete identity trailers"
         try std.testing.expectError(error.BadBitfield, Bitfield.decode(gpa, buf[0 .. body.len + n], 4096, 40960));
     }
     try std.testing.expectError(error.BadBitfield, Bitfield.decode(gpa, buf[0 .. body.len + manifest_identity_len + 1], 4096, 40960));
+    // A blob whose own geometry is larger than the caller's is a different
+    // length class: its body (here one extra byte, the field for 17 pieces)
+    // is neither the caller's body nor that body plus a full identity
+    // trailer, so it must be refused rather than decoded with the tail
+    // dropped. A loader that then reads an identity at the caller's body
+    // length would take those dropped bit bytes for one.
+    var wider: [64]u8 = @splat(0);
+    @memcpy(wider[0..body.len], body);
+    // 25 pieces at this grid: three body bytes, so body+1 names that blob's
+    // own geometry exactly and only the caller's geometry rejects it.
+    std.mem.writeInt(u64, wider[8..16], 25 * 4096, .little);
+    wider[body.len] = 0x01;
+    try std.testing.expectError(error.BadBitfield, Bitfield.decode(gpa, wider[0 .. body.len + 1], 4096, 40960));
     for ([_]usize{ body.len, body.len + manifest_identity_len }) |n| {
         var decoded = try Bitfield.decode(gpa, buf[0..n], 4096, 40960);
         defer decoded.deinit(gpa);
@@ -1292,9 +1313,15 @@ fn fuzzBitfieldDecodeOne(_: void, smith: *std.testing.Smith) anyerror!void {
         const ps = std.mem.readInt(u32, blob[4..8], .little);
         const fs = std.mem.readInt(u64, blob[8..16], .little);
         if (ps == 0) break :blk false;
-        const n = @min(fs / ps + @intFromBool(fs % ps != 0), std.math.maxInt(u32));
-        const body_len = 16 + (n + 7) / 8;
-        break :blk blob.len == body_len or blob.len == body_len + manifest_identity_len;
+        // Both geometries must name an exact body or an exact body plus one
+        // identity trailer. The blob's own geometry passing is not enough:
+        // a caller-geometry field shorter than the blob's body would leave
+        // a tail that is neither empty nor a full trailer.
+        const recorded_n = @min(fs / ps + @intFromBool(fs % ps != 0), std.math.maxInt(u32));
+        const recorded_body = 16 + (recorded_n + 7) / 8;
+        if (blob.len != recorded_body and blob.len != recorded_body + manifest_identity_len) break :blk false;
+        const caller_body = 16 + (count(geo.fs, geo.ps) + 7) / 8;
+        break :blk blob.len == caller_body or blob.len == caller_body + manifest_identity_len;
     };
     if (!valid) {
         try std.testing.expectError(error.BadBitfield, Bitfield.decode(gpa, blob, geo.ps, geo.fs));

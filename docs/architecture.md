@@ -59,8 +59,11 @@ Every origin open is hostile-tree-safe. The data plane (`originPread` / `originP
 src/store.zig) uses `O_NOFOLLOW`, so a planted symlink is `ELOOP`, and `O_NONBLOCK`, so a FIFO
 at the name cannot hang a FUSE worker. `sys.chmod`, `sys.statfsNoFollow`, and
 `sys.opendirNoFollow` are `O_NOFOLLOW` the same way (`opendirNoFollow` is `O_NONBLOCK` too).
-`preadAll` / `pwriteAll` / `writeAll` in src/sys.zig return `-errno` like `sendfileAll`, so an
-origin I/O failure surfaces as the real errno (EIO, ESTALE) rather than EPERM.
+`preadAll` / `pwriteAll` / `writeAll` / `readOnce` in src/sys.zig return `-errno` from the raw
+syscall, the same contract `renameAt2` has, so an origin I/O failure surfaces as the real errno
+(EIO, ESTALE) rather than EPERM and an `EINTR` cannot be reclassified by a libc call that lands
+between the failure and the check. `sendfileAll` stays on libc `sendfile`: the kernel writes the
+file offset back through the pointer it is passed.
 
 ---
 
@@ -572,7 +575,13 @@ with the marks on size change, same-size rewrite (mtime/ino), distrust, and forg
 (`Store.clearHashes`).
 
 The sidecar bitfield prefix is unchanged; an optional origin-identity trailer follows the bits
-so a restart can still detect a same-size rewrite. The same identity is an optional trailer on
+so a restart can still detect a same-size rewrite. `Bitfield.decode` accepts a blob only when
+both the geometry it records and the geometry the caller asks for name one of two lengths: the
+body alone, or the body plus exactly one identity trailer. A recorded file covering more pieces
+than the caller is loading used to pass on its own geometry and have the extra body bytes
+dropped, and `Store.loadBits` reads the trailer at the caller's body length, so the dropped
+bytes were decoded as the identity and the stale marks survived the rewrite. That length is now
+`BadBitfield`, the same answer a trailer torn mid-write gets. The same identity is an optional trailer on
 the origin manifest, so a rewrite cannot keep the previous object's hashes as the trust
 reference for peer fills. Hashes ride in memory and in the manifest, not in the bit bytes.
 `OriginId` reads that trailer into an `i64` second, an `i64` nanosecond, and a `u64` inode, and

@@ -470,22 +470,47 @@ fn offT(n: u64) ?c.off_t {
     return std.math.cast(c.off_t, n);
 }
 
+/// read(2) or pread(2) as one raw syscall. The return is the byte count, or
+/// -errno in the register: a libc wrapper would return -1 and leave the code
+/// in thread-local errno, which any libc call between the failure and the
+/// read of errno replaces. `off` null selects read(2).
+fn linuxRead(fd: c_int, buf: []u8, off: ?c.off_t) isize {
+    const rc: usize = if (off) |o|
+        std.os.linux.pread(fd, buf.ptr, buf.len, o)
+    else
+        std.os.linux.read(fd, buf.ptr, buf.len);
+    return @bitCast(rc);
+}
+
+/// write(2) or pwrite(2), same contract as linuxRead. `off` null selects
+/// write(2).
+fn linuxWrite(fd: c_int, buf: []const u8, off: ?c.off_t) isize {
+    const rc: usize = if (off) |o|
+        std.os.linux.pwrite(fd, buf.ptr, buf.len, o)
+    else
+        std.os.linux.write(fd, buf.ptr, buf.len);
+    return @bitCast(rc);
+}
+
 pub fn preadAll(fd: c_int, buf: []u8, off: u64) isize {
     var got: usize = 0;
     while (got < buf.len) {
         const pos = offT(off +| got) orelse return -c.EFBIG;
-        const n = c.pread(fd, buf[got..].ptr, buf.len - got, pos);
-        if (n < 0) {
+        // The raw syscall returns the byte count or -errno in the
+        // register, so the retry decision cannot observe an errno a later
+        // libc call replaced. libc pread returns -1 and stashes the code
+        // in TLS, which is exactly the window this used to have.
+        const rc = linuxRead(fd, buf[got..], pos);
+        if (rc < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll: a
             // stray signal must not end a multi-chunk transfer midway.
-            // libc returns -1 and sets errno; callers treat a negative as
-            // -errno (FUSE, noteOriginIo), so a raw -1 would surface as
-            // EPERM and hide EIO/ESTALE/ETIMEDOUT.
-            if (errno() == c.EINTR) continue;
-            return @as(isize, negErrno());
+            // Callers treat a negative as -errno (FUSE, noteOriginIo), so
+            // a raw -1 would surface as EPERM and hide EIO/ESTALE/ETIMEDOUT.
+            if (rc == -c.EINTR) continue;
+            return rc;
         }
-        if (n == 0) break;
-        got += @intCast(n);
+        if (rc == 0) break;
+        got += @intCast(rc);
     }
     return @intCast(got);
 }
@@ -508,17 +533,19 @@ pub fn pwriteAll(fd: c_int, buf: []const u8, off: u64) isize {
     var put: usize = 0;
     while (put < buf.len) {
         const pos = offT(off +| put) orelse return -c.EFBIG;
-        const n = c.pwrite(fd, buf[put..].ptr, buf.len - put, pos);
-        if (n < 0) {
+        // Raw syscall, like preadAll: -errno comes back in the register
+        // instead of through the thread-local errno libc would clobber.
+        const rc = linuxWrite(fd, buf[put..], pos);
+        if (rc < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll; a
             // partial write must never be mistaken for a completed one.
             // Same -errno contract as preadAll: a raw -1 is EPERM to every
             // caller that logs or returns the negative as an errno.
-            if (errno() == c.EINTR) continue;
-            return @as(isize, negErrno());
+            if (rc == -c.EINTR) continue;
+            return rc;
         }
-        if (n == 0) return -c.EIO;
-        put += @intCast(n);
+        if (rc == 0) return -c.EIO;
+        put += @intCast(rc);
     }
     return @intCast(put);
 }
@@ -737,16 +764,18 @@ pub fn ftruncate(fd: c_int, size: u64) i32 {
 pub fn writeAll(fd: c_int, buf: []const u8) isize {
     var put: usize = 0;
     while (put < buf.len) {
-        const n = c.write(fd, buf.ptr + put, buf.len - put);
-        if (n < 0) {
+        // Raw syscall, like preadAll: the error code travels in the return
+        // value, so nothing between the write and the branch can replace it.
+        const rc = linuxWrite(fd, buf[put..], null);
+        if (rc < 0) {
             // Signal interrupts are retried like readOnce/sendfileAll: a
             // stray signal must not truncate a response or file write midway.
             // Same -errno contract as preadAll/pwriteAll and sendfileAll.
-            if (errno() == c.EINTR) continue;
-            return @as(isize, negErrno());
+            if (rc == -c.EINTR) continue;
+            return rc;
         }
-        if (n == 0) return -c.EIO;
-        put += @intCast(n);
+        if (rc == 0) return -c.EIO;
+        put += @intCast(rc);
     }
     return @intCast(put);
 }
@@ -756,9 +785,12 @@ pub fn writeAll(fd: c_int, buf: []const u8) isize {
 /// connection death.
 pub fn readOnce(fd: c_int, buf: []u8) !usize {
     while (true) {
-        const n = c.read(fd, buf.ptr, buf.len);
-        if (n >= 0) return @intCast(n);
-        if (errno() != c.EINTR) return error.Read;
+        // Raw syscall, like preadAll: -errno is the return value, so the
+        // retry test cannot see an errno a later call stored over the
+        // read's. An EINTR misread as anything else would end the transfer.
+        const rc = linuxRead(fd, buf, null);
+        if (rc >= 0) return @intCast(rc);
+        if (rc != -c.EINTR) return error.Read;
     }
 }
 
