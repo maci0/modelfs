@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | Status | Living document; describes `src/` and the shipped NAS units and wrappers as of the date below |
-| Last reviewed | 2026-11-04 |
+| Last reviewed | 2026-11-12 |
 | Covers | modelfs daemon (`mount`) and CLI as of `v0.23.0`, peer HTTP protocol, lease discovery, FUSE surface, handover IPC, Hugging Face pull, GitHub release self-update, and the shipped NAS snapshot/replica/drill/offsite plane (`scripts/nas/`, the restore and alarm wrappers) |
 | Security owner | Unassigned |
 | Review cadence | Unassigned; re-verify against `src/` after any protocol, auth, or listener change |
@@ -144,10 +144,12 @@ tree: bytes that become the installed executable.
   `github.com`, `*.github.com`, or `*.githubusercontent.com`, so `github.com.evil.com` and
   `evil@github.com` are refused. Bodies are capped per request (`max_sums_bytes` 64 KiB,
   `max_asset_bytes` 100 MiB) with `WriteFailed` past the cap reported as `BodyTooLarge`.
-* **Outbound credential.** `GITHUB_TOKEN` (`githubBearer` src/update.zig) is trimmed, refused if
-  empty or if it contains CR or LF, and sent as a privileged header, so the HTTP client drops it
-  on any cross-host redirect. The token is only needed for private repositories or for rate
-  limits on api.github.com; anonymous use is the default.
+* **Outbound credential.** `GITHUB_TOKEN` (`githubBearer` src/update.zig) is trimmed; empty or
+  whitespace-only counts as unset and no bearer is sent, so anonymous use stays the default.
+  Interior CR or LF and a value past `max_token_bytes` are refused (`TokenNotHeaderSafe`,
+  `TokenTooLarge`) rather than sent or silently dropped. It is sent as a privileged header, so
+  the HTTP client drops it on any cross-host redirect. The token is only needed for private
+  repositories or for rate limits on api.github.com.
 * **Decision.** `decide` src/update.zig is pure and refuses, in order: a target with no release
   asset (`unsupported_target`), a missing asset or checksum sidecar, an untrusted asset or sums
   URL, a sidecar with no line for the asset name (`parseChecksum` requires 64 hex characters and
@@ -191,9 +193,8 @@ or inject terminal escapes. Origin-write precondition, CLI-triggered (B3).
 |---|---|---|
 | PSK file (`--psk`, default `/etc/modelfs.psk`) or `MODELFS_PSK_VALUE` | `loadPsk` src/main.zig | Up to 4096 bytes after surrounding-whitespace trim. Files may contain at most 4098 raw bytes, allowing a maximum-length secret with LF or CRLF. A whitespace-only value is empty and refused; interior CR/LF is refused |
 | Hugging Face token: `HF_TOKEN`, else `$HF_HOME/token`, else `~/.cache/huggingface/token` | `loadToken` src/hf.zig | Up to 4096 bytes after trimming for `HF_TOKEN`; files are capped at 4096 raw bytes, including whitespace. Whitespace-only counts as unset. No flag carries it, and `cmdPull` disables core dumps for the run when one is loaded |
-| `GITHUB_TOKEN` (outbound, `modelfs update` only) | `githubBearer` src/update.zig | Trimmed of surrounding whitespace; empty is treated as unset and no bearer is sent; interior CR/LF is refused so the header cannot be split. Bounded by the caller's 4096-byte buffer. No flag carries it |
 | `MODELFS_ORIGIN/CACHE/PSK/PSK_VALUE/ID/LOG` | src/main.zig | Same values as their flags; an explicit flag wins. Whitespace-trimmed (`envValue`), empty counts as unset, except a whitespace-only `MODELFS_PSK_VALUE` which is refused as empty. Any other `MODELFS_*` name is refused as a typo (`checkKnownEnv` over the `env_knobs` table) |
-| `GITHUB_TOKEN` | `githubBearer` src/update.zig | Trimmed of surrounding whitespace; interior CR or LF is refused (`TokenNotHeaderSafe`) and a value over 4096 bytes is refused (`TokenTooLarge`), both as errors rather than as no token. Empty counts as unset, and no flag or file carries it; `--reload` reads nothing because it makes no request. `updateFetchHint` names the 401/403 an API answers a bad or rate-limited token with |
+| `GITHUB_TOKEN` (outbound, `modelfs update` only) | `githubBearer` src/update.zig | Trimmed of surrounding whitespace; empty counts as unset and no bearer is sent. Interior CR or LF is refused (`TokenNotHeaderSafe`) and a value over 4096 bytes (`max_token_bytes`) is refused (`TokenTooLarge`), both as errors rather than as no token: an oversized token used to fall through to the anonymous rate limit, which `updateFetchHint` then described as the endpoint being unreachable. No flag or file carries it, and `--reload` reads nothing because it makes no request. `updateFetchHint` names the 401/403 an API answers a bad or rate-limited token with |
 
 `modelfs config` prints the resolved value and source of every knob except the inline PSK,
 which it reports as set and never renders; a file PSK is printed by path only, since the path
@@ -855,7 +856,7 @@ rather than ignore.
 | SHA-256 of the asset must equal the sidecar line naming that exact asset, with the `  ` or ` *` separator `sha256sum` writes; a sidecar with no such line is refused | `parseChecksum` / `checksumMatches` / `decide` src/update.zig | B7/T: transport corruption, truncation, and an asset swapped for a different file from the same release. Not publisher identity (R11) |
 | Per-request byte caps with `WriteFailed` past the cap reported as `BodyTooLarge`, and `.current`/`.ahead` short-circuit before any download | `max_json_bytes`, `max_sums_bytes`, `max_asset_bytes` in `fetchUrl`; `decide` src/update.zig | B7/D: a hostile or broken release cannot drive unbounded allocation or force a 100 MiB download to compare versions |
 | Staged write beside the destination with `O_NOFOLLOW | O_NONBLOCK` at mode 0755, renamed onto `/proc/self/exe`'s target, staging file unlinked on both failure arms | `replaceVerifiedPath` src/update.zig, `sys.writeFileExec` src/sys.zig | B7/T: a failed write leaves the installed binary intact, and a planted symlink at the staging name fails closed instead of receiving the bytes |
-| `GITHUB_TOKEN` is environment-only, trimmed, refused when empty or holding CR/LF, and sent as a privileged header to trusted hosts only | `githubBearer` src/update.zig, `fetchUrl` `privileged_headers` | B7/I: the token stays off argv and out of a redirected third-party request. Residual: the stack buffer is not zeroed and core dumps stay enabled for this command |
+| `GITHUB_TOKEN` is environment-only and trimmed; empty counts as unset, interior CR/LF and a value past `max_token_bytes` are refused, and it is sent as a privileged header to trusted hosts only | `githubBearer` src/update.zig, `fetchUrl` `privileged_headers` | B7/I: the token stays off argv and out of a redirected third-party request. Residual: the stack buffer is not zeroed and core dumps stay enabled for this command |
 | The handover gate is unchanged by a self-update: a live daemon still refuses a request it does not own and still requires `SIGUSR2` | `handover.reqOwnerOk` src/handover.zig, `onUsr2` / `execHandover` src/fuse_fs.zig | B4: replacing the on-disk binary does not let a different local uid drive the exec; the run that replaced it is the one that asks |
 
 ### Recovery plane (NAS units and root wrappers)
@@ -1237,9 +1238,10 @@ the replica itself.
 
 **Vulnerability handling.** [SECURITY.md](../SECURITY.md) names the supported version (`v0.23.0`
 is current, and fixes land on `main` and ship as the next tag, with no backport line) and the
-route from report to shipped fix.
-GitHub private vulnerability reporting is not enabled on the repository, so that route has no
-intake until a repository admin turns the feature on, and there is no other disclosed contact.
+route from report to shipped fix: email the maintainer at the address that policy names, and
+do not open a public issue. GitHub private vulnerability reporting is not enabled on the
+repository, so the email is the only intake; nothing here tracks whether mail sent to it is
+read.
 
 **Compromise recovery that exists today.** PSK regeneration guidance is in
 [recovery.md](recovery.md), which also documents wiping caches before remounting after a
