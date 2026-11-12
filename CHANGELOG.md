@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### CI - 2026-11-12
+- **shellcheck also runs `avoid-negated-conditions` and `useless-use-of-cat`.** Both were already clean across `scripts/**/*.sh` and the extracted CI `run:` steps, and neither was enabled, so a negated comparison or a `cat` piped into a filter (which hides `cat`'s exit status) could merge. `.shellcheckrc` names them with the other optional checks, so the gate and a bare `shellcheck` of those scripts enforce the same set. The style-only brace and double-bracket checks stay off. No script behavior changes.
+
 ### Changed - 2026-11-12
 - **`parseHostPort` now lives in `src/proto.zig`, beside `LeaseAddr` and `default_port`.** `--seed`, `--advertise`, and `buildSeeds` (`src/main.zig`) all split `HOST[:PORT]` into the lease address type the wire document carries, and the parser was private to the CLI, so every other module that needed the same split had to reach into `main.zig` or re-spell it. The contract is unchanged: a missing port is `default_port`, an empty host is `error.BadHostPort`, port 0 is `error.ZeroPort`, and a port past u16 is `error.Overflow`. `--listen` keeps its own parser: it accepts a leading colon and a bare port, which a lease address does not.
 

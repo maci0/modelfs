@@ -355,7 +355,9 @@ echo "=== shellcheck ==="
 # Optional checks live in .shellcheckrc so a glob of every scripts/**/*.sh
 # matches this gate. Recurse: scripts/*.sh would skip a nested script.
 # The style-only brace/double-bracket checks stay off: this tree does
-# not follow those conventions.
+# not follow those conventions. avoid-negated-conditions and
+# useless-use-of-cat are on: both already pass, and a negated comparison
+# or a cat piped into a filter would otherwise merge unseen.
 shopt -s globstar nullglob
 sh_files=(scripts/**/*.sh)
 shopt -u nullglob

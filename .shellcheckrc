@@ -15,15 +15,19 @@
 # an uppercase-looking assignment is always set before use, a negated
 # numeric comparison ([ ! "$x" -eq 1 ]) is written as its direct operator
 # (-ne), a return value swallowed by command/process substitution must be
-# propagated or explicitly dismissed with || true, and cat piped into a
-# filter (which hides cat's exit status) is written as a direct redirect.
+# propagated or explicitly dismissed with || true, cat piped into a
+# filter (which hides cat's exit status) is written as a direct redirect,
+# and a negated comparison of any kind is written as its direct operator
+# so a later edit cannot hide a double negation.
 #
 # Style-only brace/double-bracket checks stay off: this tree does not
 # follow those conventions (require-double-brackets / require-variable-braces).
 enable=add-default-case
+enable=avoid-negated-conditions
 enable=avoid-nullary-conditions
 enable=deprecate-which
 enable=quote-safe-variables
 enable=check-set-e-suppressed
 enable=check-unassigned-uppercase
 enable=check-extra-masked-returns
+enable=useless-use-of-cat
