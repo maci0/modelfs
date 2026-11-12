@@ -327,7 +327,10 @@ repo produces.
 recv, the property set, and the monthly hold. It is dry-run by default; `--execute` pulls.
 
 * `--from` is a `--recursive` syncoid with `BatchMode=yes` and `ConnectTimeout=30`, the same
-  fail-closed SSH as the daily pull. `--local-from` is `zfs send -R`, already recursive.
+  fail-closed SSH as the daily pull. `--local-from` is `zfs send -R`, already recursive. A
+  second `--execute --local-from` skips `zfs recv -F` when `DEST@that snapshot` is already
+  present: `-F` would roll the restored dataset back and drop snapshots taken after the first
+  recv, including the monthlies this script holds. Property set and holds still run.
 * Holds do not travel with the stream, so after a successful recv the script holds monthlies on
   DEST the same way the replica's `ExecStartPost` does.
 * It refuses a mounted DEST unless `--force`, so it cannot `--force-delete` the live export by

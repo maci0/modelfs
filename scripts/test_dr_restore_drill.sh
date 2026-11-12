@@ -2029,6 +2029,12 @@ case "${sub}" in
             printf '%s\n' "${LOCAL_FROM}"
             exit 0
         fi
+        # Exact snapshot name: the restore skips recv -F only when this
+        # answers. runtime keeps the snap across zfs set; a fresh env does not.
+        if [[ -n "${DEST_RECV_SNAP:-}" && "${dataset}" == "${DEST_RECV_SNAP}" ]]; then
+            printf '%s\n' "${dataset}"
+            exit 0
+        fi
         exit 1
         ;;
     get)
@@ -2080,7 +2086,19 @@ case "${sub}" in
         ;;
     recv)
         cat >/dev/null
-        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=/export/ai\n' >"${STATE}/runtime"
+        read_state
+        dest=""
+        for arg in "$@"; do
+            case "${arg}" in
+                -*) ;;
+                *) dest="${arg}" ;;
+            esac
+        done
+        snap=""
+        if [[ -n "${LOCAL_SNAP:-}" && -n "${dest}" ]]; then
+            snap="${dest}@${LOCAL_SNAP#*@}"
+        fi
+        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=/export/ai\nDEST_RECV_SNAP=%q\n' "${snap}" >"${STATE}/runtime"
         exit 0
         ;;
     set)
@@ -2102,7 +2120,8 @@ case "${sub}" in
                     ;;
             esac
         done
-        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=%q\n' "${mp:-/export/ai}" >"${STATE}/runtime"
+        read_state
+        printf 'DEST_EXISTS=1\nDEST_MOUNTED=yes\nDEST_MP=%q\nDEST_RECV_SNAP=%q\n' "${mp:-/export/ai}" "${DEST_RECV_SNAP:-}" >"${STATE}/runtime"
         printf 'zfs set dest=%s mp=%s nfs=%s\n' "${dest}" "${mp}" "${nfs}" >>"${STATE}/set.log"
         exit 0
         ;;
@@ -2289,6 +2308,19 @@ elif ! grep -q "zfs send" "${RESTORE_STATE}/commands.log" || ! grep -q "zfs recv
     fail "pool restore --local-from missing send/recv: $(cat "${RESTORE_STATE}/commands.log" 2>/dev/null || true)"
 else
     pass "pool restore --execute --local-from used send/recv, held monthlies, and printed the cache wipe"
+fi
+# The recv above left DEST@autosnap_ok in the stub runtime. A second
+# --execute must not zfs recv -F that snapshot again: -F would roll DEST
+# back and drop snapshots taken after the first restore. --force because
+# the stub's recv mounted DEST, which a real rerun also sees.
+RECV_BEFORE="$(grep -c 'zfs recv' "${RESTORE_STATE}/commands.log" || true)"
+expect_restore "pool restore --local-from rerun skips recv -F" 0 "already present" \
+    MF_RESTORE_LOG="${RLOG2}" "${RESTORE}" --execute --force --local-from tank/ai-backup
+RECV_AFTER="$(grep -c 'zfs recv' "${RESTORE_STATE}/commands.log" || true)"
+if [[ "${RECV_AFTER}" == "${RECV_BEFORE}" ]]; then
+    pass "pool restore --local-from rerun did not recv -F again"
+else
+    fail "pool restore --local-from rerun ran recv -F again (${RECV_BEFORE} -> ${RECV_AFTER})"
 fi
 
 # --- backup_config.sh: the drop-in values a rebuilt host needs

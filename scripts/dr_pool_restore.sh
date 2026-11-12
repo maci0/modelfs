@@ -28,6 +28,7 @@ write nothing.
 
 --from HOST:DATASET     syncoid --recursive pull from the replica host
 --local-from DATASET    zfs send -R newest snapshot | zfs recv -Fs DEST
+                        (skipped when DEST@that snapshot already exists)
 --force                 allow DEST that is currently mounted (otherwise refuse)
 --execute               run the recv, set export properties, hold monthlies
 
@@ -207,8 +208,24 @@ print_cache_wipe() {
 # time counts, which is what recovery.md's pool-loss RTO row wants.
 T0="$(awk '{print $1}' /proc/uptime)"
 if [[ -n "${LOCAL_FROM}" ]]; then
-    zfs send -R "${SEND_SNAP}" | zfs recv -Fs "${DEST}" \
-        || die "zfs send/recv from ${SEND_SNAP} to ${DEST} failed"
+    # A second --execute must not `zfs recv -F` again: -F rolls DEST back to
+    # the stream and destroys snapshots taken after the first restore
+    # (including the monthlies this script just held). The snapshot name
+    # already on DEST means that stream landed. This is the name, not the
+    # ZFS guid, so a same-named snap from a different stream is treated as
+    # present; comparing `zfs get -H -o value guid` is the upgrade if that
+    # collision becomes real.
+    snap_short="${SEND_SNAP#*@}"
+    dest_snap="${DEST}@${snap_short}"
+    if [[ -z "${snap_short}" || "${snap_short}" == "${SEND_SNAP}" ]]; then
+        die "local replica snapshot ${SEND_SNAP} has no short name"
+    fi
+    if zfs list -H -o name "${dest_snap}" >/dev/null 2>&1; then
+        echo "pool-restore: ${dest_snap} already present; skipping zfs recv -F"
+    else
+        zfs send -R "${SEND_SNAP}" | zfs recv -Fs "${DEST}" \
+            || die "zfs send/recv from ${SEND_SNAP} to ${DEST} failed"
+    fi
 else
     command -v syncoid >/dev/null 2>&1 \
         || die "syncoid not found; install sanoid (docs/recovery.md section 3) or use --local-from"
@@ -249,8 +266,9 @@ fi
 
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 LOG_LINE="${STAMP} ${DEST} ok recv_s=${ELAPSED} source=${SOURCE_LABEL}"
-# A rerun of the same dest+source must not append a second line: the
-# syncoid/zfs recv and zfs set above converge, so the log does too. Stamp
+# A rerun of the same dest+source must not append a second line. A local
+# recv is skipped once that snapshot is already on DEST; syncoid is a pull;
+# zfs set converges. Stamp
 # and recv_s differ on every run, so the match is dest + source on one
 # line. Separate greps treat a prior restore of this dest and a prior
 # restore from this source as the same run, and a later restore from a
