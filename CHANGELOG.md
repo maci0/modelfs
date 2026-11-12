@@ -17,6 +17,8 @@
 
 ### CI
 - **Dependabot now uses the `uv` ecosystem for the Python pins.** The `pip` entry edited its own requirements view and left `uv.lock` stale, so every proposed bump failed `uv sync --frozen` until a maintainer ran `uv lock` by hand. The `uv` entry updates `pyproject.toml` and `uv.lock` together; only the regenerated `sbom.cdx.json` remains a manual step.
+- **The gate's Python pins move to mypy 2.4.1 and ruff 0.17.3.** `0.22.0` locked mypy 2.3.1 and ruff 0.16.4, and that release's `sbom.cdx.json` still named those. `pyproject.toml` (the `dev` group and ruff's `required-version`), `uv.lock`, and `sbom.cdx.json` now all name mypy 2.4.1 and ruff 0.17.3, so a bare ruff older than 0.17.3 refuses to run. Dev tooling only: the daemon, the CLI, and the release binary are unchanged. The release workflow's `actions/upload-artifact` and `actions/download-artifact` pins move to v7.0.2 and v8.0.2 in the same cut; both stay SHA-pinned, and the SBOM records the new digests.
+- **Build and gate scripts pin `LC_ALL=C` and `TZ=UTC`.** `scripts/run_e2e_tests.sh`, `scripts/run_cluster_e2e_9nodes.sh`, `scripts/test_fault_tolerance.sh`, and `scripts/test_extract_fuse3_arm64.sh` export both, and the in-VM `zig build` in `scripts/run_vm_cluster_e2e.sh` sets both, so a host locale or timezone can no longer change what those runs compare or print. `scripts/check.sh` also refuses a `pyproject.toml` whose mypy `python_version` or ruff `target-version` disagrees with `.python-version`, which previously let the two pins drift while the gate still passed. No daemon or CLI behavior changes.
 
 ## [0.22.0] - 2026-11-04
 
