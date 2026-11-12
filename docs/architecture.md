@@ -77,7 +77,7 @@ New code goes in the module that already owns that concern.
 | `c.h`, `c.zig` | Sole door to libfuse3 and libc |
 | `sys.zig` | Syscall wrappers: EINTR retry, CLOEXEC, nofollow/owner-only writes, process liveness (`pidAlive`); IPv4 `bind`/`accept`/`connectIn`/`listen`/`getsockname` and socket options through `std.c`; shared IPv4 text rendering (`dottedQuad` takes network-order `s_addr`, returns a slice of the caller's buffer or null when too small) |
 | `piece.zig` | Piece arithmetic (`count`/`cover`/`trackedEnd`), the persisted bitfield codec, and piece-hash manifest overlap (`manifestOverlapPrepared`) |
-| `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`), and the origin's cluster path namespace (`cluster_dir`, `manifests_dir`) |
+| `proto.zig` | Peer HTTP and lease wire helpers (`HaveBits`, Range, bearer, lease JSON, `containsControl`), the origin's cluster path namespace (`cluster_dir`, `manifests_dir`), and the shared `HOST[:PORT]` split (`parseHostPort`) that `--seed`, `--advertise`, and `buildSeeds` all consume |
 | `cull.zig` | Free-space watermark policy |
 | `fuzzcorpus.zig` | Shared framing for `std.testing.fuzz` seed corpora |
 | `store.zig` | Local piece cache, path gate (`relOk`), cache-root artifact names (`cacheMetaPath`, `sidecarPieceSize`, `manifestPath`) |

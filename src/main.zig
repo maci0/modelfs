@@ -566,23 +566,6 @@ fn knobSource(env_field: ?EnvField, from_flag: bool, flag_name: []const u8) []co
     return "default";
 }
 
-fn parseHostPort(s: []const u8) !proto.LeaseAddr {
-    // Every consumer inet_pton's the ip field (bind, dial, hops scoring), so
-    // an empty host ("", ":1234") can only fail later -- or, for --seed,
-    // silently on every discovery tick. Reject it where the flag is parsed.
-    if (std.mem.findScalarLast(u8, s, ':')) |i| {
-        if (i == 0) return error.BadHostPort;
-        const port = try std.fmt.parseInt(u16, s[i + 1 ..], 10);
-        // Port 0 is a kernel ephemeral bind, not a dialable address: a lease
-        // or seed that advertises it is silently unreachable. Refuse it at
-        // the flag, like an empty host.
-        if (port == 0) return error.ZeroPort;
-        return .{ .ip = s[0..i], .port = port, .mbps = 0 };
-    }
-    if (s.len == 0) return error.BadHostPort;
-    return .{ .ip = s, .port = proto.default_port, .mbps = 0 };
-}
-
 /// True when a dotted-quad host is 0.0.0.0 or 255.255.255.255: parseV4
 /// admits both (they match inet_pton) but neither is a unicast address a
 /// peer can dial. --advertise would publish them in the lease; --seed would
@@ -1266,7 +1249,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 // after each comma; a leading/trailing space is not part of
                 // the address and would fail parseV4 as a host name.
                 const tok = std.mem.trim(u8, one, " \t");
-                const hp = parseHostPort(tok) catch |err| {
+                const hp = proto.parseHostPort(tok) catch |err| {
                     if (err == error.ZeroPort)
                         diagUsage("--advertise {s}: port 0 is not a peer port (want 1-65535)\n", .{v})
                     else
@@ -1298,11 +1281,11 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             try rejectOutsideMount(cmd, flag);
             // Same surrounding-space trim --advertise applies to each
             // comma-separated token: a quoted " 10.0.0.9" is the address,
-            // not a hostname parseHostPort would then reject.
+            // not a hostname proto.parseHostPort would then reject.
             const s = std.mem.trim(u8, try takeValue(args, flag, &i, inline_val), " \t");
             // Validate now with a named message instead of failing later in
             // mount setup with a bare parseInt error.
-            const hp = parseHostPort(s) catch |err| {
+            const hp = proto.parseHostPort(s) catch |err| {
                 if (err == error.ZeroPort)
                     diagUsage("--seed {s}: port 0 is not a peer port (want 1-65535)\n", .{s})
                 else
@@ -1574,7 +1557,7 @@ fn buildSeeds(gpa: std.mem.Allocator, specs: []const []const u8) !SeedList {
     var out: SeedList = .{};
     errdefer out.deinit(gpa);
     for (specs) |s| {
-        const hp = try parseHostPort(s);
+        const hp = try proto.parseHostPort(s);
         var quad: [4]u8 = undefined;
         if (discover.parseV4(hp.ip, &quad)) {
             if (!discover.isDialableHost(&quad)) {
@@ -3049,24 +3032,6 @@ test "badIdLine renders refused ids through the displayName echo gate" {
     try std.testing.expectEqualStrings("--id unusable as cluster id (see 'modelfs help')\n", long);
 }
 
-test "parseHostPort splits and defaults" {
-    const a = try parseHostPort("192.168.1.5:9999");
-    try std.testing.expectEqualStrings("192.168.1.5", a.ip);
-    try std.testing.expectEqual(@as(u16, 9999), a.port);
-    const b = try parseHostPort("spark1");
-    try std.testing.expectEqualStrings("spark1", b.ip);
-    try std.testing.expectEqual(@as(u16, 18080), b.port);
-    try std.testing.expectError(error.Overflow, parseHostPort("h:70000"));
-    // An empty host names no interface: bind/dial inet_pton would reject it
-    // later (a bad --seed silently, on every discovery tick), so refuse it
-    // at the flag boundary instead.
-    try std.testing.expectError(error.BadHostPort, parseHostPort(""));
-    try std.testing.expectError(error.BadHostPort, parseHostPort(":19081"));
-    // Port 0 would publish an undialable lease / seed.
-    try std.testing.expectError(error.ZeroPort, parseHostPort("10.0.0.9:0"));
-    try std.testing.expectError(error.ZeroPort, parseHostPort("spark1:0"));
-}
-
 test "listenPort accepts bare port per --listen [IP:]PORT" {
     // bare port must win, not fall back to the default (regression: it did)
     try std.testing.expectEqual(@as(u16, 19090), try listenPort("19090"));
@@ -3223,7 +3188,7 @@ fn fuzzFlagValuesOne(_: void, smith: *std.testing.Smith) anyerror!void {
     // both accept as a HOST:PORT form, they must name the same explicit
     // port; on a bare host --seed defaults while --listen only takes a bare
     // numeric port.
-    const hp: ?proto.LeaseAddr = parseHostPort(s) catch null;
+    const hp: ?proto.LeaseAddr = proto.parseHostPort(s) catch null;
     const lp: ?u16 = listenPort(s) catch null;
     if (hp) |a| {
         try std.testing.expectEqual(@as(u32, 0), a.mbps);
@@ -6015,7 +5980,7 @@ test "buildSeeds passes numeric ips through and resolves names" {
         try std.testing.expectEqual(@as(usize, 1), sl.owned_ips.items.len);
     }
     // Malformed specs keep parseArgs' named failure path (port overflow
-    // surfaces as the underlying parse error, as parseHostPort has always
+    // surfaces as the underlying parse error, as proto.parseHostPort has always
     // propagated it).
     try std.testing.expectError(error.Overflow, buildSeeds(gpa, &.{"h:70000"}));
     // parseArgs already refuses these; buildSeeds is the mount-time backstop

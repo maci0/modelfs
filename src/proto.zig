@@ -493,6 +493,44 @@ pub const LeaseAddr = struct {
     mbps: u32 = 0,
 };
 
+/// Split `HOST[:PORT]` into a `LeaseAddr`. A missing port is `default_port`.
+/// The host slice borrows `s`. An empty host (`""`, `":1234"`) is
+/// `error.BadHostPort`: every consumer inet_pton's the ip field, so the
+/// empty form can only fail later. Port 0 is `error.ZeroPort`: it is a
+/// kernel ephemeral bind, not a dialable address, and a lease or seed that
+/// advertises it is silently unreachable. A port past u16 is
+/// `error.Overflow`. The ip is not checked to be a dotted quad here: a
+/// `--seed` value may still be a hostname that `buildSeeds` resolves.
+pub fn parseHostPort(s: []const u8) !LeaseAddr {
+    if (std.mem.findScalarLast(u8, s, ':')) |i| {
+        if (i == 0) return error.BadHostPort;
+        const port = try std.fmt.parseInt(u16, s[i + 1 ..], 10);
+        if (port == 0) return error.ZeroPort;
+        return .{ .ip = s[0..i], .port = port, .mbps = 0 };
+    }
+    if (s.len == 0) return error.BadHostPort;
+    return .{ .ip = s, .port = default_port, .mbps = 0 };
+}
+
+test "parseHostPort splits and defaults" {
+    const a = try parseHostPort("192.168.1.5:9999");
+    try std.testing.expectEqualStrings("192.168.1.5", a.ip);
+    try std.testing.expectEqual(@as(u16, 9999), a.port);
+    try std.testing.expectEqual(@as(u32, 0), a.mbps);
+    const b = try parseHostPort("spark1");
+    try std.testing.expectEqualStrings("spark1", b.ip);
+    try std.testing.expectEqual(default_port, b.port);
+    try std.testing.expectError(error.Overflow, parseHostPort("h:70000"));
+    // An empty host names no interface: bind/dial inet_pton would reject it
+    // later (a bad --seed silently, on every discovery tick), so refuse it
+    // at the flag boundary instead.
+    try std.testing.expectError(error.BadHostPort, parseHostPort(""));
+    try std.testing.expectError(error.BadHostPort, parseHostPort(":19081"));
+    // Port 0 would publish an undialable lease / seed.
+    try std.testing.expectError(error.ZeroPort, parseHostPort("10.0.0.9:0"));
+    try std.testing.expectError(error.ZeroPort, parseHostPort("spark1:0"));
+}
+
 pub const Lease = struct {
     id: []const u8,
     until: i64,
