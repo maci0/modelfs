@@ -2048,12 +2048,6 @@ fn printStatusCell(io: std.Io, gpa: std.mem.Allocator, key: []const u8, value: s
 const update_wait_ms: u32 = 30_000;
 const update_poll_ms: u32 = 50;
 
-fn selfExe(io: std.Io, buf: *[sys.c.PATH_MAX]u8) ![]const u8 {
-    const n = try std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", buf);
-    if (n == 0 or n >= buf.len) return error.NoExe;
-    return buf[0..n];
-}
-
 /// Publishes the update request into the cache by writing a per-pid staging
 /// file and renaming it onto update.req. Every arm that does not publish
 /// drops the stage: nothing sweeps the cache tree, so an abandoned
@@ -2085,7 +2079,7 @@ fn cmdReload(io: std.Io, gpa: std.mem.Allocator, opts: Opts) !u8 {
     defer if (blob) |b| gpa.free(b);
 
     var exe_buf: [sys.c.PATH_MAX]u8 = undefined;
-    const bin = selfExe(io, &exe_buf) catch {
+    const bin = sys.selfExe(io, &exe_buf) catch {
         printErr("modelfs: cannot resolve this binary via /proc/self/exe\n", .{});
         return 1;
     };

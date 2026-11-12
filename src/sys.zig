@@ -7,7 +7,7 @@
 //! Clocks and sleeps go through `std.Io.Clock`/`std.Io.sleep` (injectable for
 //! simulation), pids through `pidSelf`, test mtime aging through `touchPath`
 //! (`Io.File.setTimestamps`), and /proc/self/exe through
-//! `Io.Dir.readLinkAbsolute` (main.zig). What must stay low-level, and why:
+//! `Io.Dir.readLinkAbsolute` (`selfExe`). What must stay low-level, and why:
 //! the libfuse3 session and reply calls are C by design; `sendfile`,
 //! `fallocate(PUNCH_HOLE)`, `statfs`, `O_NOFOLLOW`/`O_PATH` opens, sealed
 //! memfds, socket options (`SO_SNDTIMEO` drives every deadline here), and
