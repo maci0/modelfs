@@ -2220,6 +2220,33 @@ else
     pass "pool restore --execute --from recorded syncoid, properties, holds, and recv_s"
 fi
 
+# Same dest+source is one log line. A different source is a new restore
+# even when an older line already contains this dest and another already
+# contains this source: the RTO record is the pair, not either token.
+# --force: the stub's recv left DEST mounted, which a real rerun on the
+# replacement NAS also sees.
+RLOG_LINES="$(wc -l <"${RLOG}" | tr -d ' ')"
+expect_restore "pool restore rerun of the same source does not append" 0 "already recorded" \
+    MF_RESTORE_LOG="${RLOG}" "${RESTORE}" --execute --force --from replica-host:tank/ai
+RLOG_AFTER="$(wc -l <"${RLOG}" | tr -d ' ')"
+if [[ "${RLOG_AFTER}" == "${RLOG_LINES}" ]]; then
+    pass "pool restore same-source rerun left the log at one line"
+else
+    fail "pool restore same-source rerun appended: $(cat "${RLOG}" 2>/dev/null || true)"
+fi
+printf '%s\n' '2026-01-01T00:00:00Z tank/other ok recv_s=1.0 source=local:tank/ai-backup@autosnap_ok' \
+    >>"${RLOG}"
+write_restore_env tank/ai 1 yes /export/ai \
+    tank/ai-backup tank/ai-backup@autosnap_ok "${FRESH}"
+expect_restore "pool restore from a new local snapshot is a new log line" 0 "recorded in" \
+    MF_RESTORE_LOG="${RLOG}" "${RESTORE}" --execute --force --local-from tank/ai-backup
+RLOG_NEW="$(wc -l <"${RLOG}" | tr -d ' ')"
+if [[ "${RLOG_NEW}" -eq $((RLOG_AFTER + 2)) ]]; then
+    pass "pool restore recorded the new source instead of reusing a split match"
+else
+    fail "pool restore new source was dropped or double-logged: $(cat "${RLOG}" 2>/dev/null || true)"
+fi
+
 RLOG2="${TEMP}/pool-restore-local.log"
 write_restore_env tank/ai 0 no /export/ai \
     tank/ai-backup tank/ai-backup@autosnap_ok "${FRESH}"

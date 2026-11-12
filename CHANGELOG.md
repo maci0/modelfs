@@ -5,6 +5,9 @@
 ### Documentation - 2026-11-12
 - **`docs/threat-model.md` no longer contradicts the token loader or the disclosure contact.** The secrets table listed `GITHUB_TOKEN` twice, and the first row said an oversized value was treated as unset and no bearer sent. `githubBearer` (`src/update.zig`) refuses it as `TokenTooLarge` instead, which is the whole point of the bound: a silently dropped token used to fall through to the anonymous rate limit. The two rows are one, stating the refusal. Response readiness said the report route had no intake and no disclosed contact; [SECURITY.md](SECURITY.md) names the maintainer's email as the intake and says GitHub private vulnerability reporting is not enabled, and the model now says the same. Last-reviewed date moves to 2026-11-12. No code changed.
 
+### Fixed - 2026-11-12
+- **`dr_pool_restore.sh` records a later restore from a different source.** The rerun check grepped the destination and the source separately, so a log that already had this destination on one line and this source on another treated a new restore as a duplicate and left it out of `/var/log/modelfs-pool-restore.log`. The RTO line is the pair: same destination and same source on one line stays one line; a different source appends.
+
 ## [0.23.0] - 2026-11-05
 
 ### Fixed - 2026-11-04

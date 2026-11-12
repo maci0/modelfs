@@ -249,11 +249,20 @@ fi
 
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 LOG_LINE="${STAMP} ${DEST} ok recv_s=${ELAPSED} source=${SOURCE_LABEL}"
-# A rerun must not append a second line: the syncoid/zfs recv and zfs set
-# above converge, so treat the log the same. Match "ok" for this
-# dest+source; a new snapshot source is a new restore, not a reopen.
-if grep -qF -- "${DEST} ok" "${LOG_FILE}" 2>/dev/null \
-    && grep -qF -- "source=${SOURCE_LABEL}" "${LOG_FILE}" 2>/dev/null; then
+# A rerun of the same dest+source must not append a second line: the
+# syncoid/zfs recv and zfs set above converge, so the log does too. Stamp
+# and recv_s differ on every run, so the match is dest + source on one
+# line. Separate greps treat a prior restore of this dest and a prior
+# restore from this source as the same run, and a later restore from a
+# different snapshot is then missing from the RTO log.
+if awk -v dest="${DEST}" -v src="${SOURCE_LABEL}" '
+    index($0, dest " ok ") {
+        suffix = "source=" src
+        if (length($0) >= length(suffix) && substr($0, length($0) - length(suffix) + 1) == suffix)
+            found = 1
+    }
+    END { exit !found }
+' "${LOG_FILE}"; then
     echo "pool-restore OK: ${DEST} from ${SOURCE_LABEL} in ${ELAPSED}s (already recorded in ${LOG_FILE})"
 else
     echo "${LOG_LINE}" >>"${LOG_FILE}"
