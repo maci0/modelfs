@@ -256,8 +256,9 @@ authoritative origin, so it is part of a deployment's attack surface.
 * **The stream itself.** `syncoid` on the replica host opens SSH to the NAS and pipes a `zfs send`
   stream into `zfs recv` (`ExecStart` in `scripts/nas/syncoid-models.service`), with the dataset
   names and the SSH source interpolated into that command line.
-* **Alarms read local files.** `check_drill_log.sh` parses the newest line of
-  `/var/log/modelfs-drill.log`; `check_offsite.sh` and `dr_restore_drill.sh --age-only` read
+* **Alarms read local files.** `check_drill_log.sh` parses the newest drill record of
+  `/var/log/modelfs-drill.log` (a line whose first field is a UTC stamp and whose remainder
+  contains ` ok `; other lines are skipped); `check_offsite.sh` and `dr_restore_drill.sh --age-only` read
   `zfs list` output and that log. None checks an owner, a mode, or a signature.
 
 ### Not present
@@ -1116,7 +1117,9 @@ until an operator takes it the pull authenticates as whoever root can become on 
 ### R14: recovery alarms trust local files nothing checks
 
 **Not prevented.** `check_drill_log.sh` decides whether the monthly restore drill succeeded by
-parsing the newest line of `/var/log/modelfs-drill.log`; `check_offsite.sh` and
+parsing the newest drill record of `/var/log/modelfs-drill.log` (first field a UTC stamp, and
+` ok ` later on the line; a trailing non-record, such as a leftover backup-config capture, is skipped
+and cannot be the record a fresh stamp would be); `check_offsite.sh` and
 `dr_restore_drill.sh --age-only` decide the same way from `zfs list` output and that log. Neither
 checks the file's owner or mode, and nothing keeps the log off a filesystem any local uid can
 write. A uid that can append to the log silences the only evidence a drill ran; a uid that can

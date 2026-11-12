@@ -1131,7 +1131,7 @@ expect_check "empty drill log is an alarm" 1 "is empty" \
     MF_DRILL_LOG="${TEMP}/empty-drill.log"
 
 echo "not-a-stamp tank/ai@x ok" >"${TEMP}/bad-stamp.log"
-expect_check "non-UTC stamp is an alarm" 1 "not a UTC stamp" \
+expect_check "non-UTC stamp is an alarm" 1 "no drill record" \
     MF_DRILL_LOG="${TEMP}/bad-stamp.log"
 
 FUTURE_STAMP="$(date -u -d "+2 hours" +%Y-%m-%dT%H:%M:%SZ)"
@@ -1151,6 +1151,29 @@ echo "${FRESH_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/
     >"${TEMP}/fresh-drill.log"
 expect_check "fresh drill log is ok" 0 "drill-log OK" \
     MF_DRILL_LOG="${TEMP}/fresh-drill.log"
+
+# The installer used to append backup_config's output to this same file.
+# That output ends in prose, so a checker that ages the last non-empty
+# line pages every day after a capture even though the drill record
+# above it is fresh, and an operator who then truncates the log to stop
+# the pages deletes the only evidence the drill ran.
+{
+    echo "${STALE_STAMP} tank/ai@old ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/old.gguf replica=unchecked"
+    echo "${FRESH_STAMP} tank/ai@x ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/m.gguf replica=unchecked"
+    echo "syncoid-models.service timer=syncoid-models.timer (enabled)"
+    echo "capture this beside the drill log; the values it prints are the ones a rebuilt host needs"
+} >"${TEMP}/captured-drill.log"
+expect_check "prose after a fresh drill record is still ok" 0 "drill-log OK" \
+    MF_DRILL_LOG="${TEMP}/captured-drill.log"
+
+# The opposite direction: a note written after a stale record must not
+# hide it. Only a line that is itself a drill record resets the age.
+{
+    echo "${STALE_STAMP} tank/ai@old ok snap_age_s=1 clone_s=0.1 drift=0 sample=/gguf/old.gguf replica=unchecked"
+    echo "${FRESH_STAMP} note: operator inspected the log, no drill ran"
+} >"${TEMP}/note-after-stale.log"
+expect_check "a fresh non-record cannot hide a stale drill record" 1 "has not succeeded recently" \
+    MF_DRILL_LOG="${TEMP}/note-after-stale.log"
 
 expect_check "bad MF_DRILL_LOG_MAX_AGE is an alarm" 1 "whole number of seconds" \
     MF_DRILL_LOG="${TEMP}/fresh-drill.log" MF_DRILL_LOG_MAX_AGE="30d"
@@ -1215,6 +1238,10 @@ elif ! grep -q "systemctl edit syncoid-models.service" <<<"${DRY_OUT}"; then
     fail "installer next steps missing drop-in edit for syncoid source: ${DRY_OUT}"
 elif ! grep -q "systemctl edit modelfs-offsite-age.service" <<<"${DRY_OUT}"; then
     fail "installer next steps missing drop-in edit for offsite dataset: ${DRY_OUT}"
+elif ! grep -q "modelfs-backup-config | tee -a /var/log/modelfs-backup-config.log" <<<"${DRY_OUT}"; then
+    fail "installer next steps append the backup-config capture to the drill log: ${DRY_OUT}"
+elif grep -q "tee -a /var/log/modelfs-drill.log" <<<"${DRY_OUT}"; then
+    fail "installer next steps still append to the drill log (check_drill_log.sh ages that file): ${DRY_OUT}"
 else
     pass "installer dry-run lists the NAS units"
 fi

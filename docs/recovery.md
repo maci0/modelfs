@@ -197,11 +197,13 @@ ships (`nas:tank/ai`) is flagged as such; `MF_DRILL_REPLICA` and
 `MF_OFFSITE_DATASET` ship commented out, so an unset one shows as no
 `Environment=` at all rather than as a flagged placeholder. It
 reads files only: no pool, no unit, nothing written. Run it after the
-drop-in edits above and keep the output with the drill log, which is
-already checked for staleness.
+drop-in edits above and keep the output in its own file. The drill log
+is the artifact `modelfs-check-drill-log` ages, and this output's last
+line is prose, not a drill record; appending it there used to make the
+daily alarm fail until someone edited the log.
 
 ```bash
-modelfs-backup-config | tee -a /var/log/modelfs-drill.log
+modelfs-backup-config | tee -a /var/log/modelfs-backup-config.log
 ```
 
 It is also how two hosts are compared: a replica whose `MF_SYNCOID_SRC`
@@ -457,9 +459,12 @@ the pool-loss RTO, which is the timed `syncoid`/`zfs send` in procedure C.
 
 The stamp is UTC (`YYYY-MM-DDTHH:MM:SSZ`), so aging it does not depend on the NAS timezone or a
 DST fall-back. [`scripts/check_drill_log.sh`](../scripts/check_drill_log.sh), and
-`modelfs-drill-log.timer` every 24 h of uptime, fails when that newest stamp is missing, empty,
-unparseable, in the future, or older than 35 days (`MF_DRILL_LOG_MAX_AGE`). That is the alarm,
-rather than a grep someone might remember to run.
+`modelfs-drill-log.timer` every 24 h of uptime, fails when the newest drill record is missing,
+empty, unparseable, in the future, or older than 35 days (`MF_DRILL_LOG_MAX_AGE`). A record is
+a line whose first field is that stamp and whose remainder contains ` ok `; anything else in
+the file (an older backup-config capture, a note) is skipped, so a non-record last line cannot
+hide a fresh record or page forever until the file is edited. That is the alarm, rather than a
+grep someone might remember to run.
 
 [`scripts/test_dr_restore_drill.sh`](../scripts/test_dr_restore_drill.sh), also run by
 `scripts/check.sh`, drives the drill, `--age-only`, `hold_monthlies.sh`, the log checker,

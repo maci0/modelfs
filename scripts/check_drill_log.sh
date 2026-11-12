@@ -5,6 +5,14 @@
 # missing, unparseable, in the future of the host clock, or older than
 # MF_DRILL_LOG_MAX_AGE (default 35 days). Pair with the systemd unit in
 # scripts/nas/modelfs-drill-log.service so a missed month pages.
+#
+# The record is a drill line, not the last non-empty line. The installer
+# used to tell the operator to keep modelfs-backup-config's output in
+# this same file, and that output's last line is prose, not a UTC stamp.
+# Aging the newest non-empty line then fails every day until someone
+# edits the log, which is how an alarm that pages constantly gets
+# silenced. A line counts only when its first field is the UTC stamp the
+# drill writes and the rest of the line contains " ok ".
 set -euo pipefail
 
 die() {
@@ -19,8 +27,12 @@ Usage: ./scripts/check_drill_log.sh
 Fail if the restore-drill artifact log is missing, empty, unparseable,
 stamped in the future, or older than MF_DRILL_LOG_MAX_AGE seconds
 (default 3024000 = 35 days). MF_DRILL_LOG relocates the log (default
-/var/log/modelfs-drill.log). Exit 0 means the newest line is a UTC
-stamp inside that window.
+/var/log/modelfs-drill.log). A drill record is a line whose first
+field is a UTC stamp and whose remainder contains " ok "; other lines
+(an older backup-config capture appended to this file) are skipped.
+Exit 0 means the newest such record is inside that window. A file whose
+newest line is not a drill record still passes when an earlier record
+is fresh.
 EOF
     exit 0
 fi
@@ -57,9 +69,19 @@ if [[ ! -s "${LOG_FILE}" ]]; then
     die "drill log ${LOG_FILE} is empty: the monthly restore drill has no successful run recorded"
 fi
 
-LINE="$(awk 'NF { line=$0 } END { print line }' "${LOG_FILE}")"
+# Newest drill record, not newest line. An older install told the
+# operator to append backup_config.sh's capture here, and that capture
+# ends in prose; treating that line as the record makes the daily alarm
+# fail until an operator deletes it. A line counts only when it is the
+# stamp-plus-" ok " record the drill appends.
+LINE="$(awk '
+    NF && $1 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$/ && index($0, " ok ") {
+        line = $0
+    }
+    END { print line }
+' "${LOG_FILE}")"
 if [[ -z "${LINE}" ]]; then
-    die "drill log ${LOG_FILE} has no non-empty line"
+    die "drill log ${LOG_FILE} has no drill record (a UTC stamp followed by \" ok \"): the monthly restore drill has no successful run recorded"
 fi
 
 STAMP="${LINE%% *}"
@@ -67,7 +89,7 @@ case "${STAMP}" in
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
         ;;
     *)
-        die "newest drill log line is not a UTC stamp (YYYY-MM-DDTHH:MM:SSZ): ${LINE}"
+        die "newest drill record is not a UTC stamp (YYYY-MM-DDTHH:MM:SSZ): ${LINE}"
         ;;
 esac
 

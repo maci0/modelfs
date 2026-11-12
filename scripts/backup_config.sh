@@ -6,7 +6,9 @@
 # `systemctl edit` and lives nowhere else: a replica or offsite host lost
 # and rebuilt from this repo comes back with the shipped placeholders, and
 # the pull then names a host nobody chose. Capture this output with the
-# monthly drill log so the values survive the host they configure.
+# monthly drill, in their own file (/var/log/modelfs-backup-config.log,
+# not the drill log: check_drill_log.sh ages drill records there, and
+# this output's last line is not one).
 #
 # Read-only: it opens no pool, writes no file, and never starts a unit.
 # ROOT is the tree holding etc/systemd/system and etc/sanoid (default /,
@@ -160,4 +162,4 @@ if [[ "${found}" -eq 0 ]]; then
 fi
 
 echo
-echo "capture this with the drill log; the values it prints are the ones a rebuilt host needs"
+echo "capture this beside the drill log (/var/log/modelfs-backup-config.log, not inside it); the values it prints are the ones a rebuilt host needs"
