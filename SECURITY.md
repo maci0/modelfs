@@ -7,7 +7,7 @@ this policy as well; the model for that plane is
 
 ## Supported versions
 
-`v0.23.0` is the current release: tag `v0.23.0`, matching `.version = "0.23.0"` in
+`v0.24.0` is the current release: tag `v0.24.0`, matching `.version = "0.24.0"` in
 [build.zig.zon](build.zig.zon), which `modelfs version` prints.
 
 Fixes land on `main` only. One concerning a released line is noted in

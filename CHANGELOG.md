@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-13
+
+### CI - 2026-11-13
+- **The gate's ruff pin moves to 0.17.4.** `pyproject.toml` (the `dev` group and ruff's `required-version`), `uv.lock`, and `sbom.cdx.json` now name ruff 0.17.4. Dev tooling only: the daemon, the CLI, and the release binary are unchanged.
+
 ### CI - 2026-11-12
 - **shellcheck also runs `avoid-negated-conditions` and `useless-use-of-cat`.** Both were already clean across `scripts/**/*.sh` and the extracted CI `run:` steps, and neither was enabled, so a negated comparison or a `cat` piped into a filter (which hides `cat`'s exit status) could merge. `.shellcheckrc` names them with the other optional checks, so the gate and a bare `shellcheck` of those scripts enforce the same set. The style-only brace and double-bracket checks stay off. No script behavior changes.
 
@@ -1520,7 +1525,8 @@ Changes made for the tag itself:
   3. 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`) provide optimal throughput on local TCP loopback.
 - **Verification Integrity**: All 31 unit tests and 3 E2E integration test suites pass 100% cleanly with 0 memory leaks.
 
-[Unreleased]: https://github.com/maci0/modelfs/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/maci0/modelfs/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/maci0/modelfs/releases/tag/v0.24.0
 [0.23.0]: https://github.com/maci0/modelfs/releases/tag/v0.23.0
 [0.22.0]: https://github.com/maci0/modelfs/releases/tag/v0.22.0
 [0.21.0]: https://github.com/maci0/modelfs/releases/tag/v0.21.0
