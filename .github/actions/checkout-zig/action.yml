@@ -1,0 +1,23 @@
+# Checkout and the pinned Zig toolchain, the pair every build job starts
+# with. ci.yml and release.yml name this instead of repeating the two
+# steps, so a pin or a credential knob moves once. The release publish
+# job does not: it is the one job with contents: write, and it needs no
+# toolchain, so it keeps its own checkout step.
+#
+# Run steps need an explicit `shell`: a composite action has no
+# workflow-level default. This action has none; both steps are uses.
+name: checkout-zig
+description: Check out the repo without a leftover write token, then install the Zig toolchain build.zig.zon names.
+runs:
+  using: composite
+  steps:
+    # persist-credentials: false so a later step cannot push with the
+    # checkout token. The workflow's top-level permissions stay
+    # contents: read; this step does not widen them.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    # version input left empty: setup-zig reads minimum_zig_version from
+    # build.zig.zon, so the manifest stays the single pin. The compile
+    # cache it keeps is per job, same as when the step was inline.
+    - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
