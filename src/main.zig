@@ -3298,24 +3298,30 @@ test "config reports every resolved knob and the source it came from" {
     defer freeParsed(parsed, gpa);
     try std.testing.expectEqual(@as(u8, 0), try cmdConfig(std.testing.io, gpa, parsed.opts));
 
-    // A value without its source cannot be checked: origin reads the same
-    // whether the variable, the flag, or the default set it.
-    for ([_][]const u8{
-        "origin = /env/origin (MODELFS_ORIGIN)\n",
-        "cache = /env/cache (MODELFS_CACHE)\n",
-        "log = err (MODELFS_LOG)\n",
-        "piece = 8388608 (default)\n",
-        "psk_file = /etc/modelfs.psk (default)\n",
-        "psk_value = (unset) (default)\n",
-        "id = (unset: mount uses the short hostname) (default)\n",
-        "listen = 18080 (default)\n",
-        "advertise = (auto-detect) (default)\n",
-    }) |line| {
-        if (std.mem.indexOf(u8, out.items, line) == null) {
-            std.debug.print("missing config line: {s}\n", .{line});
-            return error.MissingConfigLine;
-        }
-    }
+    // The whole report, in the order cmdConfig prints it. A substring scan
+    // stays green when a knob is dropped (brun/bcull/bstop, direct_io) or
+    // two lines trade places, and a value without its source cannot be
+    // checked: origin reads the same whether the variable or the default
+    // set it.
+    try std.testing.expectEqualStrings(
+        "origin = /env/origin (MODELFS_ORIGIN)\n" ++
+            "cache = /env/cache (MODELFS_CACHE)\n" ++
+            "id = (unset: mount uses the short hostname) (default)\n" ++
+            "psk_file = /etc/modelfs.psk (default)\n" ++
+            "psk_value = (unset) (default)\n" ++
+            "log = err (MODELFS_LOG)\n" ++
+            "piece = 8388608 (default)\n" ++
+            "brun = 10 (default)\n" ++
+            "bcull = 7 (default)\n" ++
+            "bstop = 3 (default)\n" ++
+            "listen = 18080 (default)\n" ++
+            "advertise = (auto-detect) (default)\n" ++
+            "seed = (none) (default)\n" ++
+            "direct_io = on (default)\n" ++
+            "allow_other = off (default)\n" ++
+            "detach = off (default)\n",
+        out.items,
+    );
 }
 
 test "config names the flag that beat its variable and never prints the secret" {
@@ -3335,11 +3341,31 @@ test "config names the flag that beat its variable and never prints the secret" 
     const parsed = try parseArgs(gpa, &environ, &.{ "config", "--cache", "/flag/cache" });
     defer freeParsed(parsed, gpa);
     try std.testing.expectEqual(@as(u8, 0), try cmdConfig(std.testing.io, gpa, parsed.opts));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "cache = /flag/cache (--cache)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "origin = /env/origin (MODELFS_ORIGIN)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "psk_value = set, value not shown (MODELFS_PSK_VALUE)") != null);
+    // --cache beats MODELFS_CACHE and the secret stays off the line. The
+    // rest of the report is the default one, so a knob that silently kept
+    // the env value (or printed it beside the flag) fails here.
+    try std.testing.expectEqualStrings(
+        "origin = /env/origin (MODELFS_ORIGIN)\n" ++
+            "cache = /flag/cache (--cache)\n" ++
+            "id = (unset: mount uses the short hostname) (default)\n" ++
+            "psk_file = /etc/modelfs.psk (default)\n" ++
+            "psk_value = set, value not shown (MODELFS_PSK_VALUE)\n" ++
+            "log = info (default)\n" ++
+            "piece = 8388608 (default)\n" ++
+            "brun = 10 (default)\n" ++
+            "bcull = 7 (default)\n" ++
+            "bstop = 3 (default)\n" ++
+            "listen = 18080 (default)\n" ++
+            "advertise = (auto-detect) (default)\n" ++
+            "seed = (none) (default)\n" ++
+            "direct_io = on (default)\n" ++
+            "allow_other = off (default)\n" ++
+            "detach = off (default)\n",
+        out.items,
+    );
     // The dump lands in a scrollback, a CI log, and a paste: the secret
-    // itself must not be in it.
+    // itself must not be in it, including inside a longer line the exact
+    // report above would already have rejected.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "cluster-secret-hex") == null);
 }
 

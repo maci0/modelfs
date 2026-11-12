@@ -4079,7 +4079,23 @@ test "FUSE fsync publishes origin outcomes and latency without counting rejected
     try std.testing.expectEqualDeep(stats, doc.value.stats);
     var line_buf: [1536]u8 = undefined;
     const line = try formatStatsTick(stats, 37, 2, &line_buf);
-    try std.testing.expect(std.mem.find(u8, line, " fsync_ok=2 fsync_err=1 fsync_completed=3 fsync_us=") != null);
+    // Wall time makes fsync_us itself unknowable; everything else on this
+    // interval is fixed. Pinning the fields on both sides of the mean stops
+    // a formatter that drops fsync_err or counts the two successes as the
+    // divisor from still matching the fragment.
+    const fsync_at = std.mem.find(u8, line, " fsync_ok=2 fsync_err=1 fsync_completed=3 fsync_us=") orelse return error.TestUnexpectedResult;
+    const us_at = fsync_at + " fsync_ok=2 fsync_err=1 fsync_completed=3 fsync_us=".len;
+    const us_end = std.mem.findScalarPos(u8, line, us_at, ' ') orelse line.len;
+    const fsync_us = try std.fmt.parseInt(u64, line[us_at..us_end], 10);
+    try std.testing.expect(fsync_us > 0);
+    // cache_free_pct is this host's real statfs reading and inflight is the
+    // listener depth, so neither has a fixed value here; both must still be
+    // the fields that close the line.
+    const tail = line[us_end..];
+    try std.testing.expect(std.mem.startsWith(u8, tail, " cache_free_pct="));
+    const inf_at = std.mem.find(u8, tail, " inflight=") orelse return error.TestUnexpectedResult;
+    _ = try std.fmt.parseInt(i32, tail[" cache_free_pct=".len..inf_at], 10);
+    _ = try std.fmt.parseInt(u64, tail[inf_at + " inflight=".len ..], 10);
 }
 
 test "formatStatsTick divides latency by all timed completions" {
@@ -4093,16 +4109,22 @@ test "formatStatsTick divides latency by all timed completions" {
         .fsync_completed = 2,
         .fsync_nanos = 8000,
     }, -1, 0, &buf);
-    try std.testing.expect(std.mem.find(u8, line, " rd_us=2 ") != null);
-    try std.testing.expect(std.mem.find(u8, line, " wr_us=3 ") != null);
-    try std.testing.expect(std.mem.find(u8, line, " reads_completed=4 writes_completed=3") != null);
-    // The open-side failure counters ride the line: an open storm whose
-    // cache entries cannot be built used to warn per open and move no
-    // counter, leaving the tick line flat through a mount-wide stall.
-    try std.testing.expect(std.mem.find(u8, line, " opens_err=0 create_warmup_err=0 ") != null);
-    // Saturation gauges close the line: the journal reader gets the cache
-    // free percentage and the peer listener depth, not just status.json.
-    try std.testing.expect(std.mem.endsWith(u8, line, " cache_free_pct=-1 inflight=0"));
+    // Exact line, not a substring scan: a mean that divides by the success
+    // counter (reads_ok=1) instead of the timed completions (4) still
+    // contains "rd_us=" and "reads_completed=4", so the fragments above
+    // would keep passing while the journal reports 8us/read instead of 2.
+    // 8000ns/4ops = 2us read, 9000ns/3ops = 3us write, 8000ns/2ops = 4us
+    // fsync; every other counter of this snap is zero.
+    try std.testing.expectEqualStrings(
+        "tick: reads_ok=1 reads_err=0 reads_warm=0 read_mib=0 rd_us=2 opens_err=0 create_warmup_err=0" ++
+            " writes_ok=0 writes_err=0 write_mib=0 wr_us=3" ++
+            " fills peer=0 nfs=0 fill_ms peer/nfs=0/0 fill_err peer/nfs/cache/verify=0/0/0/0" ++
+            " probe_err=0 lease_err=0 peer_mib=0 origin_mib=0 serve_mib=0 serve_verify_fail=0 culled=0 httpok=0 http401=0 http5xx=0 http_send_err=0 httpbad=0 httpdrop=0 http405=0 http_completed=0 http_us=0 md_us=0 meta_err=0" ++
+            " reads_completed=4 writes_completed=3" ++
+            " fsync_ok=0 fsync_err=0 fsync_completed=2 fsync_us=4" ++
+            " cache_free_pct=-1 inflight=0",
+        line,
+    );
 }
 
 test "tick line fits its buffer at every counter's widest value" {

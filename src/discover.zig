@@ -1222,7 +1222,9 @@ pub const Catalog = struct {
         try std.testing.expectEqual(prior, cat.paths.items[0].ewma_bps);
 
         cat.updateGoodput("10.0.0.1", 1, 5e9);
-        try std.testing.expectEqual(0.3 * 5e9 + 0.7 * prior, cat.paths.items[0].ewma_bps);
+        // 0.3*5e9 + 0.7*1e8, written out: restating the blend here would
+        // pass a formula that moved the weights and the assertion together.
+        try std.testing.expectEqual(@as(f64, 1_570_000_000.0), cat.paths.items[0].ewma_bps);
     }
 
     pub fn inflight(self: *Catalog, ip: []const u8, port: u16, delta: i32) u32 {
@@ -1544,10 +1546,12 @@ test "probeTryClaim cap overflow still lets the caller probe" {
     }
     try std.testing.expectEqual(Catalog.ProbeClaim.overflow, cat.probeTryClaim("spill.bin"));
     try std.testing.expectEqual(Catalog.ProbeClaim.overflow, cat.probeTryClaim("spill.bin"));
-    const overflow = cat.probeTryClaim("spill.bin");
+    // A third refusal of the same name must stay .overflow: a gate that
+    // answered .busy for a name it never stored would pass the two lines
+    // above and then skip the release below, so the slot leak never shows.
+    try std.testing.expectEqual(Catalog.ProbeClaim.overflow, cat.probeTryClaim("spill.bin"));
     cat.probeRelease("f0.bin");
     try std.testing.expectEqual(Catalog.ProbeClaim.claimed, cat.probeTryClaim("spill.bin"));
-    if (overflow == .claimed) cat.probeRelease("spill.bin");
     try std.testing.expectEqual(Catalog.ProbeClaim.busy, cat.probeTryClaim("spill.bin"));
     cat.probeRelease("spill.bin");
     i = 0;
@@ -2098,11 +2102,16 @@ test "fuzz lease ip parsing matches the dialer's inet_pton exactly" {
 }
 
 test "path score: 200G L2 beats 10G routed beats busy 200G" {
+    // goodput / (1+hops) / (1+inflight), in bytes/s. Ordering alone would
+    // still pass a formula that dropped the hop penalty (200G/8 stays above
+    // 10G/8) or the inflight penalty (an unpenalized busy path ties fabric
+    // and the strict > holds nowhere it should fail).
     const fabric = pathScore(200_000_000_000.0 / 8.0, 0, 0);
     const mgmt = pathScore(10_000_000_000.0 / 8.0, 1, 0);
     const busy = pathScore(200_000_000_000.0 / 8.0, 0, 8);
-    try std.testing.expect(fabric > mgmt);
-    try std.testing.expect(fabric > busy);
+    try std.testing.expectEqual(@as(f64, 25_000_000_000.0), fabric);
+    try std.testing.expectEqual(@as(f64, 625_000_000.0), mgmt);
+    try std.testing.expectEqual(@as(f64, 25_000_000_000.0 / 9.0), busy);
 }
 
 test "pickBest is exclusive: one winner, skips !have" {
@@ -2408,7 +2417,10 @@ test "refresh skips self and expired leases" {
     cat.updateGoodput("10.0.0.1", 18080, 5e9);
     const paths = cat.paths.items;
     try std.testing.expectEqual(@as(usize, 1), paths.len);
-    try std.testing.expect(paths[0].ewma_bps < 25_000_000_000.0 and paths[0].ewma_bps > 5e9);
+    // 0.3*sample + 0.7*prior, twice: 0.3*5e9 + 0.7*25e9 = 19e9, then
+    // 0.3*5e9 + 0.7*19e9 = 14.8e9. The open interval (5e9, 25e9) also held
+    // for a blend that ran once, ran backwards, or dropped the prior.
+    try std.testing.expectEqual(@as(f64, 14_800_000_000.0), paths[0].ewma_bps);
 
     try std.testing.expectEqual(@as(u32, 1), cat.inflight("10.0.0.1", 18080, 1));
     try std.testing.expectEqual(@as(u32, 0), cat.inflight("10.0.0.1", 18080, -1));
@@ -2843,7 +2855,9 @@ test "refresh carries learned goodput and inflight across ticks" {
     // in-flight fetch.
     cat.updateGoodput("10.0.0.9", 19099, 5e9);
     const learned = cat.paths.items[0].ewma_bps;
-    try std.testing.expectEqual(0.3 * 5e9 + 0.7 * @as(f64, 1e8), learned);
+    // 0.3*5e9 + 0.7*1e8. Naming the blend here would let a weight change in
+    // updateGoodput pass as long as this line copied it.
+    try std.testing.expectEqual(@as(f64, 1_570_000_000.0), learned);
     try std.testing.expectEqual(@as(u32, 1), cat.inflight("10.0.0.9", 19099, 1));
 
     // A later tick republishes leases; the same address must keep its
