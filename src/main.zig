@@ -651,7 +651,7 @@ fn splitFlag(a: []const u8) struct { name: []const u8, value: ?[]const u8 } {
 
 fn rejectInlineValue(flag: []const u8, inline_val: ?[]const u8) !void {
     if (inline_val != null) {
-        if (!builtin.is_test) std.debug.print("{s} does not take a value (see 'modelfs help')\n", .{flag});
+        diagUsage("{s} does not take a value (see 'modelfs help')\n", .{flag});
         return error.UnexpectedValue;
     }
 }
@@ -662,7 +662,7 @@ fn takeValue(args: []const []const u8, flag: []const u8, i: *usize, inline_val: 
     if (inline_val) |v| return v;
     i.* += 1;
     if (i.* >= args.len) {
-        if (!builtin.is_test) std.debug.print("{s} needs a value (see 'modelfs help')\n", .{flag});
+        diagUsage("{s} needs a value (see 'modelfs help')\n", .{flag});
         return error.MissingValue;
     }
     return args[i.*];
@@ -673,7 +673,7 @@ fn takeValue(args: []const []const u8, flag: []const u8, i: *usize, inline_val: 
 /// a flag with no argument at all.
 fn refuseEmpty(flag: []const u8, value: []const u8) !void {
     if (value.len == 0) {
-        if (!builtin.is_test) std.debug.print("{s} needs a value (see 'modelfs help')\n", .{flag});
+        diagUsage("{s} needs a value (see 'modelfs help')\n", .{flag});
         return error.MissingValue;
     }
 }
@@ -744,8 +744,7 @@ fn parseLogLevel(s: []const u8) ?std.log.Level {
 /// was wrong.
 fn takeLogLevel(source: []const u8, raw: []const u8) !std.log.Level {
     return parseLogLevel(raw) orelse {
-        if (!builtin.is_test)
-            std.debug.print("{s} {s}: want err, warn, info, or debug\n", .{ source, proto.displayName(raw) });
+        diagUsage("{s} {s}: want err, warn, info, or debug\n", .{ source, proto.displayName(raw) });
         return error.BadLogLevel;
     };
 }
@@ -811,10 +810,8 @@ fn unknownEnvName(environ: *const std.process.Environ.Map) ?[]const u8 {
 /// pass untouched.
 fn checkKnownEnv(environ: *const std.process.Environ.Map) !void {
     const name = unknownEnvName(environ) orelse return;
-    if (!builtin.is_test) {
-        var lbuf: [512]u8 = undefined;
-        std.debug.print("{s}", .{unknownEnvLine(&lbuf, name)});
-    }
+    var lbuf: [512]u8 = undefined;
+    diagUsage("{s}", .{unknownEnvLine(&lbuf, name)});
     return error.UnknownEnv;
 }
 
@@ -875,14 +872,14 @@ fn resolveOriginDir(io: std.Io, gpa: std.mem.Allocator, origin: []const u8) ![]u
 /// the failure to avoid: it reads as a working knob.
 fn rejectOutsideCommand(cmd: []const u8, want: []const u8, flag: []const u8) !void {
     if (!std.mem.eql(u8, cmd, want)) {
-        if (!builtin.is_test) std.debug.print("{s} only applies to modelfs {s}\n", .{ flag, want });
+        diagUsage("{s} only applies to modelfs {s}\n", .{ flag, want });
         return error.FlagOutsideCommand;
     }
 }
 
 fn rejectOutsideMount(cmd: []const u8, flag: []const u8) !void {
     if (!mountScope(cmd)) {
-        if (!builtin.is_test) std.debug.print("{s} only applies to modelfs mount\n", .{flag});
+        diagUsage("{s} only applies to modelfs mount\n", .{flag});
         return error.FlagOutsideMount;
     }
 }
@@ -911,14 +908,14 @@ fn badIdLine(buf: []u8, id: []const u8) []const u8 {
 /// as a bare InvalidCharacter.
 fn parsePercent(flag: []const u8, raw: []const u8) !u32 {
     const pct = std.fmt.parseInt(u32, raw, 10) catch {
-        if (!builtin.is_test) std.debug.print("{s} {s}: not a percentage\n", .{ flag, raw });
+        diagUsage("{s} {s}: not a percentage\n", .{ flag, raw });
         return error.BadWatermark;
     };
     // freePercent clamps to 0..100, so an out-of-range watermark would pin
     // the phase decision permanently (bstop=101 culls hard on every tick no
     // matter how full the cache fs is) instead of tracking it.
     if (pct > 100) {
-        if (!builtin.is_test) std.debug.print("{s} {s}: percentage must be 0..100\n", .{ flag, raw });
+        diagUsage("{s} {s}: percentage must be 0..100\n", .{ flag, raw });
         return error.BadWatermark;
     }
     return pct;
@@ -1197,17 +1194,17 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             try rejectOutsideMount(cmd, flag);
             const raw = try takeValue(args, flag, &i, inline_val);
             const psz = parseSize(raw) catch {
-                if (!builtin.is_test) std.debug.print("--piece {s}: bad size (want e.g. 16M)\n", .{raw});
+                diagUsage("--piece {s}: bad size (want e.g. 16M)\n", .{raw});
                 return error.BadSize;
             };
             if (psz > std.math.maxInt(u32)) {
-                if (!builtin.is_test) std.debug.print("--piece {s}: too large (max 4294967295)\n", .{raw});
+                diagUsage("--piece {s}: too large (max 4294967295)\n", .{raw});
                 return error.ValueTooLarge;
             }
             // A zero piece makes piece.cover() empty: reads would serve hole
             // zeros forever and nothing would ever hydrate.
             if (psz == 0) {
-                if (!builtin.is_test) std.debug.print("--piece {s}: must be above zero\n", .{raw});
+                diagUsage("--piece {s}: must be above zero\n", .{raw});
                 return error.ZeroPieceSize;
             }
             opts.piece = @intCast(psz);
@@ -1254,12 +1251,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             const raw = try takeValue(args, flag, &i, inline_val);
             opts.from_flag.listen = true;
             opts.listen_port = listenPort(raw) catch |err| {
-                if (!builtin.is_test) {
-                    if (err == error.ZeroPort)
-                        std.debug.print("--listen {s}: port 0 is not a listen port (want 1-65535)\n", .{raw})
-                    else
-                        std.debug.print("--listen {s}: bad endpoint (want [IP:]PORT)\n", .{raw});
-                }
+                if (err == error.ZeroPort)
+                    diagUsage("--listen {s}: port 0 is not a listen port (want 1-65535)\n", .{raw})
+                else
+                    diagUsage("--listen {s}: bad endpoint (want [IP:]PORT)\n", .{raw});
                 return error.BadListen;
             };
         } else if (std.mem.eql(u8, flag, "--advertise")) {
@@ -1272,12 +1267,10 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 // the address and would fail parseV4 as a host name.
                 const tok = std.mem.trim(u8, one, " \t");
                 const hp = parseHostPort(tok) catch |err| {
-                    if (!builtin.is_test) {
-                        if (err == error.ZeroPort)
-                            std.debug.print("--advertise {s}: port 0 is not a peer port (want 1-65535)\n", .{v})
-                        else
-                            std.debug.print("--advertise {s}: bad address (want IP[:PORT])\n", .{v});
-                    }
+                    if (err == error.ZeroPort)
+                        diagUsage("--advertise {s}: port 0 is not a peer port (want 1-65535)\n", .{v})
+                    else
+                        diagUsage("--advertise {s}: bad address (want IP[:PORT])\n", .{v});
                     return error.BadHostPort;
                 };
                 // Same contract --seed resolves for: every lease consumer
@@ -1288,11 +1281,11 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
                 // require the dotted quad where the flag is parsed.
                 var quad: [4]u8 = undefined;
                 if (!discover.parseV4(hp.ip, &quad)) {
-                    if (!builtin.is_test) std.debug.print("--advertise {s}: {s} is not an IPv4 address (peers dial dotted quads only)\n", .{ v, hp.ip });
+                    diagUsage("--advertise {s}: {s} is not an IPv4 address (peers dial dotted quads only)\n", .{ v, hp.ip });
                     return error.BadAdvertiseIp;
                 }
                 if (!discover.isDialableHost(&quad)) {
-                    if (!builtin.is_test) std.debug.print("--advertise {s}: {s} is not a dialable peer address\n", .{ v, hp.ip });
+                    diagUsage("--advertise {s}: {s} is not a dialable peer address\n", .{ v, hp.ip });
                     return error.UndialableIp;
                 }
                 try opts.advertise.append(gpa, .{
@@ -1310,18 +1303,16 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
             // Validate now with a named message instead of failing later in
             // mount setup with a bare parseInt error.
             const hp = parseHostPort(s) catch |err| {
-                if (!builtin.is_test) {
-                    if (err == error.ZeroPort)
-                        std.debug.print("--seed {s}: port 0 is not a peer port (want 1-65535)\n", .{s})
-                    else
-                        std.debug.print("--seed {s}: bad address (want HOST[:PORT])\n", .{s});
-                }
+                if (err == error.ZeroPort)
+                    diagUsage("--seed {s}: port 0 is not a peer port (want 1-65535)\n", .{s})
+                else
+                    diagUsage("--seed {s}: bad address (want HOST[:PORT])\n", .{s});
                 return error.BadHostPort;
             };
             // Numeric form is gated here; a hostname that resolves to
             // 0.0.0.0 is refused in buildSeeds after DNS, same message.
             if (undialablePeerIp(hp.ip)) {
-                if (!builtin.is_test) std.debug.print("--seed {s}: {s} is not a dialable peer address\n", .{ s, hp.ip });
+                diagUsage("--seed {s}: {s} is not a dialable peer address\n", .{ s, hp.ip });
                 return error.UndialableIp;
             }
             try opts.seed.append(gpa, s);
@@ -1351,10 +1342,8 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // discover.hostname answers to.
     if (opts.id) |id| {
         if (!discover.validId(id)) {
-            if (!builtin.is_test) {
-                var lbuf: [512]u8 = undefined;
-                std.debug.print("{s}", .{badIdLine(&lbuf, id)});
-            }
+            var lbuf: [512]u8 = undefined;
+            diagUsage("{s}", .{badIdLine(&lbuf, id)});
             return error.BadId;
         }
     }
@@ -1364,8 +1353,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // hard-culls far above the intended floor (bstop >= bcull) or punches
     // candidates every tick in the run/cull flap band (brun <= bcull).
     if (!cull.ordered(opts.water)) {
-        if (!builtin.is_test)
-            std.debug.print("watermarks out of order (brun {d}, bcull {d}, bstop {d}): need brun > bcull > bstop\n", .{ opts.water.brun, opts.water.bcull, opts.water.bstop });
+        diagUsage("watermarks out of order (brun {d}, bcull {d}, bstop {d}): need brun > bcull > bstop\n", .{ opts.water.brun, opts.water.bcull, opts.water.bstop });
         return error.BadWatermarks;
     }
     // Empty path flags would fail later as "not reachable" / missing PSK
@@ -1381,8 +1369,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     // shell-wide inline value must not fail those commands the way the
     // e2e suites pass --psk to them.
     if (std.mem.eql(u8, cmd, "mount") and opts.psk_value != null and psk_file_set) {
-        if (!builtin.is_test)
-            std.debug.print("MODELFS_PSK_VALUE cannot be combined with --psk or MODELFS_PSK; pick one\n", .{});
+        diagUsage("MODELFS_PSK_VALUE cannot be combined with --psk or MODELFS_PSK; pick one\n", .{});
         return error.ConflictingPsk;
     }
     // Empty positional after flags (`mount ""`) is the same missing
@@ -1391,8 +1378,7 @@ fn parseArgs(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, ar
     if (std.mem.eql(u8, cmd, "mount")) {
         for (rest.items) |r| {
             if (r.len == 0) {
-                if (!builtin.is_test)
-                    std.debug.print("mount takes exactly one directory argument (see 'modelfs help')\n", .{});
+                diagUsage("mount takes exactly one directory argument (see 'modelfs help')\n", .{});
                 return error.MissingValue;
             }
         }
@@ -1679,7 +1665,7 @@ test "cache piece size validation probes the data filesystem" {
 fn cmdMount(init: std.process.Init, opts: Opts, mount: []const u8) !u8 {
     const gpa = init.gpa;
     const origin_raw = opts.origin orelse {
-        std.debug.print("mount needs --origin (the NFS path, e.g. /mnt/nas/models; or MODELFS_ORIGIN)\n", .{});
+        diagUsage("mount needs --origin (the NFS path, e.g. /mnt/nas/models; or MODELFS_ORIGIN)\n", .{});
         return 2;
     };
     const origin = resolveOriginDir(init.io, gpa, origin_raw) catch return 1;
@@ -2946,7 +2932,7 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, opts: Opts, path: []const u8) !
         return 1;
     }
     if ((st.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) {
-        if (!builtin.is_test) std.debug.print("verify: {s} is not a regular file\n", .{rel});
+        diagFailed("verify: {s} is not a regular file\n", .{rel});
         return 1;
     }
     const size = sys.sizeFromStat(st.st_size) orelse {
@@ -4586,8 +4572,7 @@ fn cmdDupes(io: std.Io, gpa: std.mem.Allocator, opts: Opts, paths: []const []con
         const blob = sys.readFileAllocNoFollowOpenErrno(gpa, mp, store_mod.Store.max_manifest_bytes, &open_errno, null) catch |err| switch (err) {
             error.OpenFailed => {
                 if (open_errno == sys.c.ENOENT) {
-                    if (!builtin.is_test)
-                        std.debug.print("{s}: no piece-hash manifest (not ingested through modelfs, or never fully hashed)\n", .{rel});
+                    diagFailed("{s}: no piece-hash manifest (not ingested through modelfs, or never fully hashed)\n", .{rel});
                 } else {
                     if (!builtin.is_test) std.log.err("manifest open failed for {s} (errno {d})", .{ rel, open_errno });
                     failed = true;
@@ -5003,7 +4988,7 @@ test "parseArgs rejects bad values" {
     const gpa = std.testing.allocator;
     var environ = std.process.Environ.Map.init(gpa);
     defer environ.deinit();
-    // Usage errors print via std.debug.print, suppressed under test, so all
+    // Usage errors print through diagUsage, captured under test, so all
     // rejection paths are assertable here.
     try std.testing.expectError(error.MissingValue, parseArgs(gpa, &environ, &.{ "mount", "--origin" }));
     try std.testing.expectError(error.Help, parseArgs(gpa, &environ, &.{ "mount", "--help" }));
@@ -6442,10 +6427,27 @@ test "cli json mode reports usage as the last stderr line" {
 
     try std.testing.expectEqual(@as(u8, 2), try cli(io, gpa, &env, &.{ "-o", "json", "nope" }, null));
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
-    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, lastStdErrLine(err.items), .{});
-    defer parsed.deinit();
-    const body = parsed.value.object.get("error").?.object;
-    try std.testing.expectEqualStrings("usage", body.get("kind").?.string);
-    try std.testing.expect(body.get("message").?.string.len > 0);
-    try std.testing.expect(body.get("hint") != null);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, lastStdErrLine(err.items), .{});
+        defer parsed.deinit();
+        const body = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("usage", body.get("kind").?.string);
+        try std.testing.expect(body.get("message").?.string.len > 0);
+        try std.testing.expect(body.get("hint") != null);
+    }
+    // A bad flag value is the same usage channel as an unknown command:
+    // JSON mode must still leave one error object as the last stderr line,
+    // and stdout must stay empty so a pipe cannot parse the refusal as data.
+    out.clearRetainingCapacity();
+    err.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u8, 2), try cli(io, gpa, &env, &.{ "-o", "json", "mount", "--piece", "nope" }, null));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    {
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, lastStdErrLine(err.items), .{});
+        defer parsed.deinit();
+        const body = parsed.value.object.get("error").?.object;
+        try std.testing.expectEqualStrings("usage", body.get("kind").?.string);
+        try std.testing.expect(std.mem.indexOf(u8, body.get("message").?.string, "--piece") != null);
+        try std.testing.expect(body.get("hint") != null);
+    }
 }

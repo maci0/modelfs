@@ -7,6 +7,7 @@
 
 ### Fixed - 2026-11-12
 - **`dr_pool_restore.sh` records a later restore from a different source.** The rerun check grepped the destination and the source separately, so a log that already had this destination on one line and this source on another treated a new restore as a duplicate and left it out of `/var/log/modelfs-pool-restore.log`. The RTO line is the pair: same destination and same source on one line stays one line; a different source appends.
+- **Usage refusals in JSON mode now end stderr with one error object.** Flag and value refusals (a missing value, a bad `--piece`/`--listen`/`--seed`/`--advertise`/`--log`/`--id`, a watermark, an unknown `MODELFS_*` name, a flag on the wrong command) printed through `std.debug.print`, so `-o json` left human prose on stderr and a script reading the declared last-line `{"error":{...}}` object saw nothing. They now go through `diagUsage`, the same channel an unknown command already used. `verify` on a non-regular file and a missing `dupes` manifest go through `diagFailed` (kind `failed`, exit 1). Text mode is unchanged.
 
 ## [0.23.0] - 2026-11-05
 

@@ -126,7 +126,11 @@ The commands that skip FUSE (`status`, `peers`, `pin`, `unpin`, `verify`, `dupes
 `update`, `schema`) import `store` and `discover` directly. `schema` is the exception: it
 prints the clispec 0.3 document and reads no store, config, or token. `-o` / `--output`
 selects `auto` (text on a terminal, JSON otherwise), `text`, or `json`, before or after
-the command. `verify`, `config`, `update`, `mount`, `version`, and `schema` keep their
+the command. Usage refusals (`diagUsage` in `src/main.zig`: a missing value, a bad
+`--piece`/`--listen`/`--seed`/`--advertise`/`--log`/`--id`, watermarks, an unknown
+`MODELFS_*`, a flag on the wrong command, `mount` without `--origin`) exit 2; in JSON
+mode that line is the last stderr object (`kind` `usage`). A non-regular `verify` target
+and a missing `dupes` manifest exit 1 (`diagFailed`, kind `failed`). `verify`, `config`, `update`, `mount`, `version`, and `schema` keep their
 text (or, for `schema`, the JSON document) whichever way `-o` is set. They admit paths through `relOk`/`relIsCluster`
 and name cache and origin artifacts through Store (`cacheMetaPath`, `sidecarPieceSize`,
 `manifestPath`, `manifestsDirPath`) rather than reconstructing those joins. Status and update
