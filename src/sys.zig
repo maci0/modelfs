@@ -1351,9 +1351,9 @@ test "setNonblocking clears the flag an origin file was opened with" {
     var z_buf: [128]u8 = undefined;
     const p = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/nonblock-{d}-{d}.tmp", .{ nowSecRaw(), pidSelf() });
     const z = try toZ(&z_buf, p);
-    // The open flags a pull uses: non-blocking so a FIFO planted at the name
-    // cannot hang the open, then cleared before the fd reaches a writer that
-    // expects blocking semantics.
+    // The open flags stagePartial (src/hf.zig) uses: non-blocking so a FIFO
+    // planted at the name cannot hang the open, then cleared before the fd
+    // reaches a writer that expects blocking semantics.
     const fd = open(z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_NOFOLLOW | c.O_NONBLOCK, 0o644);
     try std.testing.expect(fd >= 0);
     defer close(fd);

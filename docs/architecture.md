@@ -758,8 +758,11 @@ JSON mode streams one record per file and one per overlap. Text mode keeps the l
 
 Downloads one Hugging Face model revision onto the origin, where the mounts then serve it. The
 recursive tree listing for the revision names every file and its size; files already present at
-that size are skipped, so a rerun resumes, and each download lands as `<name>.part` and is
-renamed only once complete.
+that size are skipped, so a rerun resumes, and each download lands as `<name>.part` then takes
+its real name only once the body is complete. `stagePartial` (src/hf.zig) creates that part
+file at 0600 and `fchmod`s the fd to the same mode, so the caller's umask and a leftover
+0644 part cannot widen it, and the rename keeps the mode. Directories stay 0755 so every
+mount can still walk them.
 
 `--revision` takes a branch, tag, or commit (default `main`); `--dest` sets where under the
 origin the files land (default: the repo id). The token comes from `HF_TOKEN`, else

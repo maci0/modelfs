@@ -21,6 +21,15 @@ const max_listing_bytes: usize = 8 << 20;
 /// that a later pull would count as already done.
 const partial_ext = ".part";
 
+/// Pulled weights land on the shared origin. 0600, matching the cache's
+/// `cache_data_mode`: the origin is the authoritative copy and an NFS
+/// export that admits other uids must not hand them out. The mode is
+/// fchmod'd onto the fd, so the caller's umask and a leftover 0644 name
+/// cannot widen it. Directories stay 0755: the origin is the tree every
+/// mount reads, and owner-only directories would hide the weights from
+/// the daemon's own peers.
+const pull_file_mode: sys.c.mode_t = 0o600;
+
 /// Where the access token comes from. Never a flag: argv is world-readable
 /// through /proc/<pid>/cmdline, the same reason `--psk-value` does not
 /// exist. `HF_TOKEN` first, then the file `huggingface-cli login` writes.
@@ -396,26 +405,14 @@ fn fetchOne(
 
     var part_buf: [sys.c.PATH_MAX]u8 = undefined;
     const part = try sys.appendExt(&part_buf, path, partial_ext);
-    // O_NOFOLLOW like every other write into a tree other hosts can plant
-    // names in: a symlink staged at this name must not redirect the pull.
-    // O_TRUNC because a leftover part file from a dead pull is not resumable
-    // (the endpoint is fetched whole, no ranged restart).
-    const fd = sys.open(part, sys.c.O_CREAT | sys.c.O_WRONLY | sys.c.O_TRUNC | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK, 0o644);
-    if (fd < 0) {
-        std.log.err("cannot open {s}{s} on the origin (errno {d})", .{ rel, partial_ext, -sys.negErrno() });
-        return error.OpenFailed;
-    }
+    const fd = try openPartial(rel, part);
     var closed = false;
     errdefer {
-        if (!closed) sys.close(fd);
-        _ = sys.unlink(part);
+        if (!closed) {
+            sys.close(fd);
+            _ = sys.unlink(part);
+        }
     }
-    // O_NONBLOCK did its job at open time; the writer below expects a
-    // blocking fd, and a regular file has nothing to poll for anyway.
-    var fst: sys.c.struct_stat = undefined;
-    if (sys.fstat(fd, &fst) != 0) return error.OpenFailed;
-    if ((fst.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return error.NotRegular;
-    if (sys.setNonblocking(fd, false) != 0) return error.OpenFailed;
 
     const url = try fileUrl(gpa, repo, revision, entry.path);
     defer gpa.free(url);
@@ -453,6 +450,65 @@ fn fetchOne(
     if (sys.rename(part, path) != 0) {
         return error.RenameFailed;
     }
+}
+
+fn openPartial(rel: []const u8, part: [*:0]const u8) !std.c.fd_t {
+    return stagePartial(part) catch |err| {
+        if (err == error.OpenFailed) {
+            std.log.err("cannot open {s}{s} on the origin (errno {d})", .{ rel, partial_ext, -sys.negErrno() });
+        }
+        return err;
+    };
+}
+
+/// stagePartial opens the part path and returns the fd at 0600.
+/// O_NOFOLLOW so a symlink staged at the name cannot redirect the
+/// download; O_TRUNC because a leftover part from a dead pull is not
+/// resumable. O_CREAT's mode is ignored when the name already exists and
+/// umask strips bits from a new file, so the fd is fchmod'd: a leftover
+/// 0644 part and a permissive umask both end at 0600, and the completing
+/// rename keeps that mode. Caller closes (and unlinks on failure).
+fn stagePartial(part: [*:0]const u8) !std.c.fd_t {
+    const fd = sys.open(part, sys.c.O_CREAT | sys.c.O_WRONLY | sys.c.O_TRUNC | sys.c.O_NOFOLLOW | sys.c.O_NONBLOCK, pull_file_mode);
+    if (fd < 0) return error.OpenFailed;
+    errdefer sys.close(fd);
+    if (sys.c.fchmod(fd, pull_file_mode) != 0) return error.OpenFailed;
+    // O_NONBLOCK did its job at open time; the writer expects a blocking
+    // fd, and a regular file has nothing to poll for anyway.
+    var fst: sys.c.struct_stat = undefined;
+    if (sys.fstat(fd, &fst) != 0) return error.OpenFailed;
+    if ((fst.st_mode & sys.c.S_IFMT) != sys.c.S_IFREG) return error.NotRegular;
+    if (sys.setNonblocking(fd, false) != 0) return error.OpenFailed;
+    return fd;
+}
+
+test "stagePartial lands a part file at 0600 under a permissive umask and tightens a leftover" {
+    var dir_buf: [128]u8 = undefined;
+    const origin = try sys.scratchDir(&dir_buf, "modelfs-hf-stage");
+    defer sys.deleteTree(std.testing.io, origin);
+
+    var path_buf: [sys.c.PATH_MAX]u8 = undefined;
+    const path = try sys.joinZ(&path_buf, origin, "sub/model.bin");
+    try std.testing.expectEqual(@as(i32, 0), sys.mkdirAll(sys.parentOf(std.mem.span(path)), 0o755));
+
+    var part_buf: [sys.c.PATH_MAX]u8 = undefined;
+    const part = try sys.appendExt(&part_buf, path, partial_ext);
+    const saved = sys.c.umask(0);
+    defer _ = sys.c.umask(saved);
+    const fd = try stagePartial(part);
+    sys.close(fd);
+    var st: sys.c.struct_stat = undefined;
+    try std.testing.expectEqual(@as(i32, 0), sys.lstatPath(part, &st));
+    try std.testing.expectEqual(@as(sys.c.mode_t, 0o600), st.st_mode & 0o777);
+    try std.testing.expect((st.st_mode & sys.c.S_IFMT) == sys.c.S_IFREG);
+
+    // A leftover world-readable part from an older pull is tightened on
+    // the fd that will be written, not left at whatever mode it had.
+    try std.testing.expectEqual(@as(i32, 0), sys.c.chmod(part, 0o644));
+    const again = try stagePartial(part);
+    sys.close(again);
+    try std.testing.expectEqual(@as(i32, 0), sys.lstatPath(part, &st));
+    try std.testing.expectEqual(@as(sys.c.mode_t, 0o600), st.st_mode & 0o777);
 }
 
 test "revision slashes are encoded as one URL segment" {
